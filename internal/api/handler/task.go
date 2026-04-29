@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"time"
 
@@ -719,4 +720,195 @@ func (h *TaskHandler) CancelSummary(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok"})
+}
+
+type batchStatusReq struct {
+	TaskIDs []int64 `json:"task_ids" binding:"required"`
+}
+
+type batchStatusItem struct {
+	ID        int64  `json:"id"`
+	Status    int    `json:"status"`
+	Progress  int    `json:"progress"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// BatchStatus handles POST /api/v1/summaries/batch-status
+func (h *TaskHandler) BatchStatus(c *gin.Context) {
+	userID := middleware.GetUserID(c)
+	spaceID := middleware.GetSpaceID(c)
+
+	var req batchStatusReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid request body"})
+		return
+	}
+
+	if len(req.TaskIDs) == 0 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40050, Message: "task_ids must not be empty"})
+		return
+	}
+	if len(req.TaskIDs) > 50 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40051, Message: "task_ids exceeds maximum of 50"})
+		return
+	}
+
+	seen := make(map[int64]struct{}, len(req.TaskIDs))
+	uniqueIDs := make([]int64, 0, len(req.TaskIDs))
+	for _, id := range req.TaskIDs {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; !ok {
+			seen[id] = struct{}{}
+			uniqueIDs = append(uniqueIDs, id)
+		}
+	}
+	if len(uniqueIDs) == 0 {
+		ok(c, gin.H{"tasks": []batchStatusItem{}})
+		return
+	}
+
+	var tasks []model.SummaryTask
+	if err := h.db.Where("id IN ? AND space_id = ? AND deleted_at IS NULL", uniqueIDs, spaceID).
+		Find(&tasks).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
+		return
+	}
+
+	if len(tasks) == 0 {
+		ok(c, gin.H{"tasks": []batchStatusItem{}})
+		return
+	}
+
+	taskIDs := make([]int64, 0, len(tasks))
+	taskMap := make(map[int64]*model.SummaryTask, len(tasks))
+	for i := range tasks {
+		taskIDs = append(taskIDs, tasks[i].ID)
+		taskMap[tasks[i].ID] = &tasks[i]
+	}
+
+	authorizedIDs := h.batchAuthorize(userID, taskIDs, taskMap)
+
+	progressMap := h.fetchLatestProgress(authorizedIDs)
+
+	items := make([]batchStatusItem, 0, len(authorizedIDs))
+	for _, id := range authorizedIDs {
+		t := taskMap[id]
+		progress := 0
+		if p, exists := progressMap[id]; exists {
+			progress = min(max(p, 0), 100)
+		}
+		items = append(items, batchStatusItem{
+			ID:        t.ID,
+			Status:    t.Status,
+			Progress:  progress,
+			UpdatedAt: t.UpdatedAt.Format(time.RFC3339),
+		})
+	}
+
+	ok(c, gin.H{"tasks": items})
+}
+
+// batchAuthorize returns the subset of taskIDs that userID is allowed to access.
+// Known limitation: source_type=2 (thread) is not checked here, consistent with
+// the existing authorizeTaskAccess implementation.
+func (h *TaskHandler) batchAuthorize(userID string, taskIDs []int64, taskMap map[int64]*model.SummaryTask) []int64 {
+	authorized := make(map[int64]struct{})
+
+	remainingIDs := make([]int64, 0, len(taskIDs))
+	for _, id := range taskIDs {
+		if taskMap[id].CreatorID == userID {
+			authorized[id] = struct{}{}
+		} else {
+			remainingIDs = append(remainingIDs, id)
+		}
+	}
+	if len(remainingIDs) == 0 {
+		return taskIDs
+	}
+
+	var participantTaskIDs []int64
+	h.db.Model(&model.SummaryParticipant{}).
+		Where("task_id IN ? AND user_id = ?", remainingIDs, userID).
+		Distinct().Pluck("task_id", &participantTaskIDs)
+	for _, id := range participantTaskIDs {
+		authorized[id] = struct{}{}
+	}
+
+	stillRemaining := make([]int64, 0)
+	for _, id := range remainingIDs {
+		if _, ok := authorized[id]; !ok {
+			stillRemaining = append(stillRemaining, id)
+		}
+	}
+	if len(stillRemaining) == 0 {
+		return mapKeys(authorized)
+	}
+
+	var sources []model.SummarySource
+	h.db.Where("task_id IN ? AND source_type = ?", stillRemaining, model.SourceGroup).
+		Find(&sources)
+
+	if len(sources) > 0 {
+		groupToTasks := make(map[string][]int64)
+		for _, s := range sources {
+			groupToTasks[s.SourceID] = append(groupToTasks[s.SourceID], s.TaskID)
+		}
+		groupNos := make([]string, 0, len(groupToTasks))
+		for gno := range groupToTasks {
+			groupNos = append(groupNos, gno)
+		}
+
+		var memberGroups []string
+		h.imDB.Table("group_member").
+			Where("group_no IN ? AND uid = ? AND is_deleted = 0", groupNos, userID).
+			Pluck("group_no", &memberGroups)
+
+		for _, gno := range memberGroups {
+			for _, taskID := range groupToTasks[gno] {
+				authorized[taskID] = struct{}{}
+			}
+		}
+	}
+
+	return mapKeys(authorized)
+}
+
+func mapKeys(m map[int64]struct{}) []int64 {
+	keys := make([]int64, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	return keys
+}
+
+// fetchLatestProgress returns the most recent progress value for each task ID
+// from the summary_event table.
+func (h *TaskHandler) fetchLatestProgress(taskIDs []int64) map[int64]int {
+	if len(taskIDs) == 0 {
+		return nil
+	}
+	type row struct {
+		TaskID   int64 `gorm:"column:task_id"`
+		Progress int   `gorm:"column:progress"`
+	}
+	var rows []row
+	h.db.Raw(`
+		SELECT e.task_id, e.progress
+		FROM summary_event e
+		INNER JOIN (
+			SELECT task_id, MAX(id) AS max_id
+			FROM summary_event
+			WHERE task_id IN ?
+			GROUP BY task_id
+		) latest ON e.id = latest.max_id
+	`, taskIDs).Scan(&rows)
+
+	m := make(map[int64]int, len(rows))
+	for _, r := range rows {
+		m[r.TaskID] = r.Progress
+	}
+	return m
 }
