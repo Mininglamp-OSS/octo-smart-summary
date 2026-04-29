@@ -16,6 +16,8 @@ import (
 	"gorm.io/gorm"
 )
 
+var callbackClient = &http.Client{Timeout: 5 * time.Second}
+
 // Processor polls the DB for pending tasks and dispatches them to the pool.
 type Processor struct {
 	db          *gorm.DB
@@ -24,18 +26,28 @@ type Processor struct {
 	llm         *service.LLMClient
 	cfg         *config.Config
 	stopCh      chan struct{}
+	triggerCh   chan model.WorkerTriggerRequest
+	meta        *MetaProcessor
 }
 
 // NewProcessor creates a new task processor.
 func NewProcessor(db, imDB *gorm.DB, pool *WorkerPool, llm *service.LLMClient, cfg *config.Config) *Processor {
-	return &Processor{
-		db:     db,
-		imDB:   imDB,
-		pool:   pool,
-		llm:    llm,
-		cfg:    cfg,
-		stopCh: make(chan struct{}),
+	p := &Processor{
+		db:        db,
+		imDB:      imDB,
+		pool:      pool,
+		llm:       llm,
+		cfg:       cfg,
+		stopCh:    make(chan struct{}),
+		triggerCh: make(chan model.WorkerTriggerRequest, 100),
 	}
+	p.meta = NewMetaProcessor(p)
+	return p
+}
+
+// TriggerCh returns the channel for worker trigger requests.
+func (p *Processor) TriggerCh() chan<- model.WorkerTriggerRequest {
+	return p.triggerCh
 }
 
 // Run starts the polling loop. Call Stop() to exit.
@@ -52,7 +64,22 @@ func (p *Processor) Run() {
 			return
 		case <-ticker.C:
 			p.poll()
+		case req := <-p.triggerCh:
+			p.handleTrigger(req)
 		}
+	}
+}
+
+func (p *Processor) handleTrigger(req model.WorkerTriggerRequest) {
+	switch req.Type {
+	case "personal_summary":
+		p.pool.Submit(func() {
+			p.processPersonalSummary(context.Background(), req.TaskID, req.ParticipantRefID)
+		})
+	case "meta_summary":
+		p.meta.TriggerMetaSummary(req.TaskID)
+	default:
+		log.Printf("[processor] unknown trigger type: %s", req.Type)
 	}
 }
 
@@ -62,30 +89,39 @@ func (p *Processor) Stop() {
 }
 
 func (p *Processor) poll() {
-	var tasks []model.SummaryTask
 	now := time.Now().UTC()
+	deadline := now.Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute)
 
-	err := p.db.Where(
-		"status = ? AND retry_count < ? AND (processing_deadline IS NULL OR processing_deadline < ?)",
-		model.StatusPending, p.cfg.WorkerMaxRetry, now,
-	).Limit(10).Find(&tasks).Error
-	if err != nil {
-		log.Printf("[processor] query pending tasks: %v", err)
-		return
-	}
+	// Claim tasks atomically: two-step select-then-claim per task.
+	for i := 0; i < 10; i++ {
+		// Step 1: find a candidate pending task
+		var candidate model.SummaryTask
+		if err := p.db.Where("status = ? AND retry_count < ? AND (processing_deadline IS NULL OR processing_deadline < ?)",
+			model.StatusPending, p.cfg.WorkerMaxRetry, now).
+			Order("id ASC").Limit(1).First(&candidate).Error; err != nil {
+			return // no pending tasks
+		}
 
-	for _, task := range tasks {
-		task := task
-		// Optimistic lock: update status to Processing
-		deadline := now.Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute)
+		// Step 2: atomically claim it by ID (prevents race with other workers)
 		result := p.db.Model(&model.SummaryTask{}).
-			Where("id = ? AND status = ?", task.ID, model.StatusPending).
+			Where("id = ? AND status = ?", candidate.ID, model.StatusPending).
 			Updates(map[string]interface{}{
 				"status":              model.StatusProcessing,
 				"processing_deadline": deadline,
 			})
+		if result.Error != nil {
+			log.Printf("[processor] claim task %d: %v", candidate.ID, result.Error)
+			return
+		}
 		if result.RowsAffected == 0 {
-			continue // another worker grabbed it
+			continue // another worker claimed it, try next
+		}
+
+		// Reload to get fresh state after claim
+		var task model.SummaryTask
+		if err := p.db.First(&task, candidate.ID).Error; err != nil {
+			log.Printf("[processor] reload task %d: %v", candidate.ID, err)
+			continue
 		}
 
 		p.pool.Submit(func() {
@@ -128,18 +164,47 @@ func (p *Processor) processTask(task model.SummaryTask) {
 		return
 	}
 
-	// Success
-	p.db.Model(&model.SummaryTask{}).Where("id = ?", task.ID).Updates(map[string]interface{}{
-		"status":              model.StatusCompleted,
-		"processing_deadline": nil,
-	})
-	p.sendCallback(model.TaskEvent{
-		TaskID:   task.ID,
-		Status:   model.StatusCompleted,
-		Progress: 100,
-		Message:  "总结完成",
-	})
-	log.Printf("[processor] task %d completed", task.ID)
+	// Success — all tasks are BY_PERSON
+	var participantCount int64
+	p.db.Model(&model.SummaryParticipant{}).Where("task_id = ?", task.ID).Count(&participantCount)
+
+	if participantCount <= 1 {
+		var participants []model.SummaryParticipant
+		p.db.Where("task_id = ?", task.ID).Find(&participants)
+		for _, pt := range participants {
+			p.db.Model(&model.SummaryParticipant{}).Where("id = ?", pt.ID).
+				Update("status", model.ParticipantAccepted)
+			ptID := pt.ID
+			p.pool.Submit(func() {
+				p.processPersonalSummary(context.Background(), task.ID, ptID)
+			})
+		}
+		p.db.Model(&model.SummaryTask{}).Where("id = ?", task.ID).Updates(map[string]interface{}{
+			"status":              model.StatusProcessing,
+			"processing_deadline": nil,
+		})
+		p.sendCallback(model.TaskEvent{
+			TaskID:   task.ID,
+			Status:   model.StatusProcessing,
+			Progress: 50,
+			Message:  "单人模式，自动处理中",
+		})
+		log.Printf("[processor] task %d single participant, skipping WaitingConfirm", task.ID)
+	} else {
+		// Multi-person: Creator already triggered by API handler;
+		// other participants remain WaitingConfirm at participant level.
+		p.db.Model(&model.SummaryTask{}).Where("id = ?", task.ID).Updates(map[string]interface{}{
+			"status":              model.StatusProcessing,
+			"processing_deadline": nil,
+		})
+		p.sendCallback(model.TaskEvent{
+			TaskID:   task.ID,
+			Status:   model.StatusProcessing,
+			Progress: 50,
+			Message:  "处理中，等待参与者确认",
+		})
+		log.Printf("[processor] task %d multi-person, processing (participants pending confirm)", task.ID)
+	}
 }
 
 func (p *Processor) executePipeline(task model.SummaryTask) error {
@@ -161,12 +226,29 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 		})
 	}
 
-	// Fetch messages via 4-layer pipeline
+	// Fetch messages via pipeline
 	llmFn := func(ctx context.Context, prompt string) (string, error) {
 		return p.llm.CallRaw(ctx, prompt)
 	}
-	messages, err := pipeline.ResolveAndFetchMessages(
-		ctx, task.CreatorID, specifiedSources, task.Title,
+
+	var messages []pipeline.Message
+	var err error
+
+	// Load participants for this task
+	var participants []model.SummaryParticipant
+	if err := p.db.Where("task_id = ?", task.ID).Find(&participants).Error; err != nil {
+		return fmt.Errorf("load participants: %w", err)
+	}
+	var participantUIDs []string
+	var participantNames []string
+	for _, pt := range participants {
+		if pt.UserID != task.CreatorID {
+			participantUIDs = append(participantUIDs, pt.UserID)
+			participantNames = append(participantNames, pt.UserName)
+		}
+	}
+	messages, err = pipeline.ResolveAndFetchMessagesForPersonal(
+		ctx, task.CreatorID, participantUIDs, participantNames, specifiedSources, task.Title,
 		task.TimeRangeStart, task.TimeRangeEnd,
 		p.imDB, llmFn, p.cfg.MsgTableCount,
 	)
@@ -175,113 +257,15 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 	}
 
 	if len(messages) == 0 {
-		// No messages, create empty result
-		nextVer, _ := service.GetNextVersion(p.db, task.ID)
-		now := time.Now().UTC()
-		result := model.SummaryResult{
-			TaskID:        task.ID,
-			Content:       "该时段内无文本消息",
-			TotalMsgCount: 0,
-			ModelVersion:  p.llm.ModelVersion(),
-			Version:       nextVer,
-			GeneratedAt:   now,
-		}
-		return p.db.Create(&result).Error
+		log.Printf("[processor] task %d: 0 messages fetched", task.ID)
+		p.db.Model(&model.SummaryTask{}).Where("id = ?", task.ID).Update("total_msg_count", 0)
+		return nil
 	}
 
-	p.sendCallback(model.TaskEvent{
-		TaskID:   task.ID,
-		Status:   model.StatusProcessing,
-		Progress: 30,
-		Message:  fmt.Sprintf("获取到 %d 条消息，开始总结", len(messages)),
-	})
-
-	// Convert messages to map format for chunking
-	msgMaps := make([]map[string]interface{}, len(messages))
-	for i, m := range messages {
-		msgMaps[i] = map[string]interface{}{
-			"sender_uid":  m.SenderUID,
-			"content":     m.Content,
-			"send_time":   m.SendTime,
-			"source_name": m.SourceName,
-		}
-	}
-
-	chunks := service.SplitIntoChunks(msgMaps, 500)
-
-	// Map phase
-	var chunkSummaries []string
-	var totalTokens int
-	startTime := task.TimeRangeStart.Format("2006-01-02 15:04")
-	endTime := task.TimeRangeEnd.Format("2006-01-02 15:04")
-	sourceName := "多来源"
-	if len(sources) == 1 {
-		sourceName = sources[0].SourceName
-	}
-
-	for i, chunk := range chunks {
-		var formatted []string
-		for _, msg := range chunk {
-			formatted = append(formatted, fmt.Sprintf("[%s] %s: %s",
-				msg["send_time"], msg["sender_uid"], msg["content"]))
-		}
-
-		summary, tokens, err := p.llm.CallMap(ctx,
-			joinStrings(formatted), sourceName, i, len(chunk),
-			startTime, endTime,
-		)
-		if err != nil {
-			return fmt.Errorf("map chunk %d: %w", i, err)
-		}
-
-		chunkSummaries = append(chunkSummaries, summary)
-		totalTokens += tokens
-
-		// Save chunk to DB
-		chunkRecord := model.SummaryChunk{
-			TaskID:       task.ID,
-			ChunkIndex:   i,
-			MsgCount:     len(chunk),
-			ChunkSummary: summary,
-			TokenUsed:    tokens,
-			Status:       1,
-		}
-		if len(sources) > 0 {
-			chunkRecord.SummarySourceID = &sources[0].ID
-		}
-		p.db.Create(&chunkRecord)
-
-		progress := 30 + (60 * (i + 1) / len(chunks))
-		p.sendCallback(model.TaskEvent{
-			TaskID:   task.ID,
-			Status:   model.StatusProcessing,
-			Progress: progress,
-			Message:  fmt.Sprintf("Map 阶段 %d/%d 完成", i+1, len(chunks)),
-		})
-	}
-
-	// Reduce phase
-	finalContent, reduceTokens, err := p.llm.CallReduce(ctx,
-		chunkSummaries, sourceName, startTime, endTime, len(messages),
-	)
-	if err != nil {
-		return fmt.Errorf("reduce: %w", err)
-	}
-	totalTokens += reduceTokens
-
-	// Save result
-	nextVer, _ := service.GetNextVersion(p.db, task.ID)
-	now := time.Now().UTC()
-	result := model.SummaryResult{
-		TaskID:         task.ID,
-		Content:        finalContent,
-		TotalMsgCount:  len(messages),
-		TotalTokenUsed: totalTokens,
-		ModelVersion:   p.llm.ModelVersion(),
-		Version:        nextVer,
-		GeneratedAt:    now,
-	}
-	return p.db.Create(&result).Error
+	// Personal summaries will be generated by personal_processor
+	log.Printf("[processor] task %d: %d messages fetched, personal_processor will handle summaries", task.ID, len(messages))
+	p.db.Model(&model.SummaryTask{}).Where("id = ?", task.ID).Update("total_msg_count", len(messages))
+	return nil
 }
 
 func (p *Processor) sendCallback(event model.TaskEvent) {
@@ -291,7 +275,7 @@ func (p *Processor) sendCallback(event model.TaskEvent) {
 		return
 	}
 
-	resp, err := http.Post(p.cfg.WorkerCallbackURL, "application/json", bytes.NewReader(body))
+	resp, err := callbackClient.Post(p.cfg.WorkerCallbackURL, "application/json", bytes.NewReader(body))
 	if err != nil {
 		log.Printf("[processor] callback POST failed: %v", err)
 		// Fallback: save event to DB
@@ -315,4 +299,47 @@ func joinStrings(ss []string) string {
 		result += s
 	}
 	return result
+}
+
+// batchResolveUserNames queries the IM DB for display names of the given message senders.
+// Returns a map from UID to display name. UIDs that cannot be resolved are omitted.
+func (p *Processor) batchResolveUserNames(messages []pipeline.Message) map[string]string {
+	nameMap := make(map[string]string)
+	if p.imDB == nil || len(messages) == 0 {
+		return nameMap
+	}
+
+	// Collect unique UIDs
+	uidSet := make(map[string]bool)
+	for _, msg := range messages {
+		if msg.SenderUID != "" {
+			uidSet[msg.SenderUID] = true
+		}
+	}
+	if len(uidSet) == 0 {
+		return nameMap
+	}
+
+	uids := make([]string, 0, len(uidSet))
+	for uid := range uidSet {
+		uids = append(uids, uid)
+	}
+
+	// Batch query from user table
+	type userRow struct {
+		UID  string `gorm:"column:uid"`
+		Name string `gorm:"column:name"`
+	}
+	var rows []userRow
+	if err := p.imDB.Raw("SELECT uid, name FROM `user` WHERE uid IN ?", uids).Scan(&rows).Error; err != nil {
+		log.Printf("[processor] batch resolve user names: %v", err)
+		return nameMap
+	}
+	for _, r := range rows {
+		if r.Name != "" {
+			nameMap[r.UID] = r.Name
+		}
+	}
+	log.Printf("[processor] resolved %d/%d user names", len(nameMap), len(uids))
+	return nameMap
 }

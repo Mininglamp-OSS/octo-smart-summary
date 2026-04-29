@@ -1,6 +1,9 @@
 package handler
 
 import (
+	"bytes"
+	"encoding/json"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -14,12 +17,65 @@ import (
 
 // TaskHandler handles summary task endpoints.
 type TaskHandler struct {
-	db *gorm.DB
+	db               *gorm.DB
+	imDB             *gorm.DB
+	workerTriggerURL string
 }
 
 // NewTaskHandler creates a new TaskHandler.
-func NewTaskHandler(db *gorm.DB) *TaskHandler {
-	return &TaskHandler{db: db}
+func NewTaskHandler(db, imDB *gorm.DB, workerTriggerURL string) *TaskHandler {
+	return &TaskHandler{db: db, imDB: imDB, workerTriggerURL: workerTriggerURL}
+}
+
+// authorizeTaskAccess loads a task by ID and checks that the current user is
+// authorized to access it. Authorization passes if the user is the task creator,
+// a participant, or a member of at least one source group.
+// Returns the task and true on success; writes a JSON error response and returns
+// nil, false on failure.
+func (h *TaskHandler) authorizeTaskAccess(c *gin.Context, taskID int64) (*model.SummaryTask, bool) {
+	userID := middleware.GetUserID(c)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, apiResponse{Code: 4010, Message: "authentication required"})
+		return nil, false
+	}
+
+	var task model.SummaryTask
+	if err := h.db.Where("id = ? AND deleted_at IS NULL", taskID).First(&task).Error; err != nil {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
+		return nil, false
+	}
+
+	// 1. Creator check
+	if task.CreatorID == userID {
+		return &task, true
+	}
+
+	// 2. Participant check
+	var participantCount int64
+	h.db.Model(&model.SummaryParticipant{}).
+		Where("task_id = ? AND user_id = ?", taskID, userID).
+		Count(&participantCount)
+	if participantCount > 0 {
+		return &task, true
+	}
+
+	// 3. Source group membership check (via imDB)
+	var sourceIDs []string
+	h.db.Model(&model.SummarySource{}).
+		Where("task_id = ? AND source_type = ?", taskID, model.SourceGroup).
+		Pluck("source_id", &sourceIDs)
+	if len(sourceIDs) > 0 {
+		var memberCount int64
+		h.imDB.Table("group_member").
+			Where("group_no IN ? AND uid = ? AND is_deleted = 0", sourceIDs, userID).
+			Count(&memberCount)
+		if memberCount > 0 {
+			return &task, true
+		}
+	}
+
+	c.JSON(http.StatusForbidden, apiResponse{Code: 40003, Message: "无权访问此任务"})
+	return nil, false
 }
 
 type apiResponse struct {
@@ -40,7 +96,6 @@ type createSummaryReq struct {
 	UID                 string       `json:"uid"`
 	Title               string       `json:"title"`
 	Topic               string       `json:"topic"`
-	SummaryMode         *int         `json:"summary_mode"`
 	TimeRange           *timeRange   `json:"time_range"`
 	Sources             []sourceReq  `json:"sources"`
 	Participants        []participantReq `json:"participants"`
@@ -58,6 +113,7 @@ type sourceReq struct {
 }
 
 type participantReq struct {
+	UserName string `json:"user_name"`
 	UserID string `json:"user_id"`
 }
 
@@ -87,29 +143,7 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		return
 	}
 
-	// Infer scope if no sources
-	var inferredScope map[string]interface{}
-	if len(req.Sources) == 0 {
-		topic := req.Topic
-		if topic == "" {
-			topic = req.Title
-		}
-		if topic == "" {
-			c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "请提供总结主题或指定信息来源"})
-			return
-		}
-		inferredScope = service.InferScope(topic)
-	}
-
-	// Resolve summary_mode
-	summaryMode := 1
-	if req.SummaryMode != nil {
-		summaryMode = *req.SummaryMode
-	} else if inferredScope != nil {
-		if m, ok := inferredScope["summary_mode"].(int); ok {
-			summaryMode = m
-		}
-	}
+	summaryMode := model.ModeByPerson
 
 	// Resolve time range
 	var timeStart, timeEnd time.Time
@@ -118,7 +152,7 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		timeEnd = req.TimeRange.End
 	} else {
 		timeEnd = time.Now().UTC()
-		timeStart = timeEnd.Add(-7 * 24 * time.Hour)
+		timeStart = timeEnd.Add(-31 * 24 * time.Hour)
 	}
 
 	if timeEnd.Sub(timeStart) > 31*24*time.Hour {
@@ -126,22 +160,12 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		return
 	}
 
-	// Resolve sources
+	// Resolve sources: use user-specified sources directly.
+	// When no sources are specified, the pipeline Layer 3 (NarrowByTopic)
+	// will use LLM to select relevant channels from all user channels.
 	var sourceList []sourceReq
 	if len(req.Sources) > 0 {
 		sourceList = req.Sources
-	} else if inferredScope != nil {
-		if sources, ok := inferredScope["sources"]; ok {
-			if sl, ok := sources.([]struct {
-				SourceType int    `json:"source_type"`
-				SourceID   string `json:"source_id"`
-				SourceName string `json:"source_name"`
-			}); ok {
-				for _, s := range sl {
-					sourceList = append(sourceList, sourceReq{SourceType: s.SourceType, SourceID: s.SourceID})
-				}
-			}
-		}
 	}
 
 	if len(sourceList) > 10 {
@@ -149,9 +173,8 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		return
 	}
 
-	if summaryMode == model.ModeByPerson && len(req.Participants) == 0 {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "按人模式必须指定参与者"})
-		return
+	if len(req.Participants) == 0 {
+		req.Participants = []participantReq{{UserID: effectiveUID}}
 	}
 
 	taskNo := service.GenerateTaskNo()
@@ -164,12 +187,8 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 	}
 
 	initialStatus := model.StatusPending
-	var confirmDeadline *time.Time
-	if summaryMode == model.ModeByPerson {
-		initialStatus = model.StatusWaitingConfirm
-		dl := time.Now().UTC().Add(time.Duration(req.ConfirmTimeoutHours) * time.Hour)
-		confirmDeadline = &dl
-	}
+	dl := time.Now().UTC().Add(time.Duration(req.ConfirmTimeoutHours) * time.Hour)
+	confirmDeadline := &dl
 
 	task := model.SummaryTask{
 		TaskNo:          taskNo,
@@ -184,6 +203,9 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		ConfirmDeadline: confirmDeadline,
 	}
 
+	log.Printf("[handler] CreateSummary space=%s user=%s mode=%d", spaceID, effectiveUID, summaryMode)
+
+	var creatorParticipantID int64
 	err := h.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&task).Error; err != nil {
 			return err
@@ -193,43 +215,68 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 				TaskID:     task.ID,
 				SourceType: s.SourceType,
 				SourceID:   s.SourceID,
-				SourceName: service.ResolveSourceName(s.SourceID),
+				SourceName: service.ResolveSourceNameWithType(s.SourceID, s.SourceType, h.imDB),
 			}
 			if err := tx.Create(&src).Error; err != nil {
 				return err
 			}
 		}
-		if summaryMode == model.ModeByPerson {
-			now := time.Now().UTC()
-			creatorP := model.SummaryParticipant{
-				TaskID:      task.ID,
-				UserID:      effectiveUID,
-				UserName:    "用户" + effectiveUID,
-				Status:      1,
-				ConfirmedAt: &now,
+		now := time.Now().UTC()
+		creatorP := model.SummaryParticipant{
+			TaskID:      task.ID,
+			UserID:      effectiveUID,
+			UserName:    service.ResolveUserName(effectiveUID),
+			Status:      model.ParticipantAccepted,
+			ConfirmedAt: &now,
+		}
+		if err := tx.Create(&creatorP).Error; err != nil {
+			return err
+		}
+
+		creatorPR := model.PersonalResult{
+			TaskID:           task.ID,
+			ParticipantRefID: creatorP.ID,
+			UserID:           effectiveUID,
+			WorkerStatus:     model.PersonalStatusPending,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}
+		if err := tx.Create(&creatorPR).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&creatorP).Update("personal_result_id", creatorPR.ID).Error; err != nil {
+			return err
+		}
+		creatorParticipantID = creatorP.ID
+
+		for _, p := range req.Participants {
+			if p.UserID == effectiveUID {
+				continue
 			}
-			if err := tx.Create(&creatorP).Error; err != nil {
+			pp := model.SummaryParticipant{
+				TaskID:   task.ID,
+				UserID:   p.UserID,
+				UserName: func() string { if p.UserName != "" { return p.UserName }; return service.ResolveUserName(p.UserID) }(),
+			}
+			if err := tx.Create(&pp).Error; err != nil {
 				return err
-			}
-			for _, p := range req.Participants {
-				if p.UserID == effectiveUID {
-					continue
-				}
-				pp := model.SummaryParticipant{
-					TaskID:   task.ID,
-					UserID:   p.UserID,
-					UserName: "用户" + p.UserID,
-				}
-				if err := tx.Create(&pp).Error; err != nil {
-					return err
-				}
 			}
 		}
 		return nil
 	})
 	if err != nil {
+		log.Printf("[handler] CreateSummary tx error: %v", err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
 		return
+	}
+
+	// Trigger personal worker for creator (async, after tx committed)
+	if creatorParticipantID > 0 {
+		go h.triggerWorker(model.WorkerTriggerRequest{
+			Type:             "personal_summary",
+			TaskID:           task.ID,
+			ParticipantRefID: creatorParticipantID,
+		})
 	}
 
 	result := gin.H{
@@ -238,9 +285,8 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		"status":     task.Status,
 		"created_at": task.CreatedAt.Format(time.RFC3339),
 	}
-	if inferredScope != nil {
+	if len(req.Sources) == 0 {
 		result["inferred"] = true
-		result["inferred_sources"] = inferredScope["sources"]
 	}
 	ok(c, result)
 }
@@ -258,17 +304,15 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 		pageSize = 20
 	}
 
+	userID := middleware.GetUserID(c)
+
 	query := h.db.Model(&model.SummaryTask{}).
-		Where("space_id = ? AND deleted_at IS NULL", spaceID)
+		Where("space_id = ? AND deleted_at IS NULL AND (creator_id = ? OR id IN (SELECT task_id FROM summary_participant WHERE user_id = ?))",
+			spaceID, userID, userID)
 
 	if s := c.Query("status"); s != "" {
 		if v, err := strconv.Atoi(s); err == nil {
 			query = query.Where("status = ?", v)
-		}
-	}
-	if s := c.Query("summary_mode"); s != "" {
-		if v, err := strconv.Atoi(s); err == nil {
-			query = query.Where("summary_mode = ?", v)
 		}
 	}
 	if s := c.Query("trigger_type"); s != "" {
@@ -328,6 +372,15 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			completedAt = &s
 		}
 
+		creatorName := ""
+		var creatorParticipant model.SummaryParticipant
+		if err := h.db.Where("task_id = ? AND user_id = ?", t.ID, t.CreatorID).First(&creatorParticipant).Error; err == nil {
+			creatorName = creatorParticipant.UserName
+		}
+		if creatorName == "" {
+			creatorName = service.ResolveUserName(t.CreatorID)
+		}
+
 		items = append(items, gin.H{
 			"task_id":          t.ID,
 			"task_no":          t.TaskNo,
@@ -339,6 +392,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			"time_range_end":   t.TimeRangeEnd.Format(time.RFC3339),
 			"sources":          srcList,
 			"total_msg_count":  totalMsgCount,
+			"creator_name":     creatorName,
 			"created_at":       t.CreatedAt.Format(time.RFC3339),
 			"completed_at":     completedAt,
 		})
@@ -349,18 +403,17 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 
 // GetSummary handles GET /api/v1/summaries/:id
 func (h *TaskHandler) GetSummary(c *gin.Context) {
-	spaceID := middleware.GetSpaceID(c)
 	taskID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid task id"})
 		return
 	}
 
-	var task model.SummaryTask
-	if err := h.db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).First(&task).Error; err != nil {
-		bizErr(c, service.NewBizError(40008, "任务不存在", http.StatusNotFound))
+	taskPtr, authorized := h.authorizeTaskAccess(c, taskID)
+	if !authorized {
 		return
 	}
+	task := *taskPtr
 
 	var sources []model.SummarySource
 	h.db.Where("task_id = ?", taskID).Find(&sources)
@@ -397,6 +450,7 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 	if latestResult.ID > 0 {
 		resultOut = gin.H{
 			"content":          latestResult.Content,
+			"citations":        latestResult.GetCitations(),
 			"total_msg_count":  latestResult.TotalMsgCount,
 			"total_token_used": latestResult.TotalTokenUsed,
 			"model_version":    latestResult.ModelVersion,
@@ -405,7 +459,7 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		}
 	}
 
-	ok(c, gin.H{
+	resp := gin.H{
 		"task_id":          task.ID,
 		"task_no":          task.TaskNo,
 		"title":            task.Title,
@@ -420,21 +474,74 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		"error_message":    task.ErrorMessage,
 		"created_at":       task.CreatedAt.Format(time.RFC3339),
 		"updated_at":       task.UpdatedAt.Format(time.RFC3339),
-	})
+	}
+
+	// Add personal_result and members info
+	userID := middleware.GetUserID(c)
+
+	var pr model.PersonalResult
+	personalOut := gin.H{
+		"worker_status": 0,
+		"content":       "",
+		"submitted_at":  nil,
+	}
+	if userID != "" {
+		if err := h.db.Where("task_id = ? AND user_id = ?", taskID, userID).First(&pr).Error; err == nil {
+			personalOut["worker_status"] = pr.WorkerStatus
+			personalOut["content"] = pr.Content
+			if pr.SubmittedAt != nil {
+				personalOut["submitted_at"] = pr.SubmittedAt.Format(time.RFC3339)
+			}
+		}
+	}
+	resp["personal_result"] = personalOut
+
+	members := make([]gin.H, 0, len(participants))
+	prMap := make(map[int64]*model.PersonalResult)
+	var prs []model.PersonalResult
+	h.db.Where("task_id = ?", taskID).Find(&prs)
+	for i := range prs {
+		prMap[prs[i].ParticipantRefID] = &prs[i]
+	}
+	for _, p := range participants {
+		member := gin.H{
+			"user_id":      p.UserID,
+			"user_name":    p.UserName,
+			"status":       model.ParticipantStatusLabel(p.Status),
+			"submitted_at": nil,
+			"content":      "",
+		}
+		if pr, exists := prMap[p.ID]; exists {
+			if pr.SubmittedAt != nil {
+				member["submitted_at"] = pr.SubmittedAt.Format(time.RFC3339)
+				member["content"] = pr.Content
+			}
+		}
+		members = append(members, member)
+	}
+	resp["members"] = members
+
+	if resultOut != nil {
+		if resultMap, ok := resultOut.(gin.H); ok {
+			var submittedCount int64
+			h.db.Model(&model.PersonalResult{}).Where("task_id = ? AND submitted_at IS NOT NULL", taskID).Count(&submittedCount)
+			resultMap["submitted_count"] = submittedCount
+			resp["result"] = resultMap
+		}
+	}
+
+	ok(c, resp)
 }
 
 // GetResult handles GET /api/v1/summaries/:id/result
 func (h *TaskHandler) GetResult(c *gin.Context) {
-	spaceID := middleware.GetSpaceID(c)
 	taskID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid task id"})
 		return
 	}
 
-	var task model.SummaryTask
-	if err := h.db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).First(&task).Error; err != nil {
-		bizErr(c, service.NewBizError(40008, "任务不存在", http.StatusNotFound))
+	if _, authorized := h.authorizeTaskAccess(c, taskID); !authorized {
 		return
 	}
 
@@ -446,6 +553,7 @@ func (h *TaskHandler) GetResult(c *gin.Context) {
 
 	ok(c, gin.H{
 		"content":          result.Content,
+		"citations":        result.GetCitations(),
 		"total_msg_count":  result.TotalMsgCount,
 		"total_token_used": result.TotalTokenUsed,
 		"model_version":    result.ModelVersion,
@@ -456,7 +564,6 @@ func (h *TaskHandler) GetResult(c *gin.Context) {
 
 // Regenerate handles POST /api/v1/summaries/:id/regenerate
 func (h *TaskHandler) Regenerate(c *gin.Context) {
-	spaceID := middleware.GetSpaceID(c)
 	userID := middleware.GetUserID(c)
 	taskID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -464,11 +571,12 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 		return
 	}
 
-	var task model.SummaryTask
-	if err := h.db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).First(&task).Error; err != nil {
-		bizErr(c, service.NewBizError(40008, "任务不存在", http.StatusNotFound))
+	taskPtr, authorized := h.authorizeTaskAccess(c, taskID)
+	if !authorized {
 		return
 	}
+	task := *taskPtr
+
 	if task.CreatorID != userID {
 		bizErr(c, service.NewBizError(40004, "仅创建者可重新生成", http.StatusForbidden))
 		return
@@ -480,13 +588,55 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 
 	nextVer, _ := service.GetNextVersion(h.db, taskID)
 
-	h.db.Where("task_id = ?", taskID).Delete(&model.SummaryChunk{})
-	h.db.Model(&task).Updates(map[string]interface{}{
-		"status":              model.StatusPending,
-		"retry_count":         0,
-		"error_message":       nil,
-		"processing_deadline": nil,
+	err = h.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("task_id = ?", taskID).Delete(&model.SummaryResult{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("task_id = ?", taskID).Delete(&model.SummaryChunk{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&model.SummaryParticipant{}).Where("task_id = ?", taskID).Updates(map[string]interface{}{
+			"status":             model.ParticipantPending,
+			"worker_started_at":  nil,
+			"confirmed_at":       nil,
+			"personal_result_id": nil,
+		}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&model.PersonalResult{}).Where("task_id = ?", taskID).Updates(map[string]interface{}{
+			"worker_status":  model.PersonalStatusPending,
+			"content":        "",
+			"citations_json": "",
+			"error_message":  nil,
+			"submitted_at":   nil,
+			"generated_at":   nil,
+		}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&task).Updates(map[string]interface{}{
+			"status":              model.StatusPending,
+			"retry_count":         0,
+			"error_message":       nil,
+			"processing_deadline": nil,
+		}).Error; err != nil {
+			return err
+		}
+		return nil
 	})
+	if err != nil {
+		log.Printf("[handler] Regenerate tx error: %v", err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
+		return
+	}
+
+	var creatorParticipant model.SummaryParticipant
+	if err := h.db.Where("task_id = ? AND user_id = ?", taskID, task.CreatorID).First(&creatorParticipant).Error; err == nil {
+		go h.triggerWorker(model.WorkerTriggerRequest{
+			Type:             "personal_summary",
+			TaskID:           taskID,
+			ParticipantRefID: creatorParticipant.ID,
+		})
+	}
 
 	ok(c, gin.H{
 		"task_id":     task.ID,
@@ -504,4 +654,69 @@ func (h *TaskHandler) InferScope(c *gin.Context) {
 	}
 	result := service.InferScope(topic)
 	ok(c, result)
+}
+
+func (h *TaskHandler) triggerWorker(req model.WorkerTriggerRequest) {
+	if h.workerTriggerURL == "" {
+		return
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		log.Printf("[task] marshal trigger: %v", err)
+		return
+	}
+	resp, err := triggerClient.Post(h.workerTriggerURL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("[task] trigger worker POST failed: %v", err)
+		return
+	}
+	resp.Body.Close()
+}
+
+// DeleteSummary handles DELETE /api/v1/summaries/:id
+func (h *TaskHandler) DeleteSummary(c *gin.Context) {
+	taskID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid task id"})
+		return
+	}
+
+	task, authorized := h.authorizeTaskAccess(c, taskID)
+	if !authorized {
+		return
+	}
+
+	// Soft delete: set status = -1 AND deleted_at = NOW()
+	if err := h.db.Model(task).Updates(map[string]interface{}{
+		"status":     -1,
+		"deleted_at": time.Now().UTC(),
+	}).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok"})
+}
+
+// CancelSummary handles POST /api/v1/summaries/:id/cancel
+func (h *TaskHandler) CancelSummary(c *gin.Context) {
+	taskID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid task id"})
+		return
+	}
+
+	task, authorized := h.authorizeTaskAccess(c, taskID)
+	if !authorized {
+		return
+	}
+
+	if task.Status == model.StatusCompleted || task.Status == model.StatusFailed {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "任务已完成，无法取消"})
+		return
+	}
+	if err := h.db.Model(task).Updates(map[string]interface{}{"status": model.StatusFailed, "error_message": "用户取消"}).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok"})
 }

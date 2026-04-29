@@ -3,6 +3,7 @@ package service
 import (
 	"fmt"
 	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -36,12 +37,82 @@ func GenerateTaskNo() string {
 	return fmt.Sprintf("ST%s%s", now.Format("20060102"), string(b))
 }
 
-// ResolveSourceName returns a fallback source name.
+// ResolveSourceNameWithType returns source name from IM DB with type suffix.
+// sourceType: 1=group, 3=DM (private chat)
+func ResolveSourceNameWithType(sourceID string, sourceType int, imDB *gorm.DB) string {
+	if imDB == nil {
+		return fallbackSourceName(sourceID, sourceType)
+	}
+
+	switch sourceType {
+	case 1: // group
+		// Strip space_id suffix if present (e.g., "uuid____spaceid" -> "uuid")
+		groupNo := sourceID
+		if idx := strings.Index(sourceID, "____"); idx > 0 {
+			groupNo = sourceID[:idx]
+		}
+		var name string
+		err := imDB.Table("group").Where("group_no = ?", groupNo).Pluck("name", &name).Error
+		if err == nil && name != "" {
+			return name + "(群聊)"
+		}
+	case 3: // DM (private chat)
+		var name string
+		err := imDB.Table("user").Where("uid = ?", sourceID).Pluck("name", &name).Error
+		if err == nil && name != "" {
+			return name + "(私聊)"
+		}
+	}
+	return fallbackSourceName(sourceID, sourceType)
+}
+
+// fallbackSourceName returns a placeholder source name.
+func fallbackSourceName(sourceID string, sourceType int) string {
+	suffix := ""
+	switch sourceType {
+	case 1:
+		suffix = "(群聊)"
+	case 3:
+		suffix = "(私聊)"
+	}
+	if len(sourceID) > 8 {
+		return "来源-" + sourceID[:8] + suffix
+	}
+	return "来源-" + sourceID + suffix
+}
+
+// ResolveSourceName returns source name from IM DB, fallback to placeholder.
+// Deprecated: use ResolveSourceNameWithType instead.
 func ResolveSourceName(sourceID string) string {
+	return resolveSourceNameFn(sourceID)
+}
+
+// resolveSourceNameFn can be overridden at init time with an IM DB resolver.
+var resolveSourceNameFn = func(sourceID string) string {
 	if len(sourceID) > 8 {
 		return "来源-" + sourceID[:8]
 	}
 	return "来源-" + sourceID
+}
+
+// SetSourceNameResolver injects an IM DB resolver so group names are fetched from DB.
+func SetSourceNameResolver(fn func(sourceID string) string) {
+	resolveSourceNameFn = fn
+}
+
+// ResolveUserName returns user display name from IM DB, fallback to uid.
+func ResolveUserName(uid string) string {
+	return resolveUserNameFn(uid)
+}
+
+// resolveUserNameFn can be overridden at init time with an IM DB resolver.
+var resolveUserNameFn = func(uid string) string {
+	return uid
+}
+
+// SetUserNameResolver injects an IM DB resolver so user names are fetched from DB.
+func SetUserNameResolver(fn func(uid string) string) {
+	resolveUserNameFn = fn
 }
 
 // GetNextVersion returns the next version number for a task result.
@@ -113,7 +184,7 @@ func InferScope(topic string) map[string]interface{} {
 
 	return map[string]interface{}{
 		"sources":      sources,
-		"summary_mode": 1,
+		"summary_mode": model.ModeByPerson,
 		"inferred":     true,
 	}
 }

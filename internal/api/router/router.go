@@ -11,7 +11,7 @@ import (
 )
 
 // SetupPublic configures the public API router on :8080.
-func SetupPublic(db *gorm.DB, hub *ws.Hub) *gin.Engine {
+func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middleware.TokenResolver, workerTriggerURL string) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
 
@@ -31,23 +31,29 @@ func SetupPublic(db *gorm.DB, hub *ws.Hub) *gin.Engine {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 
-	// WebSocket
-	r.GET("/ws/summaries", hub.HandleWS)
-	r.GET("/ws", hub.HandleWS)
+	// WebSocket (requires auth)
+	r.GET("/ws/summaries", middleware.StrictAuthMiddleware(authResolver), middleware.SpaceMiddleware(), hub.HandleWS)
+	r.GET("/ws", middleware.StrictAuthMiddleware(authResolver), middleware.SpaceMiddleware(), hub.HandleWS)
 
 	// API routes
-	taskH := handler.NewTaskHandler(db)
+	taskH := handler.NewTaskHandler(db, imDB, workerTriggerURL)
 	schedH := handler.NewScheduleHandler(db)
+	personalH := handler.NewPersonalHandler(db, workerTriggerURL, hub)
 
 	v1 := r.Group("/api/v1")
-	v1.Use(middleware.AuthMiddleware(), middleware.SpaceMiddleware())
+	v1.Use(middleware.StrictAuthMiddleware(authResolver), middleware.SpaceMiddleware())
 	{
 		v1.POST("/summaries", taskH.CreateSummary)
 		v1.GET("/summaries", taskH.ListSummaries)
 		v1.GET("/summaries/:id", taskH.GetSummary)
 		v1.GET("/summaries/:id/result", taskH.GetResult)
 		v1.POST("/summaries/:id/regenerate", taskH.Regenerate)
+		v1.DELETE("/summaries/:id", taskH.DeleteSummary)
+		v1.POST("/summaries/:id/cancel", taskH.CancelSummary)
 		v1.GET("/summary-infer", taskH.InferScope)
+		v1.GET("/summary-member-candidates", handler.NewCandidateHandler(imDB).SearchCandidates)
+		v1.GET("/summary-chat-candidates", handler.NewCandidateHandler(imDB).SearchChatCandidates)
+		v1.GET("/summary-templates", func(c *gin.Context) { c.JSON(200, gin.H{"code": 0, "data": gin.H{"templates": []string{}}}) })
 
 		v1.POST("/summary-schedules", schedH.CreateSchedule)
 		v1.GET("/summary-schedules", schedH.ListSchedules)
@@ -57,16 +63,30 @@ func SetupPublic(db *gorm.DB, hub *ws.Hub) *gin.Engine {
 		v1.PUT("/summary-schedules/:id/toggle", schedH.ToggleSchedule)
 	}
 
+	// P2 routes: strict auth required
+	p2 := r.Group("/api/v1")
+	p2.Use(middleware.StrictAuthMiddleware(authResolver), middleware.SpaceMiddleware())
+	{
+		p2.POST("/summaries/:id/accept", personalH.Accept)
+		p2.POST("/summaries/:id/decline", personalH.Decline)
+		p2.POST("/summaries/:id/respond", personalH.Respond)
+		p2.GET("/summaries/:id/personal", personalH.GetPersonal)
+		p2.POST("/summaries/:id/submit", personalH.Submit)
+		p2.GET("/summaries/:id/members", personalH.GetMembers)
+	}
+
 	return r
 }
 
 // SetupInternal configures the internal API router on :8081.
-func SetupInternal(hub *ws.Hub) *gin.Engine {
+// Returns the engine and the InternalHandler so the caller can wire the worker trigger channel.
+func SetupInternal(hub *ws.Hub) (*gin.Engine, *handler.InternalHandler) {
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
 
 	intH := handler.NewInternalHandler(hub)
 	r.POST("/internal/task-event", intH.TaskEvent)
+	r.POST("/internal/worker-trigger", intH.WorkerTrigger)
 
-	return r
+	return r, intH
 }

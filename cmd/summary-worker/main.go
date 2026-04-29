@@ -2,10 +2,13 @@ package main
 
 import (
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/router"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/ws"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/db"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
@@ -30,6 +33,16 @@ func main() {
 	// Init LLM client
 	llm := service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken)
 
+	// Set up user/source name resolvers (same as API process)
+	service.SetUserNameResolver(func(uid string) string {
+		var name string
+		imDB.Raw("SELECT name FROM `user` WHERE uid = ? LIMIT 1", uid).Scan(&name)
+		if name != "" {
+			return name
+		}
+		return uid
+	})
+
 	// Start worker pool
 	pool := worker.NewWorkerPool(cfg.WorkerMaxConcurrent)
 
@@ -38,7 +51,25 @@ func main() {
 	go proc.Run()
 
 	// Start scheduler (cron jobs)
-	cron := worker.StartScheduler(summaryDB)
+	workerTriggerURL := "http://127.0.0.1:" + cfg.WorkerInternalPort + "/internal/worker-trigger"
+	// Worker internal trigger server listens on all interfaces so API container can reach it
+	workerTriggerListenAddr := cfg.WorkerListenAllInterfaces
+	cronSched := worker.StartScheduler(summaryDB, cfg.WorkerMaxRetry, workerTriggerURL)
+
+	// Start internal HTTP server for worker-trigger
+	hub := ws.NewHub(summaryDB)
+	internalRouter, intH := router.SetupInternal(hub)
+	intH.SetTriggerCh(proc.TriggerCh())
+	internalSrv := &http.Server{
+		Addr:    workerTriggerListenAddr + ":" + cfg.WorkerInternalPort,
+		Handler: internalRouter,
+	}
+	go func() {
+		log.Printf("[worker] internal server listening on %s:%s", workerTriggerListenAddr, cfg.WorkerInternalPort)
+		if err := internalSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("[worker] internal server error: %v", err)
+		}
+	}()
 
 	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
@@ -48,7 +79,7 @@ func main() {
 
 	proc.Stop()
 	pool.Drain()
-	cron.Stop()
+	cronSched.Stop()
 
 	log.Println("[worker] exited")
 }

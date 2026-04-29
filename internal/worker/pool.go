@@ -14,9 +14,11 @@ func NewWorkerPool(maxConcurrent int) *WorkerPool {
 }
 
 // Submit runs fn in a goroutine, blocking if pool is full.
+// wg.Add(1) is called before acquiring the semaphore to prevent
+// a race where Drain() returns before the goroutine starts.
 func (p *WorkerPool) Submit(fn func()) {
-	p.sem <- struct{}{}
 	p.wg.Add(1)
+	p.sem <- struct{}{}
 	go func() {
 		defer func() {
 			<-p.sem

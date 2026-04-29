@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -25,7 +26,6 @@ func NewScheduleHandler(db *gorm.DB) *ScheduleHandler {
 
 type createScheduleReq struct {
 	Title         string       `json:"title"`
-	SummaryMode   *int         `json:"summary_mode"`
 	CronExpr      string       `json:"cron_expr" binding:"required"`
 	TimeRangeType int          `json:"time_range_type"`
 	Sources       []sourceReq  `json:"sources"`
@@ -34,7 +34,6 @@ type createScheduleReq struct {
 
 type updateScheduleReq struct {
 	Title         *string      `json:"title"`
-	SummaryMode   *int         `json:"summary_mode"`
 	CronExpr      *string      `json:"cron_expr"`
 	TimeRangeType *int         `json:"time_range_type"`
 	Sources       []sourceReq  `json:"sources,omitempty"`
@@ -63,10 +62,7 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		return
 	}
 
-	summaryMode := 1
-	if req.SummaryMode != nil {
-		summaryMode = *req.SummaryMode
-	}
+	summaryMode := model.ModeByPerson
 	if req.TimeRangeType == 0 {
 		req.TimeRangeType = 2
 	}
@@ -95,6 +91,7 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		NextRunAt:         &nextRun,
 	}
 	if err := h.db.Create(&sched).Error; err != nil {
+		log.Printf("[handler] CreateSchedule error: %v", err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
 		return
 	}
@@ -204,9 +201,6 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 	updates := make(map[string]interface{})
 	if req.Title != nil {
 		updates["title"] = *req.Title
-	}
-	if req.SummaryMode != nil {
-		updates["summary_mode"] = *req.SummaryMode
 	}
 	if req.CronExpr != nil {
 		nextRun, err := service.NextRun(*req.CronExpr, time.Now().UTC())

@@ -1,0 +1,19 @@
+# Build artifacts
+bin/
+*.exe
+*.log
+
+# Claude Code
+.claude/
+CLAUDE.md
+CC-*.md
+TASK*.md
+CONTINUE.md
+REVIEW*.md
+thread-*.md
+
+# Deployment config
+docker-compose.yml
+# Root-level binaries
+summary-api
+summary-worker

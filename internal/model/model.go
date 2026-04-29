@@ -72,7 +72,6 @@ const (
 
 // Summary mode constants.
 const (
-	ModeByGroup  = 1
 	ModeByPerson = 2
 )
 
@@ -81,6 +80,12 @@ const (
 	SourceGroup  = 1
 	SourceThread = 2
 	SourceDirect = 3
+)
+
+// Channel type constants (aligned with WuKongIM).
+const (
+	ChannelTypeDM    = 1
+	ChannelTypeGroup = 2
 )
 
 // SummaryTask represents a summary generation task.
@@ -122,14 +127,16 @@ func (SummarySource) TableName() string { return "summary_source" }
 
 // SummaryParticipant represents a participant in a by-person task.
 type SummaryParticipant struct {
-	ID          int64      `gorm:"primaryKey;autoIncrement" json:"id"`
-	TaskID      int64      `gorm:"column:task_id;not null" json:"task_id"`
-	UserID      string     `gorm:"column:user_id;type:varchar(64);not null" json:"user_id"`
-	UserName    string     `gorm:"column:user_name;type:varchar(100);not null;default:''" json:"user_name"`
-	Status      int        `gorm:"column:status;type:tinyint;not null;default:0" json:"status"`
-	ConfirmedAt *time.Time `gorm:"column:confirmed_at" json:"confirmed_at"`
-	CreatedAt   time.Time  `gorm:"column:created_at;not null" json:"created_at"`
-	UpdatedAt   time.Time  `gorm:"column:updated_at;not null" json:"updated_at"`
+	ID               int64      `gorm:"primaryKey;autoIncrement" json:"id"`
+	TaskID           int64      `gorm:"column:task_id;not null" json:"task_id"`
+	UserID           string     `gorm:"column:user_id;type:varchar(64);not null" json:"user_id"`
+	UserName         string     `gorm:"column:user_name;type:varchar(100);not null;default:''" json:"user_name"`
+	Status           int        `gorm:"column:status;type:tinyint;not null;default:0" json:"status"`
+	ConfirmedAt      *time.Time `gorm:"column:confirmed_at" json:"confirmed_at"`
+	PersonalResultID *int64     `gorm:"column:personal_result_id" json:"personal_result_id"`
+	WorkerStartedAt  *time.Time `gorm:"column:worker_started_at" json:"worker_started_at"`
+	CreatedAt        time.Time  `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt        time.Time  `gorm:"column:updated_at;not null" json:"updated_at"`
 }
 
 func (SummaryParticipant) TableName() string { return "summary_participant" }
@@ -153,18 +160,101 @@ type SummaryChunk struct {
 
 func (SummaryChunk) TableName() string { return "summary_chunk" }
 
+// Citation represents a reference from a summary back to the original message.
+type Citation struct {
+	Index         int          `json:"index"`
+	Sender        string       `json:"sender"`
+	Content       string       `json:"content"`
+	SentAt        string       `json:"sent_at"`
+	Source        string       `json:"source"`
+	ChannelID     string       `json:"channel_id"`
+	ChannelType   int          `json:"channel_type"`
+	MessageSeq    int64        `json:"message_seq"`
+	ContextBefore []ContextMsg `json:"context_before,omitempty"`
+	ContextAfter  []ContextMsg `json:"context_after,omitempty"`
+}
+
+// ContextMsg represents a surrounding message used as context for a citation.
+type ContextMsg struct {
+	Sender     string `json:"sender"`
+	Content    string `json:"content"`
+	SentAt     string `json:"sent_at"`
+	MessageSeq int64  `json:"message_seq"`
+}
+
+// TeamCitation represents a [Pn] reference in a team summary pointing to a participant.
+type TeamCitation struct {
+	Index    int    `json:"index"`
+	UserID   string `json:"user_id"`
+	UserName string `json:"user_name"`
+}
+
 // SummaryResult represents the final summary output.
 type SummaryResult struct {
-	ID             int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	TaskID         int64     `gorm:"column:task_id;not null" json:"task_id"`
-	Content        string    `gorm:"column:content;type:mediumtext;not null" json:"content"`
-	TotalMsgCount  int       `gorm:"column:total_msg_count;not null;default:0" json:"total_msg_count"`
-	TotalTokenUsed int       `gorm:"column:total_token_used;not null;default:0" json:"total_token_used"`
-	ModelVersion   string    `gorm:"column:model_version;type:varchar(50);not null;default:''" json:"model_version"`
-	Version        int       `gorm:"column:version;not null;default:1" json:"version"`
-	GeneratedAt    time.Time `gorm:"column:generated_at;not null" json:"generated_at"`
-	CreatedAt      time.Time `gorm:"column:created_at;not null" json:"created_at"`
-	UpdatedAt      time.Time `gorm:"column:updated_at;not null" json:"updated_at"`
+	ID                 int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	TaskID             int64     `gorm:"column:task_id;not null" json:"task_id"`
+	Content            string    `gorm:"column:content;type:mediumtext;not null" json:"content"`
+	CitationsJSON      string    `gorm:"column:citations_json;type:mediumtext" json:"-"`
+	TeamCitationsJSON  string    `gorm:"column:team_citations_json;type:mediumtext" json:"-"`
+	TotalMsgCount      int       `gorm:"column:total_msg_count;not null;default:0" json:"total_msg_count"`
+	TotalTokenUsed     int       `gorm:"column:total_token_used;not null;default:0" json:"total_token_used"`
+	ModelVersion       string    `gorm:"column:model_version;type:varchar(50);not null;default:''" json:"model_version"`
+	Version            int       `gorm:"column:version;not null;default:1" json:"version"`
+	GeneratedAt        time.Time `gorm:"column:generated_at;not null" json:"generated_at"`
+	CreatedAt          time.Time `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt          time.Time `gorm:"column:updated_at;not null" json:"updated_at"`
+}
+
+// GetCitations deserializes CitationsJSON into a slice of Citation.
+func (r *SummaryResult) GetCitations() []Citation {
+	if r.CitationsJSON == "" {
+		return []Citation{}
+	}
+	var citations []Citation
+	if err := json.Unmarshal([]byte(r.CitationsJSON), &citations); err != nil {
+		return []Citation{}
+	}
+	return citations
+}
+
+// SetCitations serializes a slice of Citation into CitationsJSON.
+func (r *SummaryResult) SetCitations(citations []Citation) {
+	if len(citations) == 0 {
+		r.CitationsJSON = "[]"
+		return
+	}
+	data, err := json.Marshal(citations)
+	if err != nil {
+		r.CitationsJSON = "[]"
+		return
+	}
+	r.CitationsJSON = string(data)
+}
+
+// GetTeamCitations deserializes TeamCitationsJSON into a slice of TeamCitation.
+func (r *SummaryResult) GetTeamCitations() []TeamCitation {
+	if r.TeamCitationsJSON == "" {
+		return []TeamCitation{}
+	}
+	var citations []TeamCitation
+	if err := json.Unmarshal([]byte(r.TeamCitationsJSON), &citations); err != nil {
+		return []TeamCitation{}
+	}
+	return citations
+}
+
+// SetTeamCitations serializes a slice of TeamCitation into TeamCitationsJSON.
+func (r *SummaryResult) SetTeamCitations(citations []TeamCitation) {
+	if len(citations) == 0 {
+		r.TeamCitationsJSON = "[]"
+		return
+	}
+	data, err := json.Marshal(citations)
+	if err != nil {
+		r.TeamCitationsJSON = "[]"
+		return
+	}
+	r.TeamCitationsJSON = string(data)
 }
 
 func (SummaryResult) TableName() string { return "summary_result" }
@@ -204,8 +294,10 @@ func (SummaryEvent) TableName() string { return "summary_event" }
 
 // TaskEvent is the payload for Worker → API HTTP callback.
 type TaskEvent struct {
-	TaskID   int64  `json:"task_id"`
-	Status   int    `json:"status"`
-	Progress int    `json:"progress"`
-	Message  string `json:"message"`
+	TaskID       int64  `json:"task_id"`
+	Status       int    `json:"status"`
+	Progress     int    `json:"progress"`
+	Message      string `json:"message"`
+	EventType    string `json:"event_type,omitempty"`
+	TargetUserID string `json:"target_user_id,omitempty"`
 }

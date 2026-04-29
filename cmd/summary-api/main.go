@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/router"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/ws"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/db"
@@ -26,24 +26,53 @@ func main() {
 		log.Fatalf("[main] connect summary DB: %v", err)
 	}
 
+	// Init IM DB (for member candidates)
+	imDB, err := db.New(cfg.IMMySQLDSN)
+	if err != nil {
+		log.Printf("[main] connect IM DB (non-fatal): %v", err)
+		imDB = nil
+	}
+
 	// Init Redis
 	rdb := appredis.New(cfg.RedisAddr, cfg.RedisDB)
-	_ = rdb // used by auth middleware via global or DI in future
 
 	// Init WebSocket hub
-	hub := ws.NewHub()
+	hub := ws.NewHub(summaryDB)
+
+	// Inject IM DB resolvers
+	if imDB != nil {
+		service.SetSourceNameResolver(func(sourceID string) string {
+			var name string
+			imDB.Raw("SELECT name FROM `group` WHERE group_no = ? LIMIT 1", sourceID).Scan(&name)
+			if name != "" {
+				return name
+			}
+			if len(sourceID) > 8 {
+				return "来源-" + sourceID[:8]
+			}
+			return "来源-" + sourceID
+		})
+		service.SetUserNameResolver(func(uid string) string {
+			var name string
+			imDB.Raw("SELECT name FROM `user` WHERE uid = ? LIMIT 1", uid).Scan(&name)
+			if name != "" {
+				return name
+			}
+			return uid
+		})
+	}
 
 	// Public API server
-	publicRouter := router.SetupPublic(summaryDB, hub)
+	publicRouter := router.SetupPublic(summaryDB, imDB, hub, rdb, cfg.WorkerTriggerURL)
 	publicSrv := &http.Server{
 		Addr:    ":" + cfg.APIPort,
 		Handler: publicRouter,
 	}
 
-	// Internal callback server (localhost only)
-	internalRouter := router.SetupInternal(hub)
+	// Internal callback server (Docker network accessible for worker callbacks)
+	internalRouter, _ := router.SetupInternal(hub)
 	internalSrv := &http.Server{
-		Addr:    net.JoinHostPort("127.0.0.1", cfg.APIInternalPort),
+		Addr:    ":" + cfg.APIInternalPort, // 0.0.0.0 so worker container can reach via Docker network
 		Handler: internalRouter,
 	}
 
@@ -56,7 +85,7 @@ func main() {
 	}()
 
 	go func() {
-		log.Printf("[api] internal server listening on 127.0.0.1:%s", cfg.APIInternalPort)
+		log.Printf("[api] internal server listening on :%s", cfg.APIInternalPort)
 		if err := internalSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("[api] internal server: %v", err)
 		}
