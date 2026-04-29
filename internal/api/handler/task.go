@@ -711,11 +711,11 @@ func (h *TaskHandler) CancelSummary(c *gin.Context) {
 		return
 	}
 
-	if task.Status == model.StatusCompleted || task.Status == model.StatusFailed {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "任务已完成，无法取消"})
+	if task.Status == model.StatusCompleted || task.Status == model.StatusFailed || task.Status == model.StatusCancelled {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "任务已结束，无法取消"})
 		return
 	}
-	if err := h.db.Model(task).Updates(map[string]interface{}{"status": model.StatusFailed, "error_message": "用户取消"}).Error; err != nil {
+	if err := h.db.Model(task).Updates(map[string]interface{}{"status": model.StatusCancelled, "error_message": "用户取消"}).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
 		return
 	}
