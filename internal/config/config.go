@@ -11,9 +11,8 @@ type Config struct {
 	// IM MySQL (read-only, message tables)
 	IMMySQLDSN string
 
-	// Redis
-	RedisAddr string
-	RedisDB   int
+	// Auth
+	OctoAPIURL string
 
 	// LLM
 	LLMApiURL   string
@@ -57,8 +56,7 @@ func Load() *Config {
 		MySQLDSN:   envStr("MYSQL_DSN", "root:tsdd123456@tcp(localhost:3306)/dmwork_summary?charset=utf8mb4&parseTime=True&loc=Local"),
 		IMMySQLDSN: envStr("IM_MYSQL_DSN", "root:tsdd123456@tcp(localhost:3306)/im?charset=utf8mb4&parseTime=True&loc=Local"),
 
-		RedisAddr: envStr("REDIS_ADDR", "localhost:6379"),
-		RedisDB:   envInt("REDIS_DB", 0),
+		OctoAPIURL: envStr("OCTO_API_URL", "http://tangsengdaodaoserver:8090"),
 
 		LLMApiURL:   envStr("LLM_API_URL", "https://api.example.com/v1"),
 		LLMApiKey:   envStr("LLM_API_KEY", ""),

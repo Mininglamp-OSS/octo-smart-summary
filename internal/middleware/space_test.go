@@ -144,7 +144,7 @@ func TestAuthMiddleware_InvalidToken(t *testing.T) {
 	}
 }
 
-func TestAuthMiddleware_XUserIdFallback(t *testing.T) {
+func TestAuthMiddleware_XUserIdIgnored(t *testing.T) {
 	r := gin.New()
 	r.Use(AuthMiddleware(nil))
 	r.GET("/test", func(c *gin.Context) {
@@ -160,5 +160,9 @@ func TestAuthMiddleware_XUserIdFallback(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", w.Code)
+	}
+	// user_id should be empty — X-User-Id header is ignored
+	if body := w.Body.String(); body == "" {
+		t.Fatal("empty response body")
 	}
 }

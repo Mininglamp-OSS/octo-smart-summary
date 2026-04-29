@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,12 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
+
+type mockTokenResolver struct{}
+
+func (m *mockTokenResolver) ResolveUID(_ context.Context, token string) (string, error) {
+	return token, nil
+}
 
 func setupTestDBs(t *testing.T) (db *gorm.DB, imDB *gorm.DB) {
 	t.Helper()
@@ -55,7 +62,7 @@ func seedTask(t *testing.T, db *gorm.DB, imDB *gorm.DB) int64 {
 func setupRouter(h *TaskHandler) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.Use(middleware.AuthMiddleware(nil), middleware.SpaceMiddleware())
+	r.Use(middleware.AuthMiddleware(&mockTokenResolver{}), middleware.SpaceMiddleware())
 	r.GET("/api/v1/summaries/:id", h.GetSummary)
 	r.DELETE("/api/v1/summaries/:id", h.DeleteSummary)
 	r.POST("/api/v1/summaries/:id/cancel", h.CancelSummary)
@@ -66,7 +73,7 @@ func doRequest(r *gin.Engine, method, path, userID string) *httptest.ResponseRec
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(method, path, nil)
 	if userID != "" {
-		req.Header.Set("X-User-Id", userID)
+		req.Header.Set("Token", userID)
 	}
 	req.Header.Set("X-Space-Id", "space1")
 	r.ServeHTTP(w, req)

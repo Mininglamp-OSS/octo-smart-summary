@@ -35,7 +35,7 @@ func setupRegenerateDB(t *testing.T) *gorm.DB {
 func setupRegenerateRouter(h *TaskHandler) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.Use(middleware.AuthMiddleware(nil), middleware.SpaceMiddleware())
+	r.Use(middleware.AuthMiddleware(&mockTokenResolver{}), middleware.SpaceMiddleware())
 	r.POST("/api/v1/summaries/:id/regenerate", h.Regenerate)
 	return r
 }
@@ -113,7 +113,7 @@ func TestRegenerate_ResetsAllAssociatedData(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/summaries/%d/regenerate", taskID), nil)
-	req.Header.Set("X-User-Id", "creator1")
+	req.Header.Set("Token", "creator1")
 	req.Header.Set("X-Space-Id", "space1")
 	r.ServeHTTP(w, req)
 
@@ -206,7 +206,7 @@ func TestRegenerate_OnlyCreatorAllowed(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/summaries/%d/regenerate", taskID), nil)
-	req.Header.Set("X-User-Id", "other_user")
+	req.Header.Set("Token", "other_user")
 	req.Header.Set("X-Space-Id", "space1")
 	r.ServeHTTP(w, req)
 
@@ -237,7 +237,7 @@ func TestRegenerate_RejectsInvalidStatus(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/summaries/%d/regenerate", task.ID), nil)
-	req.Header.Set("X-User-Id", "creator1")
+	req.Header.Set("Token", "creator1")
 	req.Header.Set("X-Space-Id", "space1")
 	r.ServeHTTP(w, req)
 
@@ -288,7 +288,7 @@ func TestRegenerate_AllowsFailedStatus(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/summaries/%d/regenerate", task.ID), nil)
-	req.Header.Set("X-User-Id", "creator1")
+	req.Header.Set("Token", "creator1")
 	req.Header.Set("X-Space-Id", "space1")
 	r.ServeHTTP(w, req)
 
@@ -341,7 +341,7 @@ func TestRegenerate_TriggersWorker(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/summaries/%d/regenerate", taskID), nil)
-	req.Header.Set("X-User-Id", "creator1")
+	req.Header.Set("Token", "creator1")
 	req.Header.Set("X-Space-Id", "space1")
 	r.ServeHTTP(w, req)
 

@@ -38,8 +38,9 @@ func TestStrictAuthMiddleware_WithUserIDHeader(t *testing.T) {
 	req.Header.Set("X-User-Id", "user123")
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Errorf("expected 200, got %d", w.Code)
+	// X-User-Id header is ignored — should return 401
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", w.Code)
 	}
 }
 

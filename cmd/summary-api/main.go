@@ -10,11 +10,11 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/router"
-	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/ws"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/auth"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/db"
-	appredis "github.com/Mininglamp-OSS/octo-smart-summary/internal/redis"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 )
 
 func main() {
@@ -33,8 +33,9 @@ func main() {
 		imDB = nil
 	}
 
-	// Init Redis
-	rdb := appredis.New(cfg.RedisAddr, cfg.RedisDB)
+	// Init auth resolver
+	httpResolver := auth.NewHTTPTokenResolver(cfg.OctoAPIURL)
+	authResolver := auth.NewCachedResolver(httpResolver, 30*time.Second, 10000)
 
 	// Init WebSocket hub
 	hub := ws.NewHub(summaryDB)
@@ -63,7 +64,7 @@ func main() {
 	}
 
 	// Public API server
-	publicRouter := router.SetupPublic(summaryDB, imDB, hub, rdb, cfg.WorkerTriggerURL)
+	publicRouter := router.SetupPublic(summaryDB, imDB, hub, authResolver, cfg.WorkerTriggerURL)
 	publicSrv := &http.Server{
 		Addr:    ":" + cfg.APIPort,
 		Handler: publicRouter,
@@ -72,7 +73,7 @@ func main() {
 	// Internal callback server (Docker network accessible for worker callbacks)
 	internalRouter, _ := router.SetupInternal(hub)
 	internalSrv := &http.Server{
-		Addr:    ":" + cfg.APIInternalPort, // 0.0.0.0 so worker container can reach via Docker network
+		Addr:    ":" + cfg.APIInternalPort,
 		Handler: internalRouter,
 	}
 
@@ -102,10 +103,6 @@ func main() {
 
 	publicSrv.Shutdown(ctx)
 	internalSrv.Shutdown(ctx)
-
-	if rdb != nil {
-		rdb.Close()
-	}
 
 	log.Println("[api] exited")
 }

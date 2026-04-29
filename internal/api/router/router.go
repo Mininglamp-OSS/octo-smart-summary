@@ -19,7 +19,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	r.Use(func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type,Authorization,Token,X-Space-Id,X-User-Id")
+		c.Header("Access-Control-Allow-Headers", "Content-Type,Authorization,Token,X-Space-Id")
 		if c.Request.Method == http.MethodOptions {
 			c.AbortWithStatus(http.StatusNoContent)
 			return
@@ -41,7 +41,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	personalH := handler.NewPersonalHandler(db, workerTriggerURL, hub)
 
 	v1 := r.Group("/api/v1")
-	v1.Use(middleware.StrictAuthMiddleware(authResolver), middleware.SpaceMiddleware())
+	v1.Use(middleware.StrictAuthMiddleware(authResolver), middleware.StrictSpaceMiddleware())
 	{
 		v1.POST("/summaries", taskH.CreateSummary)
 		v1.GET("/summaries", taskH.ListSummaries)
@@ -65,7 +65,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 
 	// P2 routes: strict auth required
 	p2 := r.Group("/api/v1")
-	p2.Use(middleware.StrictAuthMiddleware(authResolver), middleware.SpaceMiddleware())
+	p2.Use(middleware.StrictAuthMiddleware(authResolver), middleware.StrictSpaceMiddleware())
 	{
 		p2.POST("/summaries/:id/accept", personalH.Accept)
 		p2.POST("/summaries/:id/decline", personalH.Decline)

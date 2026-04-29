@@ -35,14 +35,13 @@ func GetSpaceID(c *gin.Context) string {
 	return s
 }
 
-// AuthMiddleware extracts Token header, resolves uid via Redis,
-// and returns 401 if authentication fails.
+// AuthMiddleware extracts Token header, resolves uid, and sets user_id in context.
+// Allows unauthenticated requests through with empty user_id.
 func AuthMiddleware(resolver TokenResolver) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token := c.GetHeader("Token")
-		userID := c.GetHeader("X-User-Id")
+		userID := ""
 
-		// If token is provided, resolve uid from Redis
 		if token != "" && resolver != nil {
 			uid, err := resolver.ResolveUID(c.Request.Context(), token)
 			if err != nil {
@@ -78,12 +77,12 @@ func GetUserID(c *gin.Context) string {
 	return s
 }
 
-// StrictAuthMiddleware is like AuthMiddleware but requires a valid user_id.
+// StrictAuthMiddleware requires a valid token that resolves to a user_id.
 // Returns 401 if user_id is empty after token resolution.
 func StrictAuthMiddleware(resolver TokenResolver) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token := c.GetHeader("Token")
-		userID := c.GetHeader("X-User-Id")
+		userID := ""
 
 		if token != "" && resolver != nil {
 			uid, err := resolver.ResolveUID(c.Request.Context(), token)
@@ -116,4 +115,29 @@ func StrictAuthMiddleware(resolver TokenResolver) gin.HandlerFunc {
 		c.Set("token", token)
 		c.Next()
 	}
+}
+
+// StrictSpaceMiddleware extracts X-Space-Id and rejects write operations without it.
+func StrictSpaceMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		spaceID := c.GetHeader("X-Space-Id")
+		if spaceID == "" {
+			spaceID = c.GetHeader("X-Org-Id")
+		}
+
+		if spaceID == "" && isWriteMethod(c.Request.Method) {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+				"code":    40001,
+				"message": "X-Space-Id header required for write operations",
+			})
+			return
+		}
+
+		c.Set("space_id", spaceID)
+		c.Next()
+	}
+}
+
+func isWriteMethod(method string) bool {
+	return method == "POST" || method == "PUT" || method == "DELETE"
 }
