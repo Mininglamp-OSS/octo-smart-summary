@@ -9,4 +9,5 @@ RUN CGO_ENABLED=0 go build -o /bin/summary-worker ./cmd/summary-worker
 FROM alpine:3.19
 RUN apk add --no-cache ca-certificates tzdata
 COPY --from=builder /bin/summary-worker /bin/summary-worker
+EXPOSE 8082
 ENTRYPOINT ["/bin/summary-worker"]

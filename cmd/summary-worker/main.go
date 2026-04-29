@@ -17,6 +17,12 @@ import (
 
 func main() {
 	cfg := config.Load()
+	config.ValidateRequired(map[string]string{
+		"MYSQL_DSN":              cfg.MySQLDSN,
+		"IM_MYSQL_DSN":           cfg.IMMySQLDSN,
+		"LLM_API_KEY":            cfg.LLMApiKey,
+		"WORKER_API_CALLBACK_URL": cfg.WorkerCallbackURL,
+	})
 
 	// Init summary DB
 	summaryDB, err := db.New(cfg.MySQLDSN)
@@ -51,21 +57,18 @@ func main() {
 	go proc.Run()
 
 	// Start scheduler (cron jobs)
-	workerTriggerURL := "http://127.0.0.1:" + cfg.WorkerInternalPort + "/internal/worker-trigger"
-	// Worker internal trigger server listens on all interfaces so API container can reach it
-	workerTriggerListenAddr := cfg.WorkerListenAllInterfaces
-	cronSched := worker.StartScheduler(summaryDB, cfg.WorkerMaxRetry, workerTriggerURL)
+	cronSched := worker.StartScheduler(summaryDB, cfg.WorkerMaxRetry, cfg.WorkerTriggerURL)
 
 	// Start internal HTTP server for worker-trigger
 	hub := ws.NewHub(summaryDB)
 	internalRouter, intH := router.SetupInternal(hub)
 	intH.SetTriggerCh(proc.TriggerCh())
 	internalSrv := &http.Server{
-		Addr:    workerTriggerListenAddr + ":" + cfg.WorkerInternalPort,
+		Addr:    cfg.WorkerListenAllInterfaces + ":" + cfg.WorkerInternalPort,
 		Handler: internalRouter,
 	}
 	go func() {
-		log.Printf("[worker] internal server listening on %s:%s", workerTriggerListenAddr, cfg.WorkerInternalPort)
+		log.Printf("[worker] internal server listening on %s:%s", cfg.WorkerListenAllInterfaces, cfg.WorkerInternalPort)
 		if err := internalSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("[worker] internal server error: %v", err)
 		}

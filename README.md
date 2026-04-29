@@ -29,19 +29,27 @@ docker build -f Dockerfile.worker -t summary-worker:local .
 
 ## Environment Variables
 
-| Variable | Description | Example |
-|---|---|---|
-| `MYSQL_DSN` | Summary database connection string | `user:pass@tcp(host:3306)/dmwork_summary?charset=utf8mb4&parseTime=True&loc=Local` |
-| `IM_MYSQL_DSN` | IM database connection string (read-only) | `user:pass@tcp(host:3306)/im?charset=utf8mb4&parseTime=True&loc=Local` |
-| `REDIS_ADDR` | Redis address | `localhost:6379` |
-| `REDIS_DB` | Redis database number | `0` |
-| `LLM_API_URL` | OpenAI-compatible API endpoint | `https://api.openai.com/v1` |
-| `LLM_API_KEY` | LLM API key | |
-| `LLM_MODEL` | LLM model name | `gpt-4o` |
-| `LLM_MAX_TOKENS` | Max tokens for LLM response | `4096` |
-| `WORKER_MAX_CONCURRENT_TASKS` | Max parallel summarization tasks | `20` |
-| `WORKER_MAP_CONCURRENCY` | Concurrency for map-reduce stage | `5` |
-| `WORKER_POLL_INTERVAL_SECONDS` | Task queue poll interval (seconds) | `2` |
-| `WORKER_TASK_LEASE_MINUTES` | Task lease duration (minutes) | `10` |
-| `WORKER_MAX_RETRY` | Max retry attempts for failed tasks | `3` |
-| `WORKER_API_CALLBACK_URL` | Callback URL for task completion | `http://summary-api:8081/internal/task-event` |
+| Variable | Description | Service | Required |
+|---|---|---|---|
+| `MYSQL_DSN` | Summary database connection string | both | yes |
+| `IM_MYSQL_DSN` | IM database connection string (read-only) | both | yes |
+| `OCTO_API_URL` | Auth/API server base URL | api | yes |
+| `LLM_API_URL` | OpenAI-compatible API endpoint | worker | no (default: `https://api.example.com/v1`) |
+| `LLM_API_KEY` | LLM API key | worker | yes |
+| `LLM_MODEL` | LLM model name | worker | no (default: `claude-sonnet-4-6`) |
+| `LLM_TIMEOUT` | LLM request timeout in seconds | worker | no (default: `120`) |
+| `LLM_MAX_TOKENS` | Max tokens for LLM response | worker | no (default: `4096`) |
+| `API_PORT` | Public API listen port | api | no (default: `8080`) |
+| `API_INTERNAL_PORT` | Internal API listen port (callbacks) | api | no (default: `8081`) |
+| `WORKER_INTERNAL_PORT` | Worker internal listen port | worker | no (default: `8082`) |
+| `WORKER_LISTEN_ADDR` | Worker bind address | worker | no (default: `0.0.0.0`) |
+| `WORKER_TRIGGER_URL` | URL for API to trigger worker tasks | api | yes |
+| `WORKER_API_CALLBACK_URL` | Callback URL for task completion | worker | yes |
+| `WORKER_MAX_CONCURRENT_TASKS` | Max parallel summarization tasks | worker | no (default: `20`) |
+| `WORKER_MAP_CONCURRENCY` | Concurrency for map-reduce stage | worker | no (default: `5`) |
+| `WORKER_POLL_INTERVAL_SECONDS` | Task queue poll interval (seconds) | worker | no (default: `2`) |
+| `WORKER_TASK_LEASE_MINUTES` | Task lease duration (minutes) | worker | no (default: `10`) |
+| `WORKER_MAX_RETRY` | Max retry attempts for failed tasks | worker | no (default: `3`) |
+| `MSG_TABLE_COUNT` | Number of message sharding tables | both | no (default: `5`) |
+| `CONTEXT_WINDOW` | Context window days for personal summary | worker | no (default: `2`) |
+| `MAX_MESSAGES_PER_PARTICIPANT` | Max messages per participant to process | worker | no (default: `5000`) |

@@ -1,8 +1,10 @@
 package config
 
 import (
+	"log"
 	"os"
 	"strconv"
+	"strings"
 )
 
 type Config struct {
@@ -26,8 +28,8 @@ type Config struct {
 	APIInternalPort string
 
 	// Worker internal port (separate from API internal port)
-	WorkerInternalPort         string
-	WorkerListenAllInterfaces  string
+	WorkerInternalPort        string
+	WorkerListenAllInterfaces string
 
 	// Worker
 	WorkerMaxConcurrent  int
@@ -41,11 +43,8 @@ type Config struct {
 	MsgTableCount int
 
 	// Context window for personal summary filtering
-	ContextWindow            int
+	ContextWindow             int
 	MaxMessagesPerParticipant int
-
-	// Frontend
-	FrontendBaseURL string
 
 	// Worker trigger URL (API → Worker)
 	WorkerTriggerURL string
@@ -53,10 +52,10 @@ type Config struct {
 
 func Load() *Config {
 	return &Config{
-		MySQLDSN:   envStr("MYSQL_DSN", "root:tsdd123456@tcp(localhost:3306)/dmwork_summary?charset=utf8mb4&parseTime=True&loc=Local"),
-		IMMySQLDSN: envStr("IM_MYSQL_DSN", "root:tsdd123456@tcp(localhost:3306)/im?charset=utf8mb4&parseTime=True&loc=Local"),
+		MySQLDSN:   envStr("MYSQL_DSN", ""),
+		IMMySQLDSN: envStr("IM_MYSQL_DSN", ""),
 
-		OctoAPIURL: envStr("OCTO_API_URL", "http://tangsengdaodaoserver:8090"),
+		OctoAPIURL: envStr("OCTO_API_URL", ""),
 
 		LLMApiURL:   envStr("LLM_API_URL", "https://api.example.com/v1"),
 		LLMApiKey:   envStr("LLM_API_KEY", ""),
@@ -75,15 +74,26 @@ func Load() *Config {
 		WorkerPollInterval:   envInt("WORKER_POLL_INTERVAL_SECONDS", 2),
 		WorkerLeaseMinutes:   envInt("WORKER_TASK_LEASE_MINUTES", 10),
 		WorkerMaxRetry:       envInt("WORKER_MAX_RETRY", 3),
-		WorkerCallbackURL:    envStr("WORKER_API_CALLBACK_URL", "http://127.0.0.1:8081/internal/task-event"),
+		WorkerCallbackURL:    envStr("WORKER_API_CALLBACK_URL", ""),
 
 		MsgTableCount: envInt("MSG_TABLE_COUNT", 5),
 
-		ContextWindow:            envInt("CONTEXT_WINDOW", 2),
+		ContextWindow:             envInt("CONTEXT_WINDOW", 2),
 		MaxMessagesPerParticipant: envInt("MAX_MESSAGES_PER_PARTICIPANT", 5000),
 
-		FrontendBaseURL:  envStr("FRONTEND_BASE_URL", "http://localhost:3000"),
-		WorkerTriggerURL: envStr("WORKER_TRIGGER_URL", "http://summary-worker:8082/internal/worker-trigger"),
+		WorkerTriggerURL: envStr("WORKER_TRIGGER_URL", ""),
+	}
+}
+
+func ValidateRequired(fields map[string]string) {
+	var missing []string
+	for name, value := range fields {
+		if value == "" {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) != 0 {
+		log.Fatalf("[config] required environment variables not set: %s", strings.Join(missing, ", "))
 	}
 }
 

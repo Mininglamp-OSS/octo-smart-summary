@@ -19,6 +19,12 @@ import (
 
 func main() {
 	cfg := config.Load()
+	config.ValidateRequired(map[string]string{
+		"MYSQL_DSN":          cfg.MySQLDSN,
+		"IM_MYSQL_DSN":       cfg.IMMySQLDSN,
+		"OCTO_API_URL":     cfg.OctoAPIURL,
+		"WORKER_TRIGGER_URL": cfg.WorkerTriggerURL,
+	})
 
 	// Init DB
 	summaryDB, err := db.New(cfg.MySQLDSN)
