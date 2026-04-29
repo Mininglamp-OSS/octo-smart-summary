@@ -195,14 +195,22 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 			Select("ce.channel_id, u.name").
 			Joins("LEFT JOIN user u ON ce.channel_id = u.uid").
 			Where("ce.uid = ? AND ce.channel_type = 1", currentUIDStr).
-			// Only standard 32-char hex uid peers (excludes fileHelper, botfather, etc.)
-			Where("LENGTH(ce.channel_id) = 32").
-			// Exclude bots
-			Where("u.robot = 0").
-			Where("ce.channel_id NOT IN (SELECT robot_id FROM robot)")
-		if spaceIDStr != "" {
-			q = q.Where("ce.channel_id IN (SELECT uid FROM space_member WHERE space_id = ? AND status = 1)", spaceIDStr)
-		}
+			// Exclude known system accounts by name; creator_uid != '' in the robot
+			// subquery is a catch-all that filters any unlisted system bots whose
+			// creator_uid is empty.
+			Where("ce.channel_id NOT IN ('fileHelper', 'botfather')").
+			// space_member filter is inside the human branch only — bots may not
+			// appear in space_member and must not be excluded by it.
+			Where(`(
+				(LENGTH(ce.channel_id) = 32 AND u.robot = 0
+					AND (? = '' OR ce.channel_id IN (SELECT uid FROM space_member WHERE space_id = ? AND status = 1)))
+				OR
+				ce.channel_id IN (
+					SELECT f.to_uid FROM friend f
+					WHERE f.uid = ? AND f.is_deleted = 0
+					AND f.to_uid IN (SELECT robot_id FROM robot WHERE creator_uid != '')
+				)
+			)`, spaceIDStr, spaceIDStr, currentUIDStr)
 		if keyword != "" {
 			q = q.Where("u.name LIKE ?", "%"+keyword+"%")
 		}
