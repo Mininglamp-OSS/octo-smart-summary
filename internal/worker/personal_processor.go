@@ -62,6 +62,9 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 		p.markPersonalFailed(&pr, &participant, err.Error())
 		return
 	}
+	if content == "" {
+		content = "在当前范围内未找到与主题相关的聊天记录。"
+	}
 
 	// Mark completed
 	pr.SetCitations(citations)
@@ -170,7 +173,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	// Apply context window filter
 	userMessages := pipeline.FilterWithContext(messages, userID, p.cfg.ContextWindow)
 	if len(userMessages) == 0 {
-		return "", nil, 0, 0, "", nil
+		return "在当前范围内未找到与主题相关的聊天记录。", nil, 0, 0, p.llm.ModelVersion(), nil
 	}
 
 	// Resolve sender names
