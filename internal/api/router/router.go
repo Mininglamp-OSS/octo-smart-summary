@@ -44,6 +44,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	v1.Use(middleware.StrictAuthMiddleware(authResolver), middleware.StrictSpaceMiddleware())
 	{
 		v1.POST("/summaries", taskH.CreateSummary)
+		v1.POST("/summaries/batch-status", taskH.BatchStatus)
 		v1.GET("/summaries", taskH.ListSummaries)
 		v1.GET("/summaries/:id", taskH.GetSummary)
 		v1.GET("/summaries/:id/result", taskH.GetResult)
