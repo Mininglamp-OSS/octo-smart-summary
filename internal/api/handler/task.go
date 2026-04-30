@@ -711,14 +711,23 @@ func (h *TaskHandler) CancelSummary(c *gin.Context) {
 		return
 	}
 
-	if task.Status == model.StatusCompleted || task.Status == model.StatusFailed || task.Status == model.StatusCancelled {
+	result := h.db.Model(&model.SummaryTask{}).
+		Where("id = ? AND status IN (?, ?, ?)", task.ID,
+			model.StatusPending, model.StatusWaitingConfirm, model.StatusProcessing).
+		Updates(map[string]interface{}{
+			"status":        model.StatusCancelled,
+			"error_message": "用户取消",
+		})
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: result.Error.Error()})
+		return
+	}
+	if result.RowsAffected == 0 {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "任务已结束，无法取消"})
 		return
 	}
-	if err := h.db.Model(task).Updates(map[string]interface{}{"status": model.StatusCancelled, "error_message": "用户取消"}).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
-		return
-	}
+
+	// TODO(#11): send WS callback (TaskEvent with StatusCancelled) to notify frontend in real-time
 	c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok"})
 }
 

@@ -150,12 +150,22 @@ func (p *Processor) processTask(task model.SummaryTask) {
 		if newRetry >= p.cfg.WorkerMaxRetry {
 			newStatus = model.StatusFailed
 		}
-		p.db.Model(&model.SummaryTask{}).Where("id = ?", task.ID).Updates(map[string]interface{}{
-			"status":              newStatus,
-			"retry_count":         newRetry,
-			"error_message":       errMsg,
-			"processing_deadline": nil,
-		})
+		casResult := p.db.Model(&model.SummaryTask{}).
+			Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
+			Updates(map[string]interface{}{
+				"status":              newStatus,
+				"retry_count":         newRetry,
+				"error_message":       errMsg,
+				"processing_deadline": nil,
+			})
+		if casResult.Error != nil {
+			log.Printf("[processor] task %d update to failed/retry failed: %v", task.ID, casResult.Error)
+			return
+		}
+		if casResult.RowsAffected == 0 {
+			log.Printf("[processor] task %d status changed during processing (likely cancelled), skipping failure update", task.ID)
+			return
+		}
 		p.sendCallback(model.TaskEvent{
 			TaskID:  task.ID,
 			Status:  newStatus,
@@ -169,6 +179,19 @@ func (p *Processor) processTask(task model.SummaryTask) {
 	p.db.Model(&model.SummaryParticipant{}).Where("task_id = ?", task.ID).Count(&participantCount)
 
 	if participantCount <= 1 {
+		casResult := p.db.Model(&model.SummaryTask{}).
+			Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
+			Updates(map[string]interface{}{
+				"processing_deadline": nil,
+			})
+		if casResult.Error != nil {
+			log.Printf("[processor] task %d CAS update failed: %v", task.ID, casResult.Error)
+			return
+		}
+		if casResult.RowsAffected == 0 {
+			log.Printf("[processor] task %d status changed (likely cancelled), skipping dispatch", task.ID)
+			return
+		}
 		var participants []model.SummaryParticipant
 		p.db.Where("task_id = ?", task.ID).Find(&participants)
 		for _, pt := range participants {
@@ -179,10 +202,6 @@ func (p *Processor) processTask(task model.SummaryTask) {
 				p.processPersonalSummary(context.Background(), task.ID, ptID)
 			})
 		}
-		p.db.Model(&model.SummaryTask{}).Where("id = ?", task.ID).Updates(map[string]interface{}{
-			"status":              model.StatusProcessing,
-			"processing_deadline": nil,
-		})
 		p.sendCallback(model.TaskEvent{
 			TaskID:   task.ID,
 			Status:   model.StatusProcessing,
@@ -193,10 +212,19 @@ func (p *Processor) processTask(task model.SummaryTask) {
 	} else {
 		// Multi-person: Creator already triggered by API handler;
 		// other participants remain WaitingConfirm at participant level.
-		p.db.Model(&model.SummaryTask{}).Where("id = ?", task.ID).Updates(map[string]interface{}{
-			"status":              model.StatusProcessing,
-			"processing_deadline": nil,
-		})
+		casResult := p.db.Model(&model.SummaryTask{}).
+			Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
+			Updates(map[string]interface{}{
+				"processing_deadline": nil,
+			})
+		if casResult.Error != nil {
+			log.Printf("[processor] task %d CAS update failed: %v", task.ID, casResult.Error)
+			return
+		}
+		if casResult.RowsAffected == 0 {
+			log.Printf("[processor] task %d status changed (likely cancelled), skipping dispatch", task.ID)
+			return
+		}
 		p.sendCallback(model.TaskEvent{
 			TaskID:   task.ID,
 			Status:   model.StatusProcessing,

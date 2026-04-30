@@ -46,9 +46,20 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 	})
 
 	// CAS update task status to PROCESSING (from any earlier state)
-	p.db.Model(&model.SummaryTask{}).
+	taskCAS := p.db.Model(&model.SummaryTask{}).
 		Where("id = ? AND status IN (?, ?)", taskID, model.StatusPending, model.StatusWaitingConfirm).
 		Update("status", model.StatusProcessing)
+	if taskCAS.Error != nil {
+		log.Printf("[personal-worker] task=%d CAS update failed: %v", taskID, taskCAS.Error)
+		return
+	}
+	if taskCAS.RowsAffected == 0 {
+		var currentTask model.SummaryTask
+		if err := p.db.Select("status").First(&currentTask, taskID).Error; err != nil || currentTask.Status != model.StatusProcessing {
+			log.Printf("[personal-worker] task=%d not in processing state, aborting", taskID)
+			return
+		}
+	}
 
 	// Load task
 	var task model.SummaryTask
@@ -69,7 +80,14 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 		content = noRelevantContentMessage
 	}
 
-	// Mark completed
+	// Best-effort check: abort early if task is no longer Processing.
+	// Final safety is guaranteed by the task-level CAS in the completion path below.
+	var taskCheck model.SummaryTask
+	if err := p.db.Select("status").First(&taskCheck, taskID).Error; err != nil || taskCheck.Status != model.StatusProcessing {
+		log.Printf("[personal-worker] task=%d no longer processing before result write, aborting", taskID)
+		return
+	}
+
 	pr.SetCitations(citations)
 	genAt := time.Now().UTC()
 	p.db.Model(&pr).Updates(map[string]interface{}{
@@ -117,8 +135,17 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 			return
 		}
 
-		p.db.Model(&model.SummaryTask{}).Where("id = ?", taskID).
+		casResult := p.db.Model(&model.SummaryTask{}).
+			Where("id = ? AND status = ?", taskID, model.StatusProcessing).
 			Update("status", model.StatusCompleted)
+		if casResult.Error != nil {
+			log.Printf("[personal-worker] task %d update to completed failed: %v", taskID, casResult.Error)
+			return
+		}
+		if casResult.RowsAffected == 0 {
+			log.Printf("[personal-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
+			return
+		}
 
 		p.sendCallback(model.TaskEvent{
 			TaskID:   taskID,

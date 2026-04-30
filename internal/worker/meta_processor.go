@@ -183,14 +183,32 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 			GeneratedAt:    now,
 		}
 		result.SetTeamCitations(teamCitations)
+
+		// Best-effort check: don't write result if task is no longer Processing.
+		// This is a best-effort guard; final safety is guaranteed by the task-level CAS below.
+		var taskCheck model.SummaryTask
+		if err := m.proc.db.Select("status").First(&taskCheck, taskID).Error; err != nil || taskCheck.Status != model.StatusProcessing {
+			log.Printf("[meta-worker] task %d no longer processing before result write, aborting", taskID)
+			return
+		}
+
 		if err := m.proc.db.Create(&result).Error; err != nil {
 			log.Printf("[meta-worker] save result error task=%d: %v", taskID, err)
 			return
 		}
 
-		// Update task status
-		m.proc.db.Model(&model.SummaryTask{}).Where("id = ?", taskID).
+		// Update task status (CAS: only if still processing)
+		casResult := m.proc.db.Model(&model.SummaryTask{}).
+			Where("id = ? AND status = ?", taskID, model.StatusProcessing).
 			Update("status", model.StatusCompleted)
+		if casResult.Error != nil {
+			log.Printf("[meta-worker] task %d update to completed failed: %v", taskID, casResult.Error)
+			return
+		}
+		if casResult.RowsAffected == 0 {
+			log.Printf("[meta-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
+			return
+		}
 
 		// Send WS notification (META_SUMMARY_UPDATED, broadcast to all)
 		m.proc.sendCallback(model.TaskEvent{
