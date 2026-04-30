@@ -45,6 +45,7 @@ type Config struct {
 	// Context window for personal summary filtering
 	ContextWindow             int
 	MaxMessagesPerParticipant int
+	MapMaxTokens             int
 
 	// Worker trigger URL (API → Worker)
 	WorkerTriggerURL string
@@ -80,6 +81,7 @@ func Load() *Config {
 
 		ContextWindow:             envInt("CONTEXT_WINDOW", 2),
 		MaxMessagesPerParticipant: envInt("MAX_MESSAGES_PER_PARTICIPANT", 5000),
+		MapMaxTokens:             envInt("MAP_MAX_TOKENS", 100000),
 
 		WorkerTriggerURL: envStr("WORKER_TRIGGER_URL", ""),
 	}

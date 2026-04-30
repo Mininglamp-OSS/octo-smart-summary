@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"gorm.io/gorm"
 )
 
 const noRelevantContentMessage = "在当前范围内未找到与主题相关的聊天记录。"
@@ -163,12 +164,55 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 }
 
 func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *model.SummaryParticipant, errMsg string) {
-	p.db.Model(pr).Updates(map[string]interface{}{
-		"worker_status": model.PersonalStatusFailed,
-		"error_message": errMsg,
+	sanitized := sanitizeErrorForUser(errMsg)
+
+	var shouldNotify bool
+	txErr := p.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(pr).Updates(map[string]interface{}{
+			"worker_status": model.PersonalStatusFailed,
+			"error_message": &sanitized,
+		}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(participant).Update("status", model.ParticipantAccepted).Error; err != nil {
+			return err
+		}
+
+		// In single-person mode, propagate failure to task level
+		var participantCount int64
+		if err := tx.Model(&model.SummaryParticipant{}).Where("task_id = ?", pr.TaskID).Count(&participantCount).Error; err != nil {
+			return err
+		}
+		if participantCount <= 1 {
+			result := tx.Model(&model.SummaryTask{}).
+				Where("id = ? AND status = ?", pr.TaskID, model.StatusProcessing).
+				Updates(map[string]interface{}{
+					"status":        model.StatusFailed,
+					"error_message": &sanitized,
+				})
+			if result.RowsAffected == 0 {
+				log.Printf("[personal-worker] task=%d CAS update skipped (not in Processing state)", pr.TaskID)
+			} else {
+				shouldNotify = true
+			}
+		}
+		return nil
 	})
-	// Revert participant to accepted so they can retry
-	p.db.Model(participant).Update("status", model.ParticipantAccepted)
+
+	if txErr != nil {
+		log.Printf("[personal-worker] markPersonalFailed transaction failed: task=%d err=%v", pr.TaskID, txErr)
+		return
+	}
+
+	if shouldNotify {
+		p.sendCallback(model.TaskEvent{
+			TaskID:   pr.TaskID,
+			Status:   model.StatusFailed,
+			Progress: 0,
+			Message:  sanitized,
+		})
+	}
+	log.Printf("[personal-worker] task=%d marked failed, sanitizedMsg=%s", pr.TaskID, sanitized)
 }
 
 func (p *Processor) executePersonalPipeline(ctx context.Context, task model.SummaryTask, userID string) (string, []model.Citation, int, int, string, error) {
@@ -227,15 +271,44 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		}
 	}
 
-	// Split messages into chunks
-	chunkSize := 500
+	// Token-aware chunking
+	maxTokens := p.cfg.MapMaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 100000
+	}
+	if maxTokens < 10000 {
+		log.Printf("[config] MAP_MAX_TOKENS=%d too small, using default 100000", maxTokens)
+		maxTokens = 100000
+	}
+	const systemPromptTokens = 3000
+	const maxMsgsPerChunk = 800
+	effectiveMax := maxTokens - systemPromptTokens
+
 	var chunks [][]pipeline.Message
-	for i := 0; i < len(userMessages); i += chunkSize {
-		end := i + chunkSize
-		if end > len(userMessages) {
-			end = len(userMessages)
+	var currentChunk []pipeline.Message
+	currentTokens := 0
+
+	for _, m := range userMessages {
+		msgTokens := estimateTokens(m.Content)
+		if msgTokens > effectiveMax {
+			log.Printf("[chunking] WARNING: single message exceeds token budget: %d > %d", msgTokens, effectiveMax)
 		}
-		chunks = append(chunks, userMessages[i:end])
+		if len(currentChunk) > 0 && (currentTokens+msgTokens > effectiveMax || len(currentChunk) >= maxMsgsPerChunk) {
+			chunks = append(chunks, currentChunk)
+			currentChunk = nil
+			currentTokens = 0
+		}
+		currentChunk = append(currentChunk, m)
+		currentTokens += msgTokens
+		// Force flush if this single message already exceeds budget
+		if msgTokens > effectiveMax {
+			chunks = append(chunks, currentChunk)
+			currentChunk = nil
+			currentTokens = 0
+		}
+	}
+	if len(currentChunk) > 0 {
+		chunks = append(chunks, currentChunk)
 	}
 
 	startTime := task.TimeRangeStart.Format("2006-01-02 15:04")
@@ -276,6 +349,18 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		totalTokens += tokens
 	}
 
+	// Detect all-chunks-failed
+	allFailed := true
+	for _, s := range chunkSummaries {
+		if !strings.Contains(s, service.MapFailedMarker) {
+			allFailed = false
+			break
+		}
+	}
+	if allFailed && len(chunkSummaries) > 0 {
+		return "", nil, 0, 0, "", fmt.Errorf("all %d chunk(s) failed during Map phase (LLM unreachable)", len(chunkSummaries))
+	}
+
 	// Reduce phase
 	finalContent, reduceTokens, err := p.llm.CallReduce(ctx,
 		chunkSummaries, sourceName, startTime, endTime, targetMsgCount, task.Title,
@@ -290,4 +375,36 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	finalContent, citations = dedupCitations(finalContent, citations)
 
 	return finalContent, citations, targetMsgCount, totalTokens, p.llm.ModelVersion(), nil
+}
+
+func estimateTokens(content string) int {
+	const overheadPerMsg = 50
+	cjkCount := 0
+	asciiCount := 0
+	for _, r := range content {
+		if r > 0x7F {
+			cjkCount++
+		} else {
+			asciiCount++
+		}
+	}
+	return cjkCount*2 + asciiCount/4 + overheadPerMsg
+}
+
+func sanitizeErrorForUser(errMsg string) string {
+	switch {
+	case strings.Contains(errMsg, "LLM API error"):
+		return "AI 服务暂时不可用，请稍后重试"
+	case strings.Contains(errMsg, "context deadline exceeded"):
+		return "处理超时，请稍后重试"
+	case strings.Contains(errMsg, "all") && strings.Contains(errMsg, "chunk(s) failed"):
+		return "AI 服务暂时不可用，所有分片处理失败"
+	default:
+		const maxLen = 100
+		runes := []rune(errMsg)
+		if len(runes) > maxLen {
+			return string(runes[:maxLen]) + "..."
+		}
+		return errMsg
+	}
 }

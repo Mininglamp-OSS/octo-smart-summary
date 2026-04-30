@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+const MapFailedMarker = "总结失败"
+
 // LLMClient handles calls to the OpenAI-compatible LLM gateway.
 type LLMClient struct {
 	apiURL    string
@@ -198,7 +200,7 @@ func (c *LLMClient) CallMap(ctx context.Context, formattedMessages string, sourc
 			time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
 		}
 	}
-	return fmt.Sprintf("(分片 %d 总结失败)", chunkIndex), 0, nil
+	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, nil
 }
 
 // CallReduce runs the Reduce phase to merge chunk summaries.
