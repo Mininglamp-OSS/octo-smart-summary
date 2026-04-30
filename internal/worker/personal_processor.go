@@ -260,13 +260,14 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		}
 	}
 
-	// Assign CitationIndex only to target user messages
+	// Assign CitationIndex to all messages (evidence pool)
+	// targetMsgCount tracks creator messages for reporting
 	citIdx := 1
 	targetMsgCount := 0
 	for i := range userMessages {
+		userMessages[i].CitationIndex = citIdx
+		citIdx++
 		if userMessages[i].IsTargetUser {
-			userMessages[i].CitationIndex = citIdx
-			citIdx++
 			targetMsgCount++
 		}
 	}
@@ -326,13 +327,8 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	for i, chunk := range chunks {
 		var formatted []string
 		for _, m := range chunk {
-			if m.IsTargetUser {
-				formatted = append(formatted, fmt.Sprintf("[%d][%s] %s: %s",
-					m.CitationIndex, m.SendTime, m.SenderName, m.Content))
-			} else {
-				formatted = append(formatted, fmt.Sprintf("[%s] %s: %s",
-					m.SendTime, m.SenderName, m.Content))
-			}
+			formatted = append(formatted, fmt.Sprintf("[%d][%s] %s: %s",
+				m.CitationIndex, m.SendTime, m.SenderName, m.Content))
 		}
 
 		summary, tokens, err := p.llm.CallMap(ctx,
@@ -379,7 +375,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	}
 	totalTokens += reduceTokens
 
-	// Build citations from final content (only target messages have CitationIndex)
+	// Build citations from final content
 	citations := buildCitations(finalContent, userMessages, messages, nameMap)
 	finalContent, citations = dedupCitations(finalContent, citations)
 
