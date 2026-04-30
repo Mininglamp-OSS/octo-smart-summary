@@ -61,6 +61,7 @@ type chatResponse struct {
 
 // Call makes a chat completion request. Returns (content, tokenUsed, error).
 func (c *LLMClient) Call(ctx context.Context, messages []chatMessage, temperature float64) (string, int, error) {
+	log.Printf("[llm] calling model=%s temperature=%.2f max_tokens=%d", c.model, temperature, c.maxTokens)
 	reqBody := chatRequest{
 		Model:       c.model,
 		Messages:    messages,
@@ -142,12 +143,14 @@ func buildMapSystemPrompt(userName, topic string) string {
 - 根据实际内容自行组织结构，不需要套用固定模板
 - 保持简洁，不要复述原文，用自己的话归纳
 
-## 引用规则
-- 每个要点末尾标注来源消息编号，格式为 [n] 或 [n1][n2]
+## 引用规则（必须严格遵守）
+- 【强制】每一条结论/要点都必须标注来源引用 [n]，没有引用的结论不允许输出
+- 格式：[n] 或 [n1][n2]（多个来源时）
 - 所有消息均带有编号（即 [数字] 开头的行），选取有意义的、相关的消息作为依据
 - 不要捏造不存在的编号
 - 多条消息支持同一要点时，列出所有相关编号
 - 如果多条消息内容完全相同（如用户重复发送），只引用其中一条
+- 如果某条信息无法找到明确来源，则不要输出该条信息
 
 ## 格式规范
 - 用显示名称指代人（如"张三"），绝对不要输出 UID 或用户 ID

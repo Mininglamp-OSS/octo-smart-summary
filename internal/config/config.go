@@ -123,6 +123,7 @@ func envInt(key string, def int) int {
 var modelMaxTokensDefaults = map[string]int{
 	"claude-sonnet-4-6": 150000,
 	"claude-opus-4-6":   150000,
+	"claude-haiku-4-5":  150000,
 }
 
 const defaultMapMaxTokens = 100000
