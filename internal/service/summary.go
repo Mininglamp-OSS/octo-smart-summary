@@ -38,7 +38,7 @@ func GenerateTaskNo() string {
 }
 
 // ResolveSourceNameWithType returns source name from IM DB with type suffix.
-// sourceType: 1=group, 3=DM (private chat)
+// sourceType: 1=group, 2=thread, 3=DM (private chat)
 func ResolveSourceNameWithType(sourceID string, sourceType int, imDB *gorm.DB) string {
 	if imDB == nil {
 		return fallbackSourceName(sourceID, sourceType)
@@ -47,6 +47,7 @@ func ResolveSourceNameWithType(sourceID string, sourceType int, imDB *gorm.DB) s
 	switch sourceType {
 	case 1: // group
 		// Strip space_id suffix if present (e.g., "uuid____spaceid" -> "uuid")
+		// Note: For group, ____ separates group_no and space_id; space_id is discarded
 		groupNo := sourceID
 		if idx := strings.Index(sourceID, "____"); idx > 0 {
 			groupNo = sourceID[:idx]
@@ -55,6 +56,30 @@ func ResolveSourceNameWithType(sourceID string, sourceType int, imDB *gorm.DB) s
 		err := imDB.Table("group").Where("group_no = ?", groupNo).Pluck("name", &name).Error
 		if err == nil && name != "" {
 			return name + "(群聊)"
+		}
+	case 2: // thread
+		// Thread source_id format: {group_no}____{short_id}
+		// Note: For thread, ____ separates group_no and short_id; both are used
+		parts := strings.SplitN(sourceID, "____", 2)
+		if len(parts) == 2 {
+			groupNo := parts[0]
+			shortID := parts[1]
+			
+			var groupName string
+			_ = imDB.Table("group").Where("group_no = ?", groupNo).Pluck("name", &groupName).Error
+			
+			var threadName string
+			_ = imDB.Table("thread").Where("short_id = ?", shortID).Pluck("name", &threadName).Error
+			
+			if groupName != "" && threadName != "" {
+				return groupName + "-" + threadName + "(子区)"
+			}
+			if threadName != "" {
+				return threadName + "(子区)"
+			}
+			if groupName != "" {
+				return groupName + "(子区)"
+			}
 		}
 	case 3: // DM (private chat)
 		var name string
@@ -72,6 +97,8 @@ func fallbackSourceName(sourceID string, sourceType int) string {
 	switch sourceType {
 	case 1:
 		suffix = "(群聊)"
+	case 2:
+		suffix = "(子区)"
 	case 3:
 		suffix = "(私聊)"
 	}
