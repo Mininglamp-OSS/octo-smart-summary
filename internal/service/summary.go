@@ -47,6 +47,7 @@ func ResolveSourceNameWithType(sourceID string, sourceType int, imDB *gorm.DB) s
 	switch sourceType {
 	case 1: // group
 		// Strip space_id suffix if present (e.g., "uuid____spaceid" -> "uuid")
+		// Note: For group, ____ separates group_no and space_id; space_id is discarded
 		groupNo := sourceID
 		if idx := strings.Index(sourceID, "____"); idx > 0 {
 			groupNo = sourceID[:idx]
@@ -58,20 +59,21 @@ func ResolveSourceNameWithType(sourceID string, sourceType int, imDB *gorm.DB) s
 		}
 	case 2: // thread
 		// Thread source_id format: {group_no}____{short_id}
+		// Note: For thread, ____ separates group_no and short_id; both are used
 		parts := strings.Split(sourceID, "____")
 		if len(parts) == 2 {
 			groupNo := parts[0]
 			shortID := parts[1]
-			// Query group name
 			var groupName string
-			imDB.Table("group").Where("group_no = ?", groupNo).Pluck("name", &groupName)
-			// Query thread name
-			var threadName string
-			imDB.Table("thread").Where("short_id = ?", shortID).Pluck("name", &threadName)
-			if groupName != "" && threadName != "" {
-				return groupName + "-" + threadName + "(子区)"
+			if err := imDB.Table("group").Where("group_no = ?", groupNo).Pluck("name", &groupName).Error; err == nil && groupName != "" {
+				var threadName string
+				if err := imDB.Table("thread").Where("short_id = ?", shortID).Pluck("name", &threadName).Error; err == nil && threadName != "" {
+					return groupName + "-" + threadName + "(子区)"
+				}
 			}
-			if threadName != "" {
+			// fallback: try thread name alone
+			var threadName string
+			if err := imDB.Table("thread").Where("short_id = ?", shortID).Pluck("name", &threadName).Error; err == nil && threadName != "" {
 				return threadName + "(子区)"
 			}
 		}
