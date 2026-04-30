@@ -45,7 +45,9 @@ type Config struct {
 	// Context window for personal summary filtering
 	ContextWindow             int
 	MaxMessagesPerParticipant int
-	MapMaxTokens             int
+	MapMaxTokens              int
+	CharsPerTokenCJK          int
+	CharsPerTokenASCII        int
 
 	// Worker trigger URL (API → Worker)
 	WorkerTriggerURL string
@@ -81,7 +83,9 @@ func Load() *Config {
 
 		ContextWindow:             envInt("CONTEXT_WINDOW", 2),
 		MaxMessagesPerParticipant: envInt("MAX_MESSAGES_PER_PARTICIPANT", 5000),
-		MapMaxTokens:             envInt("MAP_MAX_TOKENS", 100000),
+		MapMaxTokens:             envInt("MAP_MAX_TOKENS", 0),
+		CharsPerTokenCJK:         envInt("CHARS_PER_TOKEN_CJK", 1),
+		CharsPerTokenASCII:       envInt("CHARS_PER_TOKEN_ASCII", 4),
 
 		WorkerTriggerURL: envStr("WORKER_TRIGGER_URL", ""),
 	}
@@ -113,4 +117,26 @@ func envInt(key string, def int) int {
 		}
 	}
 	return def
+}
+
+// modelMaxTokensDefaults maps LLM model names to their recommended Map-phase token budget.
+var modelMaxTokensDefaults = map[string]int{
+	"claude-sonnet-4-6": 150000,
+	"claude-opus-4-6":   150000,
+}
+
+const defaultMapMaxTokens = 100000
+
+// ResolveMapMaxTokens returns the Map-phase token budget using three-tier fallback:
+// 1. Explicit MapMaxTokens config (> 0)
+// 2. Per-model default from modelMaxTokensDefaults
+// 3. Global default (defaultMapMaxTokens)
+func (c *Config) ResolveMapMaxTokens() int {
+	if c.MapMaxTokens > 0 {
+		return c.MapMaxTokens
+	}
+	if v, ok := modelMaxTokensDefaults[c.LLMModel]; ok {
+		return v
+	}
+	return defaultMapMaxTokens
 }

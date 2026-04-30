@@ -271,13 +271,10 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		}
 	}
 
-	// Token-aware chunking
-	maxTokens := p.cfg.MapMaxTokens
-	if maxTokens <= 0 {
-		maxTokens = 100000
-	}
+	// Token-aware chunking — resolve budget via explicit config / per-model default / global fallback
+	maxTokens := p.cfg.ResolveMapMaxTokens()
 	if maxTokens < 10000 {
-		log.Printf("[config] MAP_MAX_TOKENS=%d too small, using default 100000", maxTokens)
+		log.Printf("[config] resolved MapMaxTokens=%d too small, using default 100000", maxTokens)
 		maxTokens = 100000
 	}
 	const systemPromptTokens = 3000
@@ -289,7 +286,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	currentTokens := 0
 
 	for _, m := range userMessages {
-		msgTokens := estimateTokens(m.Content)
+		msgTokens := estimateTokens(m.Content, p.cfg.CharsPerTokenCJK, p.cfg.CharsPerTokenASCII)
 		if msgTokens > effectiveMax {
 			log.Printf("[chunking] WARNING: single message exceeds token budget: %d > %d", msgTokens, effectiveMax)
 		}
@@ -377,8 +374,15 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	return finalContent, citations, targetMsgCount, totalTokens, p.llm.ModelVersion(), nil
 }
 
-func estimateTokens(content string) int {
+func estimateTokens(content string, charsPerTokenCJK, charsPerTokenASCII int) int {
 	const overheadPerMsg = 50
+	// Defensive: avoid divide-by-zero or pathological values
+	if charsPerTokenCJK <= 0 {
+		charsPerTokenCJK = 1
+	}
+	if charsPerTokenASCII <= 0 {
+		charsPerTokenASCII = 4
+	}
 	cjkCount := 0
 	asciiCount := 0
 	for _, r := range content {
@@ -388,7 +392,7 @@ func estimateTokens(content string) int {
 			asciiCount++
 		}
 	}
-	return cjkCount*2 + asciiCount/4 + overheadPerMsg
+	return cjkCount/charsPerTokenCJK + asciiCount/charsPerTokenASCII + overheadPerMsg
 }
 
 func sanitizeErrorForUser(errMsg string) string {
@@ -396,15 +400,12 @@ func sanitizeErrorForUser(errMsg string) string {
 	case strings.Contains(errMsg, "LLM API error"):
 		return "AI 服务暂时不可用，请稍后重试"
 	case strings.Contains(errMsg, "context deadline exceeded"):
-		return "处理超时，请稍后重试"
+		return "AI 处理超时，请稍后重试"
 	case strings.Contains(errMsg, "all") && strings.Contains(errMsg, "chunk(s) failed"):
 		return "AI 服务暂时不可用，所有分片处理失败"
 	default:
-		const maxLen = 100
-		runes := []rune(errMsg)
-		if len(runes) > maxLen {
-			return string(runes[:maxLen]) + "..."
-		}
-		return errMsg
+		// Do not leak raw internal errors (may contain DSN, IPs, stack traces).
+		// Raw error is already logged by the caller via log.Printf.
+		return "AI 处理失败，请稍后重试"
 	}
 }
