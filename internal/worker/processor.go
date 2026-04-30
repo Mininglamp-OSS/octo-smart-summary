@@ -182,7 +182,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 		casResult := p.db.Model(&model.SummaryTask{}).
 			Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
 			Updates(map[string]interface{}{
-				"processing_deadline": nil,
+				"processing_deadline": time.Now().UTC().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute),
 			})
 		if casResult.Error != nil {
 			log.Printf("[processor] task %d CAS update failed: %v", task.ID, casResult.Error)
@@ -215,7 +215,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 		casResult := p.db.Model(&model.SummaryTask{}).
 			Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
 			Updates(map[string]interface{}{
-				"processing_deadline": nil,
+				"processing_deadline": time.Now().UTC().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute),
 			})
 		if casResult.Error != nil {
 			log.Printf("[processor] task %d CAS update failed: %v", task.ID, casResult.Error)

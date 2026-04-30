@@ -75,7 +75,7 @@ func Load() *Config {
 		WorkerMaxConcurrent:  envInt("WORKER_MAX_CONCURRENT_TASKS", 20),
 		WorkerMapConcurrency: envInt("WORKER_MAP_CONCURRENCY", 5),
 		WorkerPollInterval:   envInt("WORKER_POLL_INTERVAL_SECONDS", 2),
-		WorkerLeaseMinutes:   envInt("WORKER_TASK_LEASE_MINUTES", 10),
+		WorkerLeaseMinutes:   envInt("WORKER_TASK_LEASE_MINUTES", 20),
 		WorkerMaxRetry:       envInt("WORKER_MAX_RETRY", 3),
 		WorkerCallbackURL:    envStr("WORKER_API_CALLBACK_URL", ""),
 
