@@ -9,12 +9,20 @@ import (
 
 // CandidateHandler handles member and chat candidate search.
 type CandidateHandler struct {
-	imDB *gorm.DB
+	imDB       *gorm.DB
+	queryLimit int // -1 = no limit, >0 = SQL LIMIT value
 }
 
 // NewCandidateHandler creates a new CandidateHandler.
-func NewCandidateHandler(imDB *gorm.DB) *CandidateHandler {
-	return &CandidateHandler{imDB: imDB}
+func NewCandidateHandler(imDB *gorm.DB, queryLimit int) *CandidateHandler {
+	return &CandidateHandler{imDB: imDB, queryLimit: queryLimit}
+}
+
+func (h *CandidateHandler) applyLimit(q *gorm.DB) *gorm.DB {
+	if h.queryLimit > 0 {
+		return q.Limit(h.queryLimit)
+	}
+	return q
 }
 
 // imUser holds basic user info from IM DB.
@@ -71,7 +79,7 @@ func (h *CandidateHandler) SearchCandidates(c *gin.Context) {
 	if keyword != "" {
 		q = q.Where("u.name LIKE ? OR u.username LIKE ?", "%"+keyword+"%", "%"+keyword+"%")
 	}
-	q.Limit(20).Find(&users)
+	h.applyLimit(q).Find(&users)
 
 	list := make([]gin.H, 0, len(users))
 	for _, u := range users {
@@ -139,7 +147,7 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 		if keyword != "" {
 			q = q.Where("g.name LIKE ?", "%"+keyword+"%")
 		}
-		q.Limit(20).Find(&groups)
+		h.applyLimit(q).Find(&groups)
 		for _, g := range groups {
 			list = append(list, gin.H{
 				"chat_id":      g.GroupNo,
@@ -172,7 +180,7 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 		if keyword != "" {
 			q = q.Where("t.name LIKE ? OR g.name LIKE ?", "%"+keyword+"%", "%"+keyword+"%")
 		}
-		q.Limit(20).Find(&threads)
+		h.applyLimit(q).Find(&threads)
 		for _, t := range threads {
 			list = append(list, gin.H{
 				"chat_id":         t.GroupNo + "____" + t.ShortID,
@@ -215,7 +223,7 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 		if keyword != "" {
 			q = q.Where("u.name LIKE ?", "%"+keyword+"%")
 		}
-		q.Order("ce.updated_at DESC").Limit(20).Find(&directs)
+		h.applyLimit(q.Order("ce.updated_at DESC")).Find(&directs)
 		for _, d := range directs {
 			name := d.Name
 			if name == "" {

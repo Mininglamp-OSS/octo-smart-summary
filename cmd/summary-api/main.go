@@ -70,7 +70,7 @@ func main() {
 	}
 
 	// Public API server
-	publicRouter := router.SetupPublic(summaryDB, imDB, hub, authResolver, cfg.WorkerTriggerURL)
+	publicRouter := router.SetupPublic(summaryDB, imDB, hub, authResolver, cfg.WorkerTriggerURL, cfg.CandidateQueryLimit)
 	publicSrv := &http.Server{
 		Addr:    ":" + cfg.APIPort,
 		Handler: publicRouter,

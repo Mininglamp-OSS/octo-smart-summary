@@ -51,6 +51,9 @@ type Config struct {
 
 	// Worker trigger URL (API → Worker)
 	WorkerTriggerURL string
+
+	// Candidate search query limit (-1 = no limit, >0 = use as SQL LIMIT)
+	CandidateQueryLimit int
 }
 
 func Load() *Config {
@@ -88,6 +91,8 @@ func Load() *Config {
 		CharsPerTokenASCII:       envInt("CHARS_PER_TOKEN_ASCII", 4),
 
 		WorkerTriggerURL: envStr("WORKER_TRIGGER_URL", ""),
+
+		CandidateQueryLimit: envInt("SUMMARY_CHAT_CANDIDATE_LIMIT", -1),
 	}
 }
 
