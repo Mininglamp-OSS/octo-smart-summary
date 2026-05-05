@@ -1,14 +1,22 @@
 package pipeline
 
-// FilterWithContext keeps target user's messages plus N context messages before/after each
-func FilterWithContext(messages []Message, userID string, contextWindow int) []Message {
+// FilterWithContext keeps target users' messages plus N context messages before/after each.
+func FilterWithContext(messages []Message, targetUIDs []string, contextWindow int) []Message {
 	if contextWindow < 0 {
 		contextWindow = 0
+	}
+	if len(targetUIDs) == 0 {
+		return nil
+	}
+
+	targetSet := make(map[string]bool, len(targetUIDs))
+	for _, uid := range targetUIDs {
+		targetSet[uid] = true
 	}
 
 	var targetIndices []int
 	for i, m := range messages {
-		if m.SenderUID == userID {
+		if targetSet[m.SenderUID] {
 			targetIndices = append(targetIndices, i)
 		}
 	}
@@ -29,7 +37,7 @@ func FilterWithContext(messages []Message, userID string, contextWindow int) []M
 	var result []Message
 	for i, m := range messages {
 		if keep[i] {
-			m.IsTargetUser = (m.SenderUID == userID)
+			m.IsTargetUser = targetSet[m.SenderUID]
 			result = append(result, m)
 		}
 	}

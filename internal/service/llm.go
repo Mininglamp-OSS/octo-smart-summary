@@ -36,14 +36,64 @@ func NewLLMClient(apiURL, apiKey, model string, timeoutSec, maxTokens int) *LLMC
 	}
 }
 
-type chatMessage struct {
+// ChatMessage represents a single message in a chat completion request.
+type ChatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
+// ToolFunction describes an OpenAI function calling tool definition.
+type ToolFunction struct {
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
+	Parameters  interface{} `json:"parameters"`
+}
+
+// Tool wraps ToolFunction in the OpenAI tool format.
+type Tool struct {
+	Type     string       `json:"type"`
+	Function ToolFunction `json:"function"`
+}
+
+// ToolChoice forces the LLM to call a specific function.
+type ToolChoice struct {
+	Type     string             `json:"type"`
+	Function ToolChoiceFunction `json:"function"`
+}
+
+// ToolChoiceFunction specifies the function name for tool_choice.
+type ToolChoiceFunction struct {
+	Name string `json:"name"`
+}
+
+type chatRequestWithTools struct {
+	Model       string        `json:"model"`
+	Messages    []ChatMessage `json:"messages"`
+	Temperature float64       `json:"temperature"`
+	MaxTokens   int           `json:"max_tokens"`
+	Tools       []Tool        `json:"tools"`
+	ToolChoice  ToolChoice    `json:"tool_choice"`
+}
+
+type chatResponseWithTools struct {
+	Choices []struct {
+		Message struct {
+			ToolCalls []struct {
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"message"`
+	} `json:"choices"`
+	Usage struct {
+		TotalTokens int `json:"total_tokens"`
+	} `json:"usage"`
+}
+
 type chatRequest struct {
 	Model       string        `json:"model"`
-	Messages    []chatMessage `json:"messages"`
+	Messages    []ChatMessage `json:"messages"`
 	Temperature float64       `json:"temperature"`
 	MaxTokens   int           `json:"max_tokens"`
 }
@@ -60,7 +110,7 @@ type chatResponse struct {
 }
 
 // Call makes a chat completion request. Returns (content, tokenUsed, error).
-func (c *LLMClient) Call(ctx context.Context, messages []chatMessage, temperature float64) (string, int, error) {
+func (c *LLMClient) Call(ctx context.Context, messages []ChatMessage, temperature float64) (string, int, error) {
 	log.Printf("[llm] calling model=%s temperature=%.2f max_tokens=%d", c.model, temperature, c.maxTokens)
 	reqBody := chatRequest{
 		Model:       c.model,
@@ -106,12 +156,99 @@ func (c *LLMClient) Call(ctx context.Context, messages []chatMessage, temperatur
 
 // CallRaw is a simple single-turn call returning text only. Used for topic narrowing.
 func (c *LLMClient) CallRaw(ctx context.Context, prompt string) (string, error) {
-	content, _, err := c.Call(ctx, []chatMessage{{Role: "user", Content: prompt}}, 0.3)
+	content, _, err := c.Call(ctx, []ChatMessage{{Role: "user", Content: prompt}}, 0.3)
 	if err != nil {
 		log.Printf("[llm] CallRaw failed: %v", err)
 		return "[]", nil
 	}
 	return content, nil
+}
+
+// CallWithTools makes a chat completion request with forced function calling.
+// Returns the raw JSON string from tool_calls[0].function.arguments and token count.
+func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, tools []Tool, forceFn string, temperature float64) (string, int, error) {
+	log.Printf("[llm] CallWithTools: tool=%s temperature=%.2f model=%s", forceFn, temperature, c.model)
+	start := time.Now()
+
+	reqBody := chatRequestWithTools{
+		Model:       c.model,
+		Messages:    messages,
+		Temperature: temperature,
+		MaxTokens:   c.maxTokens,
+		Tools:       tools,
+		ToolChoice: ToolChoice{
+			Type:     "function",
+			Function: ToolChoiceFunction{Name: forceFn},
+		},
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", 0, fmt.Errorf("marshal request: %w", err)
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(1<<uint(attempt-1)) * time.Second)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL+"/chat/completions", bytes.NewReader(body))
+		if err != nil {
+			return "", 0, fmt.Errorf("create request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := c.client.Do(req)
+		if err != nil {
+			lastErr = err
+			log.Printf("[llm] CallWithTools attempt %d network error: %v", attempt+1, err)
+			continue
+		}
+
+		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("read response body: %w", err)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("LLM API error: status=%d body=%s", resp.StatusCode, string(respBody))
+			log.Printf("[llm] CallWithTools attempt %d: %v", attempt+1, lastErr)
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != 429 {
+				return "", 0, lastErr
+			}
+			continue
+		}
+
+		var chatResp chatResponseWithTools
+		if err := json.Unmarshal(respBody, &chatResp); err != nil {
+			lastErr = fmt.Errorf("unmarshal response: %w", err)
+			continue
+		}
+
+		if len(chatResp.Choices) == 0 {
+			lastErr = fmt.Errorf("LLM returned no choices")
+			continue
+		}
+		if len(chatResp.Choices[0].Message.ToolCalls) == 0 {
+			lastErr = fmt.Errorf("LLM returned no tool_calls")
+			continue
+		}
+
+		args := chatResp.Choices[0].Message.ToolCalls[0].Function.Arguments
+		if args == "" {
+			lastErr = fmt.Errorf("LLM returned empty arguments")
+			continue
+		}
+
+		log.Printf("[llm] CallWithTools: tool=%s took %dms tokens=%d", forceFn, time.Since(start).Milliseconds(), chatResp.Usage.TotalTokens)
+		return args, chatResp.Usage.TotalTokens, nil
+	}
+	elapsed := time.Since(start).Milliseconds()
+	log.Printf("[llm] CallWithTools: tool=%s took %dms error=%v", forceFn, elapsed, lastErr)
+	return "", 0, fmt.Errorf("CallWithTools failed after 3 attempts: %w", lastErr)
 }
 
 // ModelVersion returns the configured model name.
@@ -212,7 +349,7 @@ func (c *LLMClient) CallMap(ctx context.Context, formattedMessages string, sourc
 		sourceName, timeStart, timeEnd, msgCount, formattedMessages)
 
 	for attempt := 0; attempt < 3; attempt++ {
-		content, tokens, err := c.Call(ctx, []chatMessage{
+		content, tokens, err := c.Call(ctx, []ChatMessage{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userPrompt},
 		}, 0.1)
@@ -243,7 +380,7 @@ func (c *LLMClient) CallReduce(ctx context.Context, chunkSummaries []string, sou
 	userPrompt := fmt.Sprintf("信息来源：%s\n时间范围：%s ~ %s\n消息总量：%d 条\n\n以下是各分片的总结，请合并：\n\n%s",
 		sourceNames, startTime, endTime, totalMsgCount, summariesText)
 
-	return c.Call(ctx, []chatMessage{
+	return c.Call(ctx, []ChatMessage{
 		{Role: "system", Content: system},
 		{Role: "user", Content: userPrompt},
 	}, 0.1)
@@ -269,7 +406,7 @@ func (c *LLMClient) CallReduceByPerson(ctx context.Context, participantSummaries
 - 根据实际内容自行组织结构，不需要套用固定模板
 - 用显示名称指代人，绝对不要输出 UID 或用户 ID`
 
-	return c.Call(ctx, []chatMessage{
+	return c.Call(ctx, []ChatMessage{
 		{Role: "system", Content: system},
 		{Role: "user", Content: fmt.Sprintf("时间范围：%s ~ %s\n\n%s", startTime, endTime, text)},
 	}, 0.1)

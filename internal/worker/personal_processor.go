@@ -238,33 +238,47 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		})
 	}
 
-	// Fetch messages via personal pipeline (with participant-aware filtering)
+	// Unified LLM tool-call callback (shared by all Function Call sites)
+	toolCallFn := func(ctx context.Context, messages []service.ChatMessage, tools []service.Tool, forceFn string) (string, error) {
+		args, _, err := p.llm.CallWithTools(ctx, messages, tools, forceFn, p.cfg.LLMTemperature)
+		return args, err
+	}
+
+	// Legacy callback for PostRetrievalNarrow (still uses CallRaw)
 	llmFn := func(ctx context.Context, prompt string) (string, error) {
 		return p.llm.CallRaw(ctx, prompt)
 	}
+
+	// Fetch messages via personal pipeline (Layer 0-5)
 	messages, err := pipeline.ResolveAndFetchMessagesForPersonal(
 		ctx, userID, nil, nil, specifiedSources, task.Title,
 		task.TimeRangeStart, task.TimeRangeEnd,
-		p.imDB, llmFn, p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency,
+		p.imDB, toolCallFn, llmFn,
+		p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency,
 	)
 	if err != nil {
 		return "", nil, 0, 0, "", fmt.Errorf("fetch messages: %w", err)
 	}
 
-	// Apply context window filter
-	filterStart := time.Now()
-	userMessages := pipeline.FilterWithContext(messages, userID, p.cfg.ContextWindow)
-	log.Printf("[personal-worker] FilterWithContext took %dms (%d → %d messages)",
-		time.Since(filterStart).Milliseconds(), len(messages), len(userMessages))
-	if len(userMessages) == 0 {
-		return noRelevantContentMessage, nil, 0, 0, p.llm.ModelVersion(), nil
-	}
-
-	// Resolve sender names
+	// Resolve sender names (moved before FilterWithContext for ResolveTopicTarget)
 	resolveStart := time.Now()
 	nameMap := p.batchResolveUserNames(messages)
 	log.Printf("[personal-worker] batchResolveUserNames took %dms (%d names)",
 		time.Since(resolveStart).Milliseconds(), len(nameMap))
+
+	// Resolve topic target via LLM Function Call
+	targetUIDs := pipeline.ResolveTopicTarget(ctx, task.Title, nameMap, userID, toolCallFn)
+	log.Printf("[personal-worker] topic target resolved: %v (creator=%s)", targetUIDs, userID)
+
+	// Apply context window filter (signature changed: userID → targetUIDs)
+	filterStart := time.Now()
+	userMessages := pipeline.FilterWithContext(messages, targetUIDs, p.cfg.ContextWindow)
+	log.Printf("[personal-worker] FilterWithContext took %dms (%d → %d messages, targets=%v)",
+		time.Since(filterStart).Milliseconds(), len(messages), len(userMessages), targetUIDs)
+	if len(userMessages) == 0 {
+		return noRelevantContentMessage, nil, 0, 0, p.llm.ModelVersion(), nil
+	}
+
 	for i := range userMessages {
 		if name, ok := nameMap[userMessages[i].SenderUID]; ok {
 			userMessages[i].SenderName = name
@@ -274,7 +288,6 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	}
 
 	// Assign CitationIndex to all messages (evidence pool)
-	// targetMsgCount tracks creator messages for reporting
 	citIdx := 1
 	targetMsgCount := 0
 	for i := range userMessages {
@@ -331,7 +344,14 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		sourceName = sources[0].SourceName
 	}
 
-	userName := nameMap[userID]
+	// Determine userName: use target's name when topic points to someone else
+	var userName string
+	if len(targetUIDs) == 1 && targetUIDs[0] != userID {
+		userName = nameMap[targetUIDs[0]]
+	}
+	if userName == "" {
+		userName = nameMap[userID]
+	}
 	if userName == "" {
 		userName = userID
 	}
