@@ -8,9 +8,11 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 )
 
-// TimeNarrowResult LLM 解析 topic 时间范围的输出
+// TimeNarrowResult represents the structured output from time-range extraction.
 type TimeNarrowResult struct {
 	HasTimeExpr bool   `json:"has_time_expr"`
 	Start       string `json:"start"`
@@ -18,17 +20,34 @@ type TimeNarrowResult struct {
 	Reasoning   string `json:"reasoning"`
 }
 
-func trimMarkdownCodeFence(s string) string {
-	s = strings.TrimSpace(s)
-	if strings.HasPrefix(s, "```") {
-		if idx := strings.Index(s, "\n"); idx >= 0 {
-			s = s[idx+1:]
-		}
-	}
-	if idx := strings.LastIndex(s, "```"); idx >= 0 {
-		s = s[:idx]
-	}
-	return strings.TrimSpace(s)
+var extractTimeRangeTool = service.Tool{
+	Type: "function",
+	Function: service.ToolFunction{
+		Name:        "extract_time_range",
+		Description: "从用户输入的主题中提取时间表达式并转换为精确的时间范围",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"has_time_expr": map[string]interface{}{
+					"type":        "boolean",
+					"description": "主题中是否包含时间表达式",
+				},
+				"start": map[string]interface{}{
+					"type":        "string",
+					"description": "时间范围起始，RFC3339 格式。无时间表达式时为空字符串",
+				},
+				"end": map[string]interface{}{
+					"type":        "string",
+					"description": "时间范围结束，RFC3339 格式。无时间表达式时为空字符串",
+				},
+				"reasoning": map[string]interface{}{
+					"type":        "string",
+					"description": "一句话解释判断依据",
+				},
+			},
+			"required": []string{"has_time_expr", "start", "end", "reasoning"},
+		},
+	},
 }
 
 func sanitizeTopic(s string) string {
@@ -43,9 +62,13 @@ func sanitizeTopic(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// PreRetrievalNarrow 用 LLM 从 topic 中提取时间范围，缩窄查询窗口。
-func PreRetrievalNarrow(ctx context.Context, topic string, originalStart, originalEnd time.Time, llmFn LLMCallFn) (time.Time, time.Time) {
-	if topic == "" || llmFn == nil {
+// LLMToolCallFn is the callback type for function-call based LLM invocations.
+type LLMToolCallFn func(ctx context.Context, messages []service.ChatMessage, tools []service.Tool, forceFn string) (string, error)
+
+// PreRetrievalNarrow uses LLM Function Call to extract time expressions from topic
+// and narrow the query window. Falls back to original range on any failure.
+func PreRetrievalNarrow(ctx context.Context, topic string, originalStart, originalEnd time.Time, toolCallFn LLMToolCallFn) (time.Time, time.Time) {
+	if topic == "" || toolCallFn == nil {
 		return originalStart, originalEnd
 	}
 	if utf8.RuneCountInString(topic) > 500 {
@@ -59,59 +82,57 @@ func PreRetrievalNarrow(ctx context.Context, topic string, originalStart, origin
 	weekdays := [...]string{"日", "一", "二", "三", "四", "五", "六"}
 	weekday := weekdays[now.Weekday()]
 
-	prompt := fmt.Sprintf(`你是一个时间表达式解析器。
+	systemPrompt := fmt.Sprintf(`你是一个时间表达式解析器。
 
 当前日期：%s（星期%s）
 当前时间：%s
 
-用户输入的主题："%s"
-
-任务：判断主题中是否包含时间表达式（如"今天"、"昨天"、"本周"、"上周"、"最近三天"等），如果有，解析出精确的时间范围。
-
-返回 JSON（只返回 JSON，不要其他内容）：
-{
-  "has_time_expr": true,
-  "start": "2026-05-01T00:00:00+08:00",
-  "end": "2026-05-01T23:59:59+08:00",
-  "reasoning": "一句话解释"
-}
-
 规则：
-- 如果没有任何时间表达式，返回 {"has_time_expr": false, "start": "", "end": "", "reasoning": "无时间表达式"}
 - "今天" = 当天 00:00:00 ~ 23:59:59
 - "昨天" = 前一天 00:00:00 ~ 23:59:59
 - "本周" = 本周一 00:00:00 ~ 当前时间
 - "上周" = 上周一 00:00:00 ~ 上周日 23:59:59
 - "最近N天" = N天前 00:00:00 ~ 当前时间
 - "这几天" = 最近3天
-- 时区统一使用 +08:00`, currentDate, weekday, now.Format("15:04"), topic)
+- 时区统一使用 +08:00
+- 如果没有任何时间表达式，has_time_expr 设为 false
+
+你必须调用 extract_time_range 工具来返回结果，不要以文本形式回复。`, currentDate, weekday, now.Format("15:04"))
+
+	userMsg := fmt.Sprintf(`判断以下主题中是否包含时间表达式，如果有，解析出精确的时间范围。
+
+主题："%s"`, topic)
+
+	messages := []service.ChatMessage{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: userMsg},
+	}
 
 	narrowStart := time.Now()
-	result, err := llmFn(ctx, prompt)
+	argsJSON, err := toolCallFn(ctx, messages, []service.Tool{extractTimeRangeTool}, "extract_time_range")
 	elapsed := time.Since(narrowStart).Milliseconds()
 
 	if err != nil {
-		log.Printf("[pipeline-personal] PreRetrievalNarrow failed (%dms): %v, using original range", elapsed, err)
+		log.Printf("[pipeline] CallWithTools: tool=extract_time_range input={topic:%q} took %dms error=%v, fallback to original range", topic, elapsed, err)
 		return originalStart, originalEnd
 	}
-
-	cleaned := trimMarkdownCodeFence(result)
 
 	var parsed TimeNarrowResult
-	if err := json.Unmarshal([]byte(cleaned), &parsed); err != nil {
-		log.Printf("[pipeline-personal] PreRetrievalNarrow parse error (%dms): %v, response=%s", elapsed, err, result)
+	if err := json.Unmarshal([]byte(argsJSON), &parsed); err != nil {
+		log.Printf("[pipeline] CallWithTools: tool=extract_time_range input={topic:%q} took %dms parse_error=%v, args=%s", topic, elapsed, err, argsJSON)
 		return originalStart, originalEnd
 	}
 
+	log.Printf("[pipeline] CallWithTools: tool=extract_time_range input={topic:%q} took %dms result={has_time_expr:%v}", topic, elapsed, parsed.HasTimeExpr)
+
 	if !parsed.HasTimeExpr {
-		log.Printf("[pipeline-personal] PreRetrievalNarrow (%dms): no time expr in topic", elapsed)
 		return originalStart, originalEnd
 	}
 
 	parsedStart, err1 := time.Parse(time.RFC3339, parsed.Start)
 	parsedEnd, err2 := time.Parse(time.RFC3339, parsed.End)
 	if err1 != nil || err2 != nil {
-		log.Printf("[pipeline-personal] PreRetrievalNarrow (%dms): time parse error start=%v end=%v", elapsed, err1, err2)
+		log.Printf("[pipeline] PreRetrievalNarrow: time parse error start=%v end=%v", err1, err2)
 		return originalStart, originalEnd
 	}
 
@@ -122,12 +143,11 @@ func PreRetrievalNarrow(ctx context.Context, topic string, originalStart, origin
 		parsedEnd = originalEnd
 	}
 	if !parsedStart.Before(parsedEnd) {
-		log.Printf("[pipeline-personal] PreRetrievalNarrow (%dms): invalid range start >= end", elapsed)
+		log.Printf("[pipeline] PreRetrievalNarrow: invalid range start >= end")
 		return originalStart, originalEnd
 	}
 
-	log.Printf("[pipeline-personal] PreRetrievalNarrow (%dms): narrowed [%s ~ %s] → [%s ~ %s] reason=%s",
-		elapsed,
+	log.Printf("[pipeline] PreRetrievalNarrow: narrowed [%s ~ %s] → [%s ~ %s] reason=%s",
 		originalStart.Format("01-02"), originalEnd.Format("01-02"),
 		parsedStart.Format("01-02 15:04"), parsedEnd.Format("01-02 15:04"),
 		parsed.Reasoning)
@@ -135,7 +155,7 @@ func PreRetrievalNarrow(ctx context.Context, topic string, originalStart, origin
 	return parsedStart, parsedEnd
 }
 
-// PostRetrievalNarrow 召回后的语义过滤（预留接口）。
+// PostRetrievalNarrow remains unchanged — uses LLMCallFn (not Function Call).
 func PostRetrievalNarrow(ctx context.Context, messages []Message, topic string, llmFn LLMCallFn) []Message {
 	return messages
 }

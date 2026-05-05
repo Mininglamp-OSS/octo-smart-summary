@@ -7,6 +7,19 @@ import (
 	"strings"
 )
 
+func getEnvFloat(key string, defaultVal float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultVal
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		log.Printf("[config] invalid %s=%q, using default %.2f", key, v, defaultVal)
+		return defaultVal
+	}
+	return f
+}
+
 type Config struct {
 	// MySQL (summary DB)
 	MySQLDSN string
@@ -17,11 +30,12 @@ type Config struct {
 	OctoAPIURL string
 
 	// LLM
-	LLMApiURL   string
-	LLMApiKey   string
-	LLMModel    string
-	LLMTimeout  int
-	LLMMaxToken int
+	LLMApiURL      string
+	LLMApiKey      string
+	LLMModel       string
+	LLMTimeout     int
+	LLMMaxToken    int
+	LLMTemperature float64
 
 	// API
 	APIPort         string
@@ -67,11 +81,12 @@ func Load() *Config {
 
 		OctoAPIURL: envStr("OCTO_API_URL", ""),
 
-		LLMApiURL:   envStr("LLM_API_URL", "https://api.example.com/v1"),
-		LLMApiKey:   envStr("LLM_API_KEY", ""),
-		LLMModel:    envStr("LLM_MODEL", "claude-sonnet-4-6"),
-		LLMTimeout:  envInt("LLM_TIMEOUT", 120),
-		LLMMaxToken: envInt("LLM_MAX_TOKENS", 4096),
+		LLMApiURL:      envStr("LLM_API_URL", "https://api.example.com/v1"),
+		LLMApiKey:      envStr("LLM_API_KEY", ""),
+		LLMModel:       envStr("LLM_MODEL", "claude-sonnet-4-6"),
+		LLMTimeout:     envInt("LLM_TIMEOUT", 120),
+		LLMMaxToken:    envInt("LLM_MAX_TOKENS", 4096),
+		LLMTemperature: getEnvFloat("LLM_TEMPERATURE", 0.3),
 
 		APIPort:         envStr("API_PORT", "8080"),
 		APIInternalPort: envStr("API_INTERNAL_PORT", "8081"),

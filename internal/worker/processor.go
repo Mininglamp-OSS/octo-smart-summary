@@ -255,6 +255,10 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 	}
 
 	// Fetch messages via pipeline
+	toolCallFn := func(ctx context.Context, messages []service.ChatMessage, tools []service.Tool, forceFn string) (string, error) {
+		args, _, err := p.llm.CallWithTools(ctx, messages, tools, forceFn, p.cfg.LLMTemperature)
+		return args, err
+	}
 	llmFn := func(ctx context.Context, prompt string) (string, error) {
 		return p.llm.CallRaw(ctx, prompt)
 	}
@@ -278,7 +282,7 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 	messages, err = pipeline.ResolveAndFetchMessagesForPersonal(
 		ctx, task.CreatorID, participantUIDs, participantNames, specifiedSources, task.Title,
 		task.TimeRangeStart, task.TimeRangeEnd,
-		p.imDB, llmFn, p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency,
+		p.imDB, toolCallFn, llmFn, p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency,
 	)
 	if err != nil {
 		return fmt.Errorf("fetch messages: %w", err)

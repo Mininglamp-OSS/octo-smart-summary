@@ -545,7 +545,7 @@ func FilterMessagesByRelevance(messages []Message, topic string, participantUIDs
 
 // ResolveAndFetchMessagesForPersonal runs the pipeline with participant-aware
 // filtering: Layer 1.5 (channel intersection) and Layer 4.5 (mutual activity).
-func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, participantUIDs []string, participantNames []string, specifiedSources []map[string]interface{}, topic string, timeStart, timeEnd time.Time, imDB *gorm.DB, llmFn LLMCallFn, tableCount int, maxPerChannel int, fetchConcurrency int) ([]Message, error) {
+func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, participantUIDs []string, participantNames []string, specifiedSources []map[string]interface{}, topic string, timeStart, timeEnd time.Time, imDB *gorm.DB, toolCallFn LLMToolCallFn, llmFn LLMCallFn, tableCount int, maxPerChannel int, fetchConcurrency int) ([]Message, error) {
 	if timeEnd.Sub(timeStart) > 31*24*time.Hour {
 		return nil, fmt.Errorf("时间范围不能超过 31 天")
 	}
@@ -555,7 +555,7 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 	// Layer 0: Pre-Retrieval Narrow
 	narrowCtx, narrowCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer narrowCancel()
-	timeStart, timeEnd = PreRetrievalNarrow(narrowCtx, topic, timeStart, timeEnd, llmFn)
+	timeStart, timeEnd = PreRetrievalNarrow(narrowCtx, topic, timeStart, timeEnd, toolCallFn)
 
 	startTS := timeStart.Unix()
 	endTS := timeEnd.Unix()
