@@ -71,9 +71,9 @@ func PreRetrievalNarrow(ctx context.Context, topic string, originalStart, origin
 	if topic == "" || toolCallFn == nil {
 		return originalStart, originalEnd
 	}
-	if utf8.RuneCountInString(topic) > 500 {
+	if utf8.RuneCountInString(topic) > 1000 {
 		runes := []rune(topic)
-		topic = string(runes[:500])
+		topic = string(runes[:1000])
 	}
 	topic = sanitizeTopic(topic)
 

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -52,6 +53,11 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 	var req createScheduleReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: err.Error()})
+		return
+	}
+
+	if utf8.RuneCountInString(req.Title) > 1000 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 1000 字符"})
 		return
 	}
 
@@ -195,6 +201,11 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 	var req updateScheduleReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: err.Error()})
+		return
+	}
+
+	if req.Title != nil && utf8.RuneCountInString(*req.Title) > 1000 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 1000 字符"})
 		return
 	}
 

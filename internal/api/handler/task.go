@@ -140,12 +140,12 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 	}
 
 	// Validate
-	if utf8.RuneCountInString(req.Title) > 500 {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 500 字符"})
+	if utf8.RuneCountInString(req.Title) > 1000 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 1000 字符"})
 		return
 	}
-	if utf8.RuneCountInString(req.Topic) > 500 {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "topic 不能超过 500 字符"})
+	if utf8.RuneCountInString(req.Topic) > 1000 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "topic 不能超过 1000 字符"})
 		return
 	}
 	if len(req.Sources) == 0 && req.Topic == "" && req.TimeRange == nil {
