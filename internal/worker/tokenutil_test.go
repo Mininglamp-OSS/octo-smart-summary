@@ -21,6 +21,9 @@ func TestEstimateTokens(t *testing.T) {
 		{"defensive zero ascii ratio", "abcd", 1, 0, 50 + 1},
 		{"defensive negative cjk ratio", "你好", -1, 4, 50 + 2},
 		{"long cjk", strings.Repeat("字", 1000), 1, 4, 50 + 1000},
+		{"cjk ratio 2 pure cjk", "你好世界", 2, 4, 50 + 2},
+		{"cjk ratio 2 mixed", "hello 你好世界", 2, 4, 50 + 1 + 2},
+		{"cjk ratio 2 long cjk", strings.Repeat("字", 1000), 2, 4, 50 + 500},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

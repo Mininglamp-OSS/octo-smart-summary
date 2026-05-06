@@ -16,23 +16,25 @@ const MapFailedMarker = "总结失败"
 
 // LLMClient handles calls to the OpenAI-compatible LLM gateway.
 type LLMClient struct {
-	apiURL    string
-	apiKey    string
-	model     string
-	timeout   time.Duration
-	maxTokens int
-	client    *http.Client
+	apiURL         string
+	apiKey         string
+	model          string
+	timeout        time.Duration
+	maxTokens      int
+	enableThinking bool
+	client         *http.Client
 }
 
 // NewLLMClient creates a new LLM client.
-func NewLLMClient(apiURL, apiKey, model string, timeoutSec, maxTokens int) *LLMClient {
+func NewLLMClient(apiURL, apiKey, model string, timeoutSec, maxTokens int, enableThinking bool) *LLMClient {
 	return &LLMClient{
-		apiURL:    strings.TrimRight(apiURL, "/"),
-		apiKey:    apiKey,
-		model:     model,
-		timeout:   time.Duration(timeoutSec) * time.Second,
-		maxTokens: maxTokens,
-		client:    &http.Client{Timeout: time.Duration(timeoutSec) * time.Second},
+		apiURL:         strings.TrimRight(apiURL, "/"),
+		apiKey:         apiKey,
+		model:          model,
+		timeout:        time.Duration(timeoutSec) * time.Second,
+		maxTokens:      maxTokens,
+		enableThinking: enableThinking,
+		client:         &http.Client{Timeout: time.Duration(timeoutSec) * time.Second},
 	}
 }
 
@@ -67,12 +69,13 @@ type ToolChoiceFunction struct {
 }
 
 type chatRequestWithTools struct {
-	Model       string        `json:"model"`
-	Messages    []ChatMessage `json:"messages"`
-	Temperature float64       `json:"temperature"`
-	MaxTokens   int           `json:"max_tokens"`
-	Tools       []Tool        `json:"tools"`
-	ToolChoice  ToolChoice    `json:"tool_choice"`
+	Model              string                 `json:"model"`
+	Messages           []ChatMessage          `json:"messages"`
+	Temperature        float64                `json:"temperature"`
+	MaxTokens          int                    `json:"max_tokens"`
+	Tools              []Tool                 `json:"tools"`
+	ToolChoice         ToolChoice             `json:"tool_choice"`
+	ChatTemplateKwargs map[string]interface{} `json:"chat_template_kwargs,omitempty"`
 }
 
 type chatResponseWithTools struct {
@@ -92,10 +95,11 @@ type chatResponseWithTools struct {
 }
 
 type chatRequest struct {
-	Model       string        `json:"model"`
-	Messages    []ChatMessage `json:"messages"`
-	Temperature float64       `json:"temperature"`
-	MaxTokens   int           `json:"max_tokens"`
+	Model              string                 `json:"model"`
+	Messages           []ChatMessage          `json:"messages"`
+	Temperature        float64                `json:"temperature"`
+	MaxTokens          int                    `json:"max_tokens"`
+	ChatTemplateKwargs map[string]interface{} `json:"chat_template_kwargs,omitempty"`
 }
 
 type chatResponse struct {
@@ -117,6 +121,9 @@ func (c *LLMClient) Call(ctx context.Context, messages []ChatMessage, temperatur
 		Messages:    messages,
 		Temperature: temperature,
 		MaxTokens:   c.maxTokens,
+	}
+	if !c.enableThinking && (strings.Contains(strings.ToLower(c.model), "qwen3.6") || strings.Contains(strings.ToLower(c.model), "deepseek-v4")) {
+		reqBody.ChatTemplateKwargs = map[string]interface{}{"enable_thinking": false}
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -180,6 +187,9 @@ func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, t
 			Type:     "function",
 			Function: ToolChoiceFunction{Name: forceFn},
 		},
+	}
+	if !c.enableThinking && (strings.Contains(strings.ToLower(c.model), "qwen3.6") || strings.Contains(strings.ToLower(c.model), "deepseek-v4")) {
+		reqBody.ChatTemplateKwargs = map[string]interface{}{"enable_thinking": false}
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
