@@ -313,7 +313,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	currentTokens := 0
 
 	for _, m := range userMessages {
-		msgTokens := estimateTokens(m.Content, p.cfg.CharsPerTokenCJK, p.cfg.CharsPerTokenASCII)
+		msgTokens := estimateTokens(m.Content, p.cfg.ResolveCharsPerTokenCJK(), p.cfg.CharsPerTokenASCII)
 		if msgTokens > effectiveMax {
 			log.Printf("[chunking] WARNING: single message exceeds token budget: %d > %d", msgTokens, effectiveMax)
 		}

@@ -30,12 +30,13 @@ type Config struct {
 	OctoAPIURL string
 
 	// LLM
-	LLMApiURL      string
-	LLMApiKey      string
-	LLMModel       string
-	LLMTimeout     int
-	LLMMaxToken    int
-	LLMTemperature float64
+	LLMApiURL         string
+	LLMApiKey         string
+	LLMModel          string
+	LLMTimeout        int
+	LLMMaxToken       int
+	LLMTemperature    float64
+	LLMEnableThinking bool
 
 	// API
 	APIPort         string
@@ -81,12 +82,13 @@ func Load() *Config {
 
 		OctoAPIURL: envStr("OCTO_API_URL", ""),
 
-		LLMApiURL:      envStr("LLM_API_URL", "https://api.example.com/v1"),
-		LLMApiKey:      envStr("LLM_API_KEY", ""),
-		LLMModel:       envStr("LLM_MODEL", "claude-sonnet-4-6"),
-		LLMTimeout:     envInt("LLM_TIMEOUT", 120),
-		LLMMaxToken:    envInt("LLM_MAX_TOKENS", 4096),
-		LLMTemperature: getEnvFloat("LLM_TEMPERATURE", 0.3),
+		LLMApiURL:         envStr("LLM_API_URL", "https://api.example.com/v1"),
+		LLMApiKey:         envStr("LLM_API_KEY", ""),
+		LLMModel:          envStr("LLM_MODEL", "claude-sonnet-4-6"),
+		LLMTimeout:        envInt("LLM_TIMEOUT", 120),
+		LLMMaxToken:       envInt("LLM_MAX_TOKENS", 4096),
+		LLMTemperature:    getEnvFloat("LLM_TEMPERATURE", 0.3),
+		LLMEnableThinking: envBool("LLM_ENABLE_THINKING", false),
 
 		APIPort:         envStr("API_PORT", "8080"),
 		APIInternalPort: envStr("API_INTERNAL_PORT", "8081"),
@@ -146,11 +148,28 @@ func envInt(key string, def int) int {
 	return def
 }
 
+func envBool(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return b
+}
+
 // modelMaxTokensDefaults maps LLM model names to their recommended Map-phase token budget.
 var modelMaxTokensDefaults = map[string]int{
 	"claude-sonnet-4-6": 150000,
 	"claude-opus-4-6":   150000,
 	"claude-haiku-4-5":  150000,
+	"qwen3.6-max":       400000,
+	"qwen3.6-plus":      400000,
+	"qwen3.6-flash":     400000,
+	"deepseek-v4-flash": 400000,
+	"deepseek-v4-pro":   400000,
 }
 
 const defaultMapMaxTokens = 100000
@@ -163,8 +182,25 @@ func (c *Config) ResolveMapMaxTokens() int {
 	if c.MapMaxTokens > 0 {
 		return c.MapMaxTokens
 	}
-	if v, ok := modelMaxTokensDefaults[c.LLMModel]; ok {
-		return v
+	model := strings.ToLower(c.LLMModel)
+	for key, v := range modelMaxTokensDefaults {
+		if strings.Contains(model, key) {
+			return v
+		}
 	}
 	return defaultMapMaxTokens
+}
+
+// ResolveCharsPerTokenCJK returns the CJK chars-per-token ratio.
+// For qwen models, defaults to 2 if not explicitly configured.
+// For other models, uses the configured value (default 1).
+func (c *Config) ResolveCharsPerTokenCJK() int {
+	if os.Getenv("CHARS_PER_TOKEN_CJK") != "" {
+		// Explicitly configured, use as-is
+		return c.CharsPerTokenCJK
+	}
+	if strings.Contains(strings.ToLower(c.LLMModel), "qwen3.6") || strings.Contains(strings.ToLower(c.LLMModel), "deepseek-v4") {
+		return 2
+	}
+	return c.CharsPerTokenCJK
 }
