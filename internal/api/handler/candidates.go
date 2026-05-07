@@ -170,7 +170,7 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 		q := h.imDB.Table("thread t").
 			Select("DISTINCT t.short_id, t.name, t.group_no").
 			Joins("INNER JOIN `group` g ON g.group_no" + h.collate + " = t.group_no").
-			Where("t.status = 1 AND g.status = 1")
+			Where("t.status = 1 AND g.status = 1 AND t.message_count > 0")
 		if currentUIDStr != "" {
 			// Use group_member instead of thread_member so that all threads in the
 			// user's groups are returned, not just threads the user has posted in.
