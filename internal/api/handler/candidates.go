@@ -10,12 +10,13 @@ import (
 // CandidateHandler handles member and chat candidate search.
 type CandidateHandler struct {
 	imDB       *gorm.DB
-	queryLimit int // -1 = no limit, >0 = SQL LIMIT value
+	queryLimit int    // -1 = no limit, >0 = SQL LIMIT value
+	collate    string // SQL COLLATE clause for cross-table joins (MySQL collation mismatch)
 }
 
 // NewCandidateHandler creates a new CandidateHandler.
 func NewCandidateHandler(imDB *gorm.DB, queryLimit int) *CandidateHandler {
-	return &CandidateHandler{imDB: imDB, queryLimit: queryLimit}
+	return &CandidateHandler{imDB: imDB, queryLimit: queryLimit, collate: " COLLATE utf8mb4_unicode_ci"}
 }
 
 func (h *CandidateHandler) applyLimit(q *gorm.DB) *gorm.DB {
@@ -139,7 +140,7 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 		q := h.imDB.Table("`group` g").Select("g.group_no, g.name")
 		if currentUIDStr != "" {
 			q = q.Joins("INNER JOIN group_member gm ON gm.group_no = g.group_no").
-				Where("gm.uid = ?", currentUIDStr)
+				Where("gm.uid = ? AND gm.is_deleted = 0", currentUIDStr)
 		}
 		if spaceIDStr != "" {
 			q = q.Where("g.space_id = ?", spaceIDStr)
@@ -167,12 +168,14 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 		}
 		var threads []imThread
 		q := h.imDB.Table("thread t").
-			Select("t.short_id, t.name, t.group_no").
-			Joins("INNER JOIN `group` g ON g.group_no COLLATE utf8mb4_unicode_ci = t.group_no").
+			Select("DISTINCT t.short_id, t.name, t.group_no").
+			Joins("INNER JOIN `group` g ON g.group_no" + h.collate + " = t.group_no").
 			Where("t.status = 1 AND g.status = 1")
 		if currentUIDStr != "" {
-			q = q.Joins("INNER JOIN thread_member tm ON tm.thread_id = t.id").
-				Where("tm.uid = ?", currentUIDStr)
+			// Use group_member instead of thread_member so that all threads in the
+			// user's groups are returned, not just threads the user has posted in.
+			q = q.Joins("INNER JOIN group_member gm ON gm.group_no" + h.collate + " = t.group_no").
+				Where("gm.uid = ? AND gm.is_deleted = 0", currentUIDStr)
 		}
 		if spaceIDStr != "" {
 			q = q.Where("g.space_id = ?", spaceIDStr)
