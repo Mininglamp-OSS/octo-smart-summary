@@ -279,10 +279,19 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 			participantNames = append(participantNames, pt.UserName)
 		}
 	}
+
+	var channelScopeOpts *pipeline.ChannelScopeOptions
+	if p.cfg.ChannelScopeEnabled {
+		channelScopeOpts = &pipeline.ChannelScopeOptions{
+			Enabled: true,
+		}
+	}
+
 	messages, err = pipeline.ResolveAndFetchMessagesForPersonal(
 		ctx, task.CreatorID, participantUIDs, participantNames, specifiedSources, task.Title,
 		task.TimeRangeStart, task.TimeRangeEnd,
 		p.imDB, toolCallFn, llmFn, p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency,
+		channelScopeOpts,
 	)
 	if err != nil {
 		return fmt.Errorf("fetch messages: %w", err)

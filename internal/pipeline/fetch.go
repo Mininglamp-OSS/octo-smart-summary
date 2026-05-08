@@ -19,6 +19,7 @@ type ChannelInfo struct {
 	ChannelType int    `json:"channel_type"`
 	ChannelName string `json:"channel_name"`
 	SpaceID     string `json:"space_id,omitempty"`
+	PeerUID     string `json:"peer_uid,omitempty"`
 }
 
 // Message represents a fetched chat message.
@@ -102,6 +103,7 @@ func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB) ([]ChannelI
 			ChannelID:   normalized,
 			ChannelType: 1,
 			ChannelName: fmt.Sprintf("私聊-%s", peerUID),
+			PeerUID:     peerUID,
 		})
 	}
 
@@ -237,6 +239,7 @@ func ApplySourceConstraints(userChannels []ChannelInfo, specifiedSources []map[s
 	return result
 }
 
+// Deprecated: use ResolveChannelScope instead.
 // NarrowByTopic uses LLM to filter channels relevant to the topic. (Layer 3)
 func NarrowByTopic(ctx context.Context, topic string, candidates []ChannelInfo, llmFn LLMCallFn) []ChannelInfo {
 	if topic == "" || len(candidates) == 0 || llmFn == nil {
@@ -545,7 +548,7 @@ func FilterMessagesByRelevance(messages []Message, topic string, participantUIDs
 
 // ResolveAndFetchMessagesForPersonal runs the pipeline with participant-aware
 // filtering: Layer 1.5 (channel intersection) and Layer 4.5 (mutual activity).
-func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, participantUIDs []string, participantNames []string, specifiedSources []map[string]interface{}, topic string, timeStart, timeEnd time.Time, imDB *gorm.DB, toolCallFn LLMToolCallFn, llmFn LLMCallFn, tableCount int, maxPerChannel int, fetchConcurrency int) ([]Message, error) {
+func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, participantUIDs []string, participantNames []string, specifiedSources []map[string]interface{}, topic string, timeStart, timeEnd time.Time, imDB *gorm.DB, toolCallFn LLMToolCallFn, llmFn LLMCallFn, tableCount int, maxPerChannel int, fetchConcurrency int, channelScopeOpts *ChannelScopeOptions) ([]Message, error) {
 	if timeEnd.Sub(timeStart) > 31*24*time.Hour {
 		return nil, fmt.Errorf("时间范围不能超过 31 天")
 	}
@@ -553,9 +556,7 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 	pipelineStart := time.Now()
 
 	// Layer 0: Pre-Retrieval Narrow
-	narrowCtx, narrowCancel := context.WithTimeout(ctx, 30*time.Second)
-	defer narrowCancel()
-	timeStart, timeEnd = PreRetrievalNarrow(narrowCtx, topic, timeStart, timeEnd, toolCallFn)
+	timeStart, timeEnd = PreRetrievalNarrow(ctx, topic, timeStart, timeEnd, toolCallFn)
 
 	startTS := timeStart.Unix()
 	endTS := timeEnd.Unix()
@@ -577,6 +578,20 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 	}
 	log.Printf("[pipeline-personal] Layer 1.5 (participant intersect) took %dms (%d channels)",
 		time.Since(l15Start).Milliseconds(), len(userChannels))
+
+	// Layer 1.7: channel scope narrowing via LLM (only when no explicit sources)
+	if channelScopeOpts != nil && channelScopeOpts.Enabled && len(specifiedSources) == 0 && toolCallFn != nil {
+		l17Start := time.Now()
+		memberMap, mErr := BuildCandidateMemberMap(ctx, userChannels, imDB)
+		if mErr != nil {
+			log.Printf("[pipeline-personal] BuildCandidateMemberMap error: %v, skipping channel scope", mErr)
+		} else if len(memberMap) > 0 {
+			userChannels = ResolveChannelScope(ctx, topic, userChannels, creatorUID,
+				memberMap, imDB, toolCallFn)
+		}
+		log.Printf("[pipeline-personal] Layer 1.7 (channel scope) took %dms (%d channels)",
+			time.Since(l17Start).Milliseconds(), len(userChannels))
+	}
 
 	// Layer 2: source constraints
 	l2Start := time.Now()

@@ -7,7 +7,7 @@ import (
 )
 
 func TestChatTemplateKwargs_QwenWithThinkingDisabled(t *testing.T) {
-	client := NewLLMClient("http://localhost", "key", "qwen3.6-max", 30, 4096, false)
+	client := NewLLMClient("http://localhost", "key", "qwen3.6-max", 30, 4096, false, 30)
 
 	reqBody := chatRequest{
 		Model:       client.model,
@@ -43,7 +43,7 @@ func TestChatTemplateKwargs_QwenWithThinkingDisabled(t *testing.T) {
 }
 
 func TestChatTemplateKwargs_DeepseekV4WithThinkingDisabled(t *testing.T) {
-	client := NewLLMClient("http://localhost", "key", "deepseek-v4-flash", 30, 4096, false)
+	client := NewLLMClient("http://localhost", "key", "deepseek-v4-flash", 30, 4096, false, 30)
 
 	reqBody := chatRequest{
 		Model:       client.model,
@@ -79,7 +79,7 @@ func TestChatTemplateKwargs_DeepseekV4WithThinkingDisabled(t *testing.T) {
 }
 
 func TestChatTemplateKwargs_DeepseekV4WithThinkingEnabled(t *testing.T) {
-	client := NewLLMClient("http://localhost", "key", "deepseek-v4-flash", 30, 4096, true)
+	client := NewLLMClient("http://localhost", "key", "deepseek-v4-flash", 30, 4096, true, 30)
 
 	reqBody := chatRequest{
 		Model:       client.model,
@@ -107,7 +107,7 @@ func TestChatTemplateKwargs_DeepseekV4WithThinkingEnabled(t *testing.T) {
 }
 
 func TestChatTemplateKwargs_ClaudeModel(t *testing.T) {
-	client := NewLLMClient("http://localhost", "key", "claude-haiku-4-5", 30, 4096, false)
+	client := NewLLMClient("http://localhost", "key", "claude-haiku-4-5", 30, 4096, false, 30)
 
 	reqBody := chatRequest{
 		Model:       client.model,
@@ -135,7 +135,7 @@ func TestChatTemplateKwargs_ClaudeModel(t *testing.T) {
 }
 
 func TestChatTemplateKwargs_QwenWithThinkingEnabled(t *testing.T) {
-	client := NewLLMClient("http://localhost", "key", "qwen3.6-plus", 30, 4096, true)
+	client := NewLLMClient("http://localhost", "key", "qwen3.6-plus", 30, 4096, true, 30)
 
 	reqBody := chatRequest{
 		Model:       client.model,
@@ -163,7 +163,7 @@ func TestChatTemplateKwargs_QwenWithThinkingEnabled(t *testing.T) {
 }
 
 func TestChatTemplateKwargs_CallWithTools_Qwen(t *testing.T) {
-	client := NewLLMClient("http://localhost", "key", "qwen3.6-flash", 30, 4096, false)
+	client := NewLLMClient("http://localhost", "key", "qwen3.6-flash", 30, 4096, false, 30)
 
 	reqBody := chatRequestWithTools{
 		Model:       client.model,

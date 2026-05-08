@@ -73,6 +73,12 @@ type Config struct {
 
 	// Fetch concurrency for parallel channel message retrieval
 	FetchConcurrency int
+
+	// Channel scope narrowing
+	ChannelScopeEnabled bool
+
+	// Tool call per-attempt timeout (seconds)
+	ToolCallTimeout int
 }
 
 func Load() *Config {
@@ -85,7 +91,7 @@ func Load() *Config {
 		LLMApiURL:         envStr("LLM_API_URL", "https://api.example.com/v1"),
 		LLMApiKey:         envStr("LLM_API_KEY", ""),
 		LLMModel:          envStr("LLM_MODEL", "claude-sonnet-4-6"),
-		LLMTimeout:        envInt("LLM_TIMEOUT", 120),
+		LLMTimeout:        envInt("LLM_TIMEOUT", 180),
 		LLMMaxToken:       envInt("LLM_MAX_TOKENS", 4096),
 		LLMTemperature:    getEnvFloat("LLM_TEMPERATURE", 0.3),
 		LLMEnableThinking: envBool("LLM_ENABLE_THINKING", false),
@@ -117,6 +123,10 @@ func Load() *Config {
 		CandidateQueryLimit: envInt("SUMMARY_CHAT_CANDIDATE_LIMIT", -1),
 
 		FetchConcurrency: envInt("FETCH_CONCURRENCY", 10),
+
+		ChannelScopeEnabled: envBool("CHANNEL_SCOPE_ENABLED", true),
+
+		ToolCallTimeout: envInt("TOOL_CALL_TIMEOUT", 30),
 	}
 }
 

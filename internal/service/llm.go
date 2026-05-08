@@ -16,25 +16,27 @@ const MapFailedMarker = "总结失败"
 
 // LLMClient handles calls to the OpenAI-compatible LLM gateway.
 type LLMClient struct {
-	apiURL         string
-	apiKey         string
-	model          string
-	timeout        time.Duration
-	maxTokens      int
-	enableThinking bool
-	client         *http.Client
+	apiURL          string
+	apiKey          string
+	model           string
+	timeout         time.Duration
+	toolCallTimeout time.Duration
+	maxTokens       int
+	enableThinking  bool
+	client          *http.Client
 }
 
 // NewLLMClient creates a new LLM client.
-func NewLLMClient(apiURL, apiKey, model string, timeoutSec, maxTokens int, enableThinking bool) *LLMClient {
+func NewLLMClient(apiURL, apiKey, model string, timeoutSec, maxTokens int, enableThinking bool, toolCallTimeoutSec int) *LLMClient {
 	return &LLMClient{
-		apiURL:         strings.TrimRight(apiURL, "/"),
-		apiKey:         apiKey,
-		model:          model,
-		timeout:        time.Duration(timeoutSec) * time.Second,
-		maxTokens:      maxTokens,
-		enableThinking: enableThinking,
-		client:         &http.Client{Timeout: time.Duration(timeoutSec) * time.Second},
+		apiURL:          strings.TrimRight(apiURL, "/"),
+		apiKey:          apiKey,
+		model:           model,
+		timeout:         time.Duration(timeoutSec) * time.Second,
+		toolCallTimeout: time.Duration(toolCallTimeoutSec) * time.Second,
+		maxTokens:       maxTokens,
+		enableThinking:  enableThinking,
+		client:          &http.Client{Timeout: time.Duration(timeoutSec) * time.Second},
 	}
 }
 
@@ -198,12 +200,19 @@ func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, t
 
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
+		select {
+		case <-ctx.Done():
+			return "", 0, ctx.Err()
+		default:
+		}
 		if attempt > 0 {
 			time.Sleep(time.Duration(1<<uint(attempt-1)) * time.Second)
 		}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL+"/chat/completions", bytes.NewReader(body))
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, c.toolCallTimeout)
+		req, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, c.apiURL+"/chat/completions", bytes.NewReader(body))
 		if err != nil {
+			attemptCancel()
 			return "", 0, fmt.Errorf("create request: %w", err)
 		}
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
@@ -213,11 +222,13 @@ func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, t
 		if err != nil {
 			lastErr = err
 			log.Printf("[llm] CallWithTools attempt %d network error: %v", attempt+1, err)
+			attemptCancel()
 			continue
 		}
 
 		respBody, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		attemptCancel()
 		if err != nil {
 			lastErr = fmt.Errorf("read response body: %w", err)
 			continue

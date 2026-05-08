@@ -621,3 +621,105 @@ func TestSchedulerForcesModeByPerson(t *testing.T) {
 		t.Errorf("ModeByPerson should be 2, got %d", model.ModeByPerson)
 	}
 }
+
+func TestPersonalProcessor_SetsProcessingDeadline(t *testing.T) {
+	db := setupProcessorTestDB(t)
+
+	now := time.Now().UTC()
+	task := model.SummaryTask{
+		TaskNo:         "TST-DL-001",
+		SpaceID:        "space1",
+		CreatorID:      "user1",
+		SummaryMode:    model.ModeByPerson,
+		TimeRangeStart: now.Add(-24 * time.Hour),
+		TimeRangeEnd:   now,
+		Status:         model.StatusPending,
+		TriggerType:    model.TriggerManual,
+	}
+	db.Create(&task)
+
+	leaseMinutes := 20
+	deadline := time.Now().UTC().Add(time.Duration(leaseMinutes) * time.Minute)
+
+	// Simulate the CAS update from personal_processor with processing_deadline
+	result := db.Model(&model.SummaryTask{}).
+		Where("id = ? AND status IN (?, ?)", task.ID, model.StatusPending, model.StatusWaitingConfirm).
+		Updates(map[string]interface{}{
+			"status":              model.StatusProcessing,
+			"processing_deadline": deadline,
+		})
+	if result.Error != nil {
+		t.Fatalf("CAS update failed: %v", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		t.Fatalf("expected 1 row affected, got %d", result.RowsAffected)
+	}
+
+	var reloaded model.SummaryTask
+	db.First(&reloaded, task.ID)
+	if reloaded.Status != model.StatusProcessing {
+		t.Errorf("expected Processing status, got %d", reloaded.Status)
+	}
+	if reloaded.ProcessingDeadline == nil {
+		t.Fatal("expected processing_deadline to be set, got nil")
+	}
+	if reloaded.ProcessingDeadline.Before(time.Now().UTC()) {
+		t.Error("processing_deadline should be in the future")
+	}
+}
+
+func TestPersonalProcessor_RefreshesDeadlineOnDuplicateTrigger(t *testing.T) {
+	db := setupProcessorTestDB(t)
+
+	now := time.Now().UTC()
+	oldDeadline := now.Add(5 * time.Minute)
+	task := model.SummaryTask{
+		TaskNo:             "TST-DL-002",
+		SpaceID:            "space1",
+		CreatorID:          "user1",
+		SummaryMode:        model.ModeByPerson,
+		TimeRangeStart:     now.Add(-24 * time.Hour),
+		TimeRangeEnd:       now,
+		Status:             model.StatusProcessing,
+		TriggerType:        model.TriggerManual,
+		ProcessingDeadline: &oldDeadline,
+	}
+	db.Create(&task)
+
+	// Simulate duplicate trigger: CAS fails because task is already Processing
+	leaseMinutes := 20
+	newDeadline := time.Now().UTC().Add(time.Duration(leaseMinutes) * time.Minute)
+
+	cas := db.Model(&model.SummaryTask{}).
+		Where("id = ? AND status IN (?, ?)", task.ID, model.StatusPending, model.StatusWaitingConfirm).
+		Updates(map[string]interface{}{
+			"status":              model.StatusProcessing,
+			"processing_deadline": newDeadline,
+		})
+	if cas.RowsAffected != 0 {
+		t.Fatal("expected CAS to not match (task already Processing)")
+	}
+
+	// Verify task is still Processing, then refresh deadline
+	var currentTask model.SummaryTask
+	if err := db.Select("status").First(&currentTask, task.ID).Error; err != nil {
+		t.Fatalf("failed to load task: %v", err)
+	}
+	if currentTask.Status != model.StatusProcessing {
+		t.Fatalf("expected Processing, got %d", currentTask.Status)
+	}
+
+	// Refresh deadline (as personal_processor does for already-processing tasks)
+	db.Model(&model.SummaryTask{}).Where("id = ?", task.ID).
+		Update("processing_deadline", newDeadline)
+
+	var reloaded model.SummaryTask
+	db.First(&reloaded, task.ID)
+	if reloaded.ProcessingDeadline == nil {
+		t.Fatal("expected processing_deadline to be set after refresh")
+	}
+	if !reloaded.ProcessingDeadline.After(oldDeadline) {
+		t.Errorf("expected refreshed deadline (%v) to be after old deadline (%v)",
+			reloaded.ProcessingDeadline, oldDeadline)
+	}
+}

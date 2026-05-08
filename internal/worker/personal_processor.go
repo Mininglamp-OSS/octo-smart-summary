@@ -52,9 +52,13 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 	})
 
 	// CAS update task status to PROCESSING (from any earlier state)
+	deadline := time.Now().UTC().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute)
 	taskCAS := p.db.Model(&model.SummaryTask{}).
 		Where("id = ? AND status IN (?, ?)", taskID, model.StatusPending, model.StatusWaitingConfirm).
-		Update("status", model.StatusProcessing)
+		Updates(map[string]interface{}{
+			"status":              model.StatusProcessing,
+			"processing_deadline": deadline,
+		})
 	if taskCAS.Error != nil {
 		log.Printf("[personal-worker] task=%d CAS update failed: %v", taskID, taskCAS.Error)
 		return
@@ -65,6 +69,9 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 			log.Printf("[personal-worker] task=%d not in processing state, aborting", taskID)
 			return
 		}
+		// Refresh deadline for already-processing task (prevents scheduler false-positive)
+		p.db.Model(&model.SummaryTask{}).Where("id = ?", taskID).
+			Update("processing_deadline", deadline)
 	}
 
 	// Load task
@@ -250,11 +257,19 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	}
 
 	// Fetch messages via personal pipeline (Layer 0-5)
+	var channelScopeOpts *pipeline.ChannelScopeOptions
+	if p.cfg.ChannelScopeEnabled {
+		channelScopeOpts = &pipeline.ChannelScopeOptions{
+			Enabled: true,
+		}
+	}
+
 	messages, err := pipeline.ResolveAndFetchMessagesForPersonal(
 		ctx, userID, nil, nil, specifiedSources, task.Title,
 		task.TimeRangeStart, task.TimeRangeEnd,
 		p.imDB, toolCallFn, llmFn,
 		p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency,
+		channelScopeOpts,
 	)
 	if err != nil {
 		return "", nil, 0, 0, "", fmt.Errorf("fetch messages: %w", err)

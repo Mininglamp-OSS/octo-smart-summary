@@ -120,11 +120,8 @@ func ResolveTopicTarget(ctx context.Context, topic string, nameMap map[string]st
 		{Role: "user", Content: userMsg},
 	}
 
-	resolveCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-
 	start := time.Now()
-	argsJSON, err := toolCallFn(resolveCtx, messages, []service.Tool{resolveTopicTargetTool}, "resolve_topic_target")
+	argsJSON, err := toolCallFn(ctx, messages, []service.Tool{resolveTopicTargetTool}, "resolve_topic_target")
 	elapsed := time.Since(start).Milliseconds()
 
 	if err != nil {
