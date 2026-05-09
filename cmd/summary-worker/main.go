@@ -18,9 +18,11 @@ import (
 func main() {
 	cfg := config.Load()
 	config.ValidateRequired(map[string]string{
-		"MYSQL_DSN":              cfg.MySQLDSN,
-		"IM_MYSQL_DSN":           cfg.IMMySQLDSN,
-		"LLM_API_KEY":            cfg.LLMApiKey,
+		"MYSQL_DSN":               cfg.MySQLDSN,
+		"IM_MYSQL_DSN":            cfg.IMMySQLDSN,
+		"LLM_API_URL":             cfg.LLMApiURL,
+		"LLM_API_KEY":             cfg.LLMApiKey,
+		"LLM_MODEL":               cfg.LLMModel,
 		"WORKER_API_CALLBACK_URL": cfg.WorkerCallbackURL,
 	})
 
