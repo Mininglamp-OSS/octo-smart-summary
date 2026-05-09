@@ -88,9 +88,9 @@ func Load() *Config {
 
 		OctoAPIURL: envStr("OCTO_API_URL", ""),
 
-		LLMApiURL:         envStr("LLM_API_URL", "https://api.example.com/v1"),
+		LLMApiURL:         envStr("LLM_API_URL", ""),
 		LLMApiKey:         envStr("LLM_API_KEY", ""),
-		LLMModel:          envStr("LLM_MODEL", "claude-sonnet-4-6"),
+		LLMModel:          envStr("LLM_MODEL", ""),
 		LLMTimeout:        envInt("LLM_TIMEOUT", 180),
 		LLMMaxToken:       envInt("LLM_MAX_TOKENS", 4096),
 		LLMTemperature:    getEnvFloat("LLM_TEMPERATURE", 0.3),
