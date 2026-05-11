@@ -75,7 +75,7 @@ func TestResolveTopicTarget_IncludeSelf_False(t *testing.T) {
 func TestResolveTopicTarget_IncludeSelf_MultiplePersons(t *testing.T) {
 	nameMap := map[string]string{
 		"creator_uid": "我",
-		"person1_uid": "小明",
+		"person1_uid": "小李",
 		"person2_uid": "小红",
 	}
 	stubFn := mockToolCallFn(TopicResolveResult{
@@ -174,7 +174,7 @@ func TestResolveTopicTarget_NoTarget_GeneralTopic(t *testing.T) {
 func TestResolveTopicTarget_NoTarget_SummarizeAll(t *testing.T) {
 	nameMap := map[string]string{
 		"creator_uid": "我",
-		"person1_uid": "小明",
+		"person1_uid": "小李",
 	}
 	stubFn := mockToolCallFn(TopicResolveResult{
 		HasTarget:   false,
