@@ -6,7 +6,7 @@ import (
 )
 
 // MessageTable returns the sharded message table name for a given channel ID.
-// Uses CRC32 IEEE to match the Go dmworkim implementation:
+// Uses CRC32 IEEE for consistent table sharding:
 //
 //	crc32.ChecksumIEEE([]byte(channelID)) % uint32(tableCount)
 //

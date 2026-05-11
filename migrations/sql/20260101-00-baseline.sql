@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS `summary_personal_result` (
   `id` bigint NOT NULL AUTO_INCREMENT,
   `task_id` bigint NOT NULL,
   `participant_ref_id` bigint NOT NULL COMMENT 'FK summary_participant.id',
-  `user_id` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT 'redundant DMWork uid for per-user queries',
+  `user_id` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL COMMENT 'redundant IM platform uid for per-user queries',
   `content` mediumtext COLLATE utf8mb4_unicode_ci NOT NULL,
   `citations_json` mediumtext COLLATE utf8mb4_unicode_ci,
   `msg_count` int NOT NULL DEFAULT '0',

@@ -16,34 +16,34 @@ func mockToolCallFn(result TopicResolveResult) LLMToolCallFn {
 	}
 }
 
-func TestResolveTopicTarget_IncludeSelf_MeAndJeff(t *testing.T) {
+func TestResolveTopicTarget_IncludeSelf_MeAndAlice(t *testing.T) {
 	nameMap := map[string]string{
 		"creator_uid": "我",
-		"jeff_uid":    "Jeff",
+		"alice_uid":    "Alice",
 	}
 	stubFn := mockToolCallFn(TopicResolveResult{
 		HasTarget:   true,
-		UIDs:        []string{"jeff_uid"},
+		UIDs:        []string{"alice_uid"},
 		IncludeSelf: true,
-		Reasoning:   "主题'我和Jeff聊了什么'包含第一人称参与者",
+		Reasoning:   "主题'我和Alice聊了什么'包含第一人称参与者",
 	})
 
-	result := ResolveTopicTarget(context.Background(), "我和Jeff聊了什么", nameMap, "creator_uid", stubFn)
+	result := ResolveTopicTarget(context.Background(), "我和Alice聊了什么", nameMap, "creator_uid", stubFn)
 
 	if len(result) != 2 {
 		t.Fatalf("expected 2 UIDs, got %d: %v", len(result), result)
 	}
-	hasJeff, hasCreator := false, false
+	hasAlice, hasCreator := false, false
 	for _, uid := range result {
-		if uid == "jeff_uid" {
-			hasJeff = true
+		if uid == "alice_uid" {
+			hasAlice = true
 		}
 		if uid == "creator_uid" {
 			hasCreator = true
 		}
 	}
-	if !hasJeff {
-		t.Error("expected jeff_uid in result")
+	if !hasAlice {
+		t.Error("expected alice_uid in result")
 	}
 	if !hasCreator {
 		t.Error("expected creator_uid in result (include_self=true)")
@@ -53,22 +53,22 @@ func TestResolveTopicTarget_IncludeSelf_MeAndJeff(t *testing.T) {
 func TestResolveTopicTarget_IncludeSelf_False(t *testing.T) {
 	nameMap := map[string]string{
 		"creator_uid": "我",
-		"hui_uid":     "辉哥",
+		"wang_uid":     "老王",
 	}
 	stubFn := mockToolCallFn(TopicResolveResult{
 		HasTarget:   true,
-		UIDs:        []string{"hui_uid"},
+		UIDs:        []string{"wang_uid"},
 		IncludeSelf: false,
-		Reasoning:   "主题'辉哥的发言'只关注辉哥",
+		Reasoning:   "主题'老王的发言'只关注老王",
 	})
 
-	result := ResolveTopicTarget(context.Background(), "辉哥的发言", nameMap, "creator_uid", stubFn)
+	result := ResolveTopicTarget(context.Background(), "老王的发言", nameMap, "creator_uid", stubFn)
 
 	if len(result) != 1 {
 		t.Fatalf("expected 1 UID, got %d: %v", len(result), result)
 	}
-	if result[0] != "hui_uid" {
-		t.Errorf("expected hui_uid, got %s", result[0])
+	if result[0] != "wang_uid" {
+		t.Errorf("expected wang_uid, got %s", result[0])
 	}
 }
 
@@ -106,16 +106,16 @@ func TestResolveTopicTarget_IncludeSelf_MultiplePersons(t *testing.T) {
 func TestResolveTopicTarget_IncludeSelf_NoDuplicate(t *testing.T) {
 	nameMap := map[string]string{
 		"creator_uid": "我",
-		"jeff_uid":    "Jeff",
+		"alice_uid":    "Alice",
 	}
 	stubFn := mockToolCallFn(TopicResolveResult{
 		HasTarget:   true,
-		UIDs:        []string{"jeff_uid", "creator_uid"},
+		UIDs:        []string{"alice_uid", "creator_uid"},
 		IncludeSelf: true,
 		Reasoning:   "LLM已返回creator_uid",
 	})
 
-	result := ResolveTopicTarget(context.Background(), "我和Jeff聊了什么", nameMap, "creator_uid", stubFn)
+	result := ResolveTopicTarget(context.Background(), "我和Alice聊了什么", nameMap, "creator_uid", stubFn)
 
 	if len(result) != 2 {
 		t.Fatalf("expected 2 UIDs (no duplicate), got %d: %v", len(result), result)
@@ -155,7 +155,7 @@ func TestResolveTopicTarget_IncludeSelf_ZeroValue_BackwardCompat(t *testing.T) {
 func TestResolveTopicTarget_NoTarget_GeneralTopic(t *testing.T) {
 	nameMap := map[string]string{
 		"creator_uid": "我",
-		"jeff_uid":    "Jeff",
+		"alice_uid":    "Alice",
 	}
 	stubFn := mockToolCallFn(TopicResolveResult{
 		HasTarget:   false,
@@ -193,7 +193,7 @@ func TestResolveTopicTarget_NoTarget_SummarizeAll(t *testing.T) {
 func TestResolveTopicTarget_SelfReference(t *testing.T) {
 	nameMap := map[string]string{
 		"creator_uid": "我",
-		"jeff_uid":    "Jeff",
+		"alice_uid":    "Alice",
 	}
 	stubFn := mockToolCallFn(TopicResolveResult{
 		HasTarget:   true,
@@ -215,7 +215,7 @@ func TestResolveTopicTarget_SelfReference(t *testing.T) {
 func TestResolveTopicTarget_AllUIDsInvalid_IncludeSelf(t *testing.T) {
 	nameMap := map[string]string{
 		"creator_uid": "我",
-		"jeff_uid":    "Jeff",
+		"alice_uid":    "Alice",
 	}
 	stubFn := mockToolCallFn(TopicResolveResult{
 		HasTarget:   true,
@@ -234,66 +234,66 @@ func TestResolveTopicTarget_AllUIDsInvalid_IncludeSelf(t *testing.T) {
 	}
 }
 
-func TestResolveTopicTarget_NoSemanticMatch_JeffNotAngie(t *testing.T) {
+func TestResolveTopicTarget_NoSemanticMatch_AliceNotCarol(t *testing.T) {
 	nameMap := map[string]string{
 		"creator_uid": "我",
-		"angie_uid":   "Angie",
+		"carol_uid":   "Carol",
 	}
 	stubFn := mockToolCallFn(TopicResolveResult{
 		HasTarget:   false,
 		UIDs:        []string{},
 		IncludeSelf: false,
-		Reasoning:   "Jeff与成员Angie之间没有语义关联，不算匹配",
+		Reasoning:   "Alice与成员Carol之间没有语义关联，不算匹配",
 	})
 
-	result := ResolveTopicTarget(context.Background(), "Jeff的发言", nameMap, "creator_uid", stubFn)
+	result := ResolveTopicTarget(context.Background(), "Alice的发言", nameMap, "creator_uid", stubFn)
 
 	if result != nil {
 		t.Fatalf("expected nil when topic name has no semantic match in members, got %v", result)
 	}
 }
 
-func TestResolveTopicTarget_SemanticMatch_HuiGe(t *testing.T) {
+func TestResolveTopicTarget_SemanticMatch_Nickname(t *testing.T) {
 	nameMap := map[string]string{
 		"creator_uid":    "我",
-		"liguanghui_uid": "李光辉",
+		"wang_uid": "王明",
 	}
 	stubFn := mockToolCallFn(TopicResolveResult{
 		HasTarget:   true,
-		UIDs:        []string{"liguanghui_uid"},
+		UIDs:        []string{"wang_uid"},
 		IncludeSelf: false,
-		Reasoning:   "辉哥中的'辉'与李光辉的'光辉'存在语义关联",
+		Reasoning:   "老王中的'王'与王明的'王'存在语义关联",
 	})
 
-	result := ResolveTopicTarget(context.Background(), "辉哥的发言", nameMap, "creator_uid", stubFn)
+	result := ResolveTopicTarget(context.Background(), "老王的发言", nameMap, "creator_uid", stubFn)
 
 	if len(result) != 1 {
 		t.Fatalf("expected 1 UID, got %d: %v", len(result), result)
 	}
-	if result[0] != "liguanghui_uid" {
-		t.Errorf("expected liguanghui_uid, got %s", result[0])
+	if result[0] != "wang_uid" {
+		t.Errorf("expected wang_uid, got %s", result[0])
 	}
 }
 
-func TestResolveTopicTarget_SemanticMatch_ThomasChinese(t *testing.T) {
+func TestResolveTopicTarget_SemanticMatch_BilingualName(t *testing.T) {
 	nameMap := map[string]string{
 		"creator_uid": "我",
-		"thomas_uid":  "托马斯",
+		"tom_uid":  "汤姆",
 	}
 	stubFn := mockToolCallFn(TopicResolveResult{
 		HasTarget:   true,
-		UIDs:        []string{"thomas_uid"},
+		UIDs:        []string{"tom_uid"},
 		IncludeSelf: false,
-		Reasoning:   "Thomas是托马斯的英文形式，语义关联明确",
+		Reasoning:   "Tom是汤姆的英文形式，语义关联明确",
 	})
 
-	result := ResolveTopicTarget(context.Background(), "Thomas说了什么", nameMap, "creator_uid", stubFn)
+	result := ResolveTopicTarget(context.Background(), "Tom说了什么", nameMap, "creator_uid", stubFn)
 
 	if len(result) != 1 {
 		t.Fatalf("expected 1 UID, got %d: %v", len(result), result)
 	}
-	if result[0] != "thomas_uid" {
-		t.Errorf("expected thomas_uid, got %s", result[0])
+	if result[0] != "tom_uid" {
+		t.Errorf("expected tom_uid, got %s", result[0])
 	}
 }
 
@@ -313,13 +313,13 @@ func TestResolveTopicTarget_EmptyTopic(t *testing.T) {
 func TestResolveTopicTarget_LLMError(t *testing.T) {
 	nameMap := map[string]string{
 		"creator_uid": "我",
-		"jeff_uid":    "Jeff",
+		"alice_uid":    "Alice",
 	}
 	errorFn := func(ctx context.Context, msgs []service.ChatMessage, tools []service.Tool, forceFn string) (string, error) {
 		return "", fmt.Errorf("LLM service unavailable")
 	}
 
-	result := ResolveTopicTarget(context.Background(), "Jeff的观点", nameMap, "creator_uid", errorFn)
+	result := ResolveTopicTarget(context.Background(), "Alice的观点", nameMap, "creator_uid", errorFn)
 
 	if result != nil {
 		t.Fatalf("expected nil on LLM error, got %v", result)

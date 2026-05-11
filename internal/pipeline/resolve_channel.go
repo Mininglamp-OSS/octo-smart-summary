@@ -60,11 +60,11 @@ var resolveChannelScopeTool = service.Tool{
 							"person_mode": map[string]interface{}{
 								"type":        "string",
 								"enum":        []string{"intersection", "union"},
-								"description": "persons 之间的组合模式。\"intersection\"：所有人需同时出现在频道中（如'我和托马斯聊了什么'）；\"union\"：任一人出现即可（如'我、托马斯、Jeff在搞什么'）。默认 \"intersection\"",
+								"description": "persons 之间的组合模式。\"intersection\"：所有人需同时出现在频道中（如'我和Alice聊了什么'）；\"union\"：任一人出现即可（如'我、Alice、Bob在搞什么'）。默认 \"intersection\"",
 							},
 							"include_self": map[string]interface{}{
 								"type":        "boolean",
-								"description": "主题中'我'是否作为对话参与方出现。如'我和Jeff聊了什么'→true；'托马斯最近在忙什么'→false",
+								"description": "主题中'我'是否作为对话参与方出现。如'我和Bob聊了什么'→true；'Alice最近在忙什么'→false",
 							},
 							"channel_ids": map[string]interface{}{
 								"type":        "array",
@@ -125,18 +125,18 @@ const resolveChannelScopeSystemPrompt = `你是一个频道范围解析器。根
   - "我参与但不管理的群" → ["member"]
   - 没有明确提到 → 省略或空数组
 - 当主题包含多个独立约束条件需要并集时，拆分为多条 rules
-  - 例："总结下我的全部私聊，以及我和托马斯所在群聊" → 两条规则
+  - 例："总结下我的全部私聊，以及我和Alice所在群聊" → 两条规则
 - 如果主题不包含任何频道范围约束（如"项目进度"、"最近在聊什么"），has_constraint 为 false，rules 为空数组
 
 示例：
-- "我和托马斯聊了什么"
-  → has_constraint=true, rules=[{persons:[托马斯UID], include_self:true, person_mode:"intersection"}]
-- "我、托马斯、Jeff在搞什么"
-  → has_constraint=true, rules=[{persons:[托马斯UID, JeffUID], include_self:true, person_mode:"union"}]
+- "我和Alice聊了什么"
+  → has_constraint=true, rules=[{persons:[AliceUID], include_self:true, person_mode:"intersection"}]
+- "我、Alice、Bob在搞什么"
+  → has_constraint=true, rules=[{persons:[AliceUID, BobUID], include_self:true, person_mode:"union"}]
 - "octo-dev群最近在聊什么"
   → has_constraint=true, rules=[{channel_ids:[octo-dev的ID]}]
-- "私聊里Jeff说了什么"
-  → has_constraint=true, rules=[{persons:[JeffUID], channel_type:["dm"], person_mode:"intersection"}]
+- "私聊里Bob说了什么"
+  → has_constraint=true, rules=[{persons:[BobUID], channel_type:["dm"], person_mode:"intersection"}]
 - "dev相关的群"
   → has_constraint=true, rules=[{channel_ids:[所有含dev的频道ID], channel_type:["group"]}]
 - "最近大家在讨论什么"
@@ -145,8 +145,8 @@ const resolveChannelScopeSystemPrompt = `你是一个频道范围解析器。根
   → has_constraint=true, rules=[{ownership:["creator"]}]
 - "我参与但不管理的群"
   → has_constraint=true, rules=[{ownership:["member"]}]
-- "总结下我的全部私聊，以及我和托马斯所在群聊的全部信息"
-  → has_constraint=true, rules=[{channel_type:["dm"], include_self:true}, {persons:[托马斯UID], include_self:true, channel_type:["group"], person_mode:"intersection"}]
+- "总结下我的全部私聊，以及我和Alice所在群聊的全部信息"
+  → has_constraint=true, rules=[{channel_type:["dm"], include_self:true}, {persons:[AliceUID], include_self:true, channel_type:["group"], person_mode:"intersection"}]
 
 你必须调用 resolve_channel_scope 工具来返回结果，不要以文本形式回复。`
 

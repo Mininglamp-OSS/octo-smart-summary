@@ -14,7 +14,7 @@ import (
 
 const MapFailedMarker = "总结失败"
 
-// LLMClient handles calls to the OpenAI-compatible LLM gateway.
+// LLMClient handles calls to a chat-completions-compatible LLM API.
 type LLMClient struct {
 	apiURL          string
 	apiKey          string

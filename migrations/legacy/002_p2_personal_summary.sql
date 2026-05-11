@@ -5,7 +5,7 @@ CREATE TABLE summary_personal_result (
     id                  BIGINT AUTO_INCREMENT PRIMARY KEY,
     task_id             BIGINT NOT NULL,
     participant_ref_id  BIGINT NOT NULL COMMENT '关联 summary_participant.id',
-    user_id             VARCHAR(64) NOT NULL COMMENT '冗余 DMWork uid，方便按用户查询',
+    user_id             VARCHAR(64) NOT NULL COMMENT 'redundant IM platform uid for per-user queries',
     content             MEDIUMTEXT NOT NULL,
     msg_count           INT NOT NULL DEFAULT 0,
     total_token_used    INT NOT NULL DEFAULT 0,
