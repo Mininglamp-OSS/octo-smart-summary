@@ -1,57 +1,162 @@
-# Smart Summary (智能总结)
+<p align="center">
+  <img src="./docs/assets/logo-light.png#gh-light-mode-only" width="200" alt="OCTO">
+  <img src="./docs/assets/logo-dark.png#gh-dark-mode-only" width="200" alt="OCTO">
+</p>
 
-AI-powered chat summary service for the dmwork IM platform. Generates intelligent summaries of group chat conversations using LLM APIs.
+<p align="center">
+  <b>OCTO — the open workplace built for humans × AI agents.</b><br/>
+  <sub>Let <b>Lobsters</b> (OpenClaw-powered digital doubles) do the <i>thinking</i> and <i>doing</i>. You focus on <i>taste</i>.</sub>
+</p>
 
-## Architecture
+<p align="center">
+  <a href="https://github.com/Mininglamp-OSS"><b>🏠 OCTO Home</b></a> ·
+  <a href="#-quickstart"><b>🚀 Quickstart</b></a> ·
+  <a href="#-octo-ecosystem"><b>📦 Ecosystem</b></a> ·
+  <a href="./CONTRIBUTING.md"><b>🤝 Contributing</b></a>
+</p>
 
-The service consists of two components:
+<p align="center">
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
+  <a href="./README.zh.md"><img src="https://img.shields.io/badge/lang-简体中文-red.svg" alt="简体中文"></a>
+</p>
 
-- **summary-api** — HTTP API server that receives summary requests and serves results
-- **summary-worker** — Background task processor that handles LLM-based summarization
+---
 
-## Tech Stack
+> 🌐 **Read in**: **English** · [简体中文](README.zh.md)
 
-Go, Gin, GORM, Redis, MySQL, LLM API (OpenAI-compatible)
+# OCTO Smart-Summary
 
-## Build
+> **LLM-powered conversation summarisation** — turn long OCTO threads, group chats, and meeting transcripts into scannable briefs.
+
+`octo-smart-summary` is a small Go service that wraps an OpenAI-compatible
+LLM endpoint behind a narrow, OCTO-aware API. Given a conversation id
+(`octo-server` channel / thread / meeting), it produces a structured summary
+with key decisions, unanswered questions, and follow-up candidates — ready
+to hand off to `octo-matter` as draft todos.
+
+## 🌟 Why OCTO Smart-Summary
+
+- **Narrow service, clean contract.** Only four endpoints (`/summarise`, `/summarise/stream`, `/healthz`, `/metrics`). No user state, no side effects beyond LLM calls and per-request tracing — easy to operate, easy to swap.
+- **Bring your own LLM.** The LLM URL is a configurable `LLM_API_URL`; point it at any OpenAI-compatible endpoint (self-hosted vLLM / Ollama / Claude gateway / commercial API). No vendor lock-in.
+- **Structured output, not prose dump.** Results are strict JSON (highlights, decisions, open questions, candidate actions) so downstream consumers — `octo-web`, `octo-matter`, Lobster agents — can render them natively instead of re-parsing free text.
+
+## 🚀 Quickstart
 
 ```bash
-go build -o bin/summary-api ./cmd/summary-api
-go build -o bin/summary-worker ./cmd/summary-worker
+git clone https://github.com/Mininglamp-OSS/octo-smart-summary.git
+cd octo-smart-summary
+go build ./cmd
+
+# minimal config via env
+export LLM_API_URL=https://api.example.com/v1
+export LLM_API_KEY=sk-your-key-here
+export SUMMARY_LISTEN_ADDR=:8090
+
+./cmd serve
 ```
 
-## Docker Build
+Then, from another terminal:
 
 ```bash
-docker build -f Dockerfile.api -t summary-api:local .
-docker build -f Dockerfile.worker -t summary-worker:local .
+curl -X POST http://localhost:8090/summarise \
+  -H 'Content-Type: application/json' \
+  -d '{"conversation_id": "channel:demo", "style": "brief"}'
 ```
 
-## Environment Variables
+## 📦 Modules / Architecture
 
-> For the full canonical reference of all configuration options, see [CONFIGURATION.md](CONFIGURATION.md).
+Top-level packages:
 
-| Variable | Description | Service | Required |
-|---|---|---|---|
-| `MYSQL_DSN` | Summary database connection string | both | yes |
-| `IM_MYSQL_DSN` | IM database connection string (read-only) | both | yes |
-| `OCTO_API_URL` | Auth/API server base URL | api | yes |
-| `LLM_API_URL` | OpenAI-compatible API endpoint | worker | yes (no default) |
-| `LLM_API_KEY` | LLM API key | worker | yes |
-| `LLM_MODEL` | LLM model name | worker | yes (no default) |
-| `LLM_TIMEOUT` | LLM request timeout in seconds | worker | no (default: `180`) |
-| `LLM_MAX_TOKENS` | Max tokens for LLM response | worker | no (default: `4096`) |
-| `API_PORT` | Public API listen port | api | no (default: `8080`) |
-| `API_INTERNAL_PORT` | Internal API listen port (callbacks) | api | no (default: `8081`) |
-| `WORKER_INTERNAL_PORT` | Worker internal listen port | worker | no (default: `8082`) |
-| `WORKER_LISTEN_ADDR` | Worker bind address | worker | no (default: `0.0.0.0`) |
-| `WORKER_TRIGGER_URL` | URL for API to trigger worker tasks | api | yes |
-| `WORKER_API_CALLBACK_URL` | Callback URL for task completion | worker | yes |
-| `WORKER_MAX_CONCURRENT_TASKS` | Max parallel summarization tasks | worker | no (default: `20`) |
-| `WORKER_MAP_CONCURRENCY` | Concurrency for map-reduce stage | worker | no (default: `5`) |
-| `WORKER_POLL_INTERVAL_SECONDS` | Task queue poll interval (seconds) | worker | no (default: `2`) |
-| `WORKER_TASK_LEASE_MINUTES` | Task lease duration (minutes) | worker | no (default: `20`) |
-| `WORKER_MAX_RETRY` | Max retry attempts for failed tasks | worker | no (default: `3`) |
-| `MSG_TABLE_COUNT` | Number of message sharding tables | both | no (default: `5`) |
-| `CONTEXT_WINDOW` | Context window days for personal summary | worker | no (default: `2`) |
-| `MAX_MESSAGES_PER_PARTICIPANT` | Max messages per participant to process | worker | no (default: `5000`) |
+| Path | Purpose |
+|---|---|
+| `cmd/` | Service entrypoint + subcommands |
+| `internal/config/` | Env-driven config (LLM endpoint, rate limits, listen address) |
+| `internal/handler/` | HTTP handlers — `/summarise`, `/summarise/stream`, `/healthz`, `/metrics` |
+| `internal/service/` | Summarisation pipeline (fetch transcript → chunk → prompt → parse → enrich) |
+| `internal/llm/` | LLM client — OpenAI-compatible `/v1/chat/completions` + streaming |
+| `internal/octo/` | Thin client for `octo-server` — fetches the conversation transcript behind a scoped token |
+| `internal/middleware/` | Auth, rate-limit, logging, tracing |
+| `internal/model/` | Request / response structs (`SummaryRequest`, `SummaryResult`) |
+
+Summary pipeline per request:
+
+1. **Resolve** the conversation id against `octo-server` (scoped to the requesting operator).
+2. **Chunk** the transcript into LLM-sized windows; preserve speaker / time boundaries.
+3. **Prompt** the LLM with a summariser template (brief / standard / decision-log modes).
+4. **Parse** the structured output; reject and re-prompt once if JSON validation fails.
+5. **Enrich** with conversation metadata (participants, duration) and return.
+
+## 🔗 OCTO Ecosystem
+
+<!-- shared snippet: OCTO repo matrix. Keep identical across all 9 repos. -->
+
+```mermaid
+graph TD
+  subgraph Clients[Clients]
+    Web[octo-web<br/>Web / PC]
+    Android[octo-android<br/>Android]
+    iOS[octo-ios<br/>iOS]
+  end
+
+  subgraph Core[Core Services]
+    Server[octo-server<br/>Backend API]
+    Matter[octo-matter<br/>Task / Todo]
+    Summary[octo-smart-summary<br/>AI Summary]
+    Admin[octo-admin<br/>Admin Console]
+  end
+
+  subgraph Shared[Shared Libraries & Integrations]
+    Lib[octo-lib<br/>Core Go Library]
+    Adapters[octo-adapters<br/>Third-party Adapters]
+  end
+
+  Web --> Server
+  Android --> Server
+  iOS --> Server
+  Admin --> Server
+  Server --> Matter
+  Server --> Summary
+  Server --> Adapters
+  Server -.uses.-> Lib
+  Matter -.uses.-> Lib
+  Adapters -.uses.-> Lib
+```
+
+| Repository | Language | Role |
+|---|---|---|
+| [`octo-server`](https://github.com/Mininglamp-OSS/octo-server) | Go | Backend API · business orchestration · Lobster agent scheduling |
+| [`octo-matter`](https://github.com/Mininglamp-OSS/octo-matter) | Go | Task / Todo / Matter micro-service |
+| [`octo-smart-summary`](https://github.com/Mininglamp-OSS/octo-smart-summary) | Go | LLM-powered conversation summarisation |
+| [`octo-web`](https://github.com/Mininglamp-OSS/octo-web) | TypeScript / React | Web & PC (Electron) client |
+| [`octo-android`](https://github.com/Mininglamp-OSS/octo-android) | Kotlin / Java | Native Android client |
+| [`octo-ios`](https://github.com/Mininglamp-OSS/octo-ios) | Swift / Objective-C | Native iOS client |
+| [`octo-admin`](https://github.com/Mininglamp-OSS/octo-admin) | TypeScript / React | Admin console (tenant / org / user / channel management) |
+| [`octo-lib`](https://github.com/Mininglamp-OSS/octo-lib) | Go | Shared core library (protocol, crypto, storage, HTTP) |
+| [`octo-adapters`](https://github.com/Mininglamp-OSS/octo-adapters) | TypeScript / Python | Third-party integrations (IM bridges, AI channels) |
+
+## 🧭 Philosophy
+
+OCTO ships under three shared principles that apply to every repository in this matrix:
+
+1. **Local-first.** Anything that can run on the user's own box — chats, embeddings, agents — should. Your data stays yours; cloud is a choice, not a requirement.
+2. **Humans judge, AI thinks and acts.** Humans focus on *taste* (what matters, what's right, what to ship). Lobster agents — OpenClaw-powered digital doubles — carry the *thinking* and *execution* load.
+3. **Release-as-product.** Every open-source cut is shipped as a self-contained product, not a code dump: one squash per release, Apache 2.0, no internal baggage, reproducible from this repo alone.
+
+## 🤝 Contributing
+
+We love pull requests! Before you open one, please read:
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) — workflow, branch model, commit style
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — community expectations
+
+For security issues please follow [SECURITY.md](SECURITY.md) instead of the public tracker.
+
+## 📄 License
+
+Apache License 2.0 — see [LICENSE](LICENSE) for the full text and [NOTICE](NOTICE) for third-party attributions.
+
+---
+
+<p align="center">
+  <sub>Made with 🐙 by <b>OCTO Contributors</b> · <a href="https://github.com/Mininglamp-OSS">Mininglamp-OSS</a></sub>
+</p>
