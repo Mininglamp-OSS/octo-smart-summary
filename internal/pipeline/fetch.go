@@ -192,7 +192,7 @@ func NormalizeDMChannelID(channelID string, selfUID string, channelType int) str
 }
 
 // mapFrontendSourceType maps frontend source_type to backend channelType.
-// Frontend: 1=group, 3=DM; Backend WuKongIM: 1=DM, 2=group
+// Frontend: 1=group, 3=DM; Backend IM server: 1=DM, 2=group
 func mapFrontendSourceType(frontendType int) int {
 	switch frontendType {
 	case 1: // frontend group -> backend group

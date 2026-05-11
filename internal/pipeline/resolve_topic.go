@@ -43,7 +43,7 @@ var resolveTopicTargetTool = service.Tool{
 				},
 				"include_self": map[string]interface{}{
 					"type":        "boolean",
-					"description": "主题中创建者以第一人称作为对话参与者出现时为 true（如'我和Jeff聊了什么'、'我跟团队讨论的内容'）；只关注他人时为 false（如'辉哥的发言'、'Jeff和Thomas的讨论'）",
+					"description": "主题中创建者以第一人称作为对话参与者出现时为 true（如'我和Alice聊了什么'、'我跟团队讨论的内容'）；只关注他人时为 false（如'老王的发言'、'Alice和Tom的讨论'）",
 				},
 			},
 			"required": []string{"has_target", "uids", "include_self", "reasoning"},
@@ -87,23 +87,23 @@ func ResolveTopicTarget(ctx context.Context, topic string, nameMap map[string]st
 	systemPrompt := `你是一个人物指代解析器。根据总结主题和成员列表，判断主题是否指向特定成员。
 
 规则：
-- 主题是关于某个特定成员的内容（如"辉哥的发言"、"CTO的观点"），返回该成员 UID
-- 主题包含多个人（如"辉哥和小明的讨论"），返回所有相关成员的 UID
+- 主题是关于某个特定成员的内容（如"老王的发言"、"CTO的观点"），返回该成员 UID
+- 主题包含多个人（如"老王和小李的讨论"），返回所有相关成员的 UID
 - 主题是自我指代（如"我的工作"、"我说了什么"），has_target 为 true，uids 为空数组，include_self 为 true
 - 主题不涉及特定人物（如"项目进度"、"最近在聊什么"），has_target 为 false
 - uids 只能从成员列表中选取，不得编造或推测不存在的 UID
 - 主题中提到的人物在成员列表中找不到匹配时，忽略该人物；所有人物都找不到时，has_target 为 false（此规则不影响"我"的处理——"我"始终通过 include_self 标识，不需要出现在成员列表中）
 - 名字匹配支持语义关联：昵称、简称、姓氏称呼、职位等，但必须与成员姓名存在明确的语义关联（如包含关系、谐音、常见缩写）
 - 两个名字之间没有语义关联时，不算匹配
-- 主题中"我"作为对话参与者出现（如"我和Jeff聊了什么"、"我跟团队讨论的内容"），include_self 为 true
-- 主题只关注他人的内容（如"辉哥的发言"、"Jeff和Thomas的讨论"），include_self 为 false
+- 主题中"我"作为对话参与者出现（如"我和Alice聊了什么"、"我跟团队讨论的内容"），include_self 为 true
+- 主题只关注他人的内容（如"老王的发言"、"Alice和Tom的讨论"），include_self 为 false
 
 示例：
-  ✅ "辉哥" → "李光辉"（辉 是 光辉 的简称，语义关联明确）
+  ✅ "老王" → "王明"（老+姓氏 = 常见称呼方式，语义关联明确）
   ✅ "老王" → "王建国"（老+姓氏 = 常见称呼方式）
-  ✅ "Thomas" → "托马斯"（同一名字的中英文形式）
-  ❌ "Jeff" → "Angie"（两个名字之间没有任何语义关联）
-  ❌ "小明" → "张伟"（没有语义关联，即使只有这一个成员）
+  ✅ "Tom" → "汤姆"（同一名字的中英文形式）
+  ❌ "Alice" → "Carol"（两个名字之间没有任何语义关联）
+  ❌ "小李" → "张伟"（没有语义关联，即使只有这一个成员）
 
 你必须调用 resolve_topic_target 工具来返回结果，不要以文本形式回复。`
 

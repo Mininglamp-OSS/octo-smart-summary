@@ -82,7 +82,7 @@ const (
 	SourceDirect = 3
 )
 
-// Channel type constants (aligned with WuKongIM).
+// Channel type constants (aligned with the IM server protocol).
 const (
 	ChannelTypeDM    = 1
 	ChannelTypeGroup = 2

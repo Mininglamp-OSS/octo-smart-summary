@@ -46,7 +46,7 @@ func TestSanitizeErrorForUser(t *testing.T) {
 		{"context deadline", "context deadline exceeded", "AI 处理超时，请稍后重试"},
 		{"all chunks failed", "all 3 chunk(s) failed during Map phase (LLM unreachable)", "AI 服务暂时不可用，所有分片处理失败"},
 		{"unknown short", "some random error", "AI 处理失败，请稍后重试"},
-		{"unknown dsn leak", "dial tcp 10.0.0.5:3306: user=root password=secret", "AI 处理失败，请稍后重试"},
+		{"unknown dsn leak", "dial tcp 192.0.2.1:3306: user=testuser password=***", "AI 处理失败，请稍后重试"},
 		{"unknown stack trace", "goroutine 12 [running]: runtime.gopanic(...)", "AI 处理失败，请稍后重试"},
 		{"empty", "", "AI 处理失败，请稍后重试"},
 	}

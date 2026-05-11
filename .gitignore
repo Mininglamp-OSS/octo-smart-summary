@@ -3,14 +3,11 @@ bin/
 *.exe
 *.log
 
-# Claude Code
-.claude/
-CLAUDE.md
-CC-*.md
-TASK*.md
-CONTINUE.md
-REVIEW*.md
-thread-*.md
+# IDE / tool workspace (not tracked)
+.idea/
+.vscode/
+*.swp
+*~
 
 # Deployment config
 docker-compose.yml
