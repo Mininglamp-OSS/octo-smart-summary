@@ -180,6 +180,8 @@ var modelMaxTokensDefaults = map[string]int{
 	"qwen3.6-flash":     400000,
 	"deepseek-v4-flash": 400000,
 	"deepseek-v4-pro":   400000,
+	"kimi-k2":           150000,
+	"kimi_k2":           150000,
 }
 
 const defaultMapMaxTokens = 100000
@@ -202,14 +204,14 @@ func (c *Config) ResolveMapMaxTokens() int {
 }
 
 // ResolveCharsPerTokenCJK returns the CJK chars-per-token ratio.
-// For qwen models, defaults to 2 if not explicitly configured.
+// For qwen/deepseek/kimi models, defaults to 2 if not explicitly configured.
 // For other models, uses the configured value (default 1).
 func (c *Config) ResolveCharsPerTokenCJK() int {
 	if os.Getenv("CHARS_PER_TOKEN_CJK") != "" {
-		// Explicitly configured, use as-is
 		return c.CharsPerTokenCJK
 	}
-	if strings.Contains(strings.ToLower(c.LLMModel), "qwen3.6") || strings.Contains(strings.ToLower(c.LLMModel), "deepseek-v4") {
+	m := strings.ToLower(c.LLMModel)
+	if IsKimiModel(m) || IsQwenOrDeepSeekModel(m) {
 		return 2
 	}
 	return c.CharsPerTokenCJK

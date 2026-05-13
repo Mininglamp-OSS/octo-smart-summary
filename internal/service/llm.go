@@ -10,9 +10,13 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 )
 
 const MapFailedMarker = "总结失败"
+
+const kimiRequiredTemperature = 0.6
 
 // LLMClient handles calls to a chat-completions-compatible LLM API.
 type LLMClient struct {
@@ -70,14 +74,23 @@ type ToolChoiceFunction struct {
 	Name string `json:"name"`
 }
 
+// ThinkingParam controls the thinking/reasoning behavior for supported models.
+type ThinkingParam struct {
+	Type string `json:"type"` // "enabled" or "disabled"
+}
+
 type chatRequestWithTools struct {
 	Model              string                 `json:"model"`
 	Messages           []ChatMessage          `json:"messages"`
 	Temperature        float64                `json:"temperature"`
 	MaxTokens          int                    `json:"max_tokens"`
 	Tools              []Tool                 `json:"tools"`
-	ToolChoice         ToolChoice             `json:"tool_choice"`
+	// ToolChoice controls function calling behavior.
+	// For Kimi models: string "auto" (Kimi does not support forced function calling).
+	// For other models: ToolChoice struct with Type="function" and Function specification.
+	ToolChoice interface{} `json:"tool_choice"`
 	ChatTemplateKwargs map[string]interface{} `json:"chat_template_kwargs,omitempty"`
+	Thinking           *ThinkingParam         `json:"thinking,omitempty"`
 }
 
 type chatResponseWithTools struct {
@@ -89,6 +102,8 @@ type chatResponseWithTools struct {
 					Arguments string `json:"arguments"`
 				} `json:"function"`
 			} `json:"tool_calls"`
+			ReasoningContent string `json:"reasoning_content"`
+			Reasoning        string `json:"reasoning"`
 		} `json:"message"`
 	} `json:"choices"`
 	Usage struct {
@@ -102,21 +117,48 @@ type chatRequest struct {
 	Temperature        float64                `json:"temperature"`
 	MaxTokens          int                    `json:"max_tokens"`
 	ChatTemplateKwargs map[string]interface{} `json:"chat_template_kwargs,omitempty"`
+	Thinking           *ThinkingParam         `json:"thinking,omitempty"`
 }
 
 type chatResponse struct {
 	Choices []struct {
 		Message struct {
-			Content string `json:"content"`
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
+			Reasoning        string `json:"reasoning"`
 		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage struct {
-		TotalTokens int `json:"total_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
 	} `json:"usage"`
+}
+
+// buildThinkingConfig returns model-specific thinking parameters.
+// For Kimi: top-level thinking field. For Qwen/DeepSeek: chat_template_kwargs.
+func (c *LLMClient) buildThinkingConfig() (*ThinkingParam, map[string]interface{}) {
+	if c.enableThinking {
+		return nil, nil
+	}
+	if config.IsKimiModel(c.model) {
+		return &ThinkingParam{Type: "disabled"}, nil
+	}
+	if config.IsQwenOrDeepSeekModel(c.model) {
+		return nil, map[string]interface{}{"enable_thinking": false}
+	}
+	return nil, nil
 }
 
 // Call makes a chat completion request. Returns (content, tokenUsed, error).
 func (c *LLMClient) Call(ctx context.Context, messages []ChatMessage, temperature float64) (string, int, error) {
+	if config.IsKimiModel(c.model) && temperature != kimiRequiredTemperature {
+		log.Printf("[llm] overriding temperature from %.2f to %.2f (model constraint)",
+			temperature, kimiRequiredTemperature)
+		temperature = kimiRequiredTemperature
+	} else if config.IsKimiModel(c.model) {
+		temperature = kimiRequiredTemperature
+	}
 	log.Printf("[llm] calling model=%s temperature=%.2f max_tokens=%d", c.model, temperature, c.maxTokens)
 	reqBody := chatRequest{
 		Model:       c.model,
@@ -124,9 +166,10 @@ func (c *LLMClient) Call(ctx context.Context, messages []ChatMessage, temperatur
 		Temperature: temperature,
 		MaxTokens:   c.maxTokens,
 	}
-	if !c.enableThinking && (strings.Contains(strings.ToLower(c.model), "qwen3.6") || strings.Contains(strings.ToLower(c.model), "deepseek-v4")) {
-		reqBody.ChatTemplateKwargs = map[string]interface{}{"enable_thinking": false}
-	}
+	thinking, kwargs := c.buildThinkingConfig()
+	reqBody.Thinking = thinking
+	reqBody.ChatTemplateKwargs = kwargs
+
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", 0, err
@@ -160,7 +203,24 @@ func (c *LLMClient) Call(ctx context.Context, messages []ChatMessage, temperatur
 	if len(chatResp.Choices) == 0 {
 		return "", 0, fmt.Errorf("LLM returned no choices")
 	}
-	return chatResp.Choices[0].Message.Content, chatResp.Usage.TotalTokens, nil
+
+	content := chatResp.Choices[0].Message.Content
+	// Check both field names: "reasoning_content" (official Kimi) and "reasoning" (gateway proxy)
+	reasoningPresent := chatResp.Choices[0].Message.ReasoningContent != "" || chatResp.Choices[0].Message.Reasoning != ""
+	if content == "" && reasoningPresent {
+		reasoningLen := len(chatResp.Choices[0].Message.ReasoningContent) + len(chatResp.Choices[0].Message.Reasoning)
+		log.Printf("[llm] WARNING: content is empty but reasoning present (%d chars), "+
+			"finish_reason=%s, completion_tokens=%d. Reasoning consumed entire budget.",
+			reasoningLen, chatResp.Choices[0].FinishReason, chatResp.Usage.CompletionTokens)
+		return "", chatResp.Usage.TotalTokens, fmt.Errorf("LLM returned empty content: reasoning consumed entire max_tokens budget")
+	}
+	if content == "" && chatResp.Choices[0].FinishReason == "length" {
+		log.Printf("[llm] WARNING: content is empty and finish_reason=length, completion_tokens=%d",
+			chatResp.Usage.CompletionTokens)
+		return "", chatResp.Usage.TotalTokens, fmt.Errorf("LLM returned empty content due to token limit")
+	}
+
+	return content, chatResp.Usage.TotalTokens, nil
 }
 
 // CallRaw is a simple single-turn call returning text only. Used for topic narrowing.
@@ -173,11 +233,28 @@ func (c *LLMClient) CallRaw(ctx context.Context, prompt string) (string, error) 
 	return content, nil
 }
 
-// CallWithTools makes a chat completion request with forced function calling.
+// CallWithTools makes a chat completion request with function calling.
 // Returns the raw JSON string from tool_calls[0].function.arguments and token count.
 func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, tools []Tool, forceFn string, temperature float64) (string, int, error) {
+	if config.IsKimiModel(c.model) && temperature != kimiRequiredTemperature {
+		log.Printf("[llm] overriding temperature from %.2f to %.2f (model constraint)",
+			temperature, kimiRequiredTemperature)
+		temperature = kimiRequiredTemperature
+	} else if config.IsKimiModel(c.model) {
+		temperature = kimiRequiredTemperature
+	}
 	log.Printf("[llm] CallWithTools: tool=%s temperature=%.2f model=%s", forceFn, temperature, c.model)
 	start := time.Now()
+
+	var toolChoice interface{}
+	if config.IsKimiModel(c.model) {
+		toolChoice = "auto"
+	} else {
+		toolChoice = ToolChoice{
+			Type:     "function",
+			Function: ToolChoiceFunction{Name: forceFn},
+		}
+	}
 
 	reqBody := chatRequestWithTools{
 		Model:       c.model,
@@ -185,14 +262,12 @@ func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, t
 		Temperature: temperature,
 		MaxTokens:   c.maxTokens,
 		Tools:       tools,
-		ToolChoice: ToolChoice{
-			Type:     "function",
-			Function: ToolChoiceFunction{Name: forceFn},
-		},
+		ToolChoice:  toolChoice,
 	}
-	if !c.enableThinking && (strings.Contains(strings.ToLower(c.model), "qwen3.6") || strings.Contains(strings.ToLower(c.model), "deepseek-v4")) {
-		reqBody.ChatTemplateKwargs = map[string]interface{}{"enable_thinking": false}
-	}
+	thinking, kwargs := c.buildThinkingConfig()
+	reqBody.Thinking = thinking
+	reqBody.ChatTemplateKwargs = kwargs
+
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", 0, fmt.Errorf("marshal request: %w", err)
@@ -254,7 +329,44 @@ func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, t
 			continue
 		}
 		if len(chatResp.Choices[0].Message.ToolCalls) == 0 {
+			reasoningPresent := chatResp.Choices[0].Message.ReasoningContent != "" || chatResp.Choices[0].Message.Reasoning != ""
+			if reasoningPresent {
+				reasoningLen := len(chatResp.Choices[0].Message.ReasoningContent) + len(chatResp.Choices[0].Message.Reasoning)
+				log.Printf("[llm] CallWithTools: no tool_calls but reasoning present (%d chars). Reasoning consumed entire budget.",
+					reasoningLen)
+				return "", chatResp.Usage.TotalTokens, fmt.Errorf("CallWithTools: reasoning consumed entire max_tokens budget, no tool_calls produced")
+			}
 			lastErr = fmt.Errorf("LLM returned no tool_calls")
+			log.Printf("[llm] CallWithTools attempt %d: no tool_calls returned", attempt+1)
+			continue
+		}
+
+		if config.IsKimiModel(c.model) {
+			matched := false
+			for _, tc := range chatResp.Choices[0].Message.ToolCalls {
+				if tc.Function.Name == forceFn {
+					matched = true
+					args := tc.Function.Arguments
+					if args == "" {
+						lastErr = fmt.Errorf("LLM returned empty arguments")
+						break
+					}
+					log.Printf("[llm] CallWithTools: tool=%s took %dms tokens=%d", forceFn, time.Since(start).Milliseconds(), chatResp.Usage.TotalTokens)
+					return args, chatResp.Usage.TotalTokens, nil
+				}
+			}
+			if !matched {
+				calledFn := chatResp.Choices[0].Message.ToolCalls[0].Function.Name
+				lastErr = fmt.Errorf("LLM called function %q instead of expected %q", calledFn, forceFn)
+				log.Printf("[llm] CallWithTools attempt %d: wrong function called: %s", attempt+1, calledFn)
+			}
+			continue
+		}
+
+		calledFn := chatResp.Choices[0].Message.ToolCalls[0].Function.Name
+		if calledFn != forceFn {
+			lastErr = fmt.Errorf("LLM called function %q instead of expected %q", calledFn, forceFn)
+			log.Printf("[llm] CallWithTools attempt %d: wrong function called: %s", attempt+1, calledFn)
 			continue
 		}
 
@@ -378,6 +490,10 @@ func (c *LLMClient) CallMap(ctx context.Context, formattedMessages string, sourc
 			return content, tokens, nil
 		}
 		log.Printf("[llm] Map chunk %d attempt %d failed: %v", chunkIndex, attempt+1, err)
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "reasoning consumed") || strings.Contains(errMsg, "empty content due to token limit") {
+			return "", tokens, fmt.Errorf("reasoning budget exhausted on chunk %d", chunkIndex)
+		}
 		if attempt < 2 {
 			time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
 		}

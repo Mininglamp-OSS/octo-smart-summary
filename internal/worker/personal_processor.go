@@ -383,6 +383,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		summary string
 		tokens  int
 		failed  bool
+		fatal   bool
 	}
 
 	concurrency := p.cfg.WorkerMapConcurrency
@@ -421,7 +422,8 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 			)
 			if err != nil {
 				log.Printf("[personal-worker] Map chunk %d failed: %v", idx, err)
-				results[idx] = chunkResult{failed: true}
+				isFatal := strings.Contains(err.Error(), "reasoning budget exhausted")
+				results[idx] = chunkResult{failed: true, fatal: isFatal}
 			} else {
 				results[idx] = chunkResult{summary: summary, tokens: tokens}
 			}
@@ -433,6 +435,17 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 
 	if ctx.Err() != nil {
 		return "", nil, 0, 0, "", fmt.Errorf("map phase cancelled: %w", ctx.Err())
+	}
+
+	var fatalChunks []int
+	for i, r := range results {
+		if r.fatal {
+			fatalChunks = append(fatalChunks, i)
+		}
+	}
+	if len(fatalChunks) > 0 {
+		return "", nil, 0, 0, "", fmt.Errorf(
+			"Map phase aborted: reasoning budget exhausted on chunk(s) %v", fatalChunks)
 	}
 
 	var chunkSummaries []string

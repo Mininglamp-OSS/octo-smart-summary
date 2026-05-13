@@ -2,7 +2,6 @@ package service
 
 import (
 	"encoding/json"
-	"strings"
 	"testing"
 )
 
@@ -15,9 +14,9 @@ func TestChatTemplateKwargs_QwenWithThinkingDisabled(t *testing.T) {
 		Temperature: 0.3,
 		MaxTokens:   client.maxTokens,
 	}
-	if !client.enableThinking && (strings.Contains(client.model, "qwen3.6") || strings.Contains(client.model, "deepseek-v4")) {
-		reqBody.ChatTemplateKwargs = map[string]interface{}{"enable_thinking": false}
-	}
+	thinking, kwargs := client.buildThinkingConfig()
+	reqBody.Thinking = thinking
+	reqBody.ChatTemplateKwargs = kwargs
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -29,11 +28,11 @@ func TestChatTemplateKwargs_QwenWithThinkingDisabled(t *testing.T) {
 		t.Fatalf("unmarshal error: %v", err)
 	}
 
-	kwargs, ok := parsed["chat_template_kwargs"]
+	kwargs2, ok := parsed["chat_template_kwargs"]
 	if !ok {
 		t.Fatal("expected chat_template_kwargs in request body for qwen model")
 	}
-	kwargsMap, ok := kwargs.(map[string]interface{})
+	kwargsMap, ok := kwargs2.(map[string]interface{})
 	if !ok {
 		t.Fatal("chat_template_kwargs is not a map")
 	}
@@ -51,9 +50,9 @@ func TestChatTemplateKwargs_DeepseekV4WithThinkingDisabled(t *testing.T) {
 		Temperature: 0.3,
 		MaxTokens:   client.maxTokens,
 	}
-	if !client.enableThinking && (strings.Contains(client.model, "qwen3.6") || strings.Contains(client.model, "deepseek-v4")) {
-		reqBody.ChatTemplateKwargs = map[string]interface{}{"enable_thinking": false}
-	}
+	thinking, kwargs := client.buildThinkingConfig()
+	reqBody.Thinking = thinking
+	reqBody.ChatTemplateKwargs = kwargs
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -65,11 +64,11 @@ func TestChatTemplateKwargs_DeepseekV4WithThinkingDisabled(t *testing.T) {
 		t.Fatalf("unmarshal error: %v", err)
 	}
 
-	kwargs, ok := parsed["chat_template_kwargs"]
+	kwargs2, ok := parsed["chat_template_kwargs"]
 	if !ok {
 		t.Fatal("expected chat_template_kwargs in request body for deepseek-v4 model")
 	}
-	kwargsMap, ok := kwargs.(map[string]interface{})
+	kwargsMap, ok := kwargs2.(map[string]interface{})
 	if !ok {
 		t.Fatal("chat_template_kwargs is not a map")
 	}
@@ -87,9 +86,9 @@ func TestChatTemplateKwargs_DeepseekV4WithThinkingEnabled(t *testing.T) {
 		Temperature: 0.3,
 		MaxTokens:   client.maxTokens,
 	}
-	if !client.enableThinking && (strings.Contains(client.model, "qwen3.6") || strings.Contains(client.model, "deepseek-v4")) {
-		reqBody.ChatTemplateKwargs = map[string]interface{}{"enable_thinking": false}
-	}
+	thinking, kwargs := client.buildThinkingConfig()
+	reqBody.Thinking = thinking
+	reqBody.ChatTemplateKwargs = kwargs
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -115,9 +114,9 @@ func TestChatTemplateKwargs_ClaudeModel(t *testing.T) {
 		Temperature: 0.3,
 		MaxTokens:   client.maxTokens,
 	}
-	if !client.enableThinking && (strings.Contains(client.model, "qwen3.6") || strings.Contains(client.model, "deepseek-v4")) {
-		reqBody.ChatTemplateKwargs = map[string]interface{}{"enable_thinking": false}
-	}
+	thinking, kwargs := client.buildThinkingConfig()
+	reqBody.Thinking = thinking
+	reqBody.ChatTemplateKwargs = kwargs
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -143,9 +142,9 @@ func TestChatTemplateKwargs_QwenWithThinkingEnabled(t *testing.T) {
 		Temperature: 0.3,
 		MaxTokens:   client.maxTokens,
 	}
-	if !client.enableThinking && (strings.Contains(client.model, "qwen3.6") || strings.Contains(client.model, "deepseek-v4")) {
-		reqBody.ChatTemplateKwargs = map[string]interface{}{"enable_thinking": false}
-	}
+	thinking, kwargs := client.buildThinkingConfig()
+	reqBody.Thinking = thinking
+	reqBody.ChatTemplateKwargs = kwargs
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -173,9 +172,9 @@ func TestChatTemplateKwargs_CallWithTools_Qwen(t *testing.T) {
 		Tools:       []Tool{{Type: "function", Function: ToolFunction{Name: "test", Description: "test", Parameters: nil}}},
 		ToolChoice:  ToolChoice{Type: "function", Function: ToolChoiceFunction{Name: "test"}},
 	}
-	if !client.enableThinking && (strings.Contains(client.model, "qwen3.6") || strings.Contains(client.model, "deepseek-v4")) {
-		reqBody.ChatTemplateKwargs = map[string]interface{}{"enable_thinking": false}
-	}
+	thinking, kw := client.buildThinkingConfig()
+	reqBody.Thinking = thinking
+	reqBody.ChatTemplateKwargs = kw
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {

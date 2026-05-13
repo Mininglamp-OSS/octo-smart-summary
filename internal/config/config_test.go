@@ -1,7 +1,6 @@
 package config
 
 import (
-	"os"
 	"testing"
 )
 
@@ -21,6 +20,10 @@ func TestResolveMapMaxTokens_QwenModels(t *testing.T) {
 		{"Qwen3.6-Max", 400000},
 		{"DEEPSEEK-V4-FLASH", 400000},
 		{"ali/Qwen3.6-Flash", 400000},
+		{"kimi-k2.6", 150000},
+		{"kimi-k2.5", 150000},
+		{"mlamp/kimi-k2.6", 150000},
+		{"KIMI-K2.6", 150000},
 		{"unknown-model", 100000},
 	}
 	for _, tt := range tests {
@@ -41,9 +44,6 @@ func TestResolveMapMaxTokens_ExplicitOverride(t *testing.T) {
 }
 
 func TestResolveCharsPerTokenCJK(t *testing.T) {
-	// Ensure env is clean
-	os.Unsetenv("CHARS_PER_TOKEN_CJK")
-
 	tests := []struct {
 		name  string
 		model string
@@ -53,11 +53,16 @@ func TestResolveCharsPerTokenCJK(t *testing.T) {
 		{"qwen3.6-max defaults to 2", "qwen3.6-max", 2},
 		{"deepseek-v4-flash defaults to 2", "deepseek-v4-flash", 2},
 		{"deepseek-v4-pro defaults to 2", "deepseek-v4-pro", 2},
+		{"kimi-k2.6 defaults to 2", "kimi-k2.6", 2},
+		{"kimi-k2.5 defaults to 2", "kimi-k2.5", 2},
+		{"mlamp/kimi-k2.6 defaults to 2", "mlamp/kimi-k2.6", 2},
+		{"kimi_k2.6 defaults to 2", "kimi_k2.6", 2},
 		{"claude model defaults to 1", "claude-haiku-4-5", 1},
 		{"unknown model defaults to 1", "some-model", 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("CHARS_PER_TOKEN_CJK", "")
 			cfg := &Config{LLMModel: tt.model, CharsPerTokenCJK: 1}
 			if got := cfg.ResolveCharsPerTokenCJK(); got != tt.want {
 				t.Errorf("ResolveCharsPerTokenCJK() for model %q = %d, want %d", tt.model, got, tt.want)
@@ -67,10 +72,9 @@ func TestResolveCharsPerTokenCJK(t *testing.T) {
 }
 
 func TestResolveCharsPerTokenCJK_ExplicitEnvOverride(t *testing.T) {
-	os.Setenv("CHARS_PER_TOKEN_CJK", "3")
-	defer os.Unsetenv("CHARS_PER_TOKEN_CJK")
+	t.Setenv("CHARS_PER_TOKEN_CJK", "3")
 
-	cfg := &Config{LLMModel: "qwen3.6-flash", CharsPerTokenCJK: 3}
+	cfg := &Config{LLMModel: "kimi-k2.6", CharsPerTokenCJK: 3}
 	if got := cfg.ResolveCharsPerTokenCJK(); got != 3 {
 		t.Errorf("ResolveCharsPerTokenCJK() with explicit env = %d, want 3", got)
 	}
