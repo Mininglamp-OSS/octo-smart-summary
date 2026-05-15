@@ -14,7 +14,7 @@ func TestKimiThinkingDisabled_Call(t *testing.T) {
 	var capturedBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedBody, _ = io.ReadAll(r.Body)
-		w.Write([]byte(`{"choices":[{"message":{"content":"hello"}}],"usage":{"total_tokens":10}}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"hello"}}],"usage":{"total_tokens":10}}`))
 	}))
 	defer srv.Close()
 
@@ -58,7 +58,7 @@ func TestKimiThinkingDisabled_CallWithTools(t *testing.T) {
 	var capturedBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedBody, _ = io.ReadAll(r.Body)
-		w.Write([]byte(`{"choices":[{"message":{"tool_calls":[{"function":{"name":"resolve_topic","arguments":"{\"topic\":\"test\"}"}}]}}],"usage":{"total_tokens":50}}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"tool_calls":[{"function":{"name":"resolve_topic","arguments":"{\"topic\":\"test\"}"}}]}}],"usage":{"total_tokens":50}}`))
 	}))
 	defer srv.Close()
 
@@ -112,7 +112,7 @@ func TestNonKimiModel_NoThinking(t *testing.T) {
 	var capturedBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedBody, _ = io.ReadAll(r.Body)
-		w.Write([]byte(`{"choices":[{"message":{"content":"hello"}}],"usage":{"total_tokens":10}}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"hello"}}],"usage":{"total_tokens":10}}`))
 	}))
 	defer srv.Close()
 
@@ -137,7 +137,7 @@ func TestQwenModel_ChatTemplateKwargs(t *testing.T) {
 	var capturedBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedBody, _ = io.ReadAll(r.Body)
-		w.Write([]byte(`{"choices":[{"message":{"content":"hello"}}],"usage":{"total_tokens":10}}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"hello"}}],"usage":{"total_tokens":10}}`))
 	}))
 	defer srv.Close()
 
@@ -168,7 +168,7 @@ func TestKimiThinkingEnabled_NoInjection(t *testing.T) {
 	var capturedBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedBody, _ = io.ReadAll(r.Body)
-		w.Write([]byte(`{"choices":[{"message":{"content":"hello"}}],"usage":{"total_tokens":10}}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"hello"}}],"usage":{"total_tokens":10}}`))
 	}))
 	defer srv.Close()
 
@@ -188,7 +188,7 @@ func TestKimiThinkingEnabled_NoInjection(t *testing.T) {
 
 func TestKimiContentEmpty_ReasoningPresent(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"choices":[{"message":{"content":"","reasoning_content":"I think therefore I am..."}}],"usage":{"total_tokens":100,"completion_tokens":4096}}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"","reasoning_content":"I think therefore I am..."}}],"usage":{"total_tokens":100,"completion_tokens":4096}}`))
 	}))
 	defer srv.Close()
 
@@ -205,7 +205,7 @@ func TestKimiContentEmpty_ReasoningPresent(t *testing.T) {
 
 func TestKimiContentEmpty_ReasoningField(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"choices":[{"message":{"content":"","reasoning":"Thinking about this..."}, "finish_reason":"length"}],"usage":{"total_tokens":100,"completion_tokens":4096}}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"","reasoning":"Thinking about this..."}, "finish_reason":"length"}],"usage":{"total_tokens":100,"completion_tokens":4096}}`))
 	}))
 	defer srv.Close()
 
@@ -221,7 +221,7 @@ func TestKimiContentEmpty_ReasoningField(t *testing.T) {
 
 func TestKimiCallWithTools_ReasoningBudgetExhausted(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"choices":[{"message":{"tool_calls":[],"reasoning_content":"very long reasoning..."}}],"usage":{"total_tokens":100}}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"tool_calls":[],"reasoning_content":"very long reasoning..."}}],"usage":{"total_tokens":100}}`))
 	}))
 	defer srv.Close()
 
@@ -246,7 +246,7 @@ func TestKimiToolChoice_FunctionNameValidation(t *testing.T) {
 		attempt++
 		w.Header().Set("Content-Type", "application/json")
 		if attempt == 1 {
-			json.NewEncoder(w).Encode(map[string]interface{}{
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"choices": []map[string]interface{}{{
 					"message": map[string]interface{}{
 						"tool_calls": []map[string]interface{}{{
@@ -260,7 +260,7 @@ func TestKimiToolChoice_FunctionNameValidation(t *testing.T) {
 				"usage": map[string]interface{}{"total_tokens": 50},
 			})
 		} else {
-			json.NewEncoder(w).Encode(map[string]interface{}{
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"choices": []map[string]interface{}{{
 					"message": map[string]interface{}{
 						"tool_calls": []map[string]interface{}{
@@ -308,7 +308,7 @@ func TestNonKimiModel_ForcedToolChoice(t *testing.T) {
 	var capturedBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedBody, _ = io.ReadAll(r.Body)
-		w.Write([]byte(`{"choices":[{"message":{"tool_calls":[{"function":{"name":"resolve_topic","arguments":"{\"topic\":\"test\"}"}}]}}],"usage":{"total_tokens":100}}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"tool_calls":[{"function":{"name":"resolve_topic","arguments":"{\"topic\":\"test\"}"}}]}}],"usage":{"total_tokens":100}}`))
 	}))
 	defer srv.Close()
 
@@ -341,7 +341,7 @@ func TestNonKimiModel_ForcedToolChoice(t *testing.T) {
 
 func TestKimiToolChoice_AllRetriesFail(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"choices":[{"message":{"tool_calls":[]}}],"usage":{"total_tokens":10}}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"tool_calls":[]}}],"usage":{"total_tokens":10}}`))
 	}))
 	defer srv.Close()
 
@@ -359,7 +359,7 @@ func TestKimiToolChoice_AllRetriesFail(t *testing.T) {
 
 func TestCallWithTools_ReasoningFieldGatewayProxy(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"choices":[{"message":{"tool_calls":[],"reasoning":"long reasoning via gateway proxy..."}}],"usage":{"total_tokens":100}}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"tool_calls":[],"reasoning":"long reasoning via gateway proxy..."}}],"usage":{"total_tokens":100}}`))
 	}))
 	defer srv.Close()
 
@@ -380,7 +380,7 @@ func TestCallWithTools_ReasoningFieldGatewayProxy(t *testing.T) {
 
 func TestCallMap_PropagatesReasoningBudgetError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"choices":[{"message":{"content":"","reasoning_content":"very long reasoning..."}}],"usage":{"total_tokens":100,"completion_tokens":4096}}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"","reasoning_content":"very long reasoning..."}}],"usage":{"total_tokens":100,"completion_tokens":4096}}`))
 	}))
 	defer srv.Close()
 
@@ -405,7 +405,7 @@ func TestCallMap_PropagatesReasoningBudgetError(t *testing.T) {
 
 func TestCallMap_PropagatesTokenLimitError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"choices":[{"message":{"content":""},"finish_reason":"length"}],"usage":{"total_tokens":100,"completion_tokens":4096}}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":""},"finish_reason":"length"}],"usage":{"total_tokens":100,"completion_tokens":4096}}`))
 	}))
 	defer srv.Close()
 
@@ -428,7 +428,7 @@ func TestCallMap_PropagatesTokenLimitError(t *testing.T) {
 func TestCallMap_TransientErrorFallsBackToMarker(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(`internal server error`))
+		_, _ = w.Write([]byte(`internal server error`))
 	}))
 	defer srv.Close()
 

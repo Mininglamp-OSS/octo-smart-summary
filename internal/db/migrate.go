@@ -39,7 +39,7 @@ func RunMigrations(db *sql.DB) (int, error) {
 	if lockResult != 1 {
 		return 0, fmt.Errorf("failed to acquire migration lock (timeout %ds)", migrationLockTimeout)
 	}
-	defer conn.ExecContext(ctx, "SELECT RELEASE_LOCK(?)", migrationLockName)
+	defer func() { _, _ = conn.ExecContext(ctx, "SELECT RELEASE_LOCK(?)", migrationLockName) }()
 
 	source := &migrate.EmbedFileSystemMigrationSource{
 		FileSystem: migrationsql.FS,
