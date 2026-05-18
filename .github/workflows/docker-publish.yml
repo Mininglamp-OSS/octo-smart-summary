@@ -125,8 +125,14 @@ jobs:
     # Matrix dimension: 2 images × 2 architectures = 4 parallel build jobs.
     # Each emits a single-arch digest-only image to Docker Hub; the merge
     # job assembles the multi-arch manifest per image.
-    name: Build ${{ matrix.image }} ${{ matrix.platform }}
-    runs-on: ${{ matrix.runner }}
+    #
+    # SHAPE CONTRACT: `matrix.image` is an OBJECT here (with .name + .dockerfile)
+    # to keep the dockerfile path adjacent to the image name. The merge job
+    # below uses a SCALAR image matrix (just the name). Both shapes
+    # independently produce the same image-name string at the artifact /
+    # cache-scope boundary — keep them in sync if you ever rename keys here.
+    name: Build ${{ matrix.image.name }} ${{ matrix.platform.id }}
+    runs-on: ${{ matrix.platform.runner }}
     needs: validate
     # `docker-hub-publish` environment gates the Docker Hub credentials:
     #   - required reviewers (Mininglamp-OSS/maintainers team)
