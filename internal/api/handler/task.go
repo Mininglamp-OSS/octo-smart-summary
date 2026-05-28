@@ -102,6 +102,8 @@ type createSummaryReq struct {
 	Sources             []sourceReq  `json:"sources"`
 	Participants        []participantReq `json:"participants"`
 	ConfirmTimeoutHours int          `json:"confirm_timeout_hours"`
+	OriginChannelID     string       `json:"origin_channel_id"`
+	OriginChannelType   int          `json:"origin_channel_type"`
 }
 
 type timeRange struct {
@@ -147,6 +149,20 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 	if utf8.RuneCountInString(req.Topic) > 1000 {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "topic 不能超过 1000 字符"})
 		return
+	}
+	if req.OriginChannelID != "" && (req.OriginChannelType < model.OriginChannelGroup || req.OriginChannelType > model.OriginChannelDM) {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "origin_channel_type must be 1, 2, or 3 when origin_channel_id is set"})
+		return
+	}
+	if req.OriginChannelID == "" && req.OriginChannelType != 0 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "origin_channel_id is required when origin_channel_type is set"})
+		return
+	}
+	if len(req.Sources) == 0 && req.OriginChannelID != "" && req.OriginChannelType >= model.OriginChannelGroup && req.OriginChannelType <= model.OriginChannelDM {
+		req.Sources = []sourceReq{{
+			SourceType: req.OriginChannelType,
+			SourceID:   req.OriginChannelID,
+		}}
 	}
 	if len(req.Sources) == 0 && req.Topic == "" && req.TimeRange == nil {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "至少提供 sources、topic 或 time_range 之一"})
@@ -201,16 +217,18 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 	confirmDeadline := &dl
 
 	task := model.SummaryTask{
-		TaskNo:          taskNo,
-		SpaceID:         spaceID,
-		CreatorID:       effectiveUID,
-		Title:           title,
-		SummaryMode:     summaryMode,
-		TimeRangeStart:  timeStart,
-		TimeRangeEnd:    timeEnd,
-		Status:          initialStatus,
-		TriggerType:     model.TriggerManual,
-		ConfirmDeadline: confirmDeadline,
+		TaskNo:            taskNo,
+		SpaceID:           spaceID,
+		CreatorID:         effectiveUID,
+		Title:             title,
+		SummaryMode:       summaryMode,
+		TimeRangeStart:    timeStart,
+		TimeRangeEnd:      timeEnd,
+		Status:            initialStatus,
+		TriggerType:       model.TriggerManual,
+		ConfirmDeadline:   confirmDeadline,
+		OriginChannelID:   req.OriginChannelID,
+		OriginChannelType: req.OriginChannelType,
 	}
 
 	log.Printf("[handler] CreateSummary space=%s user=%s mode=%d", spaceID, effectiveUID, summaryMode)
@@ -333,6 +351,9 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	if s := c.Query("keyword"); s != "" {
 		query = query.Where("title LIKE ?", "%"+s+"%")
 	}
+	if s := c.Query("origin_channel_id"); s != "" {
+		query = query.Where("origin_channel_id = ?", s)
+	}
 	if s := c.Query("created_after"); s != "" {
 		if t, err := time.Parse(time.RFC3339, s); err == nil {
 			query = query.Where("created_at >= ?", t)
@@ -392,19 +413,21 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 		}
 
 		items = append(items, gin.H{
-			"task_id":          t.ID,
-			"task_no":          t.TaskNo,
-			"title":            t.Title,
-			"summary_mode":     t.SummaryMode,
-			"status":           t.Status,
-			"trigger_type":     t.TriggerType,
-			"time_range_start": t.TimeRangeStart.Format(time.RFC3339),
-			"time_range_end":   t.TimeRangeEnd.Format(time.RFC3339),
-			"sources":          srcList,
-			"total_msg_count":  totalMsgCount,
-			"creator_name":     creatorName,
-			"created_at":       t.CreatedAt.Format(time.RFC3339),
-			"completed_at":     completedAt,
+			"task_id":             t.ID,
+			"task_no":             t.TaskNo,
+			"title":              t.Title,
+			"summary_mode":       t.SummaryMode,
+			"status":             t.Status,
+			"trigger_type":       t.TriggerType,
+			"time_range_start":   t.TimeRangeStart.Format(time.RFC3339),
+			"time_range_end":     t.TimeRangeEnd.Format(time.RFC3339),
+			"sources":            srcList,
+			"total_msg_count":    totalMsgCount,
+			"creator_name":       creatorName,
+			"origin_channel_id":  t.OriginChannelID,
+			"origin_channel_type": t.OriginChannelType,
+			"created_at":         t.CreatedAt.Format(time.RFC3339),
+			"completed_at":       completedAt,
 		})
 	}
 
@@ -470,20 +493,22 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 	}
 
 	resp := gin.H{
-		"task_id":          task.ID,
-		"task_no":          task.TaskNo,
-		"title":            task.Title,
-		"summary_mode":     task.SummaryMode,
-		"status":           task.Status,
-		"trigger_type":     task.TriggerType,
-		"time_range_start": task.TimeRangeStart.Format(time.RFC3339),
-		"time_range_end":   task.TimeRangeEnd.Format(time.RFC3339),
-		"sources":          srcList,
-		"participants":     partList,
-		"result":           resultOut,
-		"error_message":    task.ErrorMessage,
-		"created_at":       task.CreatedAt.Format(time.RFC3339),
-		"updated_at":       task.UpdatedAt.Format(time.RFC3339),
+		"task_id":             task.ID,
+		"task_no":             task.TaskNo,
+		"title":              task.Title,
+		"summary_mode":       task.SummaryMode,
+		"status":             task.Status,
+		"trigger_type":       task.TriggerType,
+		"time_range_start":   task.TimeRangeStart.Format(time.RFC3339),
+		"time_range_end":     task.TimeRangeEnd.Format(time.RFC3339),
+		"sources":            srcList,
+		"participants":       partList,
+		"result":             resultOut,
+		"error_message":      task.ErrorMessage,
+		"origin_channel_id":  task.OriginChannelID,
+		"origin_channel_type": task.OriginChannelType,
+		"created_at":         task.CreatedAt.Format(time.RFC3339),
+		"updated_at":         task.UpdatedAt.Format(time.RFC3339),
 	}
 
 	if latestResult.ID > 0 {
@@ -683,6 +708,63 @@ func (h *TaskHandler) InferScope(c *gin.Context) {
 	}
 	result := service.InferScope(topic)
 	ok(c, result)
+}
+
+// GetTemplates handles GET /api/v1/summary-templates
+func (h *TaskHandler) GetTemplates(c *gin.Context) {
+	type placeholder struct {
+		Key      string `json:"key"`
+		Label    string `json:"label"`
+		Position []int  `json:"position,omitempty"`
+	}
+	type tmpl struct {
+		ID           string        `json:"id"`
+		Label        string        `json:"label"`
+		Icon         string        `json:"icon"`
+		Description  string        `json:"description"`
+		Type         string        `json:"type"`
+		Pattern      string        `json:"pattern"`
+		Placeholders []placeholder `json:"placeholders,omitempty"`
+	}
+
+	templates := []tmpl{
+		{
+			ID:           "project_progress",
+			Label:        "汇总项目进展",
+			Icon:         "FileText",
+			Description:  "与团队成员一起总结进展",
+			Type:         "parameterized",
+			Pattern:      "总结 {project_name} 的项目进展",
+			Placeholders: []placeholder{{Key: "project_name", Label: "输入项目名称", Position: []int{3, 9}}},
+		},
+		{
+			ID:           "task_tracking",
+			Label:        "跟踪任务进度",
+			Icon:         "ListChecks",
+			Description:  "邀请同事汇总任务完成情况",
+			Type:         "parameterized",
+			Pattern:      "总结 {task_name} 的完成情况",
+			Placeholders: []placeholder{{Key: "task_name", Label: "输入任务名称", Position: []int{3, 9}}},
+		},
+		{
+			ID:          "weekly_report",
+			Label:       "总结团队周报",
+			Icon:        "Calendar",
+			Description: "总结团队成员每周的工作",
+			Type:        "fixed",
+			Pattern:     "总结每周的工作周报",
+		},
+		{
+			ID:          "chat_content",
+			Label:       "总结聊天内容",
+			Icon:        "MessageSquare",
+			Description: "总结指定聊天中的事情进展",
+			Type:        "fixed",
+			Pattern:     "总结本群中的关键内容",
+		},
+	}
+
+	ok(c, gin.H{"templates": templates})
 }
 
 func (h *TaskHandler) triggerWorker(req model.WorkerTriggerRequest) {

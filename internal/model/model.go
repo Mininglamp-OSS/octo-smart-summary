@@ -82,6 +82,14 @@ const (
 	SourceDirect = 3
 )
 
+// Origin channel type constants.
+const (
+	OriginChannelGlobal = 0
+	OriginChannelGroup  = 1
+	OriginChannelThread = 2
+	OriginChannelDM     = 3
+)
+
 // Channel type constants (aligned with the IM server protocol).
 const (
 	ChannelTypeDM    = 1
@@ -103,6 +111,8 @@ type SummaryTask struct {
 	RetryCount         int        `gorm:"column:retry_count;type:tinyint;not null;default:0" json:"retry_count"`
 	ErrorMessage       *string    `gorm:"column:error_message;type:varchar(500)" json:"error_message"`
 	ScheduleID         *int64     `gorm:"column:schedule_id" json:"schedule_id"`
+	OriginChannelID    string     `gorm:"column:origin_channel_id;type:varchar(64);not null;default:'';index:idx_origin_channel" json:"origin_channel_id"`
+	OriginChannelType  int        `gorm:"column:origin_channel_type;type:tinyint;not null;default:0" json:"origin_channel_type"`
 	ProcessingDeadline *time.Time `gorm:"column:processing_deadline" json:"processing_deadline"`
 	ConfirmDeadline    *time.Time `gorm:"column:confirm_deadline" json:"confirm_deadline"`
 	CreatedAt          time.Time  `gorm:"column:created_at;not null" json:"created_at"`
