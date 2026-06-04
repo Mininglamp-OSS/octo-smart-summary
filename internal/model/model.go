@@ -269,6 +269,8 @@ type SummarySchedule struct {
 	SummaryMode       int        `gorm:"column:summary_mode;type:tinyint;not null" json:"summary_mode"`
 	CronExpr          string     `gorm:"column:cron_expr;type:varchar(50);not null" json:"cron_expr"`
 	IntervalDays      int        `gorm:"column:interval_days;type:int;not null;default:0" json:"interval_days"`
+	IntervalMonths    int        `gorm:"column:interval_months;type:int;not null;default:0" json:"interval_months"`
+	RunTime           string     `gorm:"column:run_time;type:varchar(5);not null;default:''" json:"run_time"`
 	TimeRangeType     int        `gorm:"column:time_range_type;type:tinyint;not null" json:"time_range_type"`
 	SourceConfig      JSON       `gorm:"column:source_config;type:json" json:"source_config"`
 	ParticipantConfig JSON       `gorm:"column:participant_config;type:json" json:"participant_config"`

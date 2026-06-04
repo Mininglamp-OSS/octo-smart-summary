@@ -26,21 +26,25 @@ func NewScheduleHandler(db *gorm.DB) *ScheduleHandler {
 }
 
 type createScheduleReq struct {
-	Title         string       `json:"title"`
-	CronExpr      string       `json:"cron_expr"`
-	IntervalDays  int          `json:"interval_days"`
-	TimeRangeType int          `json:"time_range_type"`
-	Sources       []sourceReq  `json:"sources"`
-	Participants  []participantReq `json:"participants"`
+	Title          string           `json:"title"`
+	CronExpr       string           `json:"cron_expr"`
+	IntervalDays   int              `json:"interval_days"`
+	IntervalMonths int              `json:"interval_months"`
+	RunTime        string           `json:"run_time"`
+	TimeRangeType  int              `json:"time_range_type"`
+	Sources        []sourceReq      `json:"sources"`
+	Participants   []participantReq `json:"participants"`
 }
 
 type updateScheduleReq struct {
-	Title         *string      `json:"title"`
-	CronExpr      *string      `json:"cron_expr"`
-	IntervalDays  *int         `json:"interval_days"`
-	TimeRangeType *int         `json:"time_range_type"`
-	Sources       []sourceReq  `json:"sources,omitempty"`
-	Participants  []participantReq `json:"participants,omitempty"`
+	Title          *string          `json:"title"`
+	CronExpr       *string          `json:"cron_expr"`
+	IntervalDays   *int             `json:"interval_days"`
+	IntervalMonths *int             `json:"interval_months"`
+	RunTime        *string          `json:"run_time"`
+	TimeRangeType  *int             `json:"time_range_type"`
+	Sources        []sourceReq      `json:"sources,omitempty"`
+	Participants   []participantReq `json:"participants,omitempty"`
 }
 
 type toggleScheduleReq struct {
@@ -64,17 +68,16 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 	}
 
 	now := time.Now().UTC()
-	if req.IntervalDays < 0 {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40011, Message: "interval_days 不能为负"})
+	// ValidateInterval enforces bounds (overflow guard) and mutual exclusivity
+	// of cron_expr / interval_days / interval_months in one place, shared with
+	// update and toggle.
+	if err := service.ValidateInterval(req.CronExpr, req.IntervalDays, req.IntervalMonths); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40011, Message: err.Error()})
 		return
 	}
-	if req.IntervalDays == 0 && req.CronExpr == "" {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40012, Message: "cron_expr 与 interval_days 至少提供一个"})
-		return
-	}
-	nextRun, err := service.NextRunWithInterval(req.CronExpr, req.IntervalDays, now)
+	nextRun, err := service.NextRunWithInterval(req.CronExpr, req.IntervalDays, req.IntervalMonths, req.RunTime, now)
 	if err != nil {
-		c.JSON(http.StatusUnprocessableEntity, apiResponse{Code: 40010, Message: "无效的 cron 表达式: " + req.CronExpr})
+		c.JSON(http.StatusUnprocessableEntity, apiResponse{Code: 40010, Message: "无效的调度配置: " + err.Error()})
 		return
 	}
 
@@ -102,6 +105,8 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		SummaryMode:       summaryMode,
 		CronExpr:          req.CronExpr,
 		IntervalDays:      req.IntervalDays,
+		IntervalMonths:    req.IntervalMonths,
+		RunTime:           req.RunTime,
 		TimeRangeType:     req.TimeRangeType,
 		SourceConfig:      sourceConfig,
 		ParticipantConfig: participantConfig,
@@ -136,6 +141,8 @@ func (h *ScheduleHandler) ListSchedules(c *gin.Context) {
 			"summary_mode":       s.SummaryMode,
 			"cron_expr":          s.CronExpr,
 			"interval_days":      s.IntervalDays,
+			"interval_months":    s.IntervalMonths,
+			"run_time":           s.RunTime,
 			"time_range_type":    s.TimeRangeType,
 			"source_config":      s.SourceConfig,
 			"participant_config": s.ParticipantConfig,
@@ -175,6 +182,8 @@ func (h *ScheduleHandler) GetSchedule(c *gin.Context) {
 		"summary_mode":       sched.SummaryMode,
 		"cron_expr":          sched.CronExpr,
 		"interval_days":      sched.IntervalDays,
+		"interval_months":    sched.IntervalMonths,
+		"run_time":           sched.RunTime,
 		"time_range_type":    sched.TimeRangeType,
 		"source_config":      sched.SourceConfig,
 		"participant_config": sched.ParticipantConfig,
@@ -228,9 +237,12 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 	}
 
 	// Determine effective cron/interval after this update to recompute next_run_at
-	// whenever either scheduling field changes.
+	// whenever any scheduling field changes. Validation + mutual exclusivity go
+	// through service.ValidateInterval so create/update/toggle stay consistent.
 	effCron := sched.CronExpr
-	effInterval := sched.IntervalDays
+	effIntervalDays := sched.IntervalDays
+	effIntervalMonths := sched.IntervalMonths
+	effRunTime := sched.RunTime
 	schedChanged := false
 	if req.CronExpr != nil {
 		effCron = *req.CronExpr
@@ -238,22 +250,38 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		schedChanged = true
 	}
 	if req.IntervalDays != nil {
-		if *req.IntervalDays < 0 {
-			c.JSON(http.StatusBadRequest, apiResponse{Code: 40011, Message: "interval_days 不能为负"})
-			return
-		}
-		effInterval = *req.IntervalDays
+		effIntervalDays = *req.IntervalDays
 		updates["interval_days"] = *req.IntervalDays
 		schedChanged = true
 	}
+	if req.IntervalMonths != nil {
+		effIntervalMonths = *req.IntervalMonths
+		updates["interval_months"] = *req.IntervalMonths
+		schedChanged = true
+	}
+	if req.RunTime != nil {
+		effRunTime = *req.RunTime
+		updates["run_time"] = *req.RunTime
+		schedChanged = true
+	}
 	if schedChanged {
-		if effInterval == 0 && effCron == "" {
-			c.JSON(http.StatusBadRequest, apiResponse{Code: 40012, Message: "cron_expr 与 interval_days 至少提供一个"})
-			return
+		// When switching to an interval mode, the caller may not have cleared the
+		// old cron_expr (or vice versa). Enforce a single active source so the
+		// recompute is unambiguous: if an interval is now set, drop cron; if cron
+		// is now set, drop intervals.
+		if effIntervalDays > 0 || effIntervalMonths > 0 {
+			effCron = ""
+			updates["cron_expr"] = ""
 		}
-		nextRun, err := service.NextRunWithInterval(effCron, effInterval, time.Now().UTC())
+		if effCron != "" {
+			effIntervalDays = 0
+			effIntervalMonths = 0
+			updates["interval_days"] = 0
+			updates["interval_months"] = 0
+		}
+		nextRun, err := service.NextRunWithInterval(effCron, effIntervalDays, effIntervalMonths, effRunTime, time.Now().UTC())
 		if err != nil {
-			c.JSON(http.StatusUnprocessableEntity, apiResponse{Code: 40010, Message: "无效的 cron 表达式: " + effCron})
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40011, Message: err.Error()})
 			return
 		}
 		updates["next_run_at"] = nextRun
@@ -339,10 +367,14 @@ func (h *ScheduleHandler) ToggleSchedule(c *gin.Context) {
 	updates := map[string]interface{}{}
 	if req.IsActive {
 		updates["is_active"] = 1
-		if sched.CronExpr != "" {
-			if nextRun, err := service.NextRun(sched.CronExpr, time.Now().UTC()); err == nil {
-				updates["next_run_at"] = nextRun
-			}
+		// CRITICAL: recompute next_run_at for ALL recurrence types on re-enable.
+		// Previously only cron was recomputed, so an interval task (cron_expr
+		// empty) kept its stale, already-past next_run_at and fired immediately
+		// on the next scan. Route through the same NextRunWithInterval used by
+		// create/update/scheduler so the next run is always at least one full
+		// interval (or next cron tick) into the future.
+		if nextRun, err := service.NextRunWithInterval(sched.CronExpr, sched.IntervalDays, sched.IntervalMonths, sched.RunTime, time.Now().UTC()); err == nil {
+			updates["next_run_at"] = nextRun
 		}
 	} else {
 		updates["is_active"] = 0
