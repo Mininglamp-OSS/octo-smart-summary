@@ -125,7 +125,7 @@ func scanPendingSchedules(db *gorm.DB) {
 		}
 
 		// Update schedule: last_run_at and next_run_at
-		nextRun, err := service.NextRun(sched.CronExpr, now)
+		nextRun, err := service.NextRunWithInterval(sched.CronExpr, sched.IntervalDays, now)
 		if err != nil {
 			log.Printf("[scheduler] compute next run for schedule %d: %v", sched.ID, err)
 			continue

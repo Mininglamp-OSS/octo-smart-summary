@@ -27,7 +27,8 @@ func NewScheduleHandler(db *gorm.DB) *ScheduleHandler {
 
 type createScheduleReq struct {
 	Title         string       `json:"title"`
-	CronExpr      string       `json:"cron_expr" binding:"required"`
+	CronExpr      string       `json:"cron_expr"`
+	IntervalDays  int          `json:"interval_days"`
 	TimeRangeType int          `json:"time_range_type"`
 	Sources       []sourceReq  `json:"sources"`
 	Participants  []participantReq `json:"participants"`
@@ -36,6 +37,7 @@ type createScheduleReq struct {
 type updateScheduleReq struct {
 	Title         *string      `json:"title"`
 	CronExpr      *string      `json:"cron_expr"`
+	IntervalDays  *int         `json:"interval_days"`
 	TimeRangeType *int         `json:"time_range_type"`
 	Sources       []sourceReq  `json:"sources,omitempty"`
 	Participants  []participantReq `json:"participants,omitempty"`
@@ -62,7 +64,15 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 	}
 
 	now := time.Now().UTC()
-	nextRun, err := service.NextRun(req.CronExpr, now)
+	if req.IntervalDays < 0 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40011, Message: "interval_days 不能为负"})
+		return
+	}
+	if req.IntervalDays == 0 && req.CronExpr == "" {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40012, Message: "cron_expr 与 interval_days 至少提供一个"})
+		return
+	}
+	nextRun, err := service.NextRunWithInterval(req.CronExpr, req.IntervalDays, now)
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, apiResponse{Code: 40010, Message: "无效的 cron 表达式: " + req.CronExpr})
 		return
@@ -91,6 +101,7 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		Title:             req.Title,
 		SummaryMode:       summaryMode,
 		CronExpr:          req.CronExpr,
+		IntervalDays:      req.IntervalDays,
 		TimeRangeType:     req.TimeRangeType,
 		SourceConfig:      sourceConfig,
 		ParticipantConfig: participantConfig,
@@ -124,6 +135,7 @@ func (h *ScheduleHandler) ListSchedules(c *gin.Context) {
 			"title":              s.Title,
 			"summary_mode":       s.SummaryMode,
 			"cron_expr":          s.CronExpr,
+			"interval_days":      s.IntervalDays,
 			"time_range_type":    s.TimeRangeType,
 			"source_config":      s.SourceConfig,
 			"participant_config": s.ParticipantConfig,
@@ -162,6 +174,7 @@ func (h *ScheduleHandler) GetSchedule(c *gin.Context) {
 		"title":              sched.Title,
 		"summary_mode":       sched.SummaryMode,
 		"cron_expr":          sched.CronExpr,
+		"interval_days":      sched.IntervalDays,
 		"time_range_type":    sched.TimeRangeType,
 		"source_config":      sched.SourceConfig,
 		"participant_config": sched.ParticipantConfig,
@@ -213,13 +226,36 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 	if req.Title != nil {
 		updates["title"] = *req.Title
 	}
+
+	// Determine effective cron/interval after this update to recompute next_run_at
+	// whenever either scheduling field changes.
+	effCron := sched.CronExpr
+	effInterval := sched.IntervalDays
+	schedChanged := false
 	if req.CronExpr != nil {
-		nextRun, err := service.NextRun(*req.CronExpr, time.Now().UTC())
-		if err != nil {
-			c.JSON(http.StatusUnprocessableEntity, apiResponse{Code: 40010, Message: "无效的 cron 表达式: " + *req.CronExpr})
+		effCron = *req.CronExpr
+		updates["cron_expr"] = *req.CronExpr
+		schedChanged = true
+	}
+	if req.IntervalDays != nil {
+		if *req.IntervalDays < 0 {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40011, Message: "interval_days 不能为负"})
 			return
 		}
-		updates["cron_expr"] = *req.CronExpr
+		effInterval = *req.IntervalDays
+		updates["interval_days"] = *req.IntervalDays
+		schedChanged = true
+	}
+	if schedChanged {
+		if effInterval == 0 && effCron == "" {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40012, Message: "cron_expr 与 interval_days 至少提供一个"})
+			return
+		}
+		nextRun, err := service.NextRunWithInterval(effCron, effInterval, time.Now().UTC())
+		if err != nil {
+			c.JSON(http.StatusUnprocessableEntity, apiResponse{Code: 40010, Message: "无效的 cron 表达式: " + effCron})
+			return
+		}
 		updates["next_run_at"] = nextRun
 	}
 	if req.TimeRangeType != nil {
