@@ -271,6 +271,12 @@ type SummarySchedule struct {
 	IntervalDays      int        `gorm:"column:interval_days;type:int;not null;default:0" json:"interval_days"`
 	IntervalMonths    int        `gorm:"column:interval_months;type:int;not null;default:0" json:"interval_months"`
 	RunTime           string     `gorm:"column:run_time;type:varchar(5);not null;default:''" json:"run_time"`
+	// DayOfWeek aligns WEEK mode (interval_days multiple of 7) to a specific
+	// weekday: 1=Mon..7=Sun, 0=unconstrained. Ignored for non-week modes.
+	DayOfWeek int `gorm:"column:day_of_week;type:tinyint;not null;default:0" json:"day_of_week"`
+	// DayOfMonth aligns MONTH mode (interval_months>0) to a specific day:
+	// 1..31 (clamped to month end), 0=unconstrained. Ignored for non-month modes.
+	DayOfMonth int `gorm:"column:day_of_month;type:tinyint;not null;default:0" json:"day_of_month"`
 	TimeRangeType     int        `gorm:"column:time_range_type;type:tinyint;not null" json:"time_range_type"`
 	SourceConfig      JSON       `gorm:"column:source_config;type:json" json:"source_config"`
 	ParticipantConfig JSON       `gorm:"column:participant_config;type:json" json:"participant_config"`

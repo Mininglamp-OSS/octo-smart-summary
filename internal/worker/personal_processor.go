@@ -11,6 +11,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timing"
 	"gorm.io/gorm"
 )
 
@@ -38,7 +40,7 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 	}
 
 	// CAS: only proceed if worker_status is still Pending (prevents duplicate runs)
-	now := time.Now().UTC()
+	now := timezone.Now()
 	cas := p.db.Model(&pr).
 		Where("worker_status = ?", model.PersonalStatusPending).
 		Update("worker_status", model.PersonalStatusProcessing)
@@ -52,7 +54,7 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 	})
 
 	// CAS update task status to PROCESSING (from any earlier state)
-	deadline := time.Now().UTC().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute)
+	deadline := timezone.Now().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute)
 	taskCAS := p.db.Model(&model.SummaryTask{}).
 		Where("id = ? AND status IN (?, ?)", taskID, model.StatusPending, model.StatusWaitingConfirm).
 		Updates(map[string]interface{}{
@@ -102,7 +104,8 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 	}
 
 	pr.SetCitations(citations)
-	genAt := time.Now().UTC()
+	genAt := timezone.Now()
+	persistStart := time.Now()
 	p.db.Model(&pr).Updates(map[string]interface{}{
 		"content":          content,
 		"citations_json":   pr.CitationsJSON,
@@ -115,6 +118,7 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 	p.db.Model(&participant).Updates(map[string]interface{}{
 		"status": model.ParticipantCompleted,
 	})
+	timing.Observe(task.TaskNo, "persist_personal_result", persistStart)
 
 	// Send directed WS notification to the specific user
 	p.sendCallback(model.TaskEvent{
@@ -229,6 +233,8 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 
 func (p *Processor) executePersonalPipeline(ctx context.Context, task model.SummaryTask, userID string) (string, []model.Citation, int, int, string, error) {
 	totalStart := time.Now()
+	taskNo := task.TaskNo
+	defer func() { timing.Observe(taskNo, "personal_pipeline_total", totalStart) }()
 
 	// Load sources
 	var sources []model.SummarySource
@@ -264,6 +270,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		}
 	}
 
+	fetchStart := time.Now()
 	messages, err := pipeline.ResolveAndFetchMessagesForPersonal(
 		ctx, userID, nil, nil, specifiedSources, task.Title,
 		task.TimeRangeStart, task.TimeRangeEnd,
@@ -271,6 +278,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency,
 		channelScopeOpts,
 	)
+	timing.Observe(taskNo, "fetch_messages", fetchStart)
 	if err != nil {
 		return "", nil, 0, 0, "", fmt.Errorf("fetch messages: %w", err)
 	}
@@ -278,6 +286,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	// Resolve sender names (moved before FilterWithContext for ResolveTopicTarget)
 	resolveStart := time.Now()
 	nameMap := p.batchResolveUserNames(messages)
+	timing.Observe(taskNo, "resolve_user_names", resolveStart)
 	log.Printf("[personal-worker] batchResolveUserNames took %dms (%d names)",
 		time.Since(resolveStart).Milliseconds(), len(nameMap))
 
@@ -430,6 +439,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		}(i, chunk)
 	}
 	mapWg.Wait()
+	timing.Observe(taskNo, "llm_map_summary", mapStart)
 	log.Printf("[personal-worker] Map phase took %dms (%d chunks, concurrency=%d)",
 		time.Since(mapStart).Milliseconds(), len(chunks), concurrency)
 
@@ -481,6 +491,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		}
 	}
 	totalTokens += reduceTokens
+	timing.Observe(taskNo, "llm_reduce_summary", reduceStart)
 	log.Printf("[personal-worker] Reduce phase took %dms", time.Since(reduceStart).Milliseconds())
 
 	// Build citations from final content
@@ -488,6 +499,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	citations := buildCitations(finalContent, userMessages, messages, nameMap)
 	finalContent, citations = dedupCitations(finalContent, citations)
 	finalContent = stripOrphanCitations(finalContent, citations)
+	timing.Observe(taskNo, "build_citations", citationStart)
 	log.Printf("[personal-worker] Citation build took %dms (%d citations)",
 		time.Since(citationStart).Milliseconds(), len(citations))
 

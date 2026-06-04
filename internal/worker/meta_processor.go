@@ -11,6 +11,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 )
 
 // MetaProcessor handles meta-summary generation with debounce and mutex.
@@ -165,7 +166,7 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 
 		// Save result (new version)
 		nextVer, _ := service.GetNextVersion(m.proc.db, taskID)
-		now := time.Now().UTC()
+		now := timezone.Now()
 
 		// Count total messages across all submitted personal results
 		var totalMsgCount int

@@ -13,6 +13,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timing"
 	"gorm.io/gorm"
 )
 
@@ -89,7 +91,7 @@ func (p *Processor) Stop() {
 }
 
 func (p *Processor) poll() {
-	now := time.Now().UTC()
+	now := timezone.Now()
 	deadline := now.Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute)
 
 	// Claim tasks atomically: two-step select-then-claim per task.
@@ -184,7 +186,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 	// dispatch and the task is stuck in Processing forever. Create them here
 	// (idempotently) so the personal pipeline can run end-to-end.
 	if participantCount == 0 {
-		now := time.Now().UTC()
+		now := timezone.Now()
 		creatorP := model.SummaryParticipant{
 			TaskID:      task.ID,
 			UserID:      task.CreatorID,
@@ -217,7 +219,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 		casResult := p.db.Model(&model.SummaryTask{}).
 			Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
 			Updates(map[string]interface{}{
-				"processing_deadline": time.Now().UTC().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute),
+				"processing_deadline": timezone.Now().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute),
 			})
 		if casResult.Error != nil {
 			log.Printf("[processor] task %d CAS update failed: %v", task.ID, casResult.Error)
@@ -250,7 +252,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 		casResult := p.db.Model(&model.SummaryTask{}).
 			Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
 			Updates(map[string]interface{}{
-				"processing_deadline": time.Now().UTC().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute),
+				"processing_deadline": timezone.Now().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute),
 			})
 		if casResult.Error != nil {
 			log.Printf("[processor] task %d CAS update failed: %v", task.ID, casResult.Error)
@@ -271,6 +273,8 @@ func (p *Processor) processTask(task model.SummaryTask) {
 }
 
 func (p *Processor) executePipeline(task model.SummaryTask) error {
+	pipelineStart := time.Now()
+	defer func() { timing.Observe(task.TaskNo, "execute_pipeline_total", pipelineStart) }()
 	ctx := context.Background()
 
 	// Load sources
@@ -322,12 +326,14 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 		}
 	}
 
+	fetchStart := time.Now()
 	messages, err = pipeline.ResolveAndFetchMessagesForPersonal(
 		ctx, task.CreatorID, participantUIDs, participantNames, specifiedSources, task.Title,
 		task.TimeRangeStart, task.TimeRangeEnd,
 		p.imDB, toolCallFn, llmFn, p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency,
 		channelScopeOpts,
 	)
+	timing.Observe(task.TaskNo, "fetch_messages", fetchStart)
 	if err != nil {
 		return fmt.Errorf("fetch messages: %w", err)
 	}

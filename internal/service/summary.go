@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"math/rand"
 	"strings"
-	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"gorm.io/gorm"
 )
 
@@ -28,7 +28,7 @@ func NewBizError(code int, message string, httpStatus int) *BizError {
 
 // GenerateTaskNo creates a unique task number.
 func GenerateTaskNo() string {
-	now := time.Now().UTC()
+	now := timezone.Now()
 	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
 	b := make([]byte, 8)
 	for i := range b {

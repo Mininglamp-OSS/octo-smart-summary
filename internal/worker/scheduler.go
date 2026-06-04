@@ -9,6 +9,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/robfig/cron/v3"
 	"gorm.io/gorm"
 )
@@ -31,7 +32,7 @@ func StartScheduler(db *gorm.DB, maxRetry int, workerTriggerURL string) *cron.Cr
 
 // scanPendingSchedules creates tasks from due schedules.
 func scanPendingSchedules(db *gorm.DB) {
-	now := time.Now().UTC()
+	now := timezone.Now()
 	var schedules []model.SummarySchedule
 	err := db.Where("is_active = 1 AND next_run_at <= ? AND deleted_at IS NULL", now).Find(&schedules).Error
 	if err != nil {
@@ -48,7 +49,7 @@ func scanPendingSchedules(db *gorm.DB) {
 		// each cycle and burning LLM cost. Now: if next_run can't be computed, we
 		// disable the schedule (is_active=0) and log an alert, then skip task
 		// creation entirely. A human can inspect/fix and re-enable.
-		nextRun, nrErr := service.NextRunWithInterval(sched.CronExpr, sched.IntervalDays, sched.IntervalMonths, sched.RunTime, now)
+		nextRun, nrErr := service.NextRunWithInterval(sched.CronExpr, sched.IntervalDays, sched.IntervalMonths, sched.RunTime, sched.DayOfWeek, sched.DayOfMonth, now)
 		if nrErr != nil {
 			log.Printf("[scheduler] ALERT schedule %d has invalid recurrence (%v); disabling to stop repeated re-scan/cost", sched.ID, nrErr)
 			db.Model(&model.SummarySchedule{}).Where("id = ?", sched.ID).
@@ -108,7 +109,7 @@ func scanPendingSchedules(db *gorm.DB) {
 			// CreateSummary path. Without this, the task has 0 participants and the
 			// processor's single-participant branch dispatches nothing, leaving the
 			// task stuck in Processing with no summary_result.
-			now := time.Now().UTC()
+			now := timezone.Now()
 			creatorP := model.SummaryParticipant{
 				TaskID:      task.ID,
 				UserID:      sched.CreatorID,
@@ -153,7 +154,7 @@ func scanPendingSchedules(db *gorm.DB) {
 // scanConfirmTimeouts auto-declines participants still in WaitingConfirm
 // past the task's confirm_deadline.
 func scanConfirmTimeouts(db *gorm.DB) {
-	now := time.Now().UTC()
+	now := timezone.Now()
 
 	// Find tasks with confirm_deadline passed that still have WaitingConfirm participants
 	var taskIDs []int64
@@ -178,7 +179,7 @@ func scanConfirmTimeouts(db *gorm.DB) {
 // scanStuckTasks resets tasks stuck in processing past their deadline.
 // Increments retry_count; if max retries exceeded, marks as Failed.
 func scanStuckTasks(db *gorm.DB, maxRetry int) {
-	now := time.Now().UTC()
+	now := timezone.Now()
 
 	// Reset tasks that can still retry (also handle NULL deadline for legacy data)
 	result := db.Model(&model.SummaryTask{}).
@@ -211,7 +212,7 @@ func scanStuckTasks(db *gorm.DB, maxRetry int) {
 // scanStuckPersonalTasks resets personal summaries stuck in processing
 // and detects accepted participants with PENDING personal_result that were never triggered.
 func scanStuckPersonalTasks(db *gorm.DB, workerTriggerURL string) {
-	now := time.Now().UTC()
+	now := timezone.Now()
 	leaseTimeout := now.Add(-10 * time.Minute)
 
 	// Find participants stuck in processing

@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -31,6 +32,8 @@ type createScheduleReq struct {
 	IntervalDays   int              `json:"interval_days"`
 	IntervalMonths int              `json:"interval_months"`
 	RunTime        string           `json:"run_time"`
+	DayOfWeek      int              `json:"day_of_week"`
+	DayOfMonth     int              `json:"day_of_month"`
 	TimeRangeType  int              `json:"time_range_type"`
 	Sources        []sourceReq      `json:"sources"`
 	Participants   []participantReq `json:"participants"`
@@ -42,6 +45,8 @@ type updateScheduleReq struct {
 	IntervalDays   *int             `json:"interval_days"`
 	IntervalMonths *int             `json:"interval_months"`
 	RunTime        *string          `json:"run_time"`
+	DayOfWeek      *int             `json:"day_of_week"`
+	DayOfMonth     *int             `json:"day_of_month"`
 	TimeRangeType  *int             `json:"time_range_type"`
 	Sources        []sourceReq      `json:"sources,omitempty"`
 	Participants   []participantReq `json:"participants,omitempty"`
@@ -67,7 +72,7 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		return
 	}
 
-	now := time.Now().UTC()
+	now := timezone.Now()
 	// ValidateIntervalForWrite enforces interval-only writes (cron is legacy
 	// read+execute-only), bounds (overflow guard) and mutual exclusivity of
 	// interval_days / interval_months in one place.
@@ -81,7 +86,18 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40012, Message: err.Error()})
 		return
 	}
-	nextRun, err := service.NextRunWithInterval(req.CronExpr, req.IntervalDays, req.IntervalMonths, req.RunTime, now)
+	if err := service.ValidateDayOfWeek(req.DayOfWeek); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40013, Message: err.Error()})
+		return
+	}
+	if err := service.ValidateDayOfMonth(req.DayOfMonth); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40014, Message: err.Error()})
+		return
+	}
+	// NextRunInitial: if today's selected run_time is still ahead of now, fire
+	// today (需求1); otherwise advance one full interval. Aligns week mode to
+	// day_of_week and month mode to day_of_month (需求4).
+	nextRun, err := service.NextRunInitial(req.CronExpr, req.IntervalDays, req.IntervalMonths, req.RunTime, req.DayOfWeek, req.DayOfMonth, now)
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, apiResponse{Code: 40010, Message: "无效的调度配置: " + err.Error()})
 		return
@@ -113,6 +129,8 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		IntervalDays:      req.IntervalDays,
 		IntervalMonths:    req.IntervalMonths,
 		RunTime:           req.RunTime,
+		DayOfWeek:         req.DayOfWeek,
+		DayOfMonth:        req.DayOfMonth,
 		TimeRangeType:     req.TimeRangeType,
 		SourceConfig:      sourceConfig,
 		ParticipantConfig: participantConfig,
@@ -149,6 +167,8 @@ func (h *ScheduleHandler) ListSchedules(c *gin.Context) {
 			"interval_days":      s.IntervalDays,
 			"interval_months":    s.IntervalMonths,
 			"run_time":           s.RunTime,
+			"day_of_week":        s.DayOfWeek,
+			"day_of_month":       s.DayOfMonth,
 			"time_range_type":    s.TimeRangeType,
 			"source_config":      s.SourceConfig,
 			"participant_config": s.ParticipantConfig,
@@ -190,6 +210,8 @@ func (h *ScheduleHandler) GetSchedule(c *gin.Context) {
 		"interval_days":      sched.IntervalDays,
 		"interval_months":    sched.IntervalMonths,
 		"run_time":           sched.RunTime,
+		"day_of_week":        sched.DayOfWeek,
+		"day_of_month":       sched.DayOfMonth,
 		"time_range_type":    sched.TimeRangeType,
 		"source_config":      sched.SourceConfig,
 		"participant_config": sched.ParticipantConfig,
@@ -249,6 +271,8 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 	effIntervalDays := sched.IntervalDays
 	effIntervalMonths := sched.IntervalMonths
 	effRunTime := sched.RunTime
+	effDayOfWeek := sched.DayOfWeek
+	effDayOfMonth := sched.DayOfMonth
 	schedChanged := false
 	if req.CronExpr != nil {
 		effCron = *req.CronExpr
@@ -275,6 +299,24 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		updates["run_time"] = *req.RunTime
 		schedChanged = true
 	}
+	if req.DayOfWeek != nil {
+		effDayOfWeek = *req.DayOfWeek
+		if err := service.ValidateDayOfWeek(*req.DayOfWeek); err != nil {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40013, Message: err.Error()})
+			return
+		}
+		updates["day_of_week"] = *req.DayOfWeek
+		schedChanged = true
+	}
+	if req.DayOfMonth != nil {
+		effDayOfMonth = *req.DayOfMonth
+		if err := service.ValidateDayOfMonth(*req.DayOfMonth); err != nil {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40014, Message: err.Error()})
+			return
+		}
+		updates["day_of_month"] = *req.DayOfMonth
+		schedChanged = true
+	}
 	if schedChanged {
 		// Interval-only write contract: reject any attempt to set/keep a cron
 		// expression through update. Legacy cron tasks remain executable but can
@@ -292,7 +334,7 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40011, Message: err.Error()})
 			return
 		}
-		nextRun, err := service.NextRunWithInterval(effCron, effIntervalDays, effIntervalMonths, effRunTime, time.Now().UTC())
+		nextRun, err := service.NextRunInitial(effCron, effIntervalDays, effIntervalMonths, effRunTime, effDayOfWeek, effDayOfMonth, timezone.Now())
 		if err != nil {
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40011, Message: err.Error()})
 			return
@@ -345,7 +387,7 @@ func (h *ScheduleHandler) DeleteSchedule(c *gin.Context) {
 		return
 	}
 
-	now := time.Now().UTC()
+	now := timezone.Now()
 	h.db.Model(&sched).Update("deleted_at", &now)
 
 	ok(c, nil)
@@ -386,7 +428,7 @@ func (h *ScheduleHandler) ToggleSchedule(c *gin.Context) {
 		// on the next scan. Route through the same NextRunWithInterval used by
 		// create/update/scheduler so the next run is always at least one full
 		// interval (or next cron tick) into the future.
-		if nextRun, err := service.NextRunWithInterval(sched.CronExpr, sched.IntervalDays, sched.IntervalMonths, sched.RunTime, time.Now().UTC()); err == nil {
+		if nextRun, err := service.NextRunWithInterval(sched.CronExpr, sched.IntervalDays, sched.IntervalMonths, sched.RunTime, sched.DayOfWeek, sched.DayOfMonth, timezone.Now()); err == nil {
 			updates["next_run_at"] = nextRun
 		}
 	} else {

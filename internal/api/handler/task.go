@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -161,7 +162,7 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		timeStart = req.TimeRange.Start
 		timeEnd = req.TimeRange.End
 	} else {
-		timeEnd = time.Now().UTC()
+		timeEnd = timezone.Now()
 		timeStart = timeEnd.Add(-31 * 24 * time.Hour)
 	}
 
@@ -197,7 +198,7 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 	}
 
 	initialStatus := model.StatusPending
-	dl := time.Now().UTC().Add(time.Duration(req.ConfirmTimeoutHours) * time.Hour)
+	dl := timezone.Now().Add(time.Duration(req.ConfirmTimeoutHours) * time.Hour)
 	confirmDeadline := &dl
 
 	task := model.SummaryTask{
@@ -231,7 +232,7 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 				return err
 			}
 		}
-		now := time.Now().UTC()
+		now := timezone.Now()
 		creatorP := model.SummaryParticipant{
 			TaskID:      task.ID,
 			UserID:      effectiveUID,
@@ -718,7 +719,7 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 	// Soft delete: set status = -1 AND deleted_at = NOW()
 	if err := h.db.Model(task).Updates(map[string]interface{}{
 		"status":     -1,
-		"deleted_at": time.Now().UTC(),
+		"deleted_at": timezone.Now(),
 	}).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
 		return

@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -114,7 +115,7 @@ func (h *EditHandler) EditSummary(c *gin.Context) {
 	tempResult.SetCitations(cleanedCitations)
 	citationsJSON = tempResult.CitationsJSON
 
-	now := time.Now().UTC()
+	now := timezone.Now()
 
 	err = h.db.Transaction(func(tx *gorm.DB) error {
 		result := tx.Model(&model.SummaryResult{}).

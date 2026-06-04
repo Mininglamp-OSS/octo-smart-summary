@@ -37,24 +37,136 @@ func NextRun(cronExpr string, from time.Time) (time.Time, error) {
 //  2. intervalDays   > 0  -> fixed N*24h interval (day = N*1, week = N*7).
 //  3. otherwise           -> standard cron expression.
 //
-// For the two interval modes runTime ("HH:MM", UTC) anchors the time-of-day so
-// the run hour stays stable regardless of when the scheduler actually fired.
-// An empty runTime keeps the time-of-day of `from`. runTime is ignored for cron
-// (the cron expression already encodes the time).
+// For the two interval modes runTime ("HH:MM", Asia/Shanghai 北京时间) anchors
+// the time-of-day so the run hour stays stable regardless of when the scheduler
+// actually fired. An empty runTime keeps the time-of-day of `from`. runTime is
+// ignored for cron (the cron expression already encodes the time). `from` is
+// expected to be in Asia/Shanghai (callers pass timezone.Now()), so all derived
+// times stay in 北京时间.
+//
+// dayOfWeek (1=Mon..7=Sun, 0=unset) aligns the WEEK mode (intervalDays multiple
+// of 7) to a specific weekday; dayOfMonth (1..31, 0=unset) aligns the MONTH mode
+// to a specific day-of-month (clamped to month end). Both are ignored when 0 or
+// not applicable to the active mode.
+//
+// This is the ADVANCE form: it always steps at least one full interval into the
+// future relative to `from`, then snaps to the requested weekday / day-of-month.
+// Use it for the scheduler's post-run recompute and for toggle re-enable.
 //
 // Callers should enforce mutual exclusivity at the API boundary; this function
 // only fixes the precedence so a stray field can never silently change meaning.
-func NextRunWithInterval(cronExpr string, intervalDays int, intervalMonths int, runTime string, from time.Time) (time.Time, error) {
+func NextRunWithInterval(cronExpr string, intervalDays int, intervalMonths int, runTime string, dayOfWeek int, dayOfMonth int, from time.Time) (time.Time, error) {
 	if err := ValidateInterval(cronExpr, intervalDays, intervalMonths); err != nil {
 		return time.Time{}, err
 	}
 	if intervalMonths > 0 {
-		return applyRunTime(addMonthsClamped(from, intervalMonths), runTime), nil
+		next := applyRunTime(addMonthsClamped(from, intervalMonths), runTime)
+		return alignDayOfMonth(next, dayOfMonth), nil
 	}
 	if intervalDays > 0 {
-		return applyRunTime(from.Add(time.Duration(intervalDays)*24*time.Hour), runTime), nil
+		next := applyRunTime(from.Add(time.Duration(intervalDays)*24*time.Hour), runTime)
+		if intervalDays%7 == 0 {
+			next = alignDayOfWeek(next, dayOfWeek)
+		}
+		return next, nil
 	}
 	return NextRun(cronExpr, from)
+}
+
+// NextRunInitial computes the FIRST next_run at create/update time. Unlike the
+// ADVANCE form, if the user-selected time-of-day for the next valid day is still
+// ahead of `from` (now), it fires that day rather than waiting a full interval.
+// Concretely:
+//
+//   - Day mode (intervalDays not a multiple of 7, no weekday): candidate =
+//     today's run_time. If candidate > now -> run today; else advance N days.
+//   - Week mode (intervalDays multiple of 7): candidate = the next occurrence of
+//     dayOfWeek (or today's run_time if no weekday selected) at run_time. If
+//     that candidate (today, when today matches the weekday) is still ahead of
+//     now -> use it; otherwise the next matching weekday.
+//   - Month mode: candidate = this month's dayOfMonth (or today's day if unset)
+//     at run_time. If candidate > now -> this month; otherwise next month.
+//   - Cron mode: unchanged (cron already encodes the schedule).
+//
+// `from` must be in Asia/Shanghai.
+func NextRunInitial(cronExpr string, intervalDays int, intervalMonths int, runTime string, dayOfWeek int, dayOfMonth int, from time.Time) (time.Time, error) {
+	if err := ValidateInterval(cronExpr, intervalDays, intervalMonths); err != nil {
+		return time.Time{}, err
+	}
+
+	// MONTH mode
+	if intervalMonths > 0 {
+		// Build this month's candidate at run_time, aligned to dayOfMonth (or
+		// the current day-of-month if unset).
+		base := applyRunTime(from, runTime)
+		candidate := alignDayOfMonth(base, dayOfMonth)
+		if candidate.After(from) {
+			return candidate, nil
+		}
+		// Already passed today/this cycle -> advance one full month and align.
+		next := applyRunTime(addMonthsClamped(from, intervalMonths), runTime)
+		return alignDayOfMonth(next, dayOfMonth), nil
+	}
+
+	// DAY / WEEK mode
+	if intervalDays > 0 {
+		if intervalDays%7 == 0 && dayOfWeek >= 1 && dayOfWeek <= 7 {
+			// Week mode with an explicit weekday: find the nearest run_time
+			// occurrence on that weekday that is still in the future (today
+			// counts when today is the weekday and the time hasn't passed).
+			candidate := alignDayOfWeek(applyRunTime(from, runTime), dayOfWeek)
+			// alignDayOfWeek moves forward to the weekday (could be today). If the
+			// aligned candidate is today but the time already passed, push a week.
+			if !candidate.After(from) {
+				candidate = candidate.Add(7 * 24 * time.Hour)
+			}
+			return candidate, nil
+		}
+		// Day mode (or week mode without an explicit weekday): today's run_time
+		// if still ahead, else advance N days.
+		candidate := applyRunTime(from, runTime)
+		if candidate.After(from) {
+			return candidate, nil
+		}
+		return applyRunTime(from.Add(time.Duration(intervalDays)*24*time.Hour), runTime), nil
+	}
+
+	return NextRun(cronExpr, from)
+}
+
+// alignDayOfWeek snaps t forward to the next occurrence of the target ISO
+// weekday (1=Mon..7=Sun), preserving t's time-of-day. dow<=0 or >7 means "no
+// alignment" and returns t unchanged. If t is already on the target weekday it
+// is returned unchanged (the caller decides whether "today" is acceptable).
+func alignDayOfWeek(t time.Time, dow int) time.Time {
+	if dow < 1 || dow > 7 {
+		return t
+	}
+	// Go's Weekday: Sunday=0..Saturday=6. Convert to ISO 1=Mon..7=Sun.
+	cur := int(t.Weekday())
+	if cur == 0 {
+		cur = 7
+	}
+	delta := (dow - cur + 7) % 7
+	if delta == 0 {
+		return t
+	}
+	return t.AddDate(0, 0, delta)
+}
+
+// alignDayOfMonth snaps t to the given day-of-month within t's own month,
+// clamping to the last day of the month when dom exceeds the month length
+// (e.g. dom=31 in February -> 28/29). dom<=0 or >31 means "no alignment".
+func alignDayOfMonth(t time.Time, dom int) time.Time {
+	if dom < 1 || dom > 31 {
+		return t
+	}
+	last := daysInMonth(t.Year(), int(t.Month()))
+	day := dom
+	if day > last {
+		day = last
+	}
+	return time.Date(t.Year(), t.Month(), day, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location())
 }
 
 // addMonthsClamped advances t by n calendar months. Go's time.AddDate rolls a
@@ -150,6 +262,29 @@ func ValidateRunTime(runTime string) error {
 	h, m, ok := parseRunTime(runTime)
 	if !ok || h < 0 || h > 23 || m < 0 || m > 59 {
 		return fmt.Errorf("run_time 超出范围 (00:00..23:59)")
+	}
+	return nil
+}
+
+// ValidateDayOfWeek accepts 0 (unset / no constraint) or 1..7 (Mon..Sun).
+func ValidateDayOfWeek(dow int) error {
+	if dow == 0 {
+		return nil
+	}
+	if dow < 1 || dow > 7 {
+		return fmt.Errorf("day_of_week 必须为 1..7 (周一..周日) 或 0(不限)")
+	}
+	return nil
+}
+
+// ValidateDayOfMonth accepts 0 (unset / no constraint) or 1..31. Days beyond a
+// given month's length are clamped at runtime (see alignDayOfMonth).
+func ValidateDayOfMonth(dom int) error {
+	if dom == 0 {
+		return nil
+	}
+	if dom < 1 || dom > 31 {
+		return fmt.Errorf("day_of_month 必须为 1..31 或 0(不限)")
 	}
 	return nil
 }

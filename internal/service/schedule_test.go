@@ -54,7 +54,7 @@ func TestNextRunWithInterval_Days(t *testing.T) {
 	from := mustTime(t, "2026-06-04T12:00:00Z")
 
 	// 3 days
-	got, err := NextRunWithInterval("", 3, 0, "", from)
+	got, err := NextRunWithInterval("", 3, 0, "", 0, 0, from)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestNextRunWithInterval_Days(t *testing.T) {
 	}
 
 	// 2 weeks = 14 days
-	got, err = NextRunWithInterval("", 14, 0, "", from)
+	got, err = NextRunWithInterval("", 14, 0, "", 0, 0, from)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestNextRunWithInterval_Days(t *testing.T) {
 func TestNextRunWithInterval_DaysRunTime(t *testing.T) {
 	from := mustTime(t, "2026-06-04T12:34:56Z")
 	// run_time snaps the time-of-day to 09:00, seconds zeroed
-	got, err := NextRunWithInterval("", 3, 0, "09:00", from)
+	got, err := NextRunWithInterval("", 3, 0, "09:00", 0, 0, from)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestNextRunWithInterval_Months(t *testing.T) {
 	from := mustTime(t, "2026-01-31T12:00:00Z")
 	// 1 month from Jan 31 -> clamp to Feb 28 (2026 non-leap), NOT Go's default
 	// AddDate overflow to Mar 3.
-	got, err := NextRunWithInterval("", 0, 1, "", from)
+	got, err := NextRunWithInterval("", 0, 1, "", 0, 0, from)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestNextRunWithInterval_Months(t *testing.T) {
 
 	// Plain mid-month case is exact.
 	from2 := mustTime(t, "2026-06-15T08:00:00Z")
-	got2, err := NextRunWithInterval("", 0, 1, "", from2)
+	got2, err := NextRunWithInterval("", 0, 1, "", 0, 0, from2)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestNextRunWithInterval_Months(t *testing.T) {
 
 func TestNextRunWithInterval_MonthsRunTime(t *testing.T) {
 	from := mustTime(t, "2026-06-15T23:11:00Z")
-	got, err := NextRunWithInterval("", 0, 2, "07:30", from)
+	got, err := NextRunWithInterval("", 0, 2, "07:30", 0, 0, from)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestNextRunWithInterval_MonthsRunTime(t *testing.T) {
 
 func TestNextRunWithInterval_Cron(t *testing.T) {
 	from := mustTime(t, "2026-06-04T12:00:00Z")
-	got, err := NextRunWithInterval("0 9 * * *", 0, 0, "", from)
+	got, err := NextRunWithInterval("0 9 * * *", 0, 0, "", 0, 0, from)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -140,11 +140,11 @@ func TestNextRunWithInterval_Cron(t *testing.T) {
 func TestNextRunWithInterval_InvalidRejected(t *testing.T) {
 	from := mustTime(t, "2026-06-04T12:00:00Z")
 	// mutual exclusivity violation must error before computing
-	if _, err := NextRunWithInterval("0 9 * * *", 3, 0, "", from); err == nil {
+	if _, err := NextRunWithInterval("0 9 * * *", 3, 0, "", 0, 0, from); err == nil {
 		t.Fatalf("expected mutual-exclusivity error")
 	}
 	// over upper bound must error (overflow guard)
-	if _, err := NextRunWithInterval("", MaxIntervalDays+1, 0, "", from); err == nil {
+	if _, err := NextRunWithInterval("", MaxIntervalDays+1, 0, "", 0, 0, from); err == nil {
 		t.Fatalf("expected upper-bound error")
 	}
 }
@@ -156,13 +156,13 @@ func TestNextRunWithInterval_InvalidRejected(t *testing.T) {
 // (interval task firing immediately on re-enable).
 func TestToggleReactivateRecomputesToFuture(t *testing.T) {
 	now := time.Now().UTC()
-	if got, err := NextRunWithInterval("", 3, 0, "", now); err != nil || !got.After(now) {
+	if got, err := NextRunWithInterval("", 3, 0, "", 0, 0, now); err != nil || !got.After(now) {
 		t.Fatalf("day toggle recompute: got %v err %v, want future", got, err)
 	}
-	if got, err := NextRunWithInterval("", 14, 0, "", now); err != nil || !got.After(now) {
+	if got, err := NextRunWithInterval("", 14, 0, "", 0, 0, now); err != nil || !got.After(now) {
 		t.Fatalf("week toggle recompute: got %v err %v, want future", got, err)
 	}
-	if got, err := NextRunWithInterval("", 0, 1, "", now); err != nil || !got.After(now) {
+	if got, err := NextRunWithInterval("", 0, 1, "", 0, 0, now); err != nil || !got.After(now) {
 		t.Fatalf("month toggle recompute: got %v err %v, want future", got, err)
 	}
 }
@@ -197,7 +197,7 @@ func TestNextRunWithInterval_MonthEndClamp(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			from := mustTime(t, tc.from)
-			got, err := NextRunWithInterval("", 0, tc.n, "", from)
+			got, err := NextRunWithInterval("", 0, tc.n, "", 0, 0, from)
 			if err != nil {
 				t.Fatalf("err: %v", err)
 			}
@@ -213,7 +213,7 @@ func TestNextRunWithInterval_MonthEndClamp(t *testing.T) {
 // with run_time anchoring: the day clamps to month-end, the time snaps to HH:MM.
 func TestNextRunWithInterval_MonthEndClampWithRunTime(t *testing.T) {
 	from := mustTime(t, "2026-01-31T23:11:00Z")
-	got, err := NextRunWithInterval("", 0, 1, "09:30", from)
+	got, err := NextRunWithInterval("", 0, 1, "09:30", 0, 0, from)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestValidateInterval_LegacyCronStillValid(t *testing.T) {
 		t.Fatalf("legacy cron must remain valid for scheduler: %v", err)
 	}
 	from := mustTime(t, "2026-06-04T12:00:00Z")
-	if _, err := NextRunWithInterval("0 9 * * *", 0, 0, "", from); err != nil {
+	if _, err := NextRunWithInterval("0 9 * * *", 0, 0, "", 0, 0, from); err != nil {
 		t.Fatalf("legacy cron next-run must still compute: %v", err)
 	}
 }
@@ -313,5 +313,203 @@ func TestParseRunTime(t *testing.T) {
 		if ok != tc.ok || (ok && (h != tc.h || m != tc.m)) {
 			t.Errorf("parseRunTime(%q) = %d,%d,%v want %d,%d,%v", tc.in, h, m, ok, tc.h, tc.m, tc.ok)
 		}
+	}
+}
+
+// ---- Need 1: first-run "today if run_time still ahead" semantics ----
+
+// shTime parses an RFC3339 string and converts it to Asia/Shanghai, mirroring
+// how the handlers feed timezone.Now() (which is already Asia/Shanghai) into
+// NextRunInitial.
+func shTime(t *testing.T, s string) time.Time {
+	t.Helper()
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		loc = time.FixedZone("CST", 8*60*60)
+	}
+	tm, err := time.ParseInLocation(time.RFC3339, s, loc)
+	if err != nil {
+		t.Fatalf("parse time %q: %v", s, err)
+	}
+	return tm
+}
+
+// Day mode: if today's run_time is still ahead of now, fire TODAY.
+func TestNextRunInitial_DayToday(t *testing.T) {
+	now := shTime(t, "2026-06-04T10:00:00+08:00")
+	// run_time 17:00 today is still ahead -> today 17:00.
+	got, err := NextRunInitial("", 1, 0, "17:00", 0, 0, now)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := shTime(t, "2026-06-04T17:00:00+08:00")
+	if !got.Equal(want) {
+		t.Errorf("day today: got %v want %v", got, want)
+	}
+}
+
+// Day mode: if today's run_time already passed, advance one interval.
+func TestNextRunInitial_DayPassed(t *testing.T) {
+	now := shTime(t, "2026-06-04T18:00:00+08:00")
+	got, err := NextRunInitial("", 1, 0, "17:00", 0, 0, now)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := shTime(t, "2026-06-05T17:00:00+08:00")
+	if !got.Equal(want) {
+		t.Errorf("day passed: got %v want %v", got, want)
+	}
+}
+
+// Week mode without explicit weekday: today if time not yet passed.
+func TestNextRunInitial_WeekTodayNoDOW(t *testing.T) {
+	now := shTime(t, "2026-06-04T10:00:00+08:00")
+	got, err := NextRunInitial("", 7, 0, "17:00", 0, 0, now)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := shTime(t, "2026-06-04T17:00:00+08:00")
+	if !got.Equal(want) {
+		t.Errorf("week today (no dow): got %v want %v", got, want)
+	}
+}
+
+// Month mode: this month's day if still ahead.
+func TestNextRunInitial_MonthThisMonth(t *testing.T) {
+	now := shTime(t, "2026-06-04T10:00:00+08:00")
+	// No explicit day_of_month -> use today's day (4th) at 17:00, still ahead.
+	got, err := NextRunInitial("", 0, 1, "17:00", 0, 0, now)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := shTime(t, "2026-06-04T17:00:00+08:00")
+	if !got.Equal(want) {
+		t.Errorf("month this month: got %v want %v", got, want)
+	}
+}
+
+// ---- Need 4: day_of_week / day_of_month alignment ----
+
+// Week mode with explicit weekday: 2026-06-04 is a Thursday (ISO 4).
+// Selecting Monday (1) at 09:00 should land on the next Monday, 2026-06-08.
+func TestNextRunInitial_WeekDOW(t *testing.T) {
+	now := shTime(t, "2026-06-04T10:00:00+08:00") // Thu
+	got, err := NextRunInitial("", 7, 0, "09:00", 1 /*Mon*/, 0, now)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := shTime(t, "2026-06-08T09:00:00+08:00") // Mon
+	if !got.Equal(want) {
+		t.Errorf("week dow Mon: got %v want %v (weekday=%v)", got, want, got.Weekday())
+	}
+}
+
+// Week mode, weekday is today and time still ahead -> run today.
+func TestNextRunInitial_WeekDOWTodayAhead(t *testing.T) {
+	now := shTime(t, "2026-06-04T08:00:00+08:00") // Thu = ISO 4
+	got, err := NextRunInitial("", 7, 0, "09:00", 4 /*Thu*/, 0, now)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := shTime(t, "2026-06-04T09:00:00+08:00")
+	if !got.Equal(want) {
+		t.Errorf("week dow today ahead: got %v want %v", got, want)
+	}
+}
+
+// Week mode, weekday is today but time already passed -> next week same weekday.
+func TestNextRunInitial_WeekDOWTodayPassed(t *testing.T) {
+	now := shTime(t, "2026-06-04T10:00:00+08:00") // Thu
+	got, err := NextRunInitial("", 7, 0, "09:00", 4 /*Thu*/, 0, now)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := shTime(t, "2026-06-11T09:00:00+08:00") // next Thu
+	if !got.Equal(want) {
+		t.Errorf("week dow today passed: got %v want %v", got, want)
+	}
+}
+
+// Month mode with explicit day-of-month ahead in the same month.
+func TestNextRunInitial_MonthDOM(t *testing.T) {
+	now := shTime(t, "2026-06-04T10:00:00+08:00")
+	got, err := NextRunInitial("", 0, 1, "09:00", 0, 15, now)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := shTime(t, "2026-06-15T09:00:00+08:00")
+	if !got.Equal(want) {
+		t.Errorf("month dom 15: got %v want %v", got, want)
+	}
+}
+
+// Month mode, day-of-month already passed this month -> next month.
+func TestNextRunInitial_MonthDOMPassed(t *testing.T) {
+	now := shTime(t, "2026-06-20T10:00:00+08:00")
+	got, err := NextRunInitial("", 0, 1, "09:00", 0, 15, now)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := shTime(t, "2026-07-15T09:00:00+08:00")
+	if !got.Equal(want) {
+		t.Errorf("month dom passed: got %v want %v", got, want)
+	}
+}
+
+// Month mode, day-of-month clamps to month end (Feb 31 -> Feb 28 in 2026).
+func TestNextRunInitial_MonthDOMClamp(t *testing.T) {
+	now := shTime(t, "2026-02-10T10:00:00+08:00")
+	got, err := NextRunInitial("", 0, 1, "09:00", 0, 31, now)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := shTime(t, "2026-02-28T09:00:00+08:00")
+	if !got.Equal(want) {
+		t.Errorf("month dom clamp: got %v want %v", got, want)
+	}
+}
+
+// ADVANCE form aligns week mode to the selected weekday.
+func TestNextRunWithInterval_WeekDOWAdvance(t *testing.T) {
+	from := shTime(t, "2026-06-04T09:00:00+08:00") // Thu
+	// +7 days = next Thu (06-11), then align to Monday(1) -> following Mon 06-15.
+	got, err := NextRunWithInterval("", 7, 0, "09:00", 1, 0, from)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := shTime(t, "2026-06-15T09:00:00+08:00") // Mon
+	if !got.Equal(want) {
+		t.Errorf("advance week dow: got %v want %v (weekday=%v)", got, want, got.Weekday())
+	}
+}
+
+// ADVANCE form aligns month mode to the selected day-of-month.
+func TestNextRunWithInterval_MonthDOMAdvance(t *testing.T) {
+	from := shTime(t, "2026-06-15T09:00:00+08:00")
+	got, err := NextRunWithInterval("", 0, 1, "09:00", 0, 20, from)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := shTime(t, "2026-07-20T09:00:00+08:00")
+	if !got.Equal(want) {
+		t.Errorf("advance month dom: got %v want %v", got, want)
+	}
+}
+
+// Need 2 sanity: run_time=17:00 with from in Asia/Shanghai yields a 17:00
+// Beijing-time next_run (no 8h skew).
+func TestNextRunInitial_TimezoneBeijing(t *testing.T) {
+	now := shTime(t, "2026-06-04T10:00:00+08:00")
+	got, err := NextRunInitial("", 1, 0, "17:00", 0, 0, now)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if got.Hour() != 17 || got.Minute() != 0 {
+		t.Errorf("expected 17:00 local, got %02d:%02d", got.Hour(), got.Minute())
+	}
+	// Offset must be +08:00 (Beijing), not UTC.
+	_, off := got.Zone()
+	if off != 8*60*60 {
+		t.Errorf("expected +08:00 offset, got %d seconds", off)
 	}
 }
