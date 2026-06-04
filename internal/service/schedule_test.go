@@ -89,12 +89,13 @@ func TestNextRunWithInterval_DaysRunTime(t *testing.T) {
 
 func TestNextRunWithInterval_Months(t *testing.T) {
 	from := mustTime(t, "2026-01-31T12:00:00Z")
-	// 1 month from Jan 31 -> Go AddDate normalizes Feb 31 to Mar 3 (2026 non-leap).
+	// 1 month from Jan 31 -> clamp to Feb 28 (2026 non-leap), NOT Go's default
+	// AddDate overflow to Mar 3.
 	got, err := NextRunWithInterval("", 0, 1, "", from)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	want := from.AddDate(0, 1, 0)
+	want := mustTime(t, "2026-02-28T12:00:00Z")
 	if !got.Equal(want) {
 		t.Errorf("1 month: got %v want %v", got, want)
 	}
@@ -163,6 +164,132 @@ func TestToggleReactivateRecomputesToFuture(t *testing.T) {
 	}
 	if got, err := NextRunWithInterval("", 0, 1, "", now); err != nil || !got.After(now) {
 		t.Fatalf("month toggle recompute: got %v err %v, want future", got, err)
+	}
+}
+
+// TestNextRunWithInterval_MonthEndClamp covers the Boss decision: month
+// stepping must clamp to the last day of the target month instead of Go's
+// default overflow (Jan 31 + 1 month -> Mar 3).
+func TestNextRunWithInterval_MonthEndClamp(t *testing.T) {
+	cases := []struct {
+		name string
+		from string
+		n    int
+		want string
+	}{
+		// Jan 31 + 1 month -> Feb 28 (2026 is NOT a leap year), not Mar 3.
+		{"jan31 +1 non-leap", "2026-01-31T08:00:00Z", 1, "2026-02-28T08:00:00Z"},
+		// Jan 31 + 1 month in a leap year (2028) -> Feb 29.
+		{"jan31 +1 leap", "2028-01-31T08:00:00Z", 1, "2028-02-29T08:00:00Z"},
+		// Jan 31 + 13 months (cross-year) lands on Feb of next year, clamp to 28.
+		{"jan31 +13 cross-year", "2026-01-31T08:00:00Z", 13, "2027-02-28T08:00:00Z"},
+		// Dec 31 + 1 month -> Jan 31 (exists), year wrap, no clamp.
+		{"dec31 +1 year-wrap", "2026-12-31T08:00:00Z", 1, "2027-01-31T08:00:00Z"},
+		// Dec 31 + 2 months -> Feb, clamp to 28 (2027 non-leap).
+		{"dec31 +2 clamp", "2026-12-31T08:00:00Z", 2, "2027-02-28T08:00:00Z"},
+		// Mar 31 + 1 month -> Apr 30 (30-day month), clamp.
+		{"mar31 +1 to apr30", "2026-03-31T08:00:00Z", 1, "2026-04-30T08:00:00Z"},
+		// Mid-month + 1 month is exact, no clamp.
+		{"mid-month exact", "2026-06-15T08:00:00Z", 1, "2026-07-15T08:00:00Z"},
+		// Jan 30 + 1 month -> Feb 28 clamp (non-leap).
+		{"jan30 +1 clamp", "2026-01-30T08:00:00Z", 1, "2026-02-28T08:00:00Z"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			from := mustTime(t, tc.from)
+			got, err := NextRunWithInterval("", 0, tc.n, "", from)
+			if err != nil {
+				t.Fatalf("err: %v", err)
+			}
+			want := mustTime(t, tc.want)
+			if !got.Equal(want) {
+				t.Errorf("%s: got %v want %v", tc.name, got, want)
+			}
+		})
+	}
+}
+
+// TestNextRunWithInterval_MonthEndClampWithRunTime verifies clamping composes
+// with run_time anchoring: the day clamps to month-end, the time snaps to HH:MM.
+func TestNextRunWithInterval_MonthEndClampWithRunTime(t *testing.T) {
+	from := mustTime(t, "2026-01-31T23:11:00Z")
+	got, err := NextRunWithInterval("", 0, 1, "09:30", from)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := mustTime(t, "2026-02-28T09:30:00Z")
+	if !got.Equal(want) {
+		t.Errorf("jan31 +1 @09:30: got %v want %v", got, want)
+	}
+}
+
+func TestValidateRunTime(t *testing.T) {
+	cases := []struct {
+		in      string
+		wantErr bool
+	}{
+		{"", false},
+		{"00:00", false},
+		{"09:00", false},
+		{"23:59", false},
+		{"24:00", true},
+		{"09:60", true},
+		{"9:00", true},  // not zero-padded -> wrong length
+		{"09:0", true},  // wrong length
+		{"0900", true},  // missing colon
+		{"ab:cd", true}, // non-digit
+		{"09-00", true}, // wrong separator
+		{"-1:00", true},
+		{"garbage", true},
+	}
+	for _, tc := range cases {
+		err := ValidateRunTime(tc.in)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("ValidateRunTime(%q) err=%v wantErr=%v", tc.in, err, tc.wantErr)
+		}
+	}
+}
+
+// TestValidateIntervalForWrite verifies the interval-only write contract:
+// cron writes are rejected, exactly one interval source required.
+func TestValidateIntervalForWrite(t *testing.T) {
+	cases := []struct {
+		name    string
+		cron    string
+		days    int
+		months  int
+		wantErr bool
+	}{
+		{"days only ok", "", 3, 0, false},
+		{"weeks as days ok", "", 14, 0, false},
+		{"months only ok", "", 0, 1, false},
+		{"cron rejected", "0 9 * * *", 0, 0, true},
+		{"cron+days rejected", "0 9 * * *", 3, 0, true},
+		{"none rejected", "", 0, 0, true},
+		{"days+months mutually exclusive", "", 3, 1, true},
+		{"over bound days", "", MaxIntervalDays + 1, 0, true},
+		{"over bound months", "", 0, MaxIntervalMonths + 1, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateIntervalForWrite(tc.cron, tc.days, tc.months)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("ValidateIntervalForWrite(%q,%d,%d) err=%v wantErr=%v", tc.cron, tc.days, tc.months, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestValidateInterval_LegacyCronStillValid ensures the scheduler-facing
+// ValidateInterval keeps accepting legacy cron so existing cron schedules keep
+// executing even though new cron writes are blocked at the API layer.
+func TestValidateInterval_LegacyCronStillValid(t *testing.T) {
+	if err := ValidateInterval("0 9 * * *", 0, 0); err != nil {
+		t.Fatalf("legacy cron must remain valid for scheduler: %v", err)
+	}
+	from := mustTime(t, "2026-06-04T12:00:00Z")
+	if _, err := NextRunWithInterval("0 9 * * *", 0, 0, "", from); err != nil {
+		t.Fatalf("legacy cron next-run must still compute: %v", err)
 	}
 }
 

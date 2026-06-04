@@ -40,6 +40,22 @@ func scanPendingSchedules(db *gorm.DB) {
 	}
 
 	for _, sched := range schedules {
+		// Compute next_run FIRST. If a schedule has dirty/illegal recurrence data
+		// (multiple sources, invalid cron, out-of-bounds interval) NextRunWithInterval
+		// returns an error. Previously we created the task and only then computed
+		// next_run, and on error just `continue`d -- leaving next_run_at in the past
+		// so the same dirty row was re-scanned every 60s, re-creating a summary task
+		// each cycle and burning LLM cost. Now: if next_run can't be computed, we
+		// disable the schedule (is_active=0) and log an alert, then skip task
+		// creation entirely. A human can inspect/fix and re-enable.
+		nextRun, nrErr := service.NextRunWithInterval(sched.CronExpr, sched.IntervalDays, sched.IntervalMonths, sched.RunTime, now)
+		if nrErr != nil {
+			log.Printf("[scheduler] ALERT schedule %d has invalid recurrence (%v); disabling to stop repeated re-scan/cost", sched.ID, nrErr)
+			db.Model(&model.SummarySchedule{}).Where("id = ?", sched.ID).
+				Update("is_active", 0)
+			continue
+		}
+
 		// Compute time range
 		start, end := service.ComputeTimeRange(sched.TimeRangeType, now)
 
@@ -124,12 +140,7 @@ func scanPendingSchedules(db *gorm.DB) {
 			continue
 		}
 
-		// Update schedule: last_run_at and next_run_at
-		nextRun, err := service.NextRunWithInterval(sched.CronExpr, sched.IntervalDays, sched.IntervalMonths, sched.RunTime, now)
-		if err != nil {
-			log.Printf("[scheduler] compute next run for schedule %d: %v", sched.ID, err)
-			continue
-		}
+		// Update schedule: last_run_at and next_run_at (next_run computed above).
 		db.Model(&sched).Updates(map[string]interface{}{
 			"last_run_at": now,
 			"next_run_at": nextRun,

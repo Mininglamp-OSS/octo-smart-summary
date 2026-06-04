@@ -68,11 +68,17 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 	}
 
 	now := time.Now().UTC()
-	// ValidateInterval enforces bounds (overflow guard) and mutual exclusivity
-	// of cron_expr / interval_days / interval_months in one place, shared with
-	// update and toggle.
-	if err := service.ValidateInterval(req.CronExpr, req.IntervalDays, req.IntervalMonths); err != nil {
+	// ValidateIntervalForWrite enforces interval-only writes (cron is legacy
+	// read+execute-only), bounds (overflow guard) and mutual exclusivity of
+	// interval_days / interval_months in one place.
+	if err := service.ValidateIntervalForWrite(req.CronExpr, req.IntervalDays, req.IntervalMonths); err != nil {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40011, Message: err.Error()})
+		return
+	}
+	// Strict run_time validation: reject malformed HH:MM rather than silently
+	// falling back to the trigger instant.
+	if err := service.ValidateRunTime(req.RunTime); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40012, Message: err.Error()})
 		return
 	}
 	nextRun, err := service.NextRunWithInterval(req.CronExpr, req.IntervalDays, req.IntervalMonths, req.RunTime, now)
@@ -261,23 +267,30 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 	}
 	if req.RunTime != nil {
 		effRunTime = *req.RunTime
+		// Strict run_time validation on update too.
+		if err := service.ValidateRunTime(*req.RunTime); err != nil {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40012, Message: err.Error()})
+			return
+		}
 		updates["run_time"] = *req.RunTime
 		schedChanged = true
 	}
 	if schedChanged {
-		// When switching to an interval mode, the caller may not have cleared the
-		// old cron_expr (or vice versa). Enforce a single active source so the
-		// recompute is unambiguous: if an interval is now set, drop cron; if cron
-		// is now set, drop intervals.
-		if effIntervalDays > 0 || effIntervalMonths > 0 {
-			effCron = ""
-			updates["cron_expr"] = ""
+		// Interval-only write contract: reject any attempt to set/keep a cron
+		// expression through update. Legacy cron tasks remain executable but can
+		// no longer be created or modified into cron mode. If the caller sent a
+		// non-empty cron_expr, reject; otherwise force a single interval source.
+		if req.CronExpr != nil && *req.CronExpr != "" {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40011, Message: "不再支持修改为自定义 cron 模式, 请选择间隔(天/周/月)"})
+			return
 		}
-		if effCron != "" {
-			effIntervalDays = 0
-			effIntervalMonths = 0
-			updates["interval_days"] = 0
-			updates["interval_months"] = 0
+		// When an interval is set, always drop any stored/legacy cron so the
+		// recompute is unambiguous and the task migrates off cron.
+		effCron = ""
+		updates["cron_expr"] = ""
+		if err := service.ValidateIntervalForWrite(effCron, effIntervalDays, effIntervalMonths); err != nil {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40011, Message: err.Error()})
+			return
 		}
 		nextRun, err := service.NextRunWithInterval(effCron, effIntervalDays, effIntervalMonths, effRunTime, time.Now().UTC())
 		if err != nil {
