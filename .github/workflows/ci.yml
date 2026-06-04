@@ -96,7 +96,7 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
       - name: Test
-        run: go test -race -count=1 -timeout 5m ./...
+        run: go test -race -shuffle=on -count=1 -timeout 5m ./...
 
   vet:
     needs: [changes]
