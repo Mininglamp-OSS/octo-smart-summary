@@ -260,6 +260,32 @@ func (h *PersonalHandler) GetMembers(c *gin.Context) {
 		return
 	}
 
+	// Authorization: only the task creator or an explicit participant may read the
+	// member list. Source-group membership alone does NOT grant access. This mirrors
+	// TaskHandler.authorizeTaskAccess / canAccessTask (codes 4010 / 40008 / 40003).
+	userID := middleware.GetUserID(c)
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, apiResponse{Code: 4010, Message: "authentication required"})
+		return
+	}
+
+	var task model.SummaryTask
+	if err := h.db.Where("id = ? AND deleted_at IS NULL", taskID).First(&task).Error; err != nil {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
+		return
+	}
+
+	if task.CreatorID != userID {
+		var cnt int64
+		h.db.Model(&model.SummaryParticipant{}).
+			Where("task_id = ? AND user_id = ?", taskID, userID).
+			Count(&cnt)
+		if cnt == 0 {
+			c.JSON(http.StatusForbidden, apiResponse{Code: 40003, Message: "无权访问此任务"})
+			return
+		}
+	}
+
 	var participants []model.SummaryParticipant
 	h.db.Where("task_id = ?", taskID).Find(&participants)
 

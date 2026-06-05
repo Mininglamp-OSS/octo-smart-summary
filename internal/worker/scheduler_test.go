@@ -1,6 +1,8 @@
 package worker
 
 import (
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,7 +17,12 @@ import (
 func setupSchedulerTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 
-	db, err := gorm.Open(sqlite.Open("file:scheduler-test?mode=memory&cache=shared"), &gorm.Config{})
+	dsn := fmt.Sprintf(
+		"file:%s-%d?mode=memory&cache=shared",
+		strings.NewReplacer("/", "_", " ", "_").Replace(t.Name()),
+		time.Now().UnixNano(),
+	)
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}

@@ -56,7 +56,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		v1.GET("/summary-infer", taskH.InferScope)
 		v1.GET("/summary-member-candidates", handler.NewCandidateHandler(imDB, candidateQueryLimit).SearchCandidates)
 		v1.GET("/summary-chat-candidates", handler.NewCandidateHandler(imDB, candidateQueryLimit).SearchChatCandidates)
-		v1.GET("/summary-templates", func(c *gin.Context) { c.JSON(200, gin.H{"code": 0, "data": gin.H{"templates": []string{}}}) })
+		v1.GET("/summary-templates", taskH.GetTemplates)
 
 		v1.POST("/summary-schedules", schedH.CreateSchedule)
 		v1.GET("/summary-schedules", schedH.ListSchedules)

@@ -137,15 +137,16 @@ func TestAuthorizeTaskAccess_Participant(t *testing.T) {
 	}
 }
 
-func TestAuthorizeTaskAccess_GroupMember(t *testing.T) {
+func TestAuthorizeTaskAccess_GroupMemberDenied(t *testing.T) {
 	db, imDB := setupTestDBs(t)
 	taskID := seedTask(t, db, imDB)
 	h := NewTaskHandler(db, imDB, "")
 	r := setupRouter(h)
 
+	// groupmember1 is only a source-group member, neither creator nor participant → 403
 	w := doRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d", taskID), "groupmember1")
-	if w.Code != http.StatusOK {
-		t.Errorf("expected 200 for group member, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for source-group member, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -409,5 +410,155 @@ func TestGetSummary_HidesDeletedOrInactiveSchedule(t *testing.T) {
 	}
 	if resp.Data["schedule_id"] != nil {
 		t.Fatalf("expected deleted schedule_id hidden, got %v", resp.Data["schedule_id"])
+	}
+}
+
+func TestDeleteSummary_GroupMemberDenied(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	taskID := seedTask(t, db, imDB)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupRouter(h)
+
+	// Source-group member must not be able to delete another user's summary.
+	w := doRequest(r, "DELETE", fmt.Sprintf("/api/v1/summaries/%d", taskID), "groupmember1")
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for delete by source-group member, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCancelSummary_GroupMemberDenied(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	h := NewTaskHandler(db, imDB, "")
+
+	// Create a pending task whose source group contains groupmember1.
+	task := model.SummaryTask{
+		TaskNo:      "TST-003",
+		SpaceID:     "space1",
+		CreatorID:   "creator1",
+		SummaryMode: model.ModeByPerson,
+		Status:      model.StatusPending,
+	}
+	db.Create(&task)
+	db.Create(&model.SummarySource{TaskID: task.ID, SourceType: model.SourceGroup, SourceID: "grp_abc"})
+	imDB.Exec("INSERT INTO group_member (group_no, uid, is_deleted) VALUES (?, ?, 0)", "grp_abc", "groupmember1")
+
+	r := setupRouter(h)
+
+	// Source-group member must not be able to cancel another user's summary.
+	w := doRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/cancel", task.ID), "groupmember1")
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for cancel by source-group member, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// setupListTestDBs migrates the extra tables ListSummaries touches (summary_result)
+// to avoid no-such-table noise during list rendering.
+func setupListTestDBs(t *testing.T) (db *gorm.DB, imDB *gorm.DB) {
+	t.Helper()
+
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open summary db: %v", err)
+	}
+	db.AutoMigrate(&model.SummaryTask{}, &model.SummarySource{}, &model.SummaryParticipant{}, &model.SummaryResult{})
+
+	imDB, err = gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open im db: %v", err)
+	}
+	imDB.Exec("CREATE TABLE group_member (group_no TEXT NOT NULL, uid TEXT NOT NULL, is_deleted INTEGER DEFAULT 0)")
+
+	return db, imDB
+}
+
+func setupListRouter(h *TaskHandler) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(middleware.AuthMiddleware(&mockTokenResolver{}), middleware.SpaceMiddleware())
+	r.GET("/api/v1/summaries", h.ListSummaries)
+	return r
+}
+
+type listResponse struct {
+	Code int `json:"code"`
+	Data struct {
+		Total int           `json:"total"`
+		Items []interface{} `json:"items"`
+	} `json:"data"`
+}
+
+func parseListResponse(t *testing.T, w *httptest.ResponseRecorder) listResponse {
+	t.Helper()
+	var resp listResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v\nbody: %s", err, w.Body.String())
+	}
+	return resp
+}
+
+func seedListTask(t *testing.T, db *gorm.DB, imDB *gorm.DB) {
+	t.Helper()
+
+	task := model.SummaryTask{
+		TaskNo:      "TST-LIST-001",
+		SpaceID:     "space1",
+		CreatorID:   "creator1",
+		SummaryMode: model.ModeByPerson,
+		Status:      model.StatusCompleted,
+	}
+	db.Create(&task)
+	db.Create(&model.SummarySource{TaskID: task.ID, SourceType: model.SourceGroup, SourceID: "grp_abc"})
+	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "participant1", UserName: "P1"})
+	imDB.Exec("INSERT INTO group_member (group_no, uid, is_deleted) VALUES (?, ?, 0)", "grp_abc", "groupmember1")
+}
+
+func TestListSummaries_GroupMemberSeesNothing(t *testing.T) {
+	db, imDB := setupListTestDBs(t)
+	seedListTask(t, db, imDB)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupListRouter(h)
+
+	w := doRequest(r, "GET", "/api/v1/summaries", "groupmember1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	resp := parseListResponse(t, w)
+	if resp.Data.Total != 0 {
+		t.Errorf("expected total 0 for source-group member, got %d", resp.Data.Total)
+	}
+	if len(resp.Data.Items) != 0 {
+		t.Errorf("expected 0 items for source-group member, got %d", len(resp.Data.Items))
+	}
+}
+
+func TestListSummaries_CreatorSeesTask(t *testing.T) {
+	db, imDB := setupListTestDBs(t)
+	seedListTask(t, db, imDB)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupListRouter(h)
+
+	w := doRequest(r, "GET", "/api/v1/summaries", "creator1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	resp := parseListResponse(t, w)
+	if resp.Data.Total != 1 {
+		t.Errorf("expected total 1 for creator, got %d", resp.Data.Total)
+	}
+}
+
+func TestListSummaries_ParticipantSeesTask(t *testing.T) {
+	db, imDB := setupListTestDBs(t)
+	seedListTask(t, db, imDB)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupListRouter(h)
+
+	w := doRequest(r, "GET", "/api/v1/summaries", "participant1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	resp := parseListResponse(t, w)
+	if resp.Data.Total != 1 {
+		t.Errorf("expected total 1 for participant, got %d", resp.Data.Total)
 	}
 }
