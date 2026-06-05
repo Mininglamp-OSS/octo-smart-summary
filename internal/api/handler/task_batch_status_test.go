@@ -252,6 +252,27 @@ func TestBatchStatus_DeletedTasks(t *testing.T) {
 	}
 }
 
+func TestBatchStatus_GroupMemberExcluded(t *testing.T) {
+	db, imDB := setupBatchTestDBs(t)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupBatchRouter(h)
+
+	task := model.SummaryTask{TaskNo: "BATCH-GRP", SpaceID: "space1", CreatorID: "owner", Status: model.StatusProcessing}
+	db.Create(&task)
+	db.Create(&model.SummarySource{TaskID: task.ID, SourceType: model.SourceGroup, SourceID: "grp_x"})
+	imDB.Exec("INSERT INTO group_member (group_no, uid, is_deleted) VALUES (?, ?, 0)", "grp_x", "gm1")
+
+	// gm1 is only a source-group member → excluded from batch results.
+	w := doBatchRequest(r, map[string]interface{}{"task_ids": []int64{task.ID}}, "gm1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	resp := parseBatchResponse(t, w)
+	if len(resp.Data.Tasks) != 0 {
+		t.Errorf("expected 0 tasks for source-group member, got %d", len(resp.Data.Tasks))
+	}
+}
+
 func TestBatchStatus_DBError(t *testing.T) {
 	db, imDB := setupBatchTestDBs(t)
 	h := NewTaskHandler(db, imDB, "")
