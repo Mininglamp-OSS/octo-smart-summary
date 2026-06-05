@@ -1,0 +1,5 @@
+# DL3018: Pin versions in apk add.
+# Pinning Alpine package versions is fragile (versions rotate with each release)
+# and breaks reproducibility more than it helps in practice.
+ignored:
+  - DL3018
