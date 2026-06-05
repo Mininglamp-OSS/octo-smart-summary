@@ -23,6 +23,11 @@ func main() {
 	if p := os.Getenv("TIMING_LOG_PATH"); p != "" {
 		timing.SetLogPath(p)
 	}
+	// Optional override of the per-run LLM summary report path; defaults to
+	// timing.DefaultReportPath (/var/log/smart-summary/summary-report.log).
+	if p := os.Getenv("SUMMARY_REPORT_PATH"); p != "" {
+		timing.SetReportPath(p)
+	}
 	config.ValidateRequired(map[string]string{
 		"MYSQL_DSN":               cfg.MySQLDSN,
 		"IM_MYSQL_DSN":            cfg.IMMySQLDSN,

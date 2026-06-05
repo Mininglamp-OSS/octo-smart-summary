@@ -293,13 +293,24 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 		})
 	}
 
-	// Fetch messages via pipeline
+	// Fetch messages via pipeline. Tool-call / raw LLM uses in this (fetch) path
+	// are accounted under the same task_no, so they appear in the same per-run
+	// report that personal_pipeline flushes at the end.
 	toolCallFn := func(ctx context.Context, messages []service.ChatMessage, tools []service.Tool, forceFn string) (string, error) {
-		args, _, err := p.llm.CallWithTools(ctx, messages, tools, forceFn, p.cfg.LLMTemperature)
+		callStart := time.Now()
+		args, tokens, err := p.llm.CallWithTools(ctx, messages, tools, forceFn, p.cfg.LLMTemperature)
+		purpose := "检索预处理(tool-call)"
+		if forceFn != "" {
+			purpose = "检索预处理: " + forceFn
+		}
+		timing.RecordLLMSince(task.TaskNo, purpose, callStart, tokens)
 		return args, err
 	}
 	llmFn := func(ctx context.Context, prompt string) (string, error) {
-		return p.llm.CallRaw(ctx, prompt)
+		callStart := time.Now()
+		out, err := p.llm.CallRaw(ctx, prompt)
+		timing.RecordLLMSince(task.TaskNo, "检索后裁剪 PostRetrievalNarrow", callStart, 0)
+		return out, err
 	}
 
 	var messages []pipeline.Message

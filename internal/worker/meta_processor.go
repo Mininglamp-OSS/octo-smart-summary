@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timing"
 )
 
 // MetaProcessor handles meta-summary generation with debounce and mutex.
@@ -153,7 +154,11 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 				})
 			}
 
+			reduceStart := time.Now()
 			content, tokens, err := m.proc.llm.CallReduceByPerson(ctx, participantSummaries, startTime, endTime)
+			reportKey := "team#" + strconv.FormatInt(taskID, 10)
+			timing.RecordLLMSince(reportKey, "团队汇总: 合并各成员总结", reduceStart, tokens)
+			timing.FlushReport(reportKey, time.Since(reduceStart).Milliseconds(), nil)
 			if err != nil {
 				log.Printf("[meta-worker] reduce error task=%d: %v", taskID, err)
 				return

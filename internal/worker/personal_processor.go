@@ -234,7 +234,12 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 func (p *Processor) executePersonalPipeline(ctx context.Context, task model.SummaryTask, userID string) (string, []model.Citation, int, int, string, error) {
 	totalStart := time.Now()
 	taskNo := task.TaskNo
-	defer func() { timing.Observe(taskNo, "personal_pipeline_total", totalStart) }()
+	defer func() {
+		timing.Observe(taskNo, "personal_pipeline_total", totalStart)
+		// Boss request: one consolidated per-run report — how many LLM calls,
+		// what each was for, time + tokens. Flushed at run end (success or error).
+		timing.FlushReport(taskNo, time.Since(totalStart).Milliseconds(), nil)
+	}()
 
 	// Load sources
 	var sources []model.SummarySource
@@ -251,15 +256,26 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		})
 	}
 
-	// Unified LLM tool-call callback (shared by all Function Call sites)
+	// Unified LLM tool-call callback (shared by all Function Call sites).
+	// purpose is derived from forceFn so the report says what each call did
+	// (extract_time_range / resolve_channel_scope / resolve_topic_target).
 	toolCallFn := func(ctx context.Context, messages []service.ChatMessage, tools []service.Tool, forceFn string) (string, error) {
-		args, _, err := p.llm.CallWithTools(ctx, messages, tools, forceFn, p.cfg.LLMTemperature)
+		callStart := time.Now()
+		args, tokens, err := p.llm.CallWithTools(ctx, messages, tools, forceFn, p.cfg.LLMTemperature)
+		purpose := "检索预处理(tool-call)"
+		if forceFn != "" {
+			purpose = "检索预处理: " + forceFn
+		}
+		timing.RecordLLMSince(taskNo, purpose, callStart, tokens)
 		return args, err
 	}
 
 	// Legacy callback for PostRetrievalNarrow (still uses CallRaw)
 	llmFn := func(ctx context.Context, prompt string) (string, error) {
-		return p.llm.CallRaw(ctx, prompt)
+		callStart := time.Now()
+		out, err := p.llm.CallRaw(ctx, prompt)
+		timing.RecordLLMSince(taskNo, "检索后裁剪 PostRetrievalNarrow", callStart, 0)
+		return out, err
 	}
 
 	// Fetch messages via personal pipeline (Layer 0-5)
@@ -425,10 +441,12 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 					escapeCitationMarkers(m.Content)))
 			}
 
+			callStart := time.Now()
 			summary, tokens, err := p.llm.CallMap(ctx,
 				joinStrings(formatted), sourceName, idx, len(c),
 				startTime, endTime, task.Title, userName,
 			)
+			timing.RecordLLMSince(taskNo, fmt.Sprintf("Map: 分块总结 chunk#%d", idx), callStart, tokens)
 			if err != nil {
 				log.Printf("[personal-worker] Map chunk %d failed: %v", idx, err)
 				isFatal := strings.Contains(err.Error(), "reasoning budget exhausted")
@@ -483,9 +501,11 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	} else {
 		// Multiple chunks: execute Reduce to merge
 		var err error
+		reduceCallStart := time.Now()
 		finalContent, reduceTokens, err = p.llm.CallReduce(ctx,
 			chunkSummaries, sourceName, startTime, endTime, targetMsgCount, task.Title,
 		)
+		timing.RecordLLMSince(taskNo, "Reduce: 合并分块总结", reduceCallStart, reduceTokens)
 		if err != nil {
 			return "", nil, 0, 0, "", fmt.Errorf("reduce: %w", err)
 		}
