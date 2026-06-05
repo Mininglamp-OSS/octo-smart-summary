@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // ScheduleHandler handles schedule endpoints.
@@ -50,6 +51,14 @@ type updateScheduleReq struct {
 	TimeRangeType  *int             `json:"time_range_type"`
 	Sources        []sourceReq      `json:"sources,omitempty"`
 	Participants   []participantReq `json:"participants,omitempty"`
+	// Scope distinguishes the call source (Plan A1). When scope == "task", the
+	// caller is the summary detail page editing the period of ONE summary; if the
+	// underlying schedule is shared by multiple tasks we must clone instead of
+	// mutating the shared row. TaskID identifies which task's schedule_id to
+	// rebind to the clone. Empty/other scope (e.g. the schedule list page) keeps
+	// the original "edit the shared template" behaviour.
+	Scope  string `json:"scope,omitempty"`
+	TaskID *int64 `json:"task_id,omitempty"`
 }
 
 type toggleScheduleReq struct {
@@ -353,18 +362,127 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		updates["participant_config"] = model.JSON(b)
 	}
 
-	h.db.Model(&sched).Updates(updates)
+	// Plan A1: detail-page single-summary edit must not mutate a schedule that is
+	// shared by multiple tasks. Determine whether to clone, and which schedule id
+	// to report back, inside a single transaction so the "is shared" check and the
+	// clone+rebind cannot interleave with concurrent edits.
+	resultScheduleID := sched.ID
+	var resultNextRunAt *time.Time
+
+	txErr := h.db.Transaction(func(tx *gorm.DB) error {
+		cloned := false
+		if req.Scope == "task" && req.TaskID != nil {
+			// Verify the task belongs to this space and currently points at this
+			// schedule; otherwise fall through to the plain update path.
+			var task model.SummaryTask
+			if err := tx.Where("id = ? AND space_id = ? AND deleted_at IS NULL", *req.TaskID, spaceID).First(&task).Error; err == nil &&
+				task.ScheduleID != nil && *task.ScheduleID == sched.ID {
+				// Count how many live tasks share this schedule. Lock the rows so a
+				// concurrent edit on a sibling task sees a consistent shared count.
+				var shareCount int64
+				if err := tx.Model(&model.SummaryTask{}).
+					Clauses(clause.Locking{Strength: "UPDATE"}).
+					Where("schedule_id = ? AND deleted_at IS NULL", sched.ID).
+					Count(&shareCount).Error; err != nil {
+					return err
+				}
+				if shareCount > 1 {
+					// Shared: clone the schedule with the original fields, then apply
+					// the requested updates onto the clone, and rebind ONLY this task.
+					clone := sched
+					clone.ID = 0
+					clone.CreatedAt = time.Time{}
+					clone.UpdatedAt = time.Time{}
+					clone.DeletedAt = nil
+					clone.LastRunAt = nil
+					// is_active inherited from original (sched.IsActive via struct copy).
+					applyScheduleUpdates(&clone, updates)
+					if err := tx.Create(&clone).Error; err != nil {
+						return err
+					}
+					if err := tx.Model(&model.SummaryTask{}).
+						Where("id = ?", task.ID).
+						Update("schedule_id", clone.ID).Error; err != nil {
+						return err
+					}
+					resultScheduleID = clone.ID
+					resultNextRunAt = clone.NextRunAt
+					cloned = true
+				}
+			}
+		}
+		if !cloned {
+			// COUNT == 1 (or list-page scope): mutate the existing schedule in place.
+			if err := tx.Model(&model.SummarySchedule{}).
+				Where("id = ?", sched.ID).
+				Updates(updates).Error; err != nil {
+				return err
+			}
+			if nr, ok := updates["next_run_at"].(time.Time); ok {
+				resultNextRunAt = &nr
+			} else {
+				resultNextRunAt = sched.NextRunAt
+			}
+		}
+		return nil
+	})
+	if txErr != nil {
+		log.Printf("[handler] UpdateSchedule error: %v", txErr)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: txErr.Error()})
+		return
+	}
 
 	var nextRunAt *string
-	if sched.NextRunAt != nil {
-		s := sched.NextRunAt.Format(time.RFC3339)
+	if resultNextRunAt != nil {
+		s := resultNextRunAt.Format(time.RFC3339)
 		nextRunAt = &s
 	}
 
 	ok(c, gin.H{
-		"schedule_id": sched.ID,
+		"schedule_id": resultScheduleID,
 		"next_run_at": nextRunAt,
 	})
+}
+
+// applyScheduleUpdates copies the fields present in an UpdateSchedule `updates`
+// map onto a SummarySchedule struct. Used by the Plan A1 clone path so the new
+// schedule carries the original fields plus the requested changes (run_time /
+// interval / day_of_week / day_of_month / next_run_at, etc.) computed by the
+// existing timezone-aware NextRunInitial logic above.
+func applyScheduleUpdates(s *model.SummarySchedule, updates map[string]interface{}) {
+	if v, ok := updates["title"].(string); ok {
+		s.Title = v
+	}
+	if v, ok := updates["cron_expr"].(string); ok {
+		s.CronExpr = v
+	}
+	if v, ok := updates["interval_days"].(int); ok {
+		s.IntervalDays = v
+	}
+	if v, ok := updates["interval_months"].(int); ok {
+		s.IntervalMonths = v
+	}
+	if v, ok := updates["run_time"].(string); ok {
+		s.RunTime = v
+	}
+	if v, ok := updates["day_of_week"].(int); ok {
+		s.DayOfWeek = v
+	}
+	if v, ok := updates["day_of_month"].(int); ok {
+		s.DayOfMonth = v
+	}
+	if v, ok := updates["time_range_type"].(int); ok {
+		s.TimeRangeType = v
+	}
+	if v, ok := updates["source_config"].(model.JSON); ok {
+		s.SourceConfig = v
+	}
+	if v, ok := updates["participant_config"].(model.JSON); ok {
+		s.ParticipantConfig = v
+	}
+	if v, ok := updates["next_run_at"].(time.Time); ok {
+		s.NextRunAt = &v
+	}
 }
 
 // DeleteSchedule handles DELETE /api/v1/summary-schedules/:id

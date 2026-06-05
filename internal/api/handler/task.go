@@ -487,6 +487,16 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		"updated_at":       task.UpdatedAt.Format(time.RFC3339),
 	}
 
+	// Plan C (P0 protocol fix): expose the task's associated schedule_id so the
+	// detail page can correctly distinguish "edit existing schedule" vs "create
+	// new schedule". Previously this field was missing, so detail.schedule_id was
+	// always empty on the frontend and the update branch never fired.
+	if task.ScheduleID != nil {
+		resp["schedule_id"] = *task.ScheduleID
+	} else {
+		resp["schedule_id"] = nil
+	}
+
 	if latestResult.ID > 0 {
 		resp["result_id"] = latestResult.ID
 		if latestResult.EditedAt != nil {
