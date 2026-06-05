@@ -29,9 +29,24 @@ func NewTaskHandler(db, imDB *gorm.DB, workerTriggerURL string) *TaskHandler {
 	return &TaskHandler{db: db, imDB: imDB, workerTriggerURL: workerTriggerURL}
 }
 
+// canAccessTask reports whether userID may read the task: creator or explicit
+// participant. This is the single source of truth shared by the detail path
+// (authorizeTaskAccess) and conceptually the batch path (batchAuthorize) and the
+// list query (ListSummaries). Source-group membership alone does NOT grant access.
+func (h *TaskHandler) canAccessTask(userID string, taskID int64, creatorID string) bool {
+	if creatorID == userID {
+		return true
+	}
+	var cnt int64
+	h.db.Model(&model.SummaryParticipant{}).
+		Where("task_id = ? AND user_id = ?", taskID, userID).
+		Count(&cnt)
+	return cnt > 0
+}
+
 // authorizeTaskAccess loads a task by ID and checks that the current user is
-// authorized to access it. Authorization passes if the user is the task creator,
-// a participant, or a member of at least one source group.
+// authorized to access it. Authorization passes if the user is the task creator
+// or an explicit participant. Source-group membership alone does NOT grant access.
 // Returns the task and true on success; writes a JSON error response and returns
 // nil, false on failure.
 func (h *TaskHandler) authorizeTaskAccess(c *gin.Context, taskID int64) (*model.SummaryTask, bool) {
@@ -47,33 +62,8 @@ func (h *TaskHandler) authorizeTaskAccess(c *gin.Context, taskID int64) (*model.
 		return nil, false
 	}
 
-	// 1. Creator check
-	if task.CreatorID == userID {
+	if h.canAccessTask(userID, task.ID, task.CreatorID) {
 		return &task, true
-	}
-
-	// 2. Participant check
-	var participantCount int64
-	h.db.Model(&model.SummaryParticipant{}).
-		Where("task_id = ? AND user_id = ?", taskID, userID).
-		Count(&participantCount)
-	if participantCount > 0 {
-		return &task, true
-	}
-
-	// 3. Source group membership check (via imDB)
-	var sourceIDs []string
-	h.db.Model(&model.SummarySource{}).
-		Where("task_id = ? AND source_type = ?", taskID, model.SourceGroup).
-		Pluck("source_id", &sourceIDs)
-	if len(sourceIDs) > 0 {
-		var memberCount int64
-		h.imDB.Table("group_member").
-			Where("group_no IN ? AND uid = ? AND is_deleted = 0", sourceIDs, userID).
-			Count(&memberCount)
-		if memberCount > 0 {
-			return &task, true
-		}
 	}
 
 	c.JSON(http.StatusForbidden, apiResponse{Code: 40003, Message: "无权访问此任务"})
@@ -95,13 +85,15 @@ func bizErr(c *gin.Context, err *service.BizError) {
 }
 
 type createSummaryReq struct {
-	UID                 string       `json:"uid"`
-	Title               string       `json:"title"`
-	Topic               string       `json:"topic"`
-	TimeRange           *timeRange   `json:"time_range"`
-	Sources             []sourceReq  `json:"sources"`
+	UID                 string           `json:"uid"`
+	Title               string           `json:"title"`
+	Topic               string           `json:"topic"`
+	TimeRange           *timeRange       `json:"time_range"`
+	Sources             []sourceReq      `json:"sources"`
 	Participants        []participantReq `json:"participants"`
-	ConfirmTimeoutHours int          `json:"confirm_timeout_hours"`
+	ConfirmTimeoutHours int              `json:"confirm_timeout_hours"`
+	OriginChannelID     string           `json:"origin_channel_id"`
+	OriginChannelType   int              `json:"origin_channel_type"`
 }
 
 type timeRange struct {
@@ -116,7 +108,7 @@ type sourceReq struct {
 
 type participantReq struct {
 	UserName string `json:"user_name"`
-	UserID string `json:"user_id"`
+	UserID   string `json:"user_id"`
 }
 
 // CreateSummary handles POST /api/v1/summaries
@@ -147,6 +139,20 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 	if utf8.RuneCountInString(req.Topic) > 1000 {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "topic 不能超过 1000 字符"})
 		return
+	}
+	if req.OriginChannelID != "" && (req.OriginChannelType < model.OriginChannelGroup || req.OriginChannelType > model.OriginChannelDM) {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "origin_channel_type must be 1, 2, or 3 when origin_channel_id is set"})
+		return
+	}
+	if req.OriginChannelID == "" && req.OriginChannelType != 0 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "origin_channel_id is required when origin_channel_type is set"})
+		return
+	}
+	if len(req.Sources) == 0 && req.OriginChannelID != "" && req.OriginChannelType >= model.OriginChannelGroup && req.OriginChannelType <= model.OriginChannelDM {
+		req.Sources = []sourceReq{{
+			SourceType: req.OriginChannelType,
+			SourceID:   req.OriginChannelID,
+		}}
 	}
 	if len(req.Sources) == 0 && req.Topic == "" && req.TimeRange == nil {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "至少提供 sources、topic 或 time_range 之一"})
@@ -201,16 +207,18 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 	confirmDeadline := &dl
 
 	task := model.SummaryTask{
-		TaskNo:          taskNo,
-		SpaceID:         spaceID,
-		CreatorID:       effectiveUID,
-		Title:           title,
-		SummaryMode:     summaryMode,
-		TimeRangeStart:  timeStart,
-		TimeRangeEnd:    timeEnd,
-		Status:          initialStatus,
-		TriggerType:     model.TriggerManual,
-		ConfirmDeadline: confirmDeadline,
+		TaskNo:            taskNo,
+		SpaceID:           spaceID,
+		CreatorID:         effectiveUID,
+		Title:             title,
+		SummaryMode:       summaryMode,
+		TimeRangeStart:    timeStart,
+		TimeRangeEnd:      timeEnd,
+		Status:            initialStatus,
+		TriggerType:       model.TriggerManual,
+		ConfirmDeadline:   confirmDeadline,
+		OriginChannelID:   req.OriginChannelID,
+		OriginChannelType: req.OriginChannelType,
 	}
 
 	log.Printf("[handler] CreateSummary space=%s user=%s mode=%d", spaceID, effectiveUID, summaryMode)
@@ -264,9 +272,14 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 				continue
 			}
 			pp := model.SummaryParticipant{
-				TaskID:   task.ID,
-				UserID:   p.UserID,
-				UserName: func() string { if p.UserName != "" { return p.UserName }; return service.ResolveUserName(p.UserID) }(),
+				TaskID: task.ID,
+				UserID: p.UserID,
+				UserName: func() string {
+					if p.UserName != "" {
+						return p.UserName
+					}
+					return service.ResolveUserName(p.UserID)
+				}(),
 			}
 			if err := tx.Create(&pp).Error; err != nil {
 				return err
@@ -333,6 +346,9 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	if s := c.Query("keyword"); s != "" {
 		query = query.Where("title LIKE ?", "%"+s+"%")
 	}
+	if s := c.Query("origin_channel_id"); s != "" {
+		query = query.Where("origin_channel_id = ?", s)
+	}
 	if s := c.Query("created_after"); s != "" {
 		if t, err := time.Parse(time.RFC3339, s); err == nil {
 			query = query.Where("created_at >= ?", t)
@@ -392,19 +408,21 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 		}
 
 		items = append(items, gin.H{
-			"task_id":          t.ID,
-			"task_no":          t.TaskNo,
-			"title":            t.Title,
-			"summary_mode":     t.SummaryMode,
-			"status":           t.Status,
-			"trigger_type":     t.TriggerType,
-			"time_range_start": t.TimeRangeStart.Format(time.RFC3339),
-			"time_range_end":   t.TimeRangeEnd.Format(time.RFC3339),
-			"sources":          srcList,
-			"total_msg_count":  totalMsgCount,
-			"creator_name":     creatorName,
-			"created_at":       t.CreatedAt.Format(time.RFC3339),
-			"completed_at":     completedAt,
+			"task_id":             t.ID,
+			"task_no":             t.TaskNo,
+			"title":               t.Title,
+			"summary_mode":        t.SummaryMode,
+			"status":              t.Status,
+			"trigger_type":        t.TriggerType,
+			"time_range_start":    t.TimeRangeStart.Format(time.RFC3339),
+			"time_range_end":      t.TimeRangeEnd.Format(time.RFC3339),
+			"sources":             srcList,
+			"total_msg_count":     totalMsgCount,
+			"creator_name":        creatorName,
+			"origin_channel_id":   t.OriginChannelID,
+			"origin_channel_type": t.OriginChannelType,
+			"created_at":          t.CreatedAt.Format(time.RFC3339),
+			"completed_at":        completedAt,
 		})
 	}
 
@@ -470,20 +488,22 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 	}
 
 	resp := gin.H{
-		"task_id":          task.ID,
-		"task_no":          task.TaskNo,
-		"title":            task.Title,
-		"summary_mode":     task.SummaryMode,
-		"status":           task.Status,
-		"trigger_type":     task.TriggerType,
-		"time_range_start": task.TimeRangeStart.Format(time.RFC3339),
-		"time_range_end":   task.TimeRangeEnd.Format(time.RFC3339),
-		"sources":          srcList,
-		"participants":     partList,
-		"result":           resultOut,
-		"error_message":    task.ErrorMessage,
-		"created_at":       task.CreatedAt.Format(time.RFC3339),
-		"updated_at":       task.UpdatedAt.Format(time.RFC3339),
+		"task_id":             task.ID,
+		"task_no":             task.TaskNo,
+		"title":               task.Title,
+		"summary_mode":        task.SummaryMode,
+		"status":              task.Status,
+		"trigger_type":        task.TriggerType,
+		"time_range_start":    task.TimeRangeStart.Format(time.RFC3339),
+		"time_range_end":      task.TimeRangeEnd.Format(time.RFC3339),
+		"sources":             srcList,
+		"participants":        partList,
+		"result":              resultOut,
+		"error_message":       task.ErrorMessage,
+		"origin_channel_id":   task.OriginChannelID,
+		"origin_channel_type": task.OriginChannelType,
+		"created_at":          task.CreatedAt.Format(time.RFC3339),
+		"updated_at":          task.UpdatedAt.Format(time.RFC3339),
 	}
 
 	if latestResult.ID > 0 {
@@ -685,6 +705,63 @@ func (h *TaskHandler) InferScope(c *gin.Context) {
 	ok(c, result)
 }
 
+// GetTemplates handles GET /api/v1/summary-templates
+func (h *TaskHandler) GetTemplates(c *gin.Context) {
+	type placeholder struct {
+		Key      string `json:"key"`
+		Label    string `json:"label"`
+		Position []int  `json:"position,omitempty"`
+	}
+	type tmpl struct {
+		ID           string        `json:"id"`
+		Label        string        `json:"label"`
+		Icon         string        `json:"icon"`
+		Description  string        `json:"description"`
+		Type         string        `json:"type"`
+		Pattern      string        `json:"pattern"`
+		Placeholders []placeholder `json:"placeholders,omitempty"`
+	}
+
+	templates := []tmpl{
+		{
+			ID:           "project_progress",
+			Label:        "汇总项目进展",
+			Icon:         "FileText",
+			Description:  "与团队成员一起总结进展",
+			Type:         "parameterized",
+			Pattern:      "总结 {project_name} 的项目进展",
+			Placeholders: []placeholder{{Key: "project_name", Label: "输入项目名称", Position: []int{3, 9}}},
+		},
+		{
+			ID:           "task_tracking",
+			Label:        "跟踪任务进度",
+			Icon:         "ListChecks",
+			Description:  "邀请同事汇总任务完成情况",
+			Type:         "parameterized",
+			Pattern:      "总结 {task_name} 的完成情况",
+			Placeholders: []placeholder{{Key: "task_name", Label: "输入任务名称", Position: []int{3, 9}}},
+		},
+		{
+			ID:          "weekly_report",
+			Label:       "总结团队周报",
+			Icon:        "Calendar",
+			Description: "总结团队成员每周的工作",
+			Type:        "fixed",
+			Pattern:     "总结每周的工作周报",
+		},
+		{
+			ID:          "chat_content",
+			Label:       "总结聊天内容",
+			Icon:        "MessageSquare",
+			Description: "总结指定聊天中的事情进展",
+			Type:        "fixed",
+			Pattern:     "总结本群中的关键内容",
+		},
+	}
+
+	ok(c, gin.H{"templates": templates})
+}
+
 func (h *TaskHandler) triggerWorker(req model.WorkerTriggerRequest) {
 	if h.workerTriggerURL == "" {
 		return
@@ -848,8 +925,10 @@ func (h *TaskHandler) BatchStatus(c *gin.Context) {
 }
 
 // batchAuthorize returns the subset of taskIDs that userID is allowed to access.
-// Known limitation: source_type=2 (thread) is not checked here, consistent with
-// the existing authorizeTaskAccess implementation.
+// Access is granted to task creators and explicit participants only.
+// Source-group membership does NOT grant access. This must stay semantically
+// equal to canAccessTask / authorizeTaskAccess; the batch Pluck form is only a
+// performance optimization to avoid N per-task queries.
 func (h *TaskHandler) batchAuthorize(userID string, taskIDs []int64, taskMap map[int64]*model.SummaryTask) []int64 {
 	authorized := make(map[int64]struct{})
 
@@ -871,42 +950,6 @@ func (h *TaskHandler) batchAuthorize(userID string, taskIDs []int64, taskMap map
 		Distinct().Pluck("task_id", &participantTaskIDs)
 	for _, id := range participantTaskIDs {
 		authorized[id] = struct{}{}
-	}
-
-	stillRemaining := make([]int64, 0)
-	for _, id := range remainingIDs {
-		if _, ok := authorized[id]; !ok {
-			stillRemaining = append(stillRemaining, id)
-		}
-	}
-	if len(stillRemaining) == 0 {
-		return mapKeys(authorized)
-	}
-
-	var sources []model.SummarySource
-	h.db.Where("task_id IN ? AND source_type = ?", stillRemaining, model.SourceGroup).
-		Find(&sources)
-
-	if len(sources) > 0 {
-		groupToTasks := make(map[string][]int64)
-		for _, s := range sources {
-			groupToTasks[s.SourceID] = append(groupToTasks[s.SourceID], s.TaskID)
-		}
-		groupNos := make([]string, 0, len(groupToTasks))
-		for gno := range groupToTasks {
-			groupNos = append(groupNos, gno)
-		}
-
-		var memberGroups []string
-		h.imDB.Table("group_member").
-			Where("group_no IN ? AND uid = ? AND is_deleted = 0", groupNos, userID).
-			Pluck("group_no", &memberGroups)
-
-		for _, gno := range memberGroups {
-			for _, taskID := range groupToTasks[gno] {
-				authorized[taskID] = struct{}{}
-			}
-		}
 	}
 
 	return mapKeys(authorized)
