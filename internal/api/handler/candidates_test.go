@@ -21,6 +21,8 @@ func setupCandidateImDB(t *testing.T) *gorm.DB {
 	imDB.Exec(`CREATE TABLE "group" (group_no TEXT NOT NULL, name TEXT, space_id TEXT, status INTEGER DEFAULT 1)`)
 	imDB.Exec(`CREATE TABLE thread (id INTEGER PRIMARY KEY, short_id TEXT, name TEXT, group_no TEXT, status INTEGER DEFAULT 1, message_count INTEGER DEFAULT 0)`)
 	imDB.Exec(`CREATE TABLE group_member (group_no TEXT NOT NULL, uid TEXT NOT NULL, is_deleted INTEGER DEFAULT 0)`)
+	imDB.Exec(`CREATE TABLE group_setting (group_no TEXT NOT NULL, uid TEXT NOT NULL, save INTEGER DEFAULT 0, top INTEGER DEFAULT 0, mute INTEGER DEFAULT 0)`)
+	imDB.Exec(`CREATE TABLE conversation_extra (uid TEXT NOT NULL, channel_id TEXT NOT NULL, channel_type INTEGER DEFAULT 2, updated_at TEXT)`)
 	return imDB
 }
 
@@ -33,10 +35,17 @@ func setupCandidateRouter(h *CandidateHandler) *gin.Engine {
 }
 
 func doCandidateRequest(r *gin.Engine, userID, chatType, keyword string) *httptest.ResponseRecorder {
+	return doCandidateRequestFilter(r, userID, chatType, keyword, "")
+}
+
+func doCandidateRequestFilter(r *gin.Engine, userID, chatType, keyword, filter string) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	path := "/api/v1/summary-chat-candidates?chat_type=" + chatType
 	if keyword != "" {
 		path += "&keyword=" + keyword
+	}
+	if filter != "" {
+		path += "&filter=" + filter
 	}
 	req := httptest.NewRequest("GET", path, nil)
 	if userID != "" {
@@ -197,5 +206,125 @@ func TestSearchChatCandidates_ThreadExcludesEmptyMessageCount(t *testing.T) {
 	}
 	if resp.Data[0]["name"] != "Active Thread" {
 		t.Errorf("expected 'Active Thread', got %v", resp.Data[0]["name"])
+	}
+}
+
+func TestSearchChatCandidates_FilterFollowed(t *testing.T) {
+	imDB := setupCandidateImDB(t)
+
+	// Two groups: user follows grp1 but not grp2
+	imDB.Exec(`INSERT INTO "group" (group_no, name, space_id, status) VALUES ('grp1', 'FollowedGroup', 'space1', 1)`)
+	imDB.Exec(`INSERT INTO "group" (group_no, name, space_id, status) VALUES ('grp2', 'UnfollowedGroup', 'space1', 1)`)
+	imDB.Exec(`INSERT INTO group_member (group_no, uid, is_deleted) VALUES ('grp1', 'user1', 0)`)
+	imDB.Exec(`INSERT INTO group_member (group_no, uid, is_deleted) VALUES ('grp2', 'user1', 0)`)
+	imDB.Exec(`INSERT INTO group_setting (group_no, uid, save) VALUES ('grp1', 'user1', 1)`)
+	imDB.Exec(`INSERT INTO group_setting (group_no, uid, save) VALUES ('grp2', 'user1', 0)`)
+
+	// Thread under followed group
+	imDB.Exec(`INSERT INTO thread (id, short_id, name, group_no, status, message_count) VALUES (1, 'th001', 'Thread In Followed', 'grp1', 1, 5)`)
+	// Thread under unfollowed group
+	imDB.Exec(`INSERT INTO thread (id, short_id, name, group_no, status, message_count) VALUES (2, 'th002', 'Thread In Unfollowed', 'grp2', 1, 3)`)
+
+	h := NewCandidateHandler(imDB, -1)
+	h.collate = ""
+	r := setupCandidateRouter(h)
+
+	w := doCandidateRequestFilter(r, "user1", "", "", "followed")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Code int              `json:"code"`
+		Data []map[string]any `json:"data"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	// Should get: FollowedGroup + Thread In Followed = 2 items
+	if len(resp.Data) != 2 {
+		t.Fatalf("expected 2 items (1 group + 1 thread), got %d: %v", len(resp.Data), resp.Data)
+	}
+
+	names := map[string]bool{}
+	for _, item := range resp.Data {
+		names[item["name"].(string)] = true
+		// All items should have is_followed=true
+		if item["is_followed"] != true {
+			t.Errorf("expected is_followed=true for %v, got %v", item["name"], item["is_followed"])
+		}
+	}
+	if !names["FollowedGroup"] {
+		t.Errorf("expected FollowedGroup in results, got %v", names)
+	}
+	if !names["Thread In Followed"] {
+		t.Errorf("expected Thread In Followed in results, got %v", names)
+	}
+	if names["UnfollowedGroup"] || names["Thread In Unfollowed"] {
+		t.Errorf("unfollowed items should not appear, got %v", names)
+	}
+}
+
+func TestSearchChatCandidates_FilterRecent(t *testing.T) {
+	imDB := setupCandidateImDB(t)
+
+	// Two groups, only grp1 has recent conversation activity
+	imDB.Exec(`INSERT INTO "group" (group_no, name, space_id, status) VALUES ('grp1', 'RecentGroup', 'space1', 1)`)
+	imDB.Exec(`INSERT INTO "group" (group_no, name, space_id, status) VALUES ('grp2', 'InactiveGroup', 'space1', 1)`)
+	imDB.Exec(`INSERT INTO group_member (group_no, uid, is_deleted) VALUES ('grp1', 'user1', 0)`)
+	imDB.Exec(`INSERT INTO group_member (group_no, uid, is_deleted) VALUES ('grp2', 'user1', 0)`)
+	imDB.Exec(`INSERT INTO conversation_extra (uid, channel_id, channel_type, updated_at) VALUES ('user1', 'grp1', 2, '2026-06-06T10:00:00Z')`)
+
+	h := NewCandidateHandler(imDB, -1)
+	h.collate = ""
+	r := setupCandidateRouter(h)
+
+	w := doCandidateRequestFilter(r, "user1", "", "", "recent")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Code int              `json:"code"`
+		Data []map[string]any `json:"data"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	// Should get only RecentGroup (grp1 has conversation_extra entry)
+	if len(resp.Data) != 1 {
+		t.Fatalf("expected 1 item, got %d: %v", len(resp.Data), resp.Data)
+	}
+	if resp.Data[0]["name"] != "RecentGroup" {
+		t.Errorf("expected RecentGroup, got %v", resp.Data[0]["name"])
+	}
+	if resp.Data[0]["last_active_at"] != "2026-06-06T10:00:00Z" {
+		t.Errorf("expected last_active_at=2026-06-06T10:00:00Z, got %v", resp.Data[0]["last_active_at"])
+	}
+}
+
+func TestSearchChatCandidates_FilterEmptyIsBackwardCompatible(t *testing.T) {
+	imDB := setupCandidateImDB(t)
+
+	imDB.Exec(`INSERT INTO "group" (group_no, name, space_id, status) VALUES ('grp1', 'Group1', 'space1', 1)`)
+	imDB.Exec(`INSERT INTO "group" (group_no, name, space_id, status) VALUES ('grp2', 'Group2', 'space1', 1)`)
+	imDB.Exec(`INSERT INTO group_member (group_no, uid, is_deleted) VALUES ('grp1', 'user1', 0)`)
+	imDB.Exec(`INSERT INTO group_member (group_no, uid, is_deleted) VALUES ('grp2', 'user1', 0)`)
+
+	h := NewCandidateHandler(imDB, -1)
+	h.collate = ""
+	r := setupCandidateRouter(h)
+
+	// No filter = returns all groups (backward compatible)
+	w := doCandidateRequestFilter(r, "user1", "group", "", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Code int              `json:"code"`
+		Data []map[string]any `json:"data"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if len(resp.Data) != 2 {
+		t.Fatalf("expected 2 groups with empty filter, got %d", len(resp.Data))
 	}
 }

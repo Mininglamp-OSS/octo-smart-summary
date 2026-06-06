@@ -108,10 +108,16 @@ type imDirect struct {
 // Query params:
 //   - keyword:   optional search keyword
 //   - chat_type: "group" | "direct" | "" (empty = all)
+//   - filter:    "followed" | "recent" | "" (empty = all, backward compatible)
 //
 // Groups are fetched from the `group` table.
 // Direct chats are fetched from `conversation_extra` (channel_type=1), filtered to
 // human peers only (32-char hex uid, not in robot table, robot flag = 0).
+//
+// When filter=followed, only groups where group_setting.save=1 for the current user
+// are returned (plus their threads). Direct chats are excluded.
+// When filter=recent, conversations are fetched from conversation_extra ordered by
+// updated_at DESC, returning recently active groups and directs.
 func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 	if h.imDB == nil {
 		c.JSON(http.StatusOK, gin.H{"code": 0, "data": []interface{}{}})
@@ -120,6 +126,7 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 
 	keyword := c.Query("keyword")
 	chatType := c.Query("chat_type") // "group", "direct", or "" = all
+	filter := c.Query("filter")     // "followed", "recent", or "" = all
 
 	// Resolve current user from context (set by AuthMiddleware).
 	currentUID, _ := c.Get("user_id")
@@ -134,13 +141,78 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 		spaceIDStr, _ = v.(string)
 	}
 
+	// --- Build followed group_no set (used by filter=followed and for is_followed enrichment) ---
+	followedGroupNos := map[string]bool{}
+	if currentUIDStr != "" {
+		type followedGroup struct {
+			GroupNo string `gorm:"column:group_no"`
+		}
+		var fgs []followedGroup
+		h.imDB.Table("group_setting").
+			Select("group_no").
+			Where("uid = ? AND save = 1", currentUIDStr).
+			Find(&fgs)
+		for _, fg := range fgs {
+			followedGroupNos[fg.GroupNo] = true
+		}
+	}
+
+	// --- Build recent channel map (used by filter=recent and for last_active_at enrichment) ---
+	recentChannels := map[string]string{} // channelID -> updated_at ISO string
+	if currentUIDStr != "" {
+		type recentConv struct {
+			ChannelID   string `gorm:"column:channel_id"`
+			ChannelType int    `gorm:"column:channel_type"`
+			UpdatedAt   string `gorm:"column:updated_at"`
+		}
+		var rcs []recentConv
+		h.imDB.Table("conversation_extra").
+			Select("channel_id, channel_type, updated_at").
+			Where("uid = ?", currentUIDStr).
+			Order("updated_at DESC").
+			Limit(50).
+			Find(&rcs)
+		for _, rc := range rcs {
+			recentChannels[rc.ChannelID] = rc.UpdatedAt
+		}
+	}
+
+	// --- Determine which sections to include based on filter ---
+	includeGroups := chatType == "" || chatType == "all" || chatType == "group"
+	includeThreads := chatType == "" || chatType == "all" || chatType == "thread"
+	includeDirects := chatType == "" || chatType == "all" || chatType == "direct"
+
+	if filter == "followed" {
+		// Followed is group-centric: only groups + their threads, no directs.
+		includeDirects = false
+	} else if filter == "recent" {
+		// Recent includes both groups and directs that appear in conversation_extra.
+	}
+
 	// --- Groups ---
-	if chatType == "" || chatType == "all" || chatType == "group" {
+	if includeGroups {
 		var groups []imGroup
 		q := h.imDB.Table("`group` g").Select("g.group_no, g.name")
 		if currentUIDStr != "" {
 			q = q.Joins("INNER JOIN group_member gm ON gm.group_no = g.group_no").
 				Where("gm.uid = ? AND gm.is_deleted = 0", currentUIDStr)
+		}
+		if filter == "followed" && currentUIDStr != "" {
+			q = q.Joins("INNER JOIN group_setting gs ON gs.group_no = g.group_no").
+				Where("gs.uid = ? AND gs.save = 1", currentUIDStr)
+		} else if filter == "recent" {
+			// Only include groups that appear in the recent conversation list.
+			recentGroupNos := make([]string, 0)
+			for chID := range recentChannels {
+				recentGroupNos = append(recentGroupNos, chID)
+			}
+			if len(recentGroupNos) > 0 {
+				q = q.Where("g.group_no IN ?", recentGroupNos)
+			} else {
+				// No recent conversations — skip group query entirely.
+				groups = nil
+				goto groupsDone
+			}
 		}
 		if spaceIDStr != "" {
 			q = q.Where("g.space_id = ?", spaceIDStr)
@@ -149,18 +221,22 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 			q = q.Where("g.name LIKE ?", "%"+keyword+"%")
 		}
 		h.applyLimit(q).Find(&groups)
+	groupsDone:
 		for _, g := range groups {
-			list = append(list, gin.H{
-				"chat_id":      g.GroupNo,
-				"chat_type":    "group",
-				"name":         g.Name,
-				"member_count": nil,
-			})
+			entry := gin.H{
+				"chat_id":        g.GroupNo,
+				"chat_type":      "group",
+				"name":           g.Name,
+				"member_count":   nil,
+				"is_followed":    followedGroupNos[g.GroupNo],
+				"last_active_at": recentChannels[g.GroupNo],
+			}
+			list = append(list, entry)
 		}
 	}
 
 	// --- Threads (子区, channelType=5) ---
-	if chatType == "" || chatType == "all" || chatType == "thread" {
+	if includeThreads {
 		type imThread struct {
 			ShortID string `gorm:"column:short_id"`
 			Name    string `gorm:"column:name"`
@@ -177,6 +253,23 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 			q = q.Joins("INNER JOIN group_member gm ON gm.group_no" + h.collate + " = t.group_no").
 				Where("gm.uid = ? AND gm.is_deleted = 0", currentUIDStr)
 		}
+		if filter == "followed" && currentUIDStr != "" {
+			// Only threads under followed groups.
+			q = q.Joins("INNER JOIN group_setting gs2 ON gs2.group_no" + h.collate + " = t.group_no").
+				Where("gs2.uid = ? AND gs2.save = 1", currentUIDStr)
+		} else if filter == "recent" {
+			// Only threads under groups that appear in recent conversations.
+			recentGroupNos := make([]string, 0)
+			for chID := range recentChannels {
+				recentGroupNos = append(recentGroupNos, chID)
+			}
+			if len(recentGroupNos) > 0 {
+				q = q.Where("t.group_no IN ?", recentGroupNos)
+			} else {
+				threads = nil
+				goto threadsDone
+			}
+		}
 		if spaceIDStr != "" {
 			q = q.Where("g.space_id = ?", spaceIDStr)
 		}
@@ -184,6 +277,7 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 			q = q.Where("t.name LIKE ? OR g.name LIKE ?", "%"+keyword+"%", "%"+keyword+"%")
 		}
 		h.applyLimit(q).Find(&threads)
+	threadsDone:
 		for _, t := range threads {
 			list = append(list, gin.H{
 				"chat_id":         t.GroupNo + "____" + t.ShortID,
@@ -191,6 +285,8 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 				"name":            t.Name,
 				"member_count":    nil,
 				"parent_group_no": t.GroupNo,
+				"is_followed":     followedGroupNos[t.GroupNo],
+				"last_active_at":  recentChannels[t.GroupNo],
 			})
 		}
 	}
@@ -201,7 +297,7 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 	// Filter: only 32-char hex uids (excludes system accounts like fileHelper/botfather),
 	//         not a robot (robot table + robot flag).
 	// Requires authentication; skipped silently if unauthenticated.
-	if (chatType == "" || chatType == "all" || chatType == "direct") && currentUIDStr != "" {
+	if includeDirects && currentUIDStr != "" {
 		var directs []imDirect
 		q := h.imDB.Table("conversation_extra ce").
 			Select("ce.channel_id, u.name, u.robot").
@@ -232,12 +328,19 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 			if name == "" {
 				name = d.ChannelID
 			}
+			// For filter=recent, skip directs not in the recent conversations list.
+			if filter == "recent" {
+				if _, ok := recentChannels[d.ChannelID]; !ok {
+					continue
+				}
+			}
 			list = append(list, gin.H{
-				"chat_id":      d.ChannelID,
-				"chat_type":    "direct",
-				"name":         name,
-				"member_count": nil,
-				"is_bot":       d.Robot == 1,
+				"chat_id":        d.ChannelID,
+				"chat_type":      "direct",
+				"name":           name,
+				"member_count":   nil,
+				"is_bot":         d.Robot == 1,
+				"last_active_at": recentChannels[d.ChannelID],
 			})
 		}
 	}
