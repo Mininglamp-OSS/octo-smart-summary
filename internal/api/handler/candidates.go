@@ -2,6 +2,7 @@ package handler
 
 import (
 	"net/http"
+	"sort"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -343,6 +344,21 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 				"last_active_at": recentChannels[d.ChannelID],
 			})
 		}
+	}
+
+	// --- Sort by recency when filter=recent ---
+	if filter == "recent" && len(list) > 1 {
+		sort.SliceStable(list, func(i, j int) bool {
+			ai, _ := list[i]["last_active_at"].(string)
+			aj, _ := list[j]["last_active_at"].(string)
+			if ai == "" {
+				return false
+			}
+			if aj == "" {
+				return true
+			}
+			return ai > aj // DESC: newer first
+		})
 	}
 
 	c.JSON(http.StatusOK, gin.H{"code": 0, "data": list})
