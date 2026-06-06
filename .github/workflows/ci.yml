@@ -98,8 +98,116 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: ${{ env.GO_VERSION }}
-      - name: Test
-        run: go test -race -shuffle=on -count=1 -timeout 5m ./...
+
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@v1.13.0
+
+      - name: Run tests
+        id: run-tests
+        run: |
+          gotestsum \
+            --junitfile junit.xml \
+            --format short-verbose \
+            -- -race -shuffle=on -count=1 -timeout 5m \
+               -coverprofile=coverage.out \
+               -covermode=atomic ./...
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-results
+          path: |
+            junit.xml
+            coverage.out
+          retention-days: 14
+
+      - name: Write PR summary
+        if: always()
+        run: |
+          outcome="${{ steps.run-tests.outcome }}"
+
+          case "$outcome" in
+            success) verdict="✅ **PASSED**" ;;
+            failure) verdict="❌ **FAILED**" ;;
+            *)       verdict="⏭️ **${outcome}**" ;;
+          esac
+
+          total=0; failed=0; errors=0; skipped=0; passed=0
+          if [ -f junit.xml ]; then
+            total=$(grep -o 'tests="[0-9]*"' junit.xml | head -1 | grep -o '[0-9]*' || echo 0)
+            failed=$(grep -o 'failures="[0-9]*"' junit.xml | head -1 | grep -o '[0-9]*' || echo 0)
+            errors=$(grep -o 'errors="[0-9]*"' junit.xml | head -1 | grep -o '[0-9]*' || echo 0)
+            skipped=$(grep -o 'skipped="[0-9]*"' junit.xml | grep -o '[0-9]*' | paste -sd+ - | bc 2>/dev/null || echo 0)
+            passed=$(( total - failed - errors - skipped ))
+            [ "$passed" -lt 0 ] && passed=0
+          fi
+
+          {
+            echo "## 🧪 Test Results"
+            echo
+            echo "${verdict}"
+            echo
+            echo "| Metric | Count |"
+            echo "|--------|-------|"
+            echo "| 🧮 Total | ${total} |"
+            echo "| ✅ Passed | ${passed} |"
+            echo "| ❌ Failed | ${failed} |"
+            echo "| 💥 Errors | ${errors} |"
+            echo "| ⏭️ Skipped | ${skipped} |"
+            echo
+            echo "**Flags:** \`-race -shuffle=on\`"
+            echo
+            echo "📦 [Download artifacts](../actions/runs/${{ github.run_id }}#artifacts)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  diff-coverage:
+    needs: [changes, test]
+    if: |
+      always() &&
+      github.event_name == 'pull_request' &&
+      needs.test.result == 'success' &&
+      needs.changes.outputs.code == 'true'
+    name: Diff Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Download test results
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: test-results
+
+      # Diff-only gate: report total coverage but only fail the job when the
+      # *diff* coverage drops below 60%. coverage.acceptable is intentionally
+      # omitted so this job does not block PRs based on the repo-wide baseline.
+      - name: Generate octocov config
+        run: |
+          cat > .octocov.yml <<'EOF'
+          coverage:
+            paths:
+              - coverage.out
+          diff:
+            coverage:
+              acceptable: 60
+          comment:
+            enable: true
+            hideFooterLink: false
+          summary:
+            enable: true
+          EOF
+
+      - name: Run octocov
+        uses: k1LoW/octocov-action@b3b6ee60482a667950f87553abf1df63217235d9 # v1.5.1
 
   vet:
     needs: [changes]
