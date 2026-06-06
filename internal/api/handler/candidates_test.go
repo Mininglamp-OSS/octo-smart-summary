@@ -23,6 +23,10 @@ func setupCandidateImDB(t *testing.T) *gorm.DB {
 	imDB.Exec(`CREATE TABLE group_member (group_no TEXT NOT NULL, uid TEXT NOT NULL, is_deleted INTEGER DEFAULT 0)`)
 	imDB.Exec(`CREATE TABLE group_setting (group_no TEXT NOT NULL, uid TEXT NOT NULL, save INTEGER DEFAULT 0, top INTEGER DEFAULT 0, mute INTEGER DEFAULT 0)`)
 	imDB.Exec(`CREATE TABLE conversation_extra (uid TEXT NOT NULL, channel_id TEXT NOT NULL, channel_type INTEGER DEFAULT 2, updated_at TEXT)`)
+	imDB.Exec(`CREATE TABLE user (uid TEXT NOT NULL, name TEXT, robot INTEGER DEFAULT 0)`)
+	imDB.Exec(`CREATE TABLE robot (robot_id TEXT, creator_uid TEXT, status INTEGER DEFAULT 1)`)
+	imDB.Exec(`CREATE TABLE space_member (uid TEXT, space_id TEXT, status INTEGER DEFAULT 1)`)
+	imDB.Exec(`CREATE TABLE friend (uid TEXT, to_uid TEXT, is_deleted INTEGER DEFAULT 0)`)
 	return imDB
 }
 
@@ -326,5 +330,130 @@ func TestSearchChatCandidates_FilterEmptyIsBackwardCompatible(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	if len(resp.Data) != 2 {
 		t.Fatalf("expected 2 groups with empty filter, got %d", len(resp.Data))
+	}
+}
+
+func TestSearchChatCandidates_FilterRecentThread(t *testing.T) {
+	imDB := setupCandidateImDB(t)
+
+	// One group with two threads. The parent group is NOT recently active, and only
+	// one thread (th001 -> 'grp1____th001') appears in conversation_extra as recent.
+	imDB.Exec(`INSERT INTO "group" (group_no, name, space_id, status) VALUES ('grp1', 'ParentGroup', 'space1', 1)`)
+	imDB.Exec(`INSERT INTO thread (id, short_id, name, group_no, status, message_count) VALUES (1, 'th001', 'Recent Thread', 'grp1', 1, 5)`)
+	imDB.Exec(`INSERT INTO thread (id, short_id, name, group_no, status, message_count) VALUES (2, 'th002', 'Stale Thread', 'grp1', 1, 7)`)
+	imDB.Exec(`INSERT INTO group_member (group_no, uid, is_deleted) VALUES ('grp1', 'user1', 0)`)
+	// channel_type=5 thread conversation, keyed by composite 'group_no____short_id'.
+	imDB.Exec(`INSERT INTO conversation_extra (uid, channel_id, channel_type, updated_at) VALUES ('user1', 'grp1____th001', 5, '2026-06-06T12:00:00Z')`)
+
+	h := NewCandidateHandler(imDB, -1)
+	h.collate = ""
+	r := setupCandidateRouter(h)
+
+	w := doCandidateRequestFilter(r, "user1", "thread", "", "recent")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Code int              `json:"code"`
+		Data []map[string]any `json:"data"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	// Only the thread whose composite channel id is recent should surface.
+	if len(resp.Data) != 1 {
+		t.Fatalf("expected 1 recent thread, got %d: %v", len(resp.Data), resp.Data)
+	}
+	got := resp.Data[0]
+	if got["name"] != "Recent Thread" {
+		t.Errorf("expected 'Recent Thread', got %v", got["name"])
+	}
+	if got["chat_id"] != "grp1____th001" {
+		t.Errorf("expected chat_id=grp1____th001, got %v", got["chat_id"])
+	}
+	// last_active_at must be the thread's own activity, not the parent group's.
+	if got["last_active_at"] != "2026-06-06T12:00:00Z" {
+		t.Errorf("expected thread last_active_at=2026-06-06T12:00:00Z, got %v", got["last_active_at"])
+	}
+}
+
+func TestSearchChatCandidates_FilterRecentGroupNotLeakingThreads(t *testing.T) {
+	imDB := setupCandidateImDB(t)
+
+	// Parent group IS recently active (channel_type=2), but its threads are NOT.
+	// The recent group must surface; none of its threads should leak in as recent.
+	imDB.Exec(`INSERT INTO "group" (group_no, name, space_id, status) VALUES ('grp1', 'RecentGroup', 'space1', 1)`)
+	imDB.Exec(`INSERT INTO thread (id, short_id, name, group_no, status, message_count) VALUES (1, 'th001', 'Thread A', 'grp1', 1, 5)`)
+	imDB.Exec(`INSERT INTO group_member (group_no, uid, is_deleted) VALUES ('grp1', 'user1', 0)`)
+	imDB.Exec(`INSERT INTO conversation_extra (uid, channel_id, channel_type, updated_at) VALUES ('user1', 'grp1', 2, '2026-06-06T10:00:00Z')`)
+
+	h := NewCandidateHandler(imDB, -1)
+	h.collate = ""
+	r := setupCandidateRouter(h)
+
+	w := doCandidateRequestFilter(r, "user1", "", "", "recent")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Code int              `json:"code"`
+		Data []map[string]any `json:"data"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	if len(resp.Data) != 1 {
+		t.Fatalf("expected 1 item (group only), got %d: %v", len(resp.Data), resp.Data)
+	}
+	if resp.Data[0]["chat_type"] != "group" || resp.Data[0]["name"] != "RecentGroup" {
+		t.Errorf("expected RecentGroup, got %v", resp.Data[0])
+	}
+}
+
+func TestSearchChatCandidates_FilterRecentMixedGroupDirectOrdering(t *testing.T) {
+	imDB := setupCandidateImDB(t)
+
+	// A recent group and a recent direct chat with distinct activity times.
+	// The direct is more recent, so it must sort ahead of the group.
+	const peerUID = "abcdef0123456789abcdef0123456789" // 32-char hex
+	imDB.Exec(`INSERT INTO "group" (group_no, name, space_id, status) VALUES ('grp1', 'RecentGroup', 'space1', 1)`)
+	imDB.Exec(`INSERT INTO group_member (group_no, uid, is_deleted) VALUES ('grp1', 'user1', 0)`)
+	imDB.Exec(`INSERT INTO user (uid, name, robot) VALUES (?, 'Peer Person', 0)`, peerUID)
+	imDB.Exec(`INSERT INTO space_member (uid, space_id, status) VALUES (?, 'space1', 1)`, peerUID)
+
+	// Group active earlier, direct active later.
+	imDB.Exec(`INSERT INTO conversation_extra (uid, channel_id, channel_type, updated_at) VALUES ('user1', 'grp1', 2, '2026-06-06T09:00:00Z')`)
+	imDB.Exec(`INSERT INTO conversation_extra (uid, channel_id, channel_type, updated_at) VALUES (?, ?, 1, '2026-06-06T11:00:00Z')`, "user1", peerUID)
+
+	h := NewCandidateHandler(imDB, -1)
+	h.collate = ""
+	r := setupCandidateRouter(h)
+
+	w := doCandidateRequestFilter(r, "user1", "", "", "recent")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Code int              `json:"code"`
+		Data []map[string]any `json:"data"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	if len(resp.Data) != 2 {
+		t.Fatalf("expected 2 items (group + direct), got %d: %v", len(resp.Data), resp.Data)
+	}
+	// Most recent first: the direct (11:00) before the group (09:00).
+	if resp.Data[0]["chat_type"] != "direct" {
+		t.Errorf("expected direct first (most recent), got %v", resp.Data[0])
+	}
+	if resp.Data[0]["name"] != "Peer Person" {
+		t.Errorf("expected 'Peer Person' first, got %v", resp.Data[0]["name"])
+	}
+	if resp.Data[1]["chat_type"] != "group" {
+		t.Errorf("expected group second, got %v", resp.Data[1])
+	}
+	if resp.Data[1]["last_active_at"] != "2026-06-06T09:00:00Z" {
+		t.Errorf("expected group last_active_at=2026-06-06T09:00:00Z, got %v", resp.Data[1]["last_active_at"])
 	}
 }

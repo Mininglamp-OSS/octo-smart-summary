@@ -158,8 +158,13 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 		}
 	}
 
-	// --- Build recent channel map (used by filter=recent and for last_active_at enrichment) ---
-	recentChannels := map[string]string{} // channelID -> updated_at ISO string
+	// --- Build recent channel maps (used by filter=recent and for last_active_at enrichment) ---
+	// conversation_extra mixes channel types under one channel_id column, so split by
+	// channel_type to avoid cross-type collisions. Thread channel_ids use the composite
+	// format 'group_no____short_id' (4 underscores), distinct from a bare group_no.
+	recentGroups := map[string]string{}  // channel_type=2: group_no       -> updated_at
+	recentThreads := map[string]string{} // channel_type=5: group_no____short_id -> updated_at
+	recentDirects := map[string]string{} // channel_type=1: peer uid       -> updated_at
 	if currentUIDStr != "" {
 		type recentConv struct {
 			ChannelID   string `gorm:"column:channel_id"`
@@ -174,7 +179,14 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 			Limit(50).
 			Find(&rcs)
 		for _, rc := range rcs {
-			recentChannels[rc.ChannelID] = rc.UpdatedAt
+			switch rc.ChannelType {
+			case 1:
+				recentDirects[rc.ChannelID] = rc.UpdatedAt
+			case 5:
+				recentThreads[rc.ChannelID] = rc.UpdatedAt
+			default: // channel_type=2 (group)
+				recentGroups[rc.ChannelID] = rc.UpdatedAt
+			}
 		}
 	}
 
@@ -203,8 +215,8 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 				Where("gs.uid = ? AND gs.save = 1", currentUIDStr)
 		} else if filter == "recent" {
 			// Only include groups that appear in the recent conversation list.
-			recentGroupNos := make([]string, 0)
-			for chID := range recentChannels {
+			recentGroupNos := make([]string, 0, len(recentGroups))
+			for chID := range recentGroups {
 				recentGroupNos = append(recentGroupNos, chID)
 			}
 			if len(recentGroupNos) > 0 {
@@ -230,7 +242,7 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 				"name":           g.Name,
 				"member_count":   nil,
 				"is_followed":    followedGroupNos[g.GroupNo],
-				"last_active_at": recentChannels[g.GroupNo],
+				"last_active_at": recentGroups[g.GroupNo],
 			}
 			list = append(list, entry)
 		}
@@ -259,14 +271,13 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 			q = q.Joins("INNER JOIN group_setting gs2 ON gs2.group_no" + h.collate + " = t.group_no").
 				Where("gs2.uid = ? AND gs2.save = 1", currentUIDStr)
 		} else if filter == "recent" {
-			// Only threads under groups that appear in recent conversations.
-			recentGroupNos := make([]string, 0)
-			for chID := range recentChannels {
-				recentGroupNos = append(recentGroupNos, chID)
-			}
-			if len(recentGroupNos) > 0 {
-				q = q.Where("t.group_no IN ?", recentGroupNos)
-			} else {
+			// Recent threads are matched by their full composite channel id
+			// ('group_no____short_id') against recentThreads, NOT by parent group_no —
+			// a recently active parent group does not make all its threads recent, and a
+			// recently active thread may live under a group that itself is not recent.
+			// The composite id is not a SQL column, so the match is applied in the loop
+			// below. If there are no recent threads at all, skip the query entirely.
+			if len(recentThreads) == 0 {
 				threads = nil
 				goto threadsDone
 			}
@@ -280,14 +291,22 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 		h.applyLimit(q).Find(&threads)
 	threadsDone:
 		for _, t := range threads {
+			compositeID := t.GroupNo + "____" + t.ShortID
+			// For filter=recent, only surface threads whose own composite channel id
+			// appears in the recent conversation list.
+			if filter == "recent" {
+				if _, ok := recentThreads[compositeID]; !ok {
+					continue
+				}
+			}
 			list = append(list, gin.H{
-				"chat_id":         t.GroupNo + "____" + t.ShortID,
+				"chat_id":         compositeID,
 				"chat_type":       "thread",
 				"name":            t.Name,
 				"member_count":    nil,
 				"parent_group_no": t.GroupNo,
 				"is_followed":     followedGroupNos[t.GroupNo],
-				"last_active_at":  recentChannels[t.GroupNo],
+				"last_active_at":  recentThreads[compositeID],
 			})
 		}
 	}
@@ -331,7 +350,7 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 			}
 			// For filter=recent, skip directs not in the recent conversations list.
 			if filter == "recent" {
-				if _, ok := recentChannels[d.ChannelID]; !ok {
+				if _, ok := recentDirects[d.ChannelID]; !ok {
 					continue
 				}
 			}
@@ -341,7 +360,7 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 				"name":           name,
 				"member_count":   nil,
 				"is_bot":         d.Robot == 1,
-				"last_active_at": recentChannels[d.ChannelID],
+				"last_active_at": recentDirects[d.ChannelID],
 			})
 		}
 	}
