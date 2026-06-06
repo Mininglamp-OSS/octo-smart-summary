@@ -127,7 +127,7 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 
 	keyword := c.Query("keyword")
 	chatType := c.Query("chat_type") // "group", "direct", or "" = all
-	filter := c.Query("filter")     // "followed", "recent", or "" = all
+	filter := c.Query("filter")      // "followed", "recent", or "" = all
 
 	// Resolve current user from context (set by AuthMiddleware).
 	currentUID, _ := c.Get("user_id")
@@ -182,10 +182,12 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 			switch rc.ChannelType {
 			case 1:
 				recentDirects[rc.ChannelID] = rc.UpdatedAt
+			case 2:
+				recentGroups[rc.ChannelID] = rc.UpdatedAt
 			case 5:
 				recentThreads[rc.ChannelID] = rc.UpdatedAt
-			default: // channel_type=2 (group)
-				recentGroups[rc.ChannelID] = rc.UpdatedAt
+			default:
+				// Ignore unknown channel types.
 			}
 		}
 	}
@@ -198,8 +200,6 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 	if filter == "followed" {
 		// Followed is group-centric: only groups + their threads, no directs.
 		includeDirects = false
-	} else if filter == "recent" {
-		// Recent includes both groups and directs that appear in conversation_extra.
 	}
 
 	// --- Groups ---
@@ -263,12 +263,12 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 		if currentUIDStr != "" {
 			// Use group_member instead of thread_member so that all threads in the
 			// user's groups are returned, not just threads the user has posted in.
-			q = q.Joins("INNER JOIN group_member gm ON gm.group_no" + h.collate + " = t.group_no").
+			q = q.Joins("INNER JOIN group_member gm ON gm.group_no"+h.collate+" = t.group_no").
 				Where("gm.uid = ? AND gm.is_deleted = 0", currentUIDStr)
 		}
 		if filter == "followed" && currentUIDStr != "" {
 			// Only threads under followed groups.
-			q = q.Joins("INNER JOIN group_setting gs2 ON gs2.group_no" + h.collate + " = t.group_no").
+			q = q.Joins("INNER JOIN group_setting gs2 ON gs2.group_no"+h.collate+" = t.group_no").
 				Where("gs2.uid = ? AND gs2.save = 1", currentUIDStr)
 		} else if filter == "recent" {
 			// Recent threads are matched by their full composite channel id
@@ -288,7 +288,15 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 		if keyword != "" {
 			q = q.Where("t.name LIKE ? OR g.name LIKE ?", "%"+keyword+"%", "%"+keyword+"%")
 		}
-		h.applyLimit(q).Find(&threads)
+		// For filter=recent the recency match happens in the loop below against the
+		// composite channel id, which is not a SQL column. Applying LIMIT here would
+		// truncate the result set before that filter runs and drop valid recent
+		// threads, so skip the limit in that case.
+		if filter == "recent" {
+			q.Find(&threads)
+		} else {
+			h.applyLimit(q).Find(&threads)
+		}
 	threadsDone:
 		for _, t := range threads {
 			compositeID := t.GroupNo + "____" + t.ShortID
@@ -342,7 +350,21 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 		if keyword != "" {
 			q = q.Where("u.name LIKE ?", "%"+keyword+"%")
 		}
+		// For filter=recent, constrain to the recent direct peers in SQL so that LIMIT
+		// truncates the already-filtered set rather than dropping recent peers before
+		// the in-loop recency check runs.
+		if filter == "recent" {
+			recentDirectIDs := make([]string, 0, len(recentDirects))
+			for chID := range recentDirects {
+				recentDirectIDs = append(recentDirectIDs, chID)
+			}
+			if len(recentDirectIDs) == 0 {
+				goto directsDone
+			}
+			q = q.Where("ce.channel_id IN ?", recentDirectIDs)
+		}
 		h.applyLimit(q.Order("ce.updated_at DESC")).Find(&directs)
+	directsDone:
 		for _, d := range directs {
 			name := d.Name
 			if name == "" {
@@ -360,6 +382,7 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 				"name":           name,
 				"member_count":   nil,
 				"is_bot":         d.Robot == 1,
+				"is_followed":    false,
 				"last_active_at": recentDirects[d.ChannelID],
 			})
 		}
