@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"log"
 	"net/http"
 	"sort"
@@ -654,18 +655,38 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid request body"})
 		return
 	}
-	if utf8.RuneCountInString(req.Topic) > 1000 {
+	topic := strings.TrimSpace(req.Topic)
+	if utf8.RuneCountInString(topic) > 1000 {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "topic 不能超过 1000 字符"})
 		return
 	}
 	newTitle := task.Title
-	if req.Topic != "" && req.Topic != task.Title {
-		newTitle = req.Topic
+	if topic != "" && topic != task.Title {
+		newTitle = topic
 	}
 
 	nextVer, _ := service.GetNextVersion(h.db, taskID)
 
 	err = h.db.Transaction(func(tx *gorm.DB) error {
+		// Atomic status transition: only proceed if the task is still in a
+		// terminal state. This prevents concurrent regenerate requests from
+		// both passing the pre-check and duplicating work.
+		res := tx.Model(&model.SummaryTask{}).
+			Where("id = ? AND status IN ?", taskID, []int{model.StatusCompleted, model.StatusFailed, model.StatusCancelled}).
+			Updates(map[string]interface{}{
+				"status":              model.StatusPending,
+				"retry_count":         0,
+				"error_message":       nil,
+				"processing_deadline": nil,
+				"title":               newTitle,
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return service.NewBizError(40005, "任务已在处理中，请稍后再试", http.StatusConflict)
+		}
+
 		if err := tx.Where("task_id = ?", taskID).Delete(&model.SummaryResult{}).Error; err != nil {
 			return err
 		}
@@ -691,18 +712,14 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 		}).Error; err != nil {
 			return err
 		}
-		if err := tx.Model(&task).Updates(map[string]interface{}{
-			"status":              model.StatusPending,
-			"retry_count":         0,
-			"error_message":       nil,
-			"processing_deadline": nil,
-			"title":               newTitle,
-		}).Error; err != nil {
-			return err
-		}
 		return nil
 	})
 	if err != nil {
+		var be *service.BizError
+		if errors.As(err, &be) {
+			bizErr(c, be)
+			return
+		}
 		log.Printf("[handler] Regenerate tx error: %v", err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
 		return

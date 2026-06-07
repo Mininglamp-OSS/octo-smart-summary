@@ -493,6 +493,36 @@ func TestRegenerate_NonStringTopic(t *testing.T) {
 	}
 }
 
+func TestRegenerate_WhitespaceOnlyTopic(t *testing.T) {
+	db := setupRegenerateDB(t)
+	imDB, _ := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	imDB.Exec("CREATE TABLE group_member (group_no TEXT NOT NULL, uid TEXT NOT NULL, is_deleted INTEGER DEFAULT 0)")
+	imDB.Exec("INSERT INTO group_member (group_no, uid, is_deleted) VALUES ('grp_abc', 'creator1', 0)")
+
+	taskID, _, _ := seedCompletedTask(t, db)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupRegenerateRouter(h)
+
+	w := httptest.NewRecorder()
+	body := bytes.NewBufferString(`{"topic": "   "}`)
+	req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/summaries/%d/regenerate", taskID), body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Token", "creator1")
+	req.Header.Set("X-Space-Id", "space1")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Whitespace-only topic should NOT overwrite the title
+	var task model.SummaryTask
+	db.First(&task, taskID)
+	if task.Title != "原始提示词" {
+		t.Errorf("whitespace-only topic should not overwrite title: want 原始提示词, got %q", task.Title)
+	}
+}
+
 func TestRegenerate_TopicTooLong(t *testing.T) {
 	db := setupRegenerateDB(t)
 	imDB, _ := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
