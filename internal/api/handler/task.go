@@ -3,7 +3,9 @@ package handler
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sort"
@@ -648,8 +650,9 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 	// optional: an empty body or a body without a topic field keeps the
 	// existing title unchanged (backward compatible).
 	var req regenerateReq
-	if c.Request.Body != nil {
-		_ = c.ShouldBindJSON(&req)
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid request body"})
+		return
 	}
 	if utf8.RuneCountInString(req.Topic) > 1000 {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "topic 不能超过 1000 字符"})

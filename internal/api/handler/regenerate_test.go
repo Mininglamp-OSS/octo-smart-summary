@@ -433,6 +433,66 @@ func TestRegenerate_WithEmptyTopic(t *testing.T) {
 	}
 }
 
+func TestRegenerate_MalformedJSON(t *testing.T) {
+	db := setupRegenerateDB(t)
+	imDB, _ := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	imDB.Exec("CREATE TABLE group_member (group_no TEXT NOT NULL, uid TEXT NOT NULL, is_deleted INTEGER DEFAULT 0)")
+	imDB.Exec("INSERT INTO group_member (group_no, uid, is_deleted) VALUES ('grp_abc', 'creator1', 0)")
+
+	taskID, _, _ := seedCompletedTask(t, db)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupRegenerateRouter(h)
+
+	w := httptest.NewRecorder()
+	body := bytes.NewBufferString(`{"topic": "test`)
+	req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/summaries/%d/regenerate", taskID), body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Token", "creator1")
+	req.Header.Set("X-Space-Id", "space1")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for malformed JSON, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Verify task was NOT reset
+	var task model.SummaryTask
+	db.First(&task, taskID)
+	if task.Status != model.StatusCompleted {
+		t.Errorf("task status should remain completed, got %d", task.Status)
+	}
+}
+
+func TestRegenerate_NonStringTopic(t *testing.T) {
+	db := setupRegenerateDB(t)
+	imDB, _ := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	imDB.Exec("CREATE TABLE group_member (group_no TEXT NOT NULL, uid TEXT NOT NULL, is_deleted INTEGER DEFAULT 0)")
+	imDB.Exec("INSERT INTO group_member (group_no, uid, is_deleted) VALUES ('grp_abc', 'creator1', 0)")
+
+	taskID, _, _ := seedCompletedTask(t, db)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupRegenerateRouter(h)
+
+	w := httptest.NewRecorder()
+	body := bytes.NewBufferString(`{"topic": 123}`)
+	req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/summaries/%d/regenerate", taskID), body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Token", "creator1")
+	req.Header.Set("X-Space-Id", "space1")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for non-string topic, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Verify task was NOT reset
+	var task model.SummaryTask
+	db.First(&task, taskID)
+	if task.Status != model.StatusCompleted {
+		t.Errorf("task status should remain completed, got %d", task.Status)
+	}
+}
+
 func TestRegenerate_TopicTooLong(t *testing.T) {
 	db := setupRegenerateDB(t)
 	imDB, _ := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
