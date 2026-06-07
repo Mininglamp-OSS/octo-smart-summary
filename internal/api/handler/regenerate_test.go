@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,6 +51,7 @@ func seedCompletedTask(t *testing.T, db *gorm.DB) (taskID int64, participantID i
 		CreatorID:   "creator1",
 		SummaryMode: model.ModeByPerson,
 		Status:      model.StatusCompleted,
+		Title:       "原始提示词",
 	}
 	db.Create(&task)
 
@@ -362,5 +365,100 @@ func TestRegenerate_TriggersWorker(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Error("triggerWorker was not called within 2s")
+	}
+}
+
+func TestRegenerate_WithNewTopic(t *testing.T) {
+	db := setupRegenerateDB(t)
+	imDB, _ := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	imDB.Exec("CREATE TABLE group_member (group_no TEXT NOT NULL, uid TEXT NOT NULL, is_deleted INTEGER DEFAULT 0)")
+	imDB.Exec("INSERT INTO group_member (group_no, uid, is_deleted) VALUES ('grp_abc', 'creator1', 0)")
+
+	taskID, _, _ := seedCompletedTask(t, db)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupRegenerateRouter(h)
+
+	w := httptest.NewRecorder()
+	body := bytes.NewBufferString(`{"topic":"新的提示词"}`)
+	req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/summaries/%d/regenerate", taskID), body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Token", "creator1")
+	req.Header.Set("X-Space-Id", "space1")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	data := resp["data"].(map[string]interface{})
+	if data["title"] != "新的提示词" {
+		t.Errorf("response title: want 新的提示词, got %v", data["title"])
+	}
+
+	var task model.SummaryTask
+	db.First(&task, taskID)
+	if task.Title != "新的提示词" {
+		t.Errorf("task title: want 新的提示词, got %q", task.Title)
+	}
+}
+
+func TestRegenerate_WithEmptyTopic(t *testing.T) {
+	db := setupRegenerateDB(t)
+	imDB, _ := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	imDB.Exec("CREATE TABLE group_member (group_no TEXT NOT NULL, uid TEXT NOT NULL, is_deleted INTEGER DEFAULT 0)")
+	imDB.Exec("INSERT INTO group_member (group_no, uid, is_deleted) VALUES ('grp_abc', 'creator1', 0)")
+
+	taskID, _, _ := seedCompletedTask(t, db)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupRegenerateRouter(h)
+
+	w := httptest.NewRecorder()
+	body := bytes.NewBufferString(`{"topic":""}`)
+	req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/summaries/%d/regenerate", taskID), body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Token", "creator1")
+	req.Header.Set("X-Space-Id", "space1")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var task model.SummaryTask
+	db.First(&task, taskID)
+	if task.Title != "原始提示词" {
+		t.Errorf("task title should be unchanged: want 原始提示词, got %q", task.Title)
+	}
+}
+
+func TestRegenerate_TopicTooLong(t *testing.T) {
+	db := setupRegenerateDB(t)
+	imDB, _ := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	imDB.Exec("CREATE TABLE group_member (group_no TEXT NOT NULL, uid TEXT NOT NULL, is_deleted INTEGER DEFAULT 0)")
+	imDB.Exec("INSERT INTO group_member (group_no, uid, is_deleted) VALUES ('grp_abc', 'creator1', 0)")
+
+	taskID, _, _ := seedCompletedTask(t, db)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupRegenerateRouter(h)
+
+	longTopic := strings.Repeat("a", 1001)
+	w := httptest.NewRecorder()
+	body := bytes.NewBufferString(fmt.Sprintf(`{"topic":%q}`, longTopic))
+	req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/summaries/%d/regenerate", taskID), body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Token", "creator1")
+	req.Header.Set("X-Space-Id", "space1")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for too-long topic, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var task model.SummaryTask
+	db.First(&task, taskID)
+	if task.Title != "原始提示词" {
+		t.Errorf("task title should be unchanged: want 原始提示词, got %q", task.Title)
 	}
 }

@@ -614,6 +614,12 @@ func (h *TaskHandler) GetResult(c *gin.Context) {
 	})
 }
 
+// regenerateReq is the optional request body for Regenerate. When Topic is
+// provided and differs from the current title, the task title is updated.
+type regenerateReq struct {
+	Topic string `json:"topic"`
+}
+
 // Regenerate handles POST /api/v1/summaries/:id/regenerate
 func (h *TaskHandler) Regenerate(c *gin.Context) {
 	userID := middleware.GetUserID(c)
@@ -636,6 +642,22 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 	if task.Status != model.StatusCompleted && task.Status != model.StatusFailed && task.Status != model.StatusCancelled {
 		bizErr(c, service.NewBizError(40005, "任务状态不允许此操作", http.StatusConflict))
 		return
+	}
+
+	// Optionally accept a new topic to update the task title. The body is
+	// optional: an empty body or a body without a topic field keeps the
+	// existing title unchanged (backward compatible).
+	var req regenerateReq
+	if c.Request.Body != nil {
+		_ = c.ShouldBindJSON(&req)
+	}
+	if utf8.RuneCountInString(req.Topic) > 1000 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "topic 不能超过 1000 字符"})
+		return
+	}
+	newTitle := task.Title
+	if req.Topic != "" && req.Topic != task.Title {
+		newTitle = req.Topic
 	}
 
 	nextVer, _ := service.GetNextVersion(h.db, taskID)
@@ -671,6 +693,7 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 			"retry_count":         0,
 			"error_message":       nil,
 			"processing_deadline": nil,
+			"title":               newTitle,
 		}).Error; err != nil {
 			return err
 		}
@@ -695,6 +718,7 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 		"task_id":     task.ID,
 		"status":      model.StatusPending,
 		"new_version": nextVer,
+		"title":       newTitle,
 	})
 }
 
