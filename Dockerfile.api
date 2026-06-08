@@ -7,7 +7,10 @@ COPY . .
 RUN CGO_ENABLED=0 go build -o /bin/summary-api ./cmd/summary-api
 
 FROM alpine:3.19
-RUN apk add --no-cache ca-certificates tzdata
+ENV TZ=Asia/Shanghai
+RUN apk add --no-cache ca-certificates tzdata \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+    && echo $TZ > /etc/timezone
 COPY --from=builder /bin/summary-api /bin/summary-api
 EXPOSE 8080 8081
 ENTRYPOINT ["/bin/summary-api"]
