@@ -1020,22 +1020,57 @@ func (h *ScheduleHandler) DeleteSchedule(c *gin.Context) {
 		bizErr(c, service.NewBizError(40008, "定时配置不存在", http.StatusNotFound))
 		return
 	}
-	if sched.CreatorID != userID {
-		bizErr(c, service.NewBizError(40004, "无权限删除", http.StatusForbidden))
-		return
-	}
 
 	now := timezone.Now()
-	if err := h.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&sched).Update("deleted_at", &now).Error; err != nil {
+	txErr := h.db.Transaction(func(tx *gorm.DB) error {
+		lockedSched, err := lockScheduleForUpdate(tx, schedID, spaceID)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errRebindConcurrentModified
+			}
 			return err
 		}
+		if lockedSched.CreatorID != userID {
+			return service.NewBizError(40004, "无权限删除", http.StatusForbidden)
+		}
+
+		var boundTasks []model.SummaryTask
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("schedule_id = ? AND deleted_at IS NULL", lockedSched.ID).
+			Order("id ASC").
+			Find(&boundTasks).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Model(&model.SummarySchedule{}).
+			Where("id = ?", lockedSched.ID).
+			Update("deleted_at", &now).Error; err != nil {
+			return err
+		}
+
+		if len(boundTasks) == 0 {
+			return nil
+		}
+
+		taskIDs := make([]int64, 0, len(boundTasks))
+		for _, task := range boundTasks {
+			taskIDs = append(taskIDs, task.ID)
+		}
 		return tx.Model(&model.SummaryTask{}).
-			Where("schedule_id = ? AND deleted_at IS NULL", sched.ID).
+			Where("id IN ?", taskIDs).
 			Update("schedule_id", nil).Error
-	}); err != nil {
-		log.Printf("[handler] DeleteSchedule error: %v", err)
-		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
+	})
+	if txErr != nil {
+		var biz *service.BizError
+		switch {
+		case isScheduleRetryableConflict(txErr):
+			writeRetryableRebindConflict(c)
+		case errors.As(txErr, &biz):
+			bizErr(c, biz)
+		default:
+			log.Printf("[handler] DeleteSchedule error: %v", txErr)
+			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: txErr.Error()})
+		}
 		return
 	}
 

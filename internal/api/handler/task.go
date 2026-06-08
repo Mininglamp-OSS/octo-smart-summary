@@ -77,6 +77,21 @@ func (h *TaskHandler) authorizeTaskAccess(c *gin.Context, taskID int64) (*model.
 	return nil, false
 }
 
+func (h *TaskHandler) pickDisplayResult(taskID int64) (model.SummaryResult, bool) {
+	var result model.SummaryResult
+	err := h.db.
+		Where("task_id = ?", taskID).
+		Order("CASE WHEN edited_at IS NULL THEN 1 ELSE 0 END ASC").
+		Order("edited_at DESC").
+		Order("version DESC").
+		Limit(1).
+		First(&result).Error
+	if err != nil {
+		return model.SummaryResult{}, false
+	}
+	return result, true
+}
+
 type apiResponse struct {
 	Code    int         `json:"code"`
 	Message string      `json:"message"`
@@ -394,15 +409,21 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			})
 		}
 
-		var latestResult model.SummaryResult
-		h.db.Where("task_id = ?", t.ID).Order("version DESC").Limit(1).Find(&latestResult)
+		latestResult, hasResult := h.pickDisplayResult(t.ID)
 
 		totalMsgCount := 0
 		var completedAt *string
-		if latestResult.ID > 0 {
+		var resultEditedAt *string
+		resultIsEdited := false
+		if hasResult {
 			totalMsgCount = latestResult.TotalMsgCount
 			s := latestResult.GeneratedAt.Format(time.RFC3339)
 			completedAt = &s
+			if latestResult.EditedAt != nil {
+				editedAt := latestResult.EditedAt.Format(time.RFC3339)
+				resultEditedAt = &editedAt
+				resultIsEdited = true
+			}
 		}
 
 		creatorName := ""
@@ -430,6 +451,8 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			"origin_channel_type": t.OriginChannelType,
 			"created_at":          t.CreatedAt.Format(time.RFC3339),
 			"completed_at":        completedAt,
+			"result_is_edited":    resultIsEdited,
+			"result_edited_at":    resultEditedAt,
 		})
 	}
 
@@ -478,11 +501,10 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		partList = append(partList, item)
 	}
 
-	var latestResult model.SummaryResult
-	h.db.Where("task_id = ?", taskID).Order("version DESC").Limit(1).Find(&latestResult)
+	latestResult, hasResult := h.pickDisplayResult(taskID)
 
 	var resultOut interface{}
-	if latestResult.ID > 0 {
+	if hasResult {
 		resultOut = gin.H{
 			"content":          latestResult.Content,
 			"citations":        latestResult.GetCitations(),
@@ -519,16 +541,19 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 	// always empty on the frontend and the update branch never fired.
 	if task.ScheduleID != nil {
 		var sched model.SummarySchedule
-		if err := h.db.Where("id = ? AND deleted_at IS NULL AND is_active = 1", *task.ScheduleID).First(&sched).Error; err == nil {
+		if err := h.db.Where("id = ? AND deleted_at IS NULL", *task.ScheduleID).First(&sched).Error; err == nil {
 			resp["schedule_id"] = *task.ScheduleID
+			resp["schedule_is_active"] = sched.IsActive
 		} else {
 			resp["schedule_id"] = nil
+			resp["schedule_is_active"] = nil
 		}
 	} else {
 		resp["schedule_id"] = nil
+		resp["schedule_is_active"] = nil
 	}
 
-	if latestResult.ID > 0 {
+	if hasResult {
 		resp["result_id"] = latestResult.ID
 		if latestResult.EditedAt != nil {
 			resp["result_edited_at"] = latestResult.EditedAt.Format(time.RFC3339)
@@ -616,7 +641,8 @@ func (h *TaskHandler) GetResult(c *gin.Context) {
 	}
 
 	var result model.SummaryResult
-	if err := h.db.Where("task_id = ?", taskID).Order("version DESC").Limit(1).First(&result).Error; err != nil {
+	var found bool
+	if result, found = h.pickDisplayResult(taskID); !found {
 		bizErr(c, service.NewBizError(40008, "暂无结果", http.StatusNotFound))
 		return
 	}
@@ -629,6 +655,13 @@ func (h *TaskHandler) GetResult(c *gin.Context) {
 		"model_version":    result.ModelVersion,
 		"version":          result.Version,
 		"generated_at":     result.GeneratedAt.Format(time.RFC3339),
+		"result_is_edited": result.EditedAt != nil,
+		"result_edited_at": func() interface{} {
+			if result.EditedAt == nil {
+				return nil
+			}
+			return result.EditedAt.Format(time.RFC3339)
+		}(),
 	})
 }
 

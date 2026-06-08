@@ -27,6 +27,23 @@ func shouldSkipScheduledPlaceholderResult(triggerType int, content string) bool 
 	return triggerType == model.TriggerScheduled && strings.TrimSpace(content) == noRelevantContentMessage
 }
 
+func completedPersonalResultUpdates(pr model.PersonalResult, content string, citations []model.Citation, msgCount, totalTokens int, modelVer string, genAt time.Time, skipContent bool) map[string]interface{} {
+	updates := map[string]interface{}{
+		"worker_status": model.PersonalStatusCompleted,
+	}
+	if skipContent {
+		return updates
+	}
+	pr.SetCitations(citations)
+	updates["content"] = content
+	updates["citations_json"] = pr.CitationsJSON
+	updates["msg_count"] = msgCount
+	updates["total_token_used"] = totalTokens
+	updates["model_version"] = modelVer
+	updates["generated_at"] = genAt
+	return updates
+}
+
 func (p *Processor) processPersonalSummary(ctx context.Context, taskID, participantRefID int64) {
 	log.Printf("[personal-worker] start task=%d participant=%d", taskID, participantRefID)
 
@@ -99,6 +116,7 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 	if strings.TrimSpace(content) == "" {
 		content = noRelevantContentMessage
 	}
+	isScheduledEmptyWindow := shouldSkipScheduledPlaceholderResult(task.TriggerType, content)
 
 	// Best-effort check: abort early if task is no longer Processing.
 	// Final safety is guaranteed by the task-level CAS in the completion path below.
@@ -108,18 +126,9 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 		return
 	}
 
-	pr.SetCitations(citations)
 	genAt := timezone.Now()
 	persistStart := time.Now()
-	p.db.Model(&pr).Updates(map[string]interface{}{
-		"content":          content,
-		"citations_json":   pr.CitationsJSON,
-		"msg_count":        msgCount,
-		"total_token_used": totalTokens,
-		"model_version":    modelVer,
-		"worker_status":    model.PersonalStatusCompleted,
-		"generated_at":     genAt,
-	})
+	p.db.Model(&pr).Updates(completedPersonalResultUpdates(pr, content, citations, msgCount, totalTokens, modelVer, genAt, isScheduledEmptyWindow))
 	p.db.Model(&participant).Updates(map[string]interface{}{
 		"status": model.ParticipantCompleted,
 	})
@@ -141,7 +150,6 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 
 	if participantCount <= 1 {
 		isScheduled := task.TriggerType == model.TriggerScheduled
-		isScheduledEmptyWindow := shouldSkipScheduledPlaceholderResult(task.TriggerType, content)
 		if isScheduledEmptyWindow {
 			if err := completeTaskWithoutNewResult(p.db, taskID); err != nil {
 				if errors.Is(err, errTaskNoLongerProcessing) {

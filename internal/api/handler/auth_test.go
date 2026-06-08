@@ -348,7 +348,7 @@ func TestCancelSummary_RequiresAuth(t *testing.T) {
 	}
 }
 
-func TestGetSummary_HidesDeletedOrInactiveSchedule(t *testing.T) {
+func TestGetSummary_HidesDeletedScheduleAndKeepsInactiveBinding(t *testing.T) {
 	db, imDB := setupTestDBs(t)
 	now := time.Now().UTC()
 	nextRun := now.Add(time.Hour)
@@ -398,8 +398,11 @@ func TestGetSummary_HidesDeletedOrInactiveSchedule(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal inactive: %v", err)
 	}
-	if resp.Data["schedule_id"] != nil {
-		t.Fatalf("expected inactive schedule_id hidden, got %v", resp.Data["schedule_id"])
+	if resp.Data["schedule_id"] == nil {
+		t.Fatalf("expected inactive schedule_id to remain exposed")
+	}
+	if resp.Data["schedule_is_active"] == nil || int(resp.Data["schedule_is_active"].(float64)) != 0 {
+		t.Fatalf("expected schedule_is_active=0 for inactive schedule, got %v", resp.Data["schedule_is_active"])
 	}
 
 	deletedAt := time.Now().UTC()
