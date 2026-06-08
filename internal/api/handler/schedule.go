@@ -66,7 +66,40 @@ var (
 	errTaskScopeMissingTaskID = errors.New("scope=task requires task_id")
 	errTaskScopeInvalidTask   = errors.New("scope=task task_id invalid")
 	errTaskScopeScheduleBound = errors.New("scope=task schedule already bound to another task")
+	// errMultiPersonNotSupported (PR#62 yujiawei r3, 方案A): scheduled summary
+	// is single-person only this version. This is the API-layer fail-closed
+	// guard that complements -- and runs IN ADDITION TO -- the worker-layer
+	// "Method A guard" in internal/worker/scheduler.go. Before this guard the
+	// API happily accepted a multi-person schedule (200 + next_run_at) while the
+	// scheduler silently skipped every cycle, so the user waited forever with no
+	// error and no result. We now reject multi-person at the door (HTTP 400) so
+	// the front-end can surface a clear message and never persists a schedule
+	// the scheduler will never run.
+	errMultiPersonNotSupported = errors.New("scheduled summary not supported for multi-person/team tasks")
 )
+
+// teamScheduleNotSupportedMsg is the user-facing (Chinese) message returned for
+// the multi-person fail-closed guard. Pairs with code 40015 so the front-end
+// can route on the error code.
+const teamScheduleNotSupportedMsg = "定时总结暂不支持多人/团队任务"
+
+// loadTaskParticipantCount counts the participants bound to a task using the
+// EXACT same measure as the worker-layer Method A guard
+// (internal/worker/scheduler.go): COUNT(*) of SummaryParticipant rows where
+// task_id = task.ID. Keeping the two口径 identical means a task the API accepts
+// as single-person is exactly the set the scheduler is willing to run, and a
+// task the API rejects as multi-person is exactly the set the scheduler would
+// have skipped. The caller passes the same `tx` it already holds (it has the
+// task locked FOR UPDATE), so this count is consistent with that snapshot.
+func loadTaskParticipantCount(tx *gorm.DB, taskID int64) (int64, error) {
+	var participantCount int64
+	if err := tx.Model(&model.SummaryParticipant{}).
+		Where("task_id = ?", taskID).
+		Count(&participantCount).Error; err != nil {
+		return 0, err
+	}
+	return participantCount, nil
+}
 
 // CreateSchedule handles POST /api/v1/summary-schedules
 func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
@@ -81,6 +114,17 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 
 	if utf8.RuneCountInString(req.Title) > 1000 {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 1000 字符"})
+		return
+	}
+
+	// 方案A (PR#62 yujiawei r3): API-layer fail-closed multi-person guard.
+	// req.Participants is exactly what gets serialized into participant_config
+	// below, so counting it here (> 1) matches the worker Method A guard's
+	// participantCount > 1 measure (it counts SummaryParticipant rows, one per
+	// participant). Reject before any DB write so a team schedule is never
+	// persisted (the scheduler would only ever skip it).
+	if len(req.Participants) > 1 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40015, Message: teamScheduleNotSupportedMsg})
 		return
 	}
 
@@ -248,6 +292,9 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		case errors.Is(txErr, errTaskScopeScheduleBound):
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "该定时已绑定其它总结，不能重复绑定"})
 			return
+		case errors.Is(txErr, errMultiPersonNotSupported):
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40015, Message: teamScheduleNotSupportedMsg})
+			return
 		}
 		if biz, ok := txErr.(*service.BizError); ok {
 			bizErr(c, biz)
@@ -372,6 +419,14 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 
 	if req.Title != nil && utf8.RuneCountInString(*req.Title) > 1000 {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 1000 字符"})
+		return
+	}
+	// 方案A (PR#62 yujiawei r3): API-layer fail-closed multi-person guard on
+	// update. Only check when the caller actually sends participants
+	// (req.Participants != nil); a nil slice means "leave participants untouched"
+	// and must not be treated as multi-person. Same > 1口径 as create / worker.
+	if req.Participants != nil && len(req.Participants) > 1 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40015, Message: teamScheduleNotSupportedMsg})
 		return
 	}
 	if req.Scope != "" && req.Scope != "task" {
@@ -579,6 +634,9 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		case errors.Is(txErr, errTaskScopeScheduleBound):
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "该定时已绑定其它总结，不能重复绑定"})
 			return
+		case errors.Is(txErr, errMultiPersonNotSupported):
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40015, Message: teamScheduleNotSupportedMsg})
+			return
 		}
 		if biz, ok := txErr.(*service.BizError); ok {
 			bizErr(c, biz)
@@ -613,6 +671,20 @@ func loadTaskForTaskScope(tx *gorm.DB, spaceID, userID string, taskID int64) (mo
 	}
 	if task.CreatorID != userID {
 		return model.SummaryTask{}, service.NewBizError(40004, "仅创建者可绑定定时", http.StatusForbidden)
+	}
+	// 方案A (PR#62 yujiawei r3): API-layer fail-closed multi-person guard on the
+	// bound task. The task is already locked FOR UPDATE above, so we count its
+	// SummaryParticipant rows under the same lock snapshot and with the exact
+	// same口径 as the worker Method A guard (participantCount > 1). If the task
+	// being bound is a team task, refuse to attach a schedule to it -- otherwise
+	// the schedule would be created/updated but the scheduler would skip it
+	// every cycle, leaving the user with a silently dead timer.
+	participantCount, err := loadTaskParticipantCount(tx, task.ID)
+	if err != nil {
+		return model.SummaryTask{}, err
+	}
+	if participantCount > 1 {
+		return model.SummaryTask{}, errMultiPersonNotSupported
 	}
 	return task, nil
 }

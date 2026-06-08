@@ -22,7 +22,7 @@ func setupScheduleDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
-	if err := db.AutoMigrate(&model.SummaryTask{}, &model.SummarySchedule{}); err != nil {
+	if err := db.AutoMigrate(&model.SummaryTask{}, &model.SummarySchedule{}, &model.SummaryParticipant{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	return db
