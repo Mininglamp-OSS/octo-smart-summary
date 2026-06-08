@@ -139,6 +139,29 @@ func syncScheduledTaskParticipants(tx *gorm.DB, task model.SummaryTask, raw mode
 	return nil
 }
 
+func markTaskCompleted(tx *gorm.DB, taskID int64) error {
+	casResult := tx.Model(&model.SummaryTask{}).
+		Where("id = ? AND status = ?", taskID, model.StatusProcessing).
+		Updates(map[string]interface{}{
+			"status":              model.StatusCompleted,
+			"error_message":       nil,
+			"processing_deadline": nil,
+		})
+	if casResult.Error != nil {
+		return casResult.Error
+	}
+	if casResult.RowsAffected == 0 {
+		return errTaskNoLongerProcessing
+	}
+	return nil
+}
+
+func completeTaskWithoutNewResult(db *gorm.DB, taskID int64) error {
+	return db.Transaction(func(tx *gorm.DB) error {
+		return markTaskCompleted(tx, taskID)
+	})
+}
+
 // saveLatestResultAndCompleteTask inserts the new result and marks the task Completed.
 // isScheduled gates version retention: scheduled runs keep only the latest result (the bound
 // task is overwritten in place each cycle); manual/normal/team-meta keep full version history.
@@ -154,9 +177,11 @@ func saveLatestResultAndCompleteTask(db *gorm.DB, taskID int64, result *model.Su
 			return err
 		}
 		if isScheduled {
-			// Scheduled-only: prune stale prior-cycle versions, keeping only the
-			// freshly inserted result. Manual/team keep full version history.
-			if err := tx.Where("task_id = ? AND id <> ?", taskID, result.ID).Delete(&model.SummaryResult{}).Error; err != nil {
+			// Scheduled-only: prune stale auto-generated prior-cycle versions after
+			// the replacement result is durably inserted. Hand-edited rows
+			// (edited_at IS NOT NULL) are retained permanently as user data, even
+			// across later scheduled cycles.
+			if err := tx.Where("task_id = ? AND id <> ? AND edited_at IS NULL", taskID, result.ID).Delete(&model.SummaryResult{}).Error; err != nil {
 				return err
 			}
 			// summary_chunk currently has no version column, so cleanup must happen
@@ -165,20 +190,6 @@ func saveLatestResultAndCompleteTask(db *gorm.DB, taskID int64, result *model.Su
 				return err
 			}
 		}
-
-		casResult := tx.Model(&model.SummaryTask{}).
-			Where("id = ? AND status = ?", taskID, model.StatusProcessing).
-			Updates(map[string]interface{}{
-				"status":              model.StatusCompleted,
-				"error_message":       nil,
-				"processing_deadline": nil,
-			})
-		if casResult.Error != nil {
-			return casResult.Error
-		}
-		if casResult.RowsAffected == 0 {
-			return errTaskNoLongerProcessing
-		}
-		return nil
+		return markTaskCompleted(tx, taskID)
 	})
 }

@@ -23,6 +23,10 @@ func escapeCitationMarkers(content string) string {
 
 const noRelevantContentMessage = "在当前范围内未找到与主题相关的聊天记录。"
 
+func shouldSkipScheduledPlaceholderResult(triggerType int, content string) bool {
+	return triggerType == model.TriggerScheduled && strings.TrimSpace(content) == noRelevantContentMessage
+}
+
 func (p *Processor) processPersonalSummary(ctx context.Context, taskID, participantRefID int64) {
 	log.Printf("[personal-worker] start task=%d participant=%d", taskID, participantRefID)
 
@@ -136,27 +140,40 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 	p.db.Model(&model.SummaryParticipant{}).Where("task_id = ?", taskID).Count(&participantCount)
 
 	if participantCount <= 1 {
-		// Single-person mode: directly create SummaryResult and complete the task
-		result := model.SummaryResult{
-			TaskID:         taskID,
-			Content:        content,
-			TotalMsgCount:  msgCount,
-			TotalTokenUsed: totalTokens,
-			ModelVersion:   modelVer,
-			GeneratedAt:    genAt,
-		}
-		result.SetCitations(citations)
-		// Bug3: only scheduled tasks prune old versions in place; manual/normal
-		// single-person runs keep their full version history.
-		if err := saveLatestResultAndCompleteTask(p.db, taskID, &result, task.TriggerType == model.TriggerScheduled); err != nil {
-			if errors.Is(err, errTaskNoLongerProcessing) {
-				log.Printf("[personal-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
+		isScheduled := task.TriggerType == model.TriggerScheduled
+		isScheduledEmptyWindow := shouldSkipScheduledPlaceholderResult(task.TriggerType, content)
+		if isScheduledEmptyWindow {
+			if err := completeTaskWithoutNewResult(p.db, taskID); err != nil {
+				if errors.Is(err, errTaskNoLongerProcessing) {
+					log.Printf("[personal-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
+					return
+				}
+				log.Printf("[personal-worker] task=%d complete-without-result error: %v", taskID, err)
 				return
 			}
-			log.Printf("[personal-worker] save result error task=%d: %v", taskID, err)
-			return
+			log.Printf("[personal-worker] task %d scheduled empty-window: kept previous result, skipped prune", taskID)
+		} else {
+			// Single-person mode: directly create SummaryResult and complete the task.
+			result := model.SummaryResult{
+				TaskID:         taskID,
+				Content:        content,
+				TotalMsgCount:  msgCount,
+				TotalTokenUsed: totalTokens,
+				ModelVersion:   modelVer,
+				GeneratedAt:    genAt,
+			}
+			result.SetCitations(citations)
+			// Bug3: only scheduled tasks prune old versions in place; manual/normal
+			// single-person runs keep their full version history.
+			if err := saveLatestResultAndCompleteTask(p.db, taskID, &result, isScheduled); err != nil {
+				if errors.Is(err, errTaskNoLongerProcessing) {
+					log.Printf("[personal-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
+					return
+				}
+				log.Printf("[personal-worker] save result error task=%d: %v", taskID, err)
+				return
+			}
 		}
-
 		p.sendCallback(model.TaskEvent{
 			TaskID:   taskID,
 			Status:   model.StatusCompleted,
