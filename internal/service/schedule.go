@@ -103,6 +103,27 @@ func NextRunScheduledAdvance(cronExpr string, intervalDays int, intervalMonths i
 	// Defensive cap: at most ~ (10 years / shortest period) steps. Each loop
 	// advances at least one day, so 4000 iterations covers >10y of downtime.
 	const maxSteps = 4000
+	if intervalMonths > 0 {
+		// Bug2 (PR#62 yujiawei r4): step whole months while keeping the target
+		// day-of-month anchored to the ORIGINAL anchor's day-of-month, not the
+		// clamped result of the previous step. See monthlyTargetDom + stepMonthTo
+		// for why feeding the clamped day back (the old behaviour) made the
+		// day-of-month monotonically decrease and never recover.
+		targetDom := monthlyTargetDom(anchor, dayOfMonth)
+		next := anchor
+		for i := 0; i < maxSteps; i++ {
+			stepped := stepMonthTo(next, intervalMonths, runTime, targetDom)
+			if !stepped.After(next) {
+				return time.Time{}, fmt.Errorf("next_run did not advance from %s (interval_months=%d)", next, intervalMonths)
+			}
+			next = stepped
+			if next.After(now) {
+				return next, nil
+			}
+		}
+		return time.Time{}, fmt.Errorf("next_run exceeded %d advance steps from anchor %s (now=%s)", maxSteps, anchor, now)
+	}
+
 	next := anchor
 	for i := 0; i < maxSteps; i++ {
 		stepped, err := NextRunWithInterval(cronExpr, intervalDays, intervalMonths, runTime, dayOfWeek, dayOfMonth, next)
@@ -215,6 +236,56 @@ func alignDayOfMonth(t time.Time, dom int) time.Time {
 		day = last
 	}
 	return time.Date(t.Year(), t.Month(), day, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location())
+}
+
+// monthlyTargetDom (PR#62 r4 Bug2) resolves the stable "target day-of-month"
+// used by month-mode stepping. The scheduler overwrites next_run_at with each
+// computed (possibly clamped) result, so across cycles the `anchor` passed in is
+// the PREVIOUS step's output, not the original creation day. The target dom must
+// therefore be reconstructable from the (drifting) anchor alone and still
+// recover the intended day in long months.
+//
+//   - dayOfMonth in 1..31 (explicitly selected): that is the target, always.
+//     alignDayOfMonth clamps it to month end in short months but the target
+//     itself never drifts, so 1/31 -> 2/28 -> 3/31 recovers.
+//   - dayOfMonth == 0 ("不限" / unset) AND the anchor is the LAST day of its
+//     month: use end-of-month semantics (target 31). This is the case that was
+//     monotonically decreasing: a Jan-31 start clamps to Feb-28, and Feb-28 is
+//     itself the last day of February, so we keep targeting month-end and
+//     recover to Mar-31, Apr-30, May-31, ... The detection is self-consistent
+//     under next_run_at drift: every clamped month-end result is again a
+//     month-end day, so each subsequent cycle re-derives target 31.
+//   - dayOfMonth == 0 AND the anchor is NOT the last day of its month: the day
+//     exists in every month (1..28), so it never clamps and the anchor's own day
+//     is a stable target (e.g. the 15th stays the 15th).
+func monthlyTargetDom(anchor time.Time, dayOfMonth int) int {
+	if dayOfMonth >= 1 && dayOfMonth <= 31 {
+		return dayOfMonth
+	}
+	if anchor.Day() == daysInMonth(anchor.Year(), int(anchor.Month())) {
+		// Anchor sits on month end with no explicit day selected: treat as
+		// "last day of each month" so we recover to 31 in long months instead of
+		// sticking at a shorter month's length forever.
+		return 31
+	}
+	return anchor.Day()
+}
+
+// stepMonthTo (PR#62 r4 Bug2) advances `from` by n calendar months and snaps the
+// result to `targetDom` (clamped to the target month's length), then applies
+// runTime. Crucially it computes the day RELATIVE TO targetDom on every call, so
+// repeated stepping never carries a clamped day forward: from Jan 31 with
+// targetDom=31 we get Feb 28/29, then Mar 31, then Apr 30, ... Leap-year
+// February and December year-wrap fall out naturally from addMonthsClamped /
+// daysInMonth. With targetDom in 1..31 the alignDayOfMonth clamp is a no-op for
+// months that have the day and clamps to month-end otherwise.
+func stepMonthTo(from time.Time, n int, runTime string, targetDom int) time.Time {
+	// Move to the target month first (addMonthsClamped keeps from's day-of-month
+	// or clamps to month end), then forcibly re-anchor to targetDom for that
+	// month so the previous step's clamped day is never propagated.
+	moved := addMonthsClamped(from, n)
+	aligned := alignDayOfMonth(moved, targetDom)
+	return applyRunTime(aligned, runTime)
 }
 
 // addMonthsClamped advances t by n calendar months. Go's time.AddDate rolls a

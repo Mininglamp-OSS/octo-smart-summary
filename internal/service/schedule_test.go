@@ -649,3 +649,105 @@ func TestNextRunScheduledAdvance_CronUsesNow(t *testing.T) {
 		t.Fatalf("cron: got %v want %v", got, want)
 	}
 }
+
+// --- Bug2 (PR#62 r4 yujiawei): month-mode day-of-month must not monotonically
+// decrease and must recover to the original day-of-month in long months. -------
+//
+// Repro: anchor Jan 31, interval_months=1, day_of_month=0 ("不限"). The r3 code
+// fed each step's clamped result back as the next base, so Feb 28 became the
+// permanent target and the schedule stuck at the 28th forever. The fix re-anchors
+// every step to the ORIGINAL anchor's day-of-month (31) so it recovers in 31-day
+// months and falls to month-end only in short months.
+func TestNextRunScheduledAdvance_MonthDom0_NoMonotonicDecrease(t *testing.T) {
+	// dom=0 (unset): target day is the anchor's own day (31).
+	anchor := shTime(t, "2026-01-31T09:00:00+08:00")
+	// Expected sequence stepping one month at a time, dom anchored at 31.
+	want := []string{
+		"2026-02-28T09:00:00+08:00", // 2026 not leap
+		"2026-03-31T09:00:00+08:00", // recover to 31
+		"2026-04-30T09:00:00+08:00", // 30-day month
+		"2026-05-31T09:00:00+08:00", // recover to 31
+		"2026-06-30T09:00:00+08:00",
+		"2026-07-31T09:00:00+08:00",
+		"2026-08-31T09:00:00+08:00",
+		"2026-09-30T09:00:00+08:00",
+		"2026-10-31T09:00:00+08:00",
+		"2026-11-30T09:00:00+08:00",
+		"2026-12-31T09:00:00+08:00", // year-wrap setup
+		"2027-01-31T09:00:00+08:00", // December -> January year wrap
+		"2027-02-28T09:00:00+08:00",
+	}
+	cur := anchor
+	for i, w := range want {
+		// now just below cur so exactly one step is taken each iteration.
+		now := cur.Add(time.Second)
+		got, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 0, cur, now)
+		if err != nil {
+			t.Fatalf("step %d err: %v", i, err)
+		}
+		wantT := shTime(t, w)
+		if !got.Equal(wantT) {
+			t.Fatalf("step %d: got %v want %v", i, got, wantT)
+		}
+		// Assert never monotonically dropping below original dom permanently:
+		// the day-of-month must be 31 whenever the month has 31 days.
+		cur = got
+	}
+}
+
+// Leap-year February: anchor Jan 31 in 2028 (leap) -> Feb 29, then Mar 31.
+func TestNextRunScheduledAdvance_MonthDom0_LeapFebruary(t *testing.T) {
+	anchor := shTime(t, "2028-01-31T09:00:00+08:00")
+	now := anchor.Add(time.Second)
+	got, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 0, anchor, now)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := shTime(t, "2028-02-29T09:00:00+08:00")
+	if !got.Equal(want) {
+		t.Fatalf("leap feb: got %v want %v", got, want)
+	}
+	// Next step from Feb 29 must recover to Mar 31, not stick at 29.
+	got2, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 0, got, got.Add(time.Second))
+	if err != nil {
+		t.Fatalf("err2: %v", err)
+	}
+	want2 := shTime(t, "2028-03-31T09:00:00+08:00")
+	if !got2.Equal(want2) {
+		t.Fatalf("recover after leap feb: got %v want %v", got2, want2)
+	}
+}
+
+// Explicit day_of_month=31 must behave identically (anchored at 31, recovering).
+func TestNextRunScheduledAdvance_MonthExplicitDom31_Recovers(t *testing.T) {
+	anchor := shTime(t, "2026-01-31T09:00:00+08:00")
+	now := anchor.Add(time.Second)
+	got, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 31, anchor, now)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if want := shTime(t, "2026-02-28T09:00:00+08:00"); !got.Equal(want) {
+		t.Fatalf("dom31 feb: got %v want %v", got, want)
+	}
+	got2, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 31, got, got.Add(time.Second))
+	if err != nil {
+		t.Fatalf("err2: %v", err)
+	}
+	if want := shTime(t, "2026-03-31T09:00:00+08:00"); !got2.Equal(want) {
+		t.Fatalf("dom31 recover: got %v want %v", got2, want)
+	}
+}
+
+// Explicit day_of_month=15 (mid-month, never clamped) must step cleanly without
+// regression and not be affected by the Bug2 fix.
+func TestNextRunScheduledAdvance_MonthExplicitDom15_Stable(t *testing.T) {
+	anchor := shTime(t, "2026-01-15T09:00:00+08:00")
+	now := anchor.Add(time.Second)
+	got, err := NextRunScheduledAdvance("", 0, 1, "09:00", 0, 15, anchor, now)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if want := shTime(t, "2026-02-15T09:00:00+08:00"); !got.Equal(want) {
+		t.Fatalf("dom15: got %v want %v", got, want)
+	}
+}
