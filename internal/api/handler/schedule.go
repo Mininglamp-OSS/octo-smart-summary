@@ -208,6 +208,13 @@ func anchorDOMForMonthlyUpdate(existing model.SummarySchedule, effIntervalMonths
 	return anchorDOMForMonthlyCreate(effDayOfMonth, changeBase), true
 }
 
+func effectiveScheduleDayOfMonth(intervalMonths int, dayOfMonth int, anchorDOM int) int {
+	if intervalMonths <= 0 {
+		return dayOfMonth
+	}
+	return service.EffectiveMonthlyDOM(dayOfMonth, anchorDOM)
+}
+
 // lockScheduleForUpdate FOR UPDATE-locks the target schedule row so concurrent binds on the
 // same schedule serialize. Locking schedule before task keeps handlers in the scheduler's
 // schedule->task order, avoiding the cross-direction deadlock.
@@ -297,14 +304,6 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40011, Message: err.Error()})
 		return
 	}
-	// NextRunInitial: if today's selected run_time is still ahead of now, fire
-	// today (需求1); otherwise advance one full interval. Aligns week mode to
-	// day_of_week and month mode to day_of_month (需求4).
-	nextRun, err := service.NextRunInitial(req.CronExpr, req.IntervalDays, req.IntervalMonths, req.RunTime, req.DayOfWeek, req.DayOfMonth, now)
-	if err != nil {
-		c.JSON(http.StatusUnprocessableEntity, apiResponse{Code: 40010, Message: "无效的调度配置: " + err.Error()})
-		return
-	}
 	summaryMode := model.ModeByPerson
 
 	var sourceConfig model.JSON
@@ -333,10 +332,6 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		TimeRangeType:     req.TimeRangeType,
 		SourceConfig:      sourceConfig,
 		ParticipantConfig: participantConfig,
-		NextRunAt:         &nextRun,
-	}
-	if req.IntervalMonths > 0 {
-		sched.AnchorDOM = anchorDOMForMonthlyCreate(req.DayOfMonth, now)
 	}
 
 	if req.Scope != "task" {
@@ -345,6 +340,7 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 	}
 
 	resultScheduleID := int64(0)
+	var resultNextRunAt time.Time
 	txErr := h.db.Transaction(func(tx *gorm.DB) error {
 		if req.TaskID == nil {
 			return errTaskScopeMissingTaskID
@@ -392,6 +388,22 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		}
 
 		if haveExisting {
+			finalAnchorDOM := existing.AnchorDOM
+			if anchorDOM, writeAnchorDOM := anchorDOMForMonthlyUpdate(existing, sched.IntervalMonths, sched.DayOfMonth, &req.DayOfMonth, now); writeAnchorDOM {
+				finalAnchorDOM = anchorDOM
+			}
+			nextRun, err := service.NextRunInitial(
+				sched.CronExpr,
+				sched.IntervalDays,
+				sched.IntervalMonths,
+				sched.RunTime,
+				sched.DayOfWeek,
+				effectiveScheduleDayOfMonth(sched.IntervalMonths, sched.DayOfMonth, finalAnchorDOM),
+				now,
+			)
+			if err != nil {
+				return service.NewBizError(40010, "无效的调度配置: "+err.Error(), http.StatusUnprocessableEntity)
+			}
 			var boundCount int64
 			if err := tx.Model(&model.SummaryTask{}).
 				Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -421,8 +433,8 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 				"next_run_at":        nextRun,
 				"is_active":          1,
 			}
-			if anchorDOM, writeAnchorDOM := anchorDOMForMonthlyUpdate(existing, sched.IntervalMonths, sched.DayOfMonth, &req.DayOfMonth, now); writeAnchorDOM {
-				updates["anchor_dom"] = anchorDOM
+			if sched.IntervalMonths > 0 {
+				updates["anchor_dom"] = finalAnchorDOM
 			}
 			if err := tx.Model(&model.SummarySchedule{}).
 				Where("id = ?", existing.ID).
@@ -430,9 +442,28 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 				return err
 			}
 			resultScheduleID = existing.ID
+			resultNextRunAt = nextRun
 			return nil
 		}
 
+		finalAnchorDOM := 0
+		if sched.IntervalMonths > 0 {
+			finalAnchorDOM = anchorDOMForMonthlyCreate(req.DayOfMonth, now)
+			sched.AnchorDOM = finalAnchorDOM
+		}
+		nextRun, err := service.NextRunInitial(
+			sched.CronExpr,
+			sched.IntervalDays,
+			sched.IntervalMonths,
+			sched.RunTime,
+			sched.DayOfWeek,
+			effectiveScheduleDayOfMonth(sched.IntervalMonths, sched.DayOfMonth, finalAnchorDOM),
+			now,
+		)
+		if err != nil {
+			return service.NewBizError(40010, "无效的调度配置: "+err.Error(), http.StatusUnprocessableEntity)
+		}
+		sched.NextRunAt = &nextRun
 		if err := tx.Create(&sched).Error; err != nil {
 			return err
 		}
@@ -445,6 +476,7 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 			return err
 		}
 		resultScheduleID = sched.ID
+		resultNextRunAt = nextRun
 		return nil
 	})
 	if txErr != nil {
@@ -479,7 +511,7 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 
 	ok(c, gin.H{
 		"schedule_id": resultScheduleID,
-		"next_run_at": nextRun.Format(time.RFC3339),
+		"next_run_at": resultNextRunAt.Format(time.RFC3339),
 	})
 }
 
@@ -684,14 +716,27 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 			return
 		}
 		recomputeNow := timezone.Now()
-		nextRun, err := service.NextRunInitial(effCron, effIntervalDays, effIntervalMonths, effRunTime, effDayOfWeek, effDayOfMonth, recomputeNow)
+		finalAnchorDOM := sched.AnchorDOM
+		anchorDOM, writeAnchorDOM := anchorDOMForMonthlyUpdate(sched, effIntervalMonths, effDayOfMonth, req.DayOfMonth, recomputeNow)
+		if writeAnchorDOM {
+			finalAnchorDOM = anchorDOM
+		}
+		nextRun, err := service.NextRunInitial(
+			effCron,
+			effIntervalDays,
+			effIntervalMonths,
+			effRunTime,
+			effDayOfWeek,
+			effectiveScheduleDayOfMonth(effIntervalMonths, effDayOfMonth, finalAnchorDOM),
+			recomputeNow,
+		)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40011, Message: err.Error()})
 			return
 		}
 		updates["next_run_at"] = nextRun
-		if anchorDOM, writeAnchorDOM := anchorDOMForMonthlyUpdate(sched, effIntervalMonths, effDayOfMonth, req.DayOfMonth, recomputeNow); writeAnchorDOM {
-			updates["anchor_dom"] = anchorDOM
+		if writeAnchorDOM {
+			updates["anchor_dom"] = finalAnchorDOM
 		}
 	}
 	if req.TimeRangeType != nil {
@@ -994,7 +1039,15 @@ func (h *ScheduleHandler) ToggleSchedule(c *gin.Context) {
 				if err := validateEffectiveParticipantsSubsetOfCreator(nil, lockedSched.ParticipantConfig, task.CreatorID); err != nil {
 					return err
 				}
-				nextRun, err := service.NextRunInitial(lockedSched.CronExpr, lockedSched.IntervalDays, lockedSched.IntervalMonths, lockedSched.RunTime, lockedSched.DayOfWeek, lockedSched.DayOfMonth, timezone.Now())
+				nextRun, err := service.NextRunInitial(
+					lockedSched.CronExpr,
+					lockedSched.IntervalDays,
+					lockedSched.IntervalMonths,
+					lockedSched.RunTime,
+					lockedSched.DayOfWeek,
+					effectiveScheduleDayOfMonth(lockedSched.IntervalMonths, lockedSched.DayOfMonth, lockedSched.AnchorDOM),
+					timezone.Now(),
+				)
 				if err != nil {
 					return service.NewBizError(40011, err.Error(), http.StatusBadRequest)
 				}

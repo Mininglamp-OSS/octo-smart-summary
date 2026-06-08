@@ -125,6 +125,27 @@ func TestNextRunWithInterval_MonthsRunTime(t *testing.T) {
 	}
 }
 
+func TestEffectiveMonthlyDOM(t *testing.T) {
+	cases := []struct {
+		name       string
+		dayOfMonth int
+		anchorDOM  int
+		want       int
+	}{
+		{name: "unset uses anchor", dayOfMonth: 0, anchorDOM: 30, want: 30},
+		{name: "explicit dom wins", dayOfMonth: 31, anchorDOM: 30, want: 31},
+		{name: "legacy zero anchor stays zero", dayOfMonth: 0, anchorDOM: 0, want: 0},
+		{name: "invalid anchor ignored", dayOfMonth: 0, anchorDOM: 99, want: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := EffectiveMonthlyDOM(tc.dayOfMonth, tc.anchorDOM); got != tc.want {
+				t.Fatalf("EffectiveMonthlyDOM(%d, %d)=%d want %d", tc.dayOfMonth, tc.anchorDOM, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestNextRunWithInterval_Cron(t *testing.T) {
 	from := mustTime(t, "2026-06-04T12:00:00Z")
 	got, err := NextRunWithInterval("0 9 * * *", 0, 0, "", 0, 0, from)

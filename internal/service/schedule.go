@@ -201,6 +201,17 @@ func ResolveAnchorDOM(dayOfMonth int, from time.Time) int {
 	return from.Day()
 }
 
+// EffectiveMonthlyDOM resolves the day-of-month that initial/recompute paths
+// should pass into NextRunInitial/NextRunWithInterval for monthly schedules.
+// Explicit DOM wins; otherwise a trusted persisted anchorDOM restores the
+// original monthly intent for rows that store day_of_month=0.
+func EffectiveMonthlyDOM(dayOfMonth int, anchorDOM int) int {
+	if dayOfMonth == 0 && anchorDOM >= 1 && anchorDOM <= 31 {
+		return anchorDOM
+	}
+	return dayOfMonth
+}
+
 func monthlyTargetDom(anchorDOM int, anchor time.Time, dayOfMonth int) int {
 	if dayOfMonth >= 1 && dayOfMonth <= 31 {
 		return dayOfMonth
