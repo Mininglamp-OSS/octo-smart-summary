@@ -138,6 +138,54 @@ func participantsSubsetOfCreator(reqParticipants []participantReq, creatorID str
 	return true
 }
 
+// storedParticipantConfigSubsetOfCreator (PR#62 r5 Blocker2 / lml2468 Y1-bis)
+// applies the SAME participantsSubsetOfCreator口径 to the participant_config
+// already stored on a schedule (model.JSON). This closes the third instance of
+// the single-person hole: UpdateSchedule only validated when the caller sent
+// req.Participants != nil. When req.Participants == nil the bind path reuses the
+// schedule's STORED participant_config (loaded into sched.ParticipantConfig),
+// which was NEVER validated -- so a historically-dirty schedule whose stored
+// config contains a non-creator could still be bound and later inflated to
+// multi-person by the worker (scheduled_replace_helpers.go prepends creator then
+// appends the stored config). We deserialize the stored config with the exact
+// same shape the worker reads (user_id) and reject if it contains anyone other
+// than the creator. An empty/nil config is vacuously a subset (PASS), matching
+// the worker which then only has {creator}.
+func storedParticipantConfigSubsetOfCreator(raw model.JSON, creatorID string) bool {
+	if len(raw) == 0 {
+		return true
+	}
+	var stored []participantReq
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		// Unparseable stored config is treated as unsafe (fail-closed): we cannot
+		// prove it is single-person, so refuse to bind. This mirrors the worker,
+		// which would also fail to deserialize and skip the cycle.
+		return false
+	}
+	return participantsSubsetOfCreator(stored, creatorID)
+}
+
+// lockScheduleForUpdate (PR#62 r5 Blocker1a / J2 lock-order) takes a FOR UPDATE
+// row lock on the target summary_schedule so that all concurrent task<->schedule
+// binding operations on the SAME schedule serialize. Without it two concurrent
+// PUTs binding DIFFERENT tasks to the SAME schedule could each read boundCount==0
+// (no DB uniqueness on summary_task.schedule_id) and both bind, breaking the
+// one-to-one invariant. Locking the schedule row first makes the second binder
+// block until the first commits, then see boundCount>0 and reject.
+//
+// It is also the anchor for the unified lock ORDER: handlers now lock
+// schedule -> task (matching the scheduler in internal/worker/scheduler.go,
+// which claims the schedule row then locks the bound task), eliminating the
+// task->schedule vs schedule->task cross-direction deadlock window
+// (lml2468 J2 non-blocking).
+func lockScheduleForUpdate(tx *gorm.DB, scheduleID int64, spaceID string) (model.SummarySchedule, error) {
+	var locked model.SummarySchedule
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND space_id = ? AND deleted_at IS NULL", scheduleID, spaceID).
+		First(&locked).Error
+	return locked, err
+}
+
 // CreateSchedule handles POST /api/v1/summary-schedules
 func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 	spaceID := middleware.GetSpaceID(c)
@@ -590,14 +638,44 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 	txErr := h.db.Transaction(func(tx *gorm.DB) error {
 		var task model.SummaryTask
 		var oldScheduleID *int64
+		// PR#62 r5 (Blocker1a + J2 lock-order): lock the TARGET schedule row FOR
+		// UPDATE first, BEFORE loading/locking the task. This (1) serializes all
+		// concurrent binds against this schedule so the boundCount check below is
+		// race-free even without a DB unique constraint, and (2) establishes the
+		// schedule->task lock order that matches the scheduler
+		// (worker/scheduler.go locks schedule then bound task), removing the
+		// previous task->schedule vs schedule->task deadlock window. We re-read the
+		// stored config under this lock so the Blocker2 stored-config guard below
+		// validates a consistent snapshot.
+		lockedSched, err := lockScheduleForUpdate(tx, sched.ID, spaceID)
+		if err != nil {
+			return err
+		}
 		if req.Scope == "task" {
 			if req.TaskID == nil {
 				return errTaskScopeMissingTaskID
 			}
-			var err error
 			task, err = loadTaskForTaskScope(tx, spaceID, userID, *req.TaskID)
 			if err != nil {
 				return err
+			}
+			// PR#62 r5 Blocker2 (lml2468 Y1-bis): fail-closed multi-person guard on
+			// the participant set that will ACTUALLY take effect for this bind.
+			//   - req.Participants != nil  -> validated at the top of the handler
+			//     (errMultiPersonNotSupported / 40015) against req.Participants.
+			//   - req.Participants == nil   -> the bind reuses the schedule's STORED
+			//     participant_config, which the top-level check skips entirely. We now
+			//     validate that stored config here, under the schedule's FOR UPDATE
+			//     lock, with the identical口径 (subset of {creator}). creator basis is
+			//     userID: loadTaskForTaskScope already enforced task.CreatorID == userID
+			//     and sched.CreatorID == userID was enforced above, so a legal bind has
+			//     task.CreatorID == sched.CreatorID == userID. Placing the check here
+			//     (inside the tx, after loadTaskForTaskScope, only when scope==task)
+			//     guarantees a pure non-binding field update is never falsely rejected,
+			//     while any bind of a schedule whose stored config contains a
+			//     non-creator is refused (40015) before schedule_id is written.
+			if req.Participants == nil && !storedParticipantConfigSubsetOfCreator(lockedSched.ParticipantConfig, userID) {
+				return errMultiPersonNotSupported
 			}
 			if task.ScheduleID != nil && *task.ScheduleID != sched.ID {
 				oldID := *task.ScheduleID
