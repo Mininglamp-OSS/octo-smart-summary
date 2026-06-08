@@ -88,6 +88,9 @@ func SetupInternal(hub *ws.Hub) (*gin.Engine, *handler.InternalHandler) {
 	r.Use(gin.Logger(), gin.Recovery())
 
 	intH := handler.NewInternalHandler(hub)
+	r.GET("/internal/healthz", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
 	r.POST("/internal/task-event", intH.TaskEvent)
 	r.POST("/internal/worker-trigger", intH.WorkerTrigger)
 
