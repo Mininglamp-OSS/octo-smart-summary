@@ -183,6 +183,34 @@ func lockScheduleForUpdate(tx *gorm.DB, scheduleID int64, spaceID string) (model
 	return locked, err
 }
 
+// loadBoundTaskForScheduleUpdate validates the schedule->task live binding on the
+// non-rebind update path. We reject orphaned/inconsistent schedules instead of
+// mutating detached config: once the live task is gone, the caller must refresh
+// and repair/recreate the schedule rather than editing a stale row in place.
+func loadBoundTaskForScheduleUpdate(tx *gorm.DB, lockedSched model.SummarySchedule, userID string) (model.SummaryTask, error) {
+	var tasks []model.SummaryTask
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("schedule_id = ? AND deleted_at IS NULL", lockedSched.ID).
+		Order("id ASC").
+		Find(&tasks).Error; err != nil {
+		return model.SummaryTask{}, err
+	}
+	if len(tasks) == 0 {
+		return model.SummaryTask{}, service.NewBizError(40008, "定时配置已失去绑定，请刷新后重试", http.StatusNotFound)
+	}
+	if len(tasks) > 1 {
+		return model.SummaryTask{}, service.NewBizError(40008, "定时配置绑定关系异常，请刷新后重试", http.StatusConflict)
+	}
+	task := tasks[0]
+	if task.SpaceID != lockedSched.SpaceID || task.ScheduleID == nil || *task.ScheduleID != lockedSched.ID {
+		return model.SummaryTask{}, service.NewBizError(40008, "定时配置绑定关系异常，请刷新后重试", http.StatusConflict)
+	}
+	if task.CreatorID != userID {
+		return model.SummaryTask{}, service.NewBizError(40004, "无权限修改", http.StatusForbidden)
+	}
+	return task, nil
+}
+
 // CreateSchedule handles POST /api/v1/summary-schedules
 func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 	spaceID := middleware.GetSpaceID(c)
@@ -708,6 +736,10 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 			}
 			if boundCount > 0 {
 				return errTaskScopeScheduleBound
+			}
+		} else {
+			if _, err := loadBoundTaskForScheduleUpdate(tx, lockedSched, userID); err != nil {
+				return err
 			}
 		}
 

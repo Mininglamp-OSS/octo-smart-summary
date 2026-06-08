@@ -63,54 +63,60 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 		return 0, false, nil
 	}
 
-	// Compute next_run FIRST: on dirty/illegal recurrence data, disable the schedule
-	// (is_active=0) and skip, instead of leaving next_run_at in the past and re-scanning
-	// (re-creating tasks + burning LLM cost) every 60s. Advance from the ORIGINAL due time
-	// (*sched.NextRunAt), not now, so a late scan doesn't skip the just-missed occurrence.
-	nextRun, err := service.NextRunScheduledAdvance(sched.CronExpr, sched.IntervalDays, sched.IntervalMonths, sched.RunTime, sched.DayOfWeek, sched.DayOfMonth, *sched.NextRunAt, now)
-	if err != nil {
-		log.Printf("[scheduler] ALERT schedule %d has invalid recurrence (%v); disabling to stop repeated re-scan/cost", sched.ID, err)
-		if updErr := db.Model(&model.SummarySchedule{}).Where("id = ?", sched.ID).Update("is_active", 0).Error; updErr != nil {
-			return 0, false, updErr
-		}
-		return 0, false, nil
-	}
-
-	// Compute time range
-	start, end := service.ComputeTimeRange(sched.TimeRangeType, now)
-
 	var task model.SummaryTask
 	claimed := false
 	requeued := false
 
-	// The schedule-claim CAS and the task reset share ONE transaction: a reset failure
-	// rolls back the next_run_at advance too (60s scan retries), avoiding a dropped cycle.
-	// Business skips (no bound task, overlapping Processing, multi-person) still commit the
-	// advanced next_run_at to avoid re-scanning forever; only real errors roll back.
+	// The schedule claim (FOR UPDATE re-read + next_run advance) and the task reset share
+	// ONE transaction: a reset failure rolls back the next_run_at advance too (60s scan
+	// retries), avoiding a dropped cycle. Business skips (no bound task, overlapping
+	// Processing, multi-person) still commit the advanced next_run_at to avoid re-scanning
+	// forever; only real errors roll back.
 	if err := db.Transaction(func(tx *gorm.DB) error {
-		claim := tx.Model(&model.SummarySchedule{}).
-			Where("id = ? AND is_active = 1 AND deleted_at IS NULL AND next_run_at = ?", sched.ID, *sched.NextRunAt).
+		var lockedSched model.SummarySchedule
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND deleted_at IS NULL", sched.ID).
+			First(&lockedSched).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		if lockedSched.IsActive != 1 || lockedSched.NextRunAt == nil || !lockedSched.NextRunAt.Equal(*sched.NextRunAt) || lockedSched.NextRunAt.After(now) {
+			// The due snapshot was deactivated, retimed or already claimed after scan().
+			// Skip instead of using stale schedule fields from the pre-scan snapshot.
+			return nil
+		}
+
+		// Recompute from the FOR UPDATE re-read row so claim sees the latest config
+		// even when non-recurrence fields changed without bumping next_run_at.
+		nextRun, err := service.NextRunScheduledAdvance(lockedSched.CronExpr, lockedSched.IntervalDays, lockedSched.IntervalMonths, lockedSched.RunTime, lockedSched.DayOfWeek, lockedSched.DayOfMonth, *lockedSched.NextRunAt, now)
+		if err != nil {
+			log.Printf("[scheduler] ALERT schedule %d has invalid recurrence (%v); disabling to stop repeated re-scan/cost", lockedSched.ID, err)
+			if err := tx.Model(&model.SummarySchedule{}).
+				Where("id = ?", lockedSched.ID).
+				Update("is_active", 0).Error; err != nil {
+				return err
+			}
+			return nil
+		}
+		start, end := service.ComputeTimeRange(lockedSched.TimeRangeType, now)
+		if err := tx.Model(&model.SummarySchedule{}).
+			Where("id = ?", lockedSched.ID).
 			Updates(map[string]interface{}{
 				"last_run_at": now,
 				"next_run_at": nextRun,
-			})
-		if claim.Error != nil {
-			return claim.Error
-		}
-		if claim.RowsAffected == 0 {
-			// Lost the optimistic-lock race (another scanner already claimed this
-			// cycle, or the row was deactivated/retimed). Not an error: commit the
-			// empty transaction and report "not claimed".
-			return nil
+			}).Error; err != nil {
+			return err
 		}
 		claimed = true
 
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("schedule_id = ? AND deleted_at IS NULL", sched.ID).
+			Where("schedule_id = ? AND deleted_at IS NULL", lockedSched.ID).
 			Order("id DESC").
 			First(&task).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				log.Printf("[scheduler] ALERT schedule %d claimed but no bound task found; skipping overwrite", sched.ID)
+				log.Printf("[scheduler] ALERT schedule %d claimed but no bound task found; skipping overwrite", lockedSched.ID)
 				// Business skip: keep the advanced next_run_at (commit), no reset.
 				return nil
 			}
@@ -118,15 +124,15 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 		}
 
 		if task.Status == model.StatusProcessing {
-			log.Printf("[scheduler] schedule %d task %d still processing; skipping overlapping overwrite", sched.ID, task.ID)
+			log.Printf("[scheduler] schedule %d task %d still processing; skipping overlapping overwrite", lockedSched.ID, task.ID)
 			// Business skip (overlap protection): commit advanced next_run_at.
 			return nil
 		}
 
 		// Method A guard: scheduled summary is single-person only this version. Multi-person
 		// (team) tasks are driven by the human meta flow and must NOT be reset here. The claim
-		// CAS already advanced next_run_at, so a multi-person row is simply skipped (and
-		// re-claimed + re-skipped next cycle) until team scheduling ships -- expected, not a bug.
+		// already advanced next_run_at, so a multi-person row is simply skipped (and re-claimed
+		// + re-skipped next cycle) until team scheduling ships -- expected, not a bug.
 		var participantCount int64
 		if err := tx.Model(&model.SummaryParticipant{}).
 			Where("task_id = ?", task.ID).
@@ -134,13 +140,13 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 			return err
 		}
 		if participantCount > 1 {
-			log.Printf("[scheduler] schedule %d bound task %d is multi-person (%d participants); scheduled summary not supported for team tasks this version, skipping (next_run_at already advanced; expected re-skip next cycle)", sched.ID, task.ID, participantCount)
+			log.Printf("[scheduler] schedule %d bound task %d is multi-person (%d participants); scheduled summary not supported for team tasks this version, skipping (next_run_at already advanced; expected re-skip next cycle)", lockedSched.ID, task.ID, participantCount)
 			// Business skip (multi-person guard): commit advanced next_run_at.
 			return nil
 		}
 
 		requeued = true
-		if err := syncScheduledTaskConfig(tx, sched, task, now); err != nil {
+		if err := syncScheduledTaskConfig(tx, lockedSched, task, now); err != nil {
 			return err
 		}
 
@@ -182,7 +188,7 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 				"error_message":       nil,
 				"processing_deadline": nil,
 				"confirm_deadline":    nil,
-				"schedule_id":         sched.ID,
+				"schedule_id":         lockedSched.ID,
 			}).Error; err != nil {
 			return err
 		}

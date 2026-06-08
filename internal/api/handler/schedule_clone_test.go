@@ -497,6 +497,11 @@ func TestUpdateSchedule_ListPageUpdatesInPlace(t *testing.T) {
 	if err := db.Create(&sched).Error; err != nil {
 		t.Fatalf("create schedule: %v", err)
 	}
+	now := time.Now().UTC()
+	task := model.SummaryTask{TaskNo: "LIST-BOUND", SpaceID: "space1", CreatorID: "creator1", SummaryMode: model.ModeByPerson, TimeRangeStart: now, TimeRangeEnd: now, ScheduleID: &sched.ID}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
 
 	data := doUpdate(t, r, sched.ID, map[string]interface{}{
 		"run_time":      "10:00",

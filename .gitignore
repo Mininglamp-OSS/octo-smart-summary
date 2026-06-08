@@ -23,3 +23,6 @@ summary-worker
 /review-*.txt
 /*-dev.log
 !docs/**
+
+# Stray local build binaries (dot-prefixed)
+.bin_*

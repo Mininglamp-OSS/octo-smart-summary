@@ -204,6 +204,19 @@ func TestPR62Round5_StoredConfigMultiPerson_NonBindingUpdateAllowed(t *testing.T
 	if err := db.Create(&sched).Error; err != nil {
 		t.Fatalf("create schedule: %v", err)
 	}
+	now := time.Now().UTC()
+	task := model.SummaryTask{
+		TaskNo:         "DIRTY-NONBIND",
+		SpaceID:        "space1",
+		CreatorID:      "creator1",
+		SummaryMode:    model.ModeByPerson,
+		TimeRangeStart: now,
+		TimeRangeEnd:   now,
+		ScheduleID:     &sched.ID,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
 
 	// No scope/task_id -> not a bind, only touches title.
 	w := doScheduleJSONRequest(t, r, http.MethodPut, "/api/v1/summary-schedules/"+itoa(sched.ID), map[string]interface{}{

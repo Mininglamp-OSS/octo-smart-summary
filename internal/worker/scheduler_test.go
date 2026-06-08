@@ -523,6 +523,130 @@ func TestClaimAndCreateScheduledTask_AppliesScheduleConfigs(t *testing.T) {
 	}
 }
 
+func TestClaimAndCreateScheduledTask_ReloadsLatestScheduleConfigBeforeClaim(t *testing.T) {
+	db := setupSchedulerTestDB(t)
+	now := timezone.Now()
+	due := now.Add(-2 * time.Hour)
+
+	oldSourceConfig := model.JSON(`[{"source_type":1,"source_id":"group-old","source_name":"Old Group"}]`)
+	newSourceConfig := model.JSON(`[{"source_type":3,"source_id":"dm-user-2","source_name":"User Two(私聊)"}]`)
+	sched := model.SummarySchedule{
+		SpaceID:       "space1",
+		CreatorID:     "creator1",
+		Title:         "Drift",
+		SummaryMode:   model.ModeByPerson,
+		IntervalDays:  1,
+		RunTime:       "09:00",
+		TimeRangeType: 1,
+		SourceConfig:  oldSourceConfig,
+		IsActive:      1,
+		NextRunAt:     &due,
+	}
+	if err := db.Create(&sched).Error; err != nil {
+		t.Fatalf("create schedule: %v", err)
+	}
+
+	task := model.SummaryTask{
+		TaskNo:         "task-config-drift",
+		SpaceID:        sched.SpaceID,
+		CreatorID:      sched.CreatorID,
+		Title:          "Drift",
+		SummaryMode:    model.ModeByPerson,
+		TimeRangeStart: now.Add(-48 * time.Hour),
+		TimeRangeEnd:   now.Add(-24 * time.Hour),
+		Status:         model.StatusCompleted,
+		TriggerType:    model.TriggerManual,
+		ScheduleID:     &sched.ID,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if err := db.Create(&model.SummarySource{
+		TaskID:     task.ID,
+		SourceType: model.SourceGroup,
+		SourceID:   "group-old",
+		SourceName: "Old Group",
+	}).Error; err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	participant := model.SummaryParticipant{
+		TaskID:      task.ID,
+		UserID:      sched.CreatorID,
+		UserName:    "Creator",
+		Status:      model.ParticipantCompleted,
+		ConfirmedAt: &now,
+	}
+	if err := db.Create(&participant).Error; err != nil {
+		t.Fatalf("create participant: %v", err)
+	}
+	pr := model.PersonalResult{
+		TaskID:           task.ID,
+		ParticipantRefID: participant.ID,
+		UserID:           sched.CreatorID,
+		WorkerStatus:     model.PersonalStatusCompleted,
+		GeneratedAt:      &now,
+	}
+	if err := db.Create(&pr).Error; err != nil {
+		t.Fatalf("create personal result: %v", err)
+	}
+	if err := db.Model(&participant).Update("personal_result_id", pr.ID).Error; err != nil {
+		t.Fatalf("bind personal result: %v", err)
+	}
+
+	snapshot := sched
+	if err := db.Model(&model.SummarySchedule{}).
+		Where("id = ?", sched.ID).
+		Updates(map[string]interface{}{
+			"interval_days":   7,
+			"run_time":        "18:45",
+			"time_range_type": 3,
+			"source_config":   newSourceConfig,
+		}).Error; err != nil {
+		t.Fatalf("update schedule config before claim: %v", err)
+	}
+
+	taskID, claimed, err := claimAndCreateScheduledTask(db, snapshot, now)
+	if err != nil {
+		t.Fatalf("claim err: %v", err)
+	}
+	if !claimed || taskID != task.ID {
+		t.Fatalf("claimed=%v taskID=%d want claimed=true taskID=%d", claimed, taskID, task.ID)
+	}
+
+	wantNextRun, err := service.NextRunScheduledAdvance("", 7, 0, "18:45", 0, 0, due, now)
+	if err != nil {
+		t.Fatalf("want next run: %v", err)
+	}
+	var reloadedSched model.SummarySchedule
+	if err := db.First(&reloadedSched, sched.ID).Error; err != nil {
+		t.Fatalf("reload schedule: %v", err)
+	}
+	if reloadedSched.NextRunAt == nil || !reloadedSched.NextRunAt.Equal(wantNextRun) {
+		t.Fatalf("next_run_at=%v want %v", reloadedSched.NextRunAt, wantNextRun)
+	}
+
+	wantStart, wantEnd := service.ComputeTimeRange(3, now)
+	var reloadedTask model.SummaryTask
+	if err := db.First(&reloadedTask, task.ID).Error; err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	if !reloadedTask.TimeRangeStart.Equal(wantStart) || !reloadedTask.TimeRangeEnd.Equal(wantEnd) {
+		t.Fatalf("time range not refreshed from latest config: got [%v,%v] want [%v,%v]",
+			reloadedTask.TimeRangeStart, reloadedTask.TimeRangeEnd, wantStart, wantEnd)
+	}
+
+	var sources []model.SummarySource
+	if err := db.Where("task_id = ?", task.ID).Order("id ASC").Find(&sources).Error; err != nil {
+		t.Fatalf("load sources: %v", err)
+	}
+	if len(sources) != 1 {
+		t.Fatalf("source count=%d want 1", len(sources))
+	}
+	if sources[0].SourceID != "dm-user-2" || sources[0].SourceType != 3 {
+		t.Fatalf("expected latest source config applied, got %+v", sources[0])
+	}
+}
+
 func TestSaveLatestResultAndCompleteTask_ReplacesOldArtifacts(t *testing.T) {
 	db := setupSchedulerTestDB(t)
 	now := timezone.Now()
@@ -933,8 +1057,10 @@ func TestClaimAndCreateScheduledTask_BusinessSkipCommitsNextRun(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // Bug3: saveLatestResultAndCompleteTask version-retention scope.
-//   isScheduled=false (manual/team) -> KEEP all prior versions.
-//   isScheduled=true  (scheduled)   -> prune to the latest version only.
+//
+//	isScheduled=false (manual/team) -> KEEP all prior versions.
+//	isScheduled=true  (scheduled)   -> prune to the latest version only.
+//
 // ---------------------------------------------------------------------------
 func TestSaveLatestResultAndCompleteTask_NonScheduledKeepsVersions(t *testing.T) {
 	db := setupSchedulerTestDB(t)
