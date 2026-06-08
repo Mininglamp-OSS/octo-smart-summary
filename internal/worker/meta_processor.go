@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"log"
 	"regexp"
 	"sort"
@@ -10,7 +11,8 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
-	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timing"
 )
 
 // MetaProcessor handles meta-summary generation with debounce and mutex.
@@ -152,7 +154,11 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 				})
 			}
 
+			reduceStart := time.Now()
 			content, tokens, err := m.proc.llm.CallReduceByPerson(ctx, participantSummaries, startTime, endTime)
+			reportKey := "team#" + strconv.FormatInt(taskID, 10)
+			timing.RecordLLMSince(reportKey, "团队汇总: 合并各成员总结", reduceStart, tokens)
+			timing.FlushReport(reportKey, time.Since(reduceStart).Milliseconds(), nil)
 			if err != nil {
 				log.Printf("[meta-worker] reduce error task=%d: %v", taskID, err)
 				return
@@ -163,9 +169,7 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 			teamCitations = extractTeamCitations(finalContent, indexed)
 		}
 
-		// Save result (new version)
-		nextVer, _ := service.GetNextVersion(m.proc.db, taskID)
-		now := time.Now().UTC()
+		now := timezone.Now()
 
 		// Count total messages across all submitted personal results
 		var totalMsgCount int
@@ -179,7 +183,6 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 			TotalMsgCount:  totalMsgCount,
 			TotalTokenUsed: totalTokens,
 			ModelVersion:   m.proc.llm.ModelVersion(),
-			Version:        nextVer,
 			GeneratedAt:    now,
 		}
 		result.SetTeamCitations(teamCitations)
@@ -192,21 +195,16 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 			return
 		}
 
-		if err := m.proc.db.Create(&result).Error; err != nil {
+		// Bug3: the meta (team) flow is the human-driven multi-person link, which
+		// intentionally retains a full version history (re-submissions create new
+		// versions). Scheduled summary is single-person-only this version and never
+		// reaches the meta path, so pruning is always disabled here.
+		if err := saveLatestResultAndCompleteTask(m.proc.db, taskID, &result, false); err != nil {
+			if errors.Is(err, errTaskNoLongerProcessing) {
+				log.Printf("[meta-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
+				return
+			}
 			log.Printf("[meta-worker] save result error task=%d: %v", taskID, err)
-			return
-		}
-
-		// Update task status (CAS: only if still processing)
-		casResult := m.proc.db.Model(&model.SummaryTask{}).
-			Where("id = ? AND status = ?", taskID, model.StatusProcessing).
-			Update("status", model.StatusCompleted)
-		if casResult.Error != nil {
-			log.Printf("[meta-worker] task %d update to completed failed: %v", taskID, casResult.Error)
-			return
-		}
-		if casResult.RowsAffected == 0 {
-			log.Printf("[meta-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
 			return
 		}
 
@@ -220,7 +218,7 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 		})
 
 		log.Printf("[meta-worker] task %d meta-summary version %d created (%d participants)",
-			taskID, nextVer, len(submitted))
+			taskID, result.Version, len(submitted))
 
 		// Check if new submissions arrived during processing
 		if !m.isDirty(taskID) {

@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -11,6 +12,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timing"
 	"gorm.io/gorm"
 )
 
@@ -19,6 +22,27 @@ func escapeCitationMarkers(content string) string {
 }
 
 const noRelevantContentMessage = "在当前范围内未找到与主题相关的聊天记录。"
+
+func shouldSkipScheduledPlaceholderResult(triggerType int, content string) bool {
+	return triggerType == model.TriggerScheduled && strings.TrimSpace(content) == noRelevantContentMessage
+}
+
+func completedPersonalResultUpdates(pr model.PersonalResult, content string, citations []model.Citation, msgCount, totalTokens int, modelVer string, genAt time.Time, skipContent bool) map[string]interface{} {
+	updates := map[string]interface{}{
+		"worker_status": model.PersonalStatusCompleted,
+	}
+	if skipContent {
+		return updates
+	}
+	pr.SetCitations(citations)
+	updates["content"] = content
+	updates["citations_json"] = pr.CitationsJSON
+	updates["msg_count"] = msgCount
+	updates["total_token_used"] = totalTokens
+	updates["model_version"] = modelVer
+	updates["generated_at"] = genAt
+	return updates
+}
 
 func (p *Processor) processPersonalSummary(ctx context.Context, taskID, participantRefID int64) {
 	log.Printf("[personal-worker] start task=%d participant=%d", taskID, participantRefID)
@@ -38,7 +62,7 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 	}
 
 	// CAS: only proceed if worker_status is still Pending (prevents duplicate runs)
-	now := time.Now().UTC()
+	now := timezone.Now()
 	cas := p.db.Model(&pr).
 		Where("worker_status = ?", model.PersonalStatusPending).
 		Update("worker_status", model.PersonalStatusProcessing)
@@ -52,7 +76,7 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 	})
 
 	// CAS update task status to PROCESSING (from any earlier state)
-	deadline := time.Now().UTC().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute)
+	deadline := timezone.Now().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute)
 	taskCAS := p.db.Model(&model.SummaryTask{}).
 		Where("id = ? AND status IN (?, ?)", taskID, model.StatusPending, model.StatusWaitingConfirm).
 		Updates(map[string]interface{}{
@@ -92,6 +116,7 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 	if strings.TrimSpace(content) == "" {
 		content = noRelevantContentMessage
 	}
+	isScheduledEmptyWindow := shouldSkipScheduledPlaceholderResult(task.TriggerType, content)
 
 	// Best-effort check: abort early if task is no longer Processing.
 	// Final safety is guaranteed by the task-level CAS in the completion path below.
@@ -101,20 +126,13 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 		return
 	}
 
-	pr.SetCitations(citations)
-	genAt := time.Now().UTC()
-	p.db.Model(&pr).Updates(map[string]interface{}{
-		"content":          content,
-		"citations_json":   pr.CitationsJSON,
-		"msg_count":        msgCount,
-		"total_token_used": totalTokens,
-		"model_version":    modelVer,
-		"worker_status":    model.PersonalStatusCompleted,
-		"generated_at":     genAt,
-	})
+	genAt := timezone.Now()
+	persistStart := time.Now()
+	p.db.Model(&pr).Updates(completedPersonalResultUpdates(pr, content, citations, msgCount, totalTokens, modelVer, genAt, isScheduledEmptyWindow))
 	p.db.Model(&participant).Updates(map[string]interface{}{
 		"status": model.ParticipantCompleted,
 	})
+	timing.Observe(task.TaskNo, "persist_personal_result", persistStart)
 
 	// Send directed WS notification to the specific user
 	p.sendCallback(model.TaskEvent{
@@ -131,35 +149,39 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 	p.db.Model(&model.SummaryParticipant{}).Where("task_id = ?", taskID).Count(&participantCount)
 
 	if participantCount <= 1 {
-		// Single-person mode: directly create SummaryResult and complete the task
-		nextVer, _ := service.GetNextVersion(p.db, taskID)
-		result := model.SummaryResult{
-			TaskID:         taskID,
-			Content:        content,
-			TotalMsgCount:  msgCount,
-			TotalTokenUsed: totalTokens,
-			ModelVersion:   modelVer,
-			Version:        nextVer,
-			GeneratedAt:    genAt,
+		isScheduled := task.TriggerType == model.TriggerScheduled
+		if isScheduledEmptyWindow {
+			if err := completeTaskWithoutNewResult(p.db, taskID); err != nil {
+				if errors.Is(err, errTaskNoLongerProcessing) {
+					log.Printf("[personal-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
+					return
+				}
+				log.Printf("[personal-worker] task=%d complete-without-result error: %v", taskID, err)
+				return
+			}
+			log.Printf("[personal-worker] task %d scheduled empty-window: kept previous result, skipped prune", taskID)
+		} else {
+			// Single-person mode: directly create SummaryResult and complete the task.
+			result := model.SummaryResult{
+				TaskID:         taskID,
+				Content:        content,
+				TotalMsgCount:  msgCount,
+				TotalTokenUsed: totalTokens,
+				ModelVersion:   modelVer,
+				GeneratedAt:    genAt,
+			}
+			result.SetCitations(citations)
+			// Bug3: only scheduled tasks prune old versions in place; manual/normal
+			// single-person runs keep their full version history.
+			if err := saveLatestResultAndCompleteTask(p.db, taskID, &result, isScheduled); err != nil {
+				if errors.Is(err, errTaskNoLongerProcessing) {
+					log.Printf("[personal-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
+					return
+				}
+				log.Printf("[personal-worker] save result error task=%d: %v", taskID, err)
+				return
+			}
 		}
-		result.SetCitations(citations)
-		if err := p.db.Create(&result).Error; err != nil {
-			log.Printf("[personal-worker] save result error task=%d: %v", taskID, err)
-			return
-		}
-
-		casResult := p.db.Model(&model.SummaryTask{}).
-			Where("id = ? AND status = ?", taskID, model.StatusProcessing).
-			Update("status", model.StatusCompleted)
-		if casResult.Error != nil {
-			log.Printf("[personal-worker] task %d update to completed failed: %v", taskID, casResult.Error)
-			return
-		}
-		if casResult.RowsAffected == 0 {
-			log.Printf("[personal-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
-			return
-		}
-
 		p.sendCallback(model.TaskEvent{
 			TaskID:   taskID,
 			Status:   model.StatusCompleted,
@@ -229,6 +251,13 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 
 func (p *Processor) executePersonalPipeline(ctx context.Context, task model.SummaryTask, userID string) (string, []model.Citation, int, int, string, error) {
 	totalStart := time.Now()
+	taskNo := task.TaskNo
+	defer func() {
+		timing.Observe(taskNo, "personal_pipeline_total", totalStart)
+		// Boss request: one consolidated per-run report — how many LLM calls,
+		// what each was for, time + tokens. Flushed at run end (success or error).
+		timing.FlushReport(taskNo, time.Since(totalStart).Milliseconds(), nil)
+	}()
 
 	// Load sources
 	var sources []model.SummarySource
@@ -245,15 +274,26 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		})
 	}
 
-	// Unified LLM tool-call callback (shared by all Function Call sites)
+	// Unified LLM tool-call callback (shared by all Function Call sites).
+	// purpose is derived from forceFn so the report says what each call did
+	// (extract_time_range / resolve_channel_scope / resolve_topic_target).
 	toolCallFn := func(ctx context.Context, messages []service.ChatMessage, tools []service.Tool, forceFn string) (string, error) {
-		args, _, err := p.llm.CallWithTools(ctx, messages, tools, forceFn, p.cfg.LLMTemperature)
+		callStart := time.Now()
+		args, tokens, err := p.llm.CallWithTools(ctx, messages, tools, forceFn, p.cfg.LLMTemperature)
+		purpose := "检索预处理(tool-call)"
+		if forceFn != "" {
+			purpose = "检索预处理: " + forceFn
+		}
+		timing.RecordLLMSince(taskNo, purpose, callStart, tokens)
 		return args, err
 	}
 
 	// Legacy callback for PostRetrievalNarrow (still uses CallRaw)
 	llmFn := func(ctx context.Context, prompt string) (string, error) {
-		return p.llm.CallRaw(ctx, prompt)
+		callStart := time.Now()
+		out, err := p.llm.CallRaw(ctx, prompt)
+		timing.RecordLLMSince(taskNo, "检索后裁剪 PostRetrievalNarrow", callStart, 0)
+		return out, err
 	}
 
 	// Fetch messages via personal pipeline (Layer 0-5)
@@ -264,6 +304,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		}
 	}
 
+	fetchStart := time.Now()
 	messages, err := pipeline.ResolveAndFetchMessagesForPersonal(
 		ctx, userID, nil, nil, specifiedSources, task.Title,
 		task.TimeRangeStart, task.TimeRangeEnd,
@@ -271,6 +312,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency,
 		channelScopeOpts,
 	)
+	timing.Observe(taskNo, "fetch_messages", fetchStart)
 	if err != nil {
 		return "", nil, 0, 0, "", fmt.Errorf("fetch messages: %w", err)
 	}
@@ -278,6 +320,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	// Resolve sender names (moved before FilterWithContext for ResolveTopicTarget)
 	resolveStart := time.Now()
 	nameMap := p.batchResolveUserNames(messages)
+	timing.Observe(taskNo, "resolve_user_names", resolveStart)
 	log.Printf("[personal-worker] batchResolveUserNames took %dms (%d names)",
 		time.Since(resolveStart).Milliseconds(), len(nameMap))
 
@@ -416,10 +459,12 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 					escapeCitationMarkers(m.Content)))
 			}
 
+			callStart := time.Now()
 			summary, tokens, err := p.llm.CallMap(ctx,
 				joinStrings(formatted), sourceName, idx, len(c),
 				startTime, endTime, task.Title, userName,
 			)
+			timing.RecordLLMSince(taskNo, fmt.Sprintf("Map: 分块总结 chunk#%d", idx), callStart, tokens)
 			if err != nil {
 				log.Printf("[personal-worker] Map chunk %d failed: %v", idx, err)
 				isFatal := strings.Contains(err.Error(), "reasoning budget exhausted")
@@ -430,6 +475,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		}(i, chunk)
 	}
 	mapWg.Wait()
+	timing.Observe(taskNo, "llm_map_summary", mapStart)
 	log.Printf("[personal-worker] Map phase took %dms (%d chunks, concurrency=%d)",
 		time.Since(mapStart).Milliseconds(), len(chunks), concurrency)
 
@@ -473,14 +519,17 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	} else {
 		// Multiple chunks: execute Reduce to merge
 		var err error
+		reduceCallStart := time.Now()
 		finalContent, reduceTokens, err = p.llm.CallReduce(ctx,
 			chunkSummaries, sourceName, startTime, endTime, targetMsgCount, task.Title,
 		)
+		timing.RecordLLMSince(taskNo, "Reduce: 合并分块总结", reduceCallStart, reduceTokens)
 		if err != nil {
 			return "", nil, 0, 0, "", fmt.Errorf("reduce: %w", err)
 		}
 	}
 	totalTokens += reduceTokens
+	timing.Observe(taskNo, "llm_reduce_summary", reduceStart)
 	log.Printf("[personal-worker] Reduce phase took %dms", time.Since(reduceStart).Milliseconds())
 
 	// Build citations from final content
@@ -488,6 +537,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	citations := buildCitations(finalContent, userMessages, messages, nameMap)
 	finalContent, citations = dedupCitations(finalContent, citations)
 	finalContent = stripOrphanCitations(finalContent, citations)
+	timing.Observe(taskNo, "build_citations", citationStart)
 	log.Printf("[personal-worker] Citation build took %dms (%d citations)",
 		time.Since(citationStart).Milliseconds(), len(citations))
 

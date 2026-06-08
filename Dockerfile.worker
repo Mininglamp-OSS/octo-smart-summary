@@ -1,16 +1,17 @@
 FROM golang:1.25-alpine AS builder
 
 WORKDIR /app
+ARG GOPROXY=https://proxy.golang.org,direct
+ARG GOSUMDB=sum.golang.org
+ENV GOPROXY=${GOPROXY} \
+    GOSUMDB=${GOSUMDB}
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -o /bin/summary-worker ./cmd/summary-worker
 
 FROM alpine:3.19
-ENV TZ=Asia/Shanghai
-RUN apk add --no-cache ca-certificates tzdata \
-    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
-    && echo $TZ > /etc/timezone
+RUN apk add --no-cache ca-certificates tzdata
 COPY --from=builder /bin/summary-worker /bin/summary-worker
 EXPOSE 8082
 ENTRYPOINT ["/bin/summary-worker"]

@@ -6,19 +6,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"log"
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // maxSourceCount is the maximum number of information sources allowed per task.
@@ -75,6 +77,14 @@ func (h *TaskHandler) authorizeTaskAccess(c *gin.Context, taskID int64) (*model.
 
 	c.JSON(http.StatusForbidden, apiResponse{Code: 40003, Message: "无权访问此任务"})
 	return nil, false
+}
+
+func (h *TaskHandler) pickDisplayResult(taskID int64) (model.SummaryResult, bool) {
+	result, err := queryDisplayResult(h.db, taskID)
+	if err != nil {
+		return model.SummaryResult{}, false
+	}
+	return result, true
 }
 
 type apiResponse struct {
@@ -174,7 +184,7 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		timeStart = req.TimeRange.Start
 		timeEnd = req.TimeRange.End
 	} else {
-		timeEnd = time.Now().UTC()
+		timeEnd = timezone.Now()
 		timeStart = timeEnd.Add(-31 * 24 * time.Hour)
 	}
 
@@ -210,7 +220,7 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 	}
 
 	initialStatus := model.StatusPending
-	dl := time.Now().UTC().Add(time.Duration(req.ConfirmTimeoutHours) * time.Hour)
+	dl := timezone.Now().Add(time.Duration(req.ConfirmTimeoutHours) * time.Hour)
 	confirmDeadline := &dl
 
 	task := model.SummaryTask{
@@ -246,7 +256,7 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 				return err
 			}
 		}
-		now := time.Now().UTC()
+		now := timezone.Now()
 		creatorP := model.SummaryParticipant{
 			TaskID:      task.ID,
 			UserID:      effectiveUID,
@@ -394,15 +404,21 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			})
 		}
 
-		var latestResult model.SummaryResult
-		h.db.Where("task_id = ?", t.ID).Order("version DESC").Limit(1).Find(&latestResult)
+		latestResult, hasResult := h.pickDisplayResult(t.ID)
 
 		totalMsgCount := 0
 		var completedAt *string
-		if latestResult.ID > 0 {
+		var resultEditedAt *string
+		resultIsEdited := false
+		if hasResult {
 			totalMsgCount = latestResult.TotalMsgCount
 			s := latestResult.GeneratedAt.Format(time.RFC3339)
 			completedAt = &s
+			if latestResult.EditedAt != nil {
+				editedAt := latestResult.EditedAt.Format(time.RFC3339)
+				resultEditedAt = &editedAt
+				resultIsEdited = true
+			}
 		}
 
 		creatorName := ""
@@ -430,6 +446,8 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			"origin_channel_type": t.OriginChannelType,
 			"created_at":          t.CreatedAt.Format(time.RFC3339),
 			"completed_at":        completedAt,
+			"result_is_edited":    resultIsEdited,
+			"result_edited_at":    resultEditedAt,
 		})
 	}
 
@@ -478,11 +496,10 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		partList = append(partList, item)
 	}
 
-	var latestResult model.SummaryResult
-	h.db.Where("task_id = ?", taskID).Order("version DESC").Limit(1).Find(&latestResult)
+	latestResult, hasResult := h.pickDisplayResult(taskID)
 
 	var resultOut interface{}
-	if latestResult.ID > 0 {
+	if hasResult {
 		resultOut = gin.H{
 			"content":          latestResult.Content,
 			"citations":        latestResult.GetCitations(),
@@ -513,7 +530,25 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		"updated_at":          task.UpdatedAt.Format(time.RFC3339),
 	}
 
-	if latestResult.ID > 0 {
+	// Plan C (P0 protocol fix): expose the task's associated schedule_id so the
+	// detail page can correctly distinguish "edit existing schedule" vs "create
+	// new schedule". Previously this field was missing, so detail.schedule_id was
+	// always empty on the frontend and the update branch never fired.
+	if task.ScheduleID != nil {
+		var sched model.SummarySchedule
+		if err := h.db.Where("id = ? AND deleted_at IS NULL", *task.ScheduleID).First(&sched).Error; err == nil {
+			resp["schedule_id"] = *task.ScheduleID
+			resp["schedule_is_active"] = sched.IsActive
+		} else {
+			resp["schedule_id"] = nil
+			resp["schedule_is_active"] = nil
+		}
+	} else {
+		resp["schedule_id"] = nil
+		resp["schedule_is_active"] = nil
+	}
+
+	if hasResult {
 		resp["result_id"] = latestResult.ID
 		if latestResult.EditedAt != nil {
 			resp["result_edited_at"] = latestResult.EditedAt.Format(time.RFC3339)
@@ -601,7 +636,8 @@ func (h *TaskHandler) GetResult(c *gin.Context) {
 	}
 
 	var result model.SummaryResult
-	if err := h.db.Where("task_id = ?", taskID).Order("version DESC").Limit(1).First(&result).Error; err != nil {
+	var found bool
+	if result, found = h.pickDisplayResult(taskID); !found {
 		bizErr(c, service.NewBizError(40008, "暂无结果", http.StatusNotFound))
 		return
 	}
@@ -614,11 +650,18 @@ func (h *TaskHandler) GetResult(c *gin.Context) {
 		"model_version":    result.ModelVersion,
 		"version":          result.Version,
 		"generated_at":     result.GeneratedAt.Format(time.RFC3339),
+		"result_is_edited": result.EditedAt != nil,
+		"result_edited_at": func() interface{} {
+			if result.EditedAt == nil {
+				return nil
+			}
+			return result.EditedAt.Format(time.RFC3339)
+		}(),
 	})
 }
 
 // regenerateReq is the optional request body for Regenerate. When Topic is
-// provided and differs from the current title, the task title is updated.
+// provided it replaces the task title; an empty/absent body keeps it unchanged.
 type regenerateReq struct {
 	Topic string `json:"topic"`
 }
@@ -670,7 +713,9 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 	err = h.db.Transaction(func(tx *gorm.DB) error {
 		// Atomic status transition: only proceed if the task is still in a
 		// terminal state. This prevents concurrent regenerate requests from
-		// both passing the pre-check and duplicating work.
+		// both passing the pre-check and duplicating work. Also resets
+		// processing_deadline so the scheduler's stale-task sweep does not
+		// immediately re-trip the freshly re-queued task.
 		res := tx.Model(&model.SummaryTask{}).
 			Where("id = ? AND status IN ?", taskID, []int{model.StatusCompleted, model.StatusFailed, model.StatusCancelled}).
 			Updates(map[string]interface{}{
@@ -840,11 +885,86 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 		return
 	}
 
-	// Soft delete: set status = -1 AND deleted_at = NOW()
-	if err := h.db.Model(task).Updates(map[string]interface{}{
-		"status":     -1,
-		"deleted_at": time.Now().UTC(),
-	}).Error; err != nil {
+	now := timezone.Now()
+	if err := h.db.Transaction(func(tx *gorm.DB) error {
+		peekedScheduleID, err := peekTaskScheduleID(tx, task.SpaceID, middleware.GetUserID(c), task.ID)
+		if err != nil {
+			return err
+		}
+
+		var lockedSched *model.SummarySchedule
+		if peekedScheduleID != nil {
+			var sched model.SummarySchedule
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ? AND deleted_at IS NULL", *peekedScheduleID).
+				First(&sched).Error; err != nil {
+				if !errors.Is(err, gorm.ErrRecordNotFound) {
+					return err
+				}
+			} else {
+				lockedSched = &sched
+			}
+		}
+
+		var liveTask model.SummaryTask
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND deleted_at IS NULL", task.ID).
+			First(&liveTask).Error; err != nil {
+			return err
+		}
+
+		if !int64PtrEqual(liveTask.ScheduleID, peekedScheduleID) {
+			return errRebindConcurrentModified
+		}
+
+		if liveTask.ScheduleID != nil {
+			// Cascade soft-delete of the bound schedule must respect the same
+			// ownership rule as DeleteSchedule (schedule.go: only the schedule
+			// creator may delete, else 40004). Without this check a mere task
+			// participant could delete the task and silently take down another
+			// user's schedule. We only cascade when the caller is the schedule's
+			// creator; otherwise we just unbind (clear schedule_id) so the task
+			// delete still succeeds but the victim's schedule survives.
+			userID := middleware.GetUserID(c)
+			if lockedSched == nil {
+				// schedule already gone; nothing to cascade
+			} else if lockedSched.CreatorID == userID {
+				if err := tx.Model(&model.SummarySchedule{}).
+					Where("id = ? AND deleted_at IS NULL", lockedSched.ID).
+					Update("deleted_at", &now).Error; err != nil {
+					return err
+				}
+			} else {
+				// Not the schedule creator: do not delete someone else's schedule.
+				// Unbind it from this task and pause it to avoid an active orphan.
+				if err := tx.Model(&model.SummaryTask{}).
+					Where("id = ?", liveTask.ID).
+					Update("schedule_id", nil).Error; err != nil {
+					return err
+				}
+				if err := tx.Model(&model.SummarySchedule{}).
+					Where("id = ? AND deleted_at IS NULL", lockedSched.ID).
+					Update("is_active", 0).Error; err != nil {
+					return err
+				}
+				log.Printf("[task] DeleteSummary: task %d caller %s is not schedule %d creator; unbinding instead of cascade-deleting", liveTask.ID, userID, lockedSched.ID)
+				log.Printf("[task] DeleteSummary: schedule %d auto-paused after non-creator unbind to prevent idle scans", lockedSched.ID)
+			}
+		}
+
+		return tx.Model(&liveTask).Updates(map[string]interface{}{
+			"status":     -1,
+			"deleted_at": now,
+		}).Error
+	}); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
+			return
+		}
+		if isScheduleRetryableConflict(err) {
+			writeRetryableRebindConflict(c)
+			return
+		}
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
 		return
 	}

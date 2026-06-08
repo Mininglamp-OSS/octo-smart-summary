@@ -12,11 +12,22 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/db"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timing"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/worker"
 )
 
 func main() {
 	cfg := config.Load()
+	// Optional override of the per-stage timing log path; defaults to
+	// timing.DefaultLogPath (/var/log/smart-summary/timing.log).
+	if p := os.Getenv("TIMING_LOG_PATH"); p != "" {
+		timing.SetLogPath(p)
+	}
+	// Optional override of the per-run LLM summary report path; defaults to
+	// timing.DefaultReportPath (/var/log/smart-summary/summary-report.log).
+	if p := os.Getenv("SUMMARY_REPORT_PATH"); p != "" {
+		timing.SetReportPath(p)
+	}
 	config.ValidateRequired(map[string]string{
 		"MYSQL_DSN":               cfg.MySQLDSN,
 		"IM_MYSQL_DSN":            cfg.IMMySQLDSN,

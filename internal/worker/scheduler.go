@@ -3,14 +3,17 @@ package worker
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/robfig/cron/v3"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var schedulerHTTPClient = &http.Client{Timeout: 5 * time.Second}
@@ -29,9 +32,9 @@ func StartScheduler(db *gorm.DB, maxRetry int, workerTriggerURL string) *cron.Cr
 	return c
 }
 
-// scanPendingSchedules creates tasks from due schedules.
+// scanPendingSchedules requeues bound tasks from due schedules.
 func scanPendingSchedules(db *gorm.DB) {
-	now := time.Now().UTC()
+	now := timezone.Now()
 	var schedules []model.SummarySchedule
 	err := db.Where("is_active = 1 AND next_run_at <= ? AND deleted_at IS NULL", now).Find(&schedules).Error
 	if err != nil {
@@ -40,78 +43,189 @@ func scanPendingSchedules(db *gorm.DB) {
 	}
 
 	for _, sched := range schedules {
-		// Compute time range
-		start, end := service.ComputeTimeRange(sched.TimeRangeType, now)
-
-		// Parse source config
-		var sources []struct {
-			SourceType int    `json:"source_type"`
-			SourceID   string `json:"source_id"`
-		}
-		if len(sched.SourceConfig) > 0 {
-			json.Unmarshal([]byte(sched.SourceConfig), &sources)
-		}
-
-		taskNo := service.GenerateTaskNo()
-		title := sched.Title
-		if title == "" {
-			title = "定时总结-" + taskNo[len(taskNo)-8:]
-		}
-
-		task := model.SummaryTask{
-			TaskNo:         taskNo,
-			SpaceID:        sched.SpaceID,
-			CreatorID:      sched.CreatorID,
-			Title:          title,
-			SummaryMode:    model.ModeByPerson,
-			TimeRangeStart: start,
-			TimeRangeEnd:   end,
-			Status:         model.StatusPending,
-			TriggerType:    model.TriggerScheduled,
-			ScheduleID:     &sched.ID,
-		}
-
-		err := db.Transaction(func(tx *gorm.DB) error {
-			if err := tx.Create(&task).Error; err != nil {
-				return err
-			}
-			for _, s := range sources {
-				src := model.SummarySource{
-					TaskID:     task.ID,
-					SourceType: s.SourceType,
-					SourceID:   s.SourceID,
-					SourceName: service.ResolveSourceName(s.SourceID),
-				}
-				if err := tx.Create(&src).Error; err != nil {
-					return err
-				}
-			}
-			return nil
-		})
+		taskID, claimed, err := claimAndCreateScheduledTask(db, sched, now)
 		if err != nil {
 			log.Printf("[scheduler] create task for schedule %d: %v", sched.ID, err)
 			continue
 		}
-
-		// Update schedule: last_run_at and next_run_at
-		nextRun, err := service.NextRun(sched.CronExpr, now)
-		if err != nil {
-			log.Printf("[scheduler] compute next run for schedule %d: %v", sched.ID, err)
+		if !claimed {
 			continue
 		}
-		db.Model(&sched).Updates(map[string]interface{}{
-			"last_run_at": now,
-			"next_run_at": nextRun,
-		})
-
-		log.Printf("[scheduler] created task %d from schedule %d", task.ID, sched.ID)
+		if taskID == 0 {
+			continue
+		}
+		log.Printf("[scheduler] requeued task %d from schedule %d", taskID, sched.ID)
 	}
+}
+
+func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now time.Time) (int64, bool, error) {
+	if sched.NextRunAt == nil {
+		return 0, false, nil
+	}
+
+	var task model.SummaryTask
+	claimed := false
+	requeued := false
+
+	// The schedule claim (FOR UPDATE re-read + next_run advance) and the task reset share
+	// ONE transaction: a reset failure rolls back the next_run_at advance too (60s scan
+	// retries), avoiding a dropped cycle. Business skips (no bound task, overlapping
+	// Processing, multi-person) still commit the advanced next_run_at to avoid re-scanning
+	// forever; only real errors roll back.
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		var lockedSched model.SummarySchedule
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND deleted_at IS NULL", sched.ID).
+			First(&lockedSched).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		if lockedSched.IsActive != 1 || lockedSched.NextRunAt == nil || !lockedSched.NextRunAt.Equal(*sched.NextRunAt) || lockedSched.NextRunAt.After(now) {
+			// The due snapshot was deactivated, retimed or already claimed after scan().
+			// Skip instead of using stale schedule fields from the pre-scan snapshot.
+			return nil
+		}
+
+		// Recompute from the FOR UPDATE re-read row so claim sees the latest config
+		// even when non-recurrence fields changed without bumping next_run_at.
+		nextRun, err := service.NextRunScheduledAdvance(lockedSched.CronExpr, lockedSched.IntervalDays, lockedSched.IntervalMonths, lockedSched.RunTime, lockedSched.DayOfWeek, lockedSched.DayOfMonth, lockedSched.AnchorDOM, *lockedSched.NextRunAt, now)
+		if err != nil {
+			log.Printf("[scheduler] ALERT schedule %d has invalid recurrence (%v); disabling to stop repeated re-scan/cost", lockedSched.ID, err)
+			if err := tx.Model(&model.SummarySchedule{}).
+				Where("id = ?", lockedSched.ID).
+				Update("is_active", 0).Error; err != nil {
+				return err
+			}
+			return nil
+		}
+		start, end, err := service.ComputeTimeRange(lockedSched.TimeRangeType, now, lockedSched.LastRunAt, lockedSched.CronExpr, lockedSched.IntervalDays, lockedSched.IntervalMonths)
+		if err != nil {
+			log.Printf("[scheduler] ALERT schedule %d has invalid time range (%v); disabling to stop repeated re-scan/cost", lockedSched.ID, err)
+			if err := tx.Model(&model.SummarySchedule{}).
+				Where("id = ?", lockedSched.ID).
+				Update("is_active", 0).Error; err != nil {
+				return err
+			}
+			return nil
+		}
+		if err := tx.Model(&model.SummarySchedule{}).
+			Where("id = ?", lockedSched.ID).
+			Updates(map[string]interface{}{
+				"last_run_at": now,
+				"next_run_at": nextRun,
+			}).Error; err != nil {
+			return err
+		}
+		claimed = true
+
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("schedule_id = ? AND deleted_at IS NULL", lockedSched.ID).
+			Order("id DESC").
+			First(&task).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				log.Printf("[scheduler] ALERT schedule %d claimed but no bound task found; skipping overwrite", lockedSched.ID)
+				// Business skip: keep the advanced next_run_at (commit), no reset.
+				return nil
+			}
+			return err
+		}
+
+		if task.Status == model.StatusProcessing {
+			log.Printf("[scheduler] schedule %d task %d still processing; skipping overlapping overwrite", lockedSched.ID, task.ID)
+			// Business skip (overlap protection): commit advanced next_run_at.
+			return nil
+		}
+
+		// Method A guard: scheduled summary is single-person only this version. Multi-person
+		// (team) tasks are driven by the human meta flow and must NOT be reset here. The claim
+		// already advanced next_run_at, so a multi-person row is simply skipped (and re-claimed
+		// + re-skipped next cycle) until team scheduling ships -- expected, not a bug.
+		var participantCount int64
+		if err := tx.Model(&model.SummaryParticipant{}).
+			Where("task_id = ?", task.ID).
+			Count(&participantCount).Error; err != nil {
+			return err
+		}
+		if participantCount > 1 {
+			log.Printf("[scheduler] schedule %d bound task %d is multi-person (%d participants); scheduled summary not supported for team tasks this version, skipping (next_run_at already advanced; expected re-skip next cycle)", lockedSched.ID, task.ID, participantCount)
+			// Business skip (multi-person guard): commit advanced next_run_at.
+			return nil
+		}
+
+		requeued = true
+		if err := syncScheduledTaskConfig(tx, lockedSched, task, now); err != nil {
+			return err
+		}
+
+		if err := tx.Model(&model.SummaryParticipant{}).
+			Where("task_id = ?", task.ID).
+			Updates(map[string]interface{}{
+				"status":            model.ParticipantAccepted,
+				"confirmed_at":      now,
+				"worker_started_at": nil,
+			}).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Model(&model.PersonalResult{}).
+			Where("task_id = ?", task.ID).
+			Updates(map[string]interface{}{
+				"worker_status":    model.PersonalStatusPending,
+				"content":          "",
+				"citations_json":   "",
+				"msg_count":        0,
+				"total_token_used": 0,
+				"model_version":    "",
+				"error_message":    nil,
+				"submitted_at":     nil,
+				"generated_at":     nil,
+				"edited_at":        nil,
+			}).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Model(&model.SummaryTask{}).
+			Where("id = ?", task.ID).
+			Updates(map[string]interface{}{
+				"time_range_start":    start,
+				"time_range_end":      end,
+				"status":              model.StatusPending,
+				"trigger_type":        model.TriggerScheduled,
+				"retry_count":         0,
+				"error_message":       nil,
+				"processing_deadline": nil,
+				"confirm_deadline":    nil,
+				"schedule_id":         lockedSched.ID,
+			}).Error; err != nil {
+			return err
+		}
+
+		return nil
+	}); err != nil {
+		// Technical failure: whole tx (including the next_run_at advance) rolled
+		// back. next_run_at stays in the past so the next 60s scan retries.
+		return 0, false, err
+	}
+
+	if !claimed {
+		return 0, false, nil
+	}
+
+	// Only report a real requeue when we actually reset the task. Skipped cases
+	// (no bound task, still processing, or multi-person guard) return taskID=0 so
+	// scanPendingSchedules does not log a misleading "requeued task" line.
+	if !requeued {
+		return 0, true, nil
+	}
+	return task.ID, true, nil
 }
 
 // scanConfirmTimeouts auto-declines participants still in WaitingConfirm
 // past the task's confirm_deadline.
 func scanConfirmTimeouts(db *gorm.DB) {
-	now := time.Now().UTC()
+	now := timezone.Now()
 
 	// Find tasks with confirm_deadline passed that still have WaitingConfirm participants
 	var taskIDs []int64
@@ -136,7 +250,7 @@ func scanConfirmTimeouts(db *gorm.DB) {
 // scanStuckTasks resets tasks stuck in processing past their deadline.
 // Increments retry_count; if max retries exceeded, marks as Failed.
 func scanStuckTasks(db *gorm.DB, maxRetry int) {
-	now := time.Now().UTC()
+	now := timezone.Now()
 
 	// Reset tasks that can still retry (also handle NULL deadline for legacy data)
 	result := db.Model(&model.SummaryTask{}).
@@ -169,7 +283,7 @@ func scanStuckTasks(db *gorm.DB, maxRetry int) {
 // scanStuckPersonalTasks resets personal summaries stuck in processing
 // and detects accepted participants with PENDING personal_result that were never triggered.
 func scanStuckPersonalTasks(db *gorm.DB, workerTriggerURL string) {
-	now := time.Now().UTC()
+	now := timezone.Now()
 	leaseTimeout := now.Add(-10 * time.Minute)
 
 	// Find participants stuck in processing

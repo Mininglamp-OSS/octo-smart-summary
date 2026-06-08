@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -68,7 +69,7 @@ func (h *PersonalHandler) Accept(c *gin.Context) {
 		return
 	}
 
-	now := time.Now().UTC()
+	now := timezone.Now()
 
 	err := h.db.Transaction(func(tx *gorm.DB) error {
 		// Update participant to accepted
@@ -224,7 +225,7 @@ func (h *PersonalHandler) Submit(c *gin.Context) {
 		return
 	}
 
-	now := time.Now().UTC()
+	now := timezone.Now()
 	h.db.Model(&pr).Update("submitted_at", now)
 
 	// Update participant status to submitted

@@ -13,21 +13,25 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timing"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var callbackClient = &http.Client{Timeout: 5 * time.Second}
 
 // Processor polls the DB for pending tasks and dispatches them to the pool.
 type Processor struct {
-	db          *gorm.DB
-	imDB        *gorm.DB
-	pool        *WorkerPool
-	llm         *service.LLMClient
-	cfg         *config.Config
-	stopCh      chan struct{}
-	triggerCh   chan model.WorkerTriggerRequest
-	meta        *MetaProcessor
+	db         *gorm.DB
+	imDB       *gorm.DB
+	pool       *WorkerPool
+	llm        *service.LLMClient
+	cfg        *config.Config
+	stopCh     chan struct{}
+	triggerCh  chan model.WorkerTriggerRequest
+	meta       *MetaProcessor
+	createPRFn func(tx *gorm.DB, pr *model.PersonalResult) error
 }
 
 // NewProcessor creates a new task processor.
@@ -89,7 +93,7 @@ func (p *Processor) Stop() {
 }
 
 func (p *Processor) poll() {
-	now := time.Now().UTC()
+	now := timezone.Now()
 	deadline := now.Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute)
 
 	// Claim tasks atomically: two-step select-then-claim per task.
@@ -176,13 +180,85 @@ func (p *Processor) processTask(task model.SummaryTask) {
 
 	// Success — all tasks are BY_PERSON
 	var participantCount int64
-	p.db.Model(&model.SummaryParticipant{}).Where("task_id = ?", task.ID).Count(&participantCount)
+	if err := p.db.Model(&model.SummaryParticipant{}).Where("task_id = ?", task.ID).Count(&participantCount).Error; err != nil {
+		log.Printf("[processor] task %d count participants failed: %v", task.ID, err)
+		errMsg := err.Error()
+		newRetry := task.RetryCount + 1
+		newStatus := model.StatusPending
+		if newRetry >= p.cfg.WorkerMaxRetry {
+			newStatus = model.StatusFailed
+		}
+		casResult := p.db.Model(&model.SummaryTask{}).
+			Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
+			Updates(map[string]interface{}{
+				"status":              newStatus,
+				"retry_count":         newRetry,
+				"error_message":       errMsg,
+				"processing_deadline": nil,
+			})
+		if casResult.Error != nil {
+			log.Printf("[processor] task %d update to failed/retry failed: %v", task.ID, casResult.Error)
+			return
+		}
+		if casResult.RowsAffected == 0 {
+			log.Printf("[processor] task %d status changed during processing (likely cancelled), skipping failure update", task.ID)
+			return
+		}
+		p.sendCallback(model.TaskEvent{
+			TaskID:  task.ID,
+			Status:  newStatus,
+			Message: errMsg,
+		})
+		return
+	}
+
+	// Defensive bootstrap: scheduled tasks (and legacy tasks reset for re-run)
+	// may have no participant rows. Without at least the creator participant +
+	// its personal_result, the single-participant branch below has nothing to
+	// dispatch and the task is stuck in Processing forever. Create them here
+	// (idempotently) so the personal pipeline can run end-to-end.
+	if participantCount == 0 {
+		creatorParticipantID, err := p.bootstrapCreatorParticipant(task)
+		if err != nil {
+			log.Printf("[processor] task %d bootstrap creator artifacts failed: %v", task.ID, err)
+			errMsg := err.Error()
+			newRetry := task.RetryCount + 1
+			newStatus := model.StatusPending
+			if newRetry >= p.cfg.WorkerMaxRetry {
+				newStatus = model.StatusFailed
+			}
+			casResult := p.db.Model(&model.SummaryTask{}).
+				Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
+				Updates(map[string]interface{}{
+					"status":              newStatus,
+					"retry_count":         newRetry,
+					"error_message":       errMsg,
+					"processing_deadline": nil,
+				})
+			if casResult.Error != nil {
+				log.Printf("[processor] task %d update to failed/retry failed: %v", task.ID, casResult.Error)
+				return
+			}
+			if casResult.RowsAffected == 0 {
+				log.Printf("[processor] task %d status changed during processing (likely cancelled), skipping failure update", task.ID)
+				return
+			}
+			p.sendCallback(model.TaskEvent{
+				TaskID:  task.ID,
+				Status:  newStatus,
+				Message: errMsg,
+			})
+			return
+		}
+		participantCount = 1
+		log.Printf("[processor] task %d bootstrapped creator participant %d", task.ID, creatorParticipantID)
+	}
 
 	if participantCount <= 1 {
 		casResult := p.db.Model(&model.SummaryTask{}).
 			Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
 			Updates(map[string]interface{}{
-				"processing_deadline": time.Now().UTC().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute),
+				"processing_deadline": timezone.Now().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute),
 			})
 		if casResult.Error != nil {
 			log.Printf("[processor] task %d CAS update failed: %v", task.ID, casResult.Error)
@@ -215,7 +291,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 		casResult := p.db.Model(&model.SummaryTask{}).
 			Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
 			Updates(map[string]interface{}{
-				"processing_deadline": time.Now().UTC().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute),
+				"processing_deadline": timezone.Now().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute),
 			})
 		if casResult.Error != nil {
 			log.Printf("[processor] task %d CAS update failed: %v", task.ID, casResult.Error)
@@ -235,7 +311,95 @@ func (p *Processor) processTask(task model.SummaryTask) {
 	}
 }
 
+func (p *Processor) bootstrapCreatorParticipant(task model.SummaryTask) (int64, error) {
+	now := timezone.Now()
+	creatorName := service.ResolveUserName(task.CreatorID)
+	var participant model.SummaryParticipant
+
+	err := p.db.Transaction(func(tx *gorm.DB) error {
+		participant = model.SummaryParticipant{
+			TaskID:      task.ID,
+			UserID:      task.CreatorID,
+			UserName:    creatorName,
+			Status:      model.ParticipantAccepted,
+			ConfirmedAt: &now,
+		}
+		result := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "task_id"}, {Name: "user_id"}},
+			DoNothing: true,
+		}).Create(&participant)
+		if result.Error != nil {
+			return fmt.Errorf("upsert participant: %w", result.Error)
+		}
+		if result.RowsAffected == 0 {
+			if err := tx.Where("task_id = ? AND user_id = ?", task.ID, task.CreatorID).First(&participant).Error; err != nil {
+				return fmt.Errorf("load existing participant: %w", err)
+			}
+		}
+
+		participantUpdates := map[string]interface{}{}
+		if participant.UserName == "" {
+			participantUpdates["user_name"] = creatorName
+		}
+		if participant.Status != model.ParticipantAccepted {
+			participantUpdates["status"] = model.ParticipantAccepted
+		}
+		if participant.ConfirmedAt == nil {
+			participantUpdates["confirmed_at"] = now
+		}
+		if len(participantUpdates) > 0 {
+			if err := tx.Model(&model.SummaryParticipant{}).Where("id = ?", participant.ID).Updates(participantUpdates).Error; err != nil {
+				return fmt.Errorf("normalize participant: %w", err)
+			}
+		}
+
+		pr := model.PersonalResult{
+			TaskID:           task.ID,
+			ParticipantRefID: participant.ID,
+			UserID:           task.CreatorID,
+			WorkerStatus:     model.PersonalStatusPending,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}
+		result = tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "task_id"}, {Name: "participant_ref_id"}},
+			DoNothing: true,
+		})
+		if p.createPRFn != nil {
+			if err := p.createPRFn(result, &pr); err != nil {
+				return fmt.Errorf("upsert personal_result: %w", err)
+			}
+		} else {
+			result = result.Create(&pr)
+			if err := result.Error; err != nil {
+				return fmt.Errorf("upsert personal_result: %w", err)
+			}
+		}
+		if result.RowsAffected == 0 {
+			if err := tx.Where("task_id = ? AND participant_ref_id = ?", task.ID, participant.ID).First(&pr).Error; err != nil {
+				return fmt.Errorf("load existing personal_result: %w", err)
+			}
+		}
+
+		if participant.PersonalResultID == nil || *participant.PersonalResultID != pr.ID {
+			if err := tx.Model(&model.SummaryParticipant{}).
+				Where("id = ? AND (personal_result_id IS NULL OR personal_result_id <> ?)", participant.ID, pr.ID).
+				Update("personal_result_id", pr.ID).Error; err != nil {
+				return fmt.Errorf("link participant personal_result: %w", err)
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return participant.ID, nil
+}
+
 func (p *Processor) executePipeline(task model.SummaryTask) error {
+	pipelineStart := time.Now()
+	defer func() { timing.Observe(task.TaskNo, "execute_pipeline_total", pipelineStart) }()
 	ctx := context.Background()
 
 	// Load sources
@@ -254,13 +418,24 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 		})
 	}
 
-	// Fetch messages via pipeline
+	// Fetch messages via pipeline. Tool-call / raw LLM uses in this (fetch) path
+	// are accounted under the same task_no, so they appear in the same per-run
+	// report that personal_pipeline flushes at the end.
 	toolCallFn := func(ctx context.Context, messages []service.ChatMessage, tools []service.Tool, forceFn string) (string, error) {
-		args, _, err := p.llm.CallWithTools(ctx, messages, tools, forceFn, p.cfg.LLMTemperature)
+		callStart := time.Now()
+		args, tokens, err := p.llm.CallWithTools(ctx, messages, tools, forceFn, p.cfg.LLMTemperature)
+		purpose := "检索预处理(tool-call)"
+		if forceFn != "" {
+			purpose = "检索预处理: " + forceFn
+		}
+		timing.RecordLLMSince(task.TaskNo, purpose, callStart, tokens)
 		return args, err
 	}
 	llmFn := func(ctx context.Context, prompt string) (string, error) {
-		return p.llm.CallRaw(ctx, prompt)
+		callStart := time.Now()
+		out, err := p.llm.CallRaw(ctx, prompt)
+		timing.RecordLLMSince(task.TaskNo, "检索后裁剪 PostRetrievalNarrow", callStart, 0)
+		return out, err
 	}
 
 	var messages []pipeline.Message
@@ -287,25 +462,27 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 		}
 	}
 
+	fetchStart := time.Now()
 	messages, err = pipeline.ResolveAndFetchMessagesForPersonal(
 		ctx, task.CreatorID, participantUIDs, participantNames, specifiedSources, task.Title,
 		task.TimeRangeStart, task.TimeRangeEnd,
 		p.imDB, toolCallFn, llmFn, p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency,
 		channelScopeOpts,
 	)
+	timing.Observe(task.TaskNo, "fetch_messages", fetchStart)
 	if err != nil {
 		return fmt.Errorf("fetch messages: %w", err)
 	}
 
 	if len(messages) == 0 {
 		log.Printf("[processor] task %d: 0 messages fetched", task.ID)
-		p.db.Model(&model.SummaryTask{}).Where("id = ?", task.ID).Update("total_msg_count", 0)
 		return nil
 	}
 
-	// Personal summaries will be generated by personal_processor
+	// Personal summaries will be generated by personal_processor.
+	// NOTE: total message count is persisted on SummaryResult.TotalMsgCount
+	// by personal_processor; summary_task has no total_msg_count column.
 	log.Printf("[processor] task %d: %d messages fetched, personal_processor will handle summaries", task.ID, len(messages))
-	p.db.Model(&model.SummaryTask{}).Where("id = ?", task.ID).Update("total_msg_count", len(messages))
 	return nil
 }
 

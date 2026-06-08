@@ -201,19 +201,19 @@ type TeamCitation struct {
 
 // SummaryResult represents the final summary output.
 type SummaryResult struct {
-	ID                 int64      `gorm:"primaryKey;autoIncrement" json:"id"`
-	TaskID             int64      `gorm:"column:task_id;not null" json:"task_id"`
-	Content            string     `gorm:"column:content;type:mediumtext;not null" json:"content"`
-	CitationsJSON      string     `gorm:"column:citations_json;type:mediumtext" json:"-"`
-	TeamCitationsJSON  string     `gorm:"column:team_citations_json;type:mediumtext" json:"-"`
-	TotalMsgCount      int        `gorm:"column:total_msg_count;not null;default:0" json:"total_msg_count"`
-	TotalTokenUsed     int        `gorm:"column:total_token_used;not null;default:0" json:"total_token_used"`
-	ModelVersion       string     `gorm:"column:model_version;type:varchar(50);not null;default:''" json:"model_version"`
-	Version            int        `gorm:"column:version;not null;default:1" json:"version"`
-	EditedAt           *time.Time `gorm:"column:edited_at" json:"edited_at"`
-	GeneratedAt        time.Time  `gorm:"column:generated_at;not null" json:"generated_at"`
-	CreatedAt          time.Time  `gorm:"column:created_at;not null" json:"created_at"`
-	UpdatedAt          time.Time  `gorm:"column:updated_at;not null" json:"updated_at"`
+	ID                int64      `gorm:"primaryKey;autoIncrement" json:"id"`
+	TaskID            int64      `gorm:"column:task_id;not null" json:"task_id"`
+	Content           string     `gorm:"column:content;type:mediumtext;not null" json:"content"`
+	CitationsJSON     string     `gorm:"column:citations_json;type:mediumtext" json:"-"`
+	TeamCitationsJSON string     `gorm:"column:team_citations_json;type:mediumtext" json:"-"`
+	TotalMsgCount     int        `gorm:"column:total_msg_count;not null;default:0" json:"total_msg_count"`
+	TotalTokenUsed    int        `gorm:"column:total_token_used;not null;default:0" json:"total_token_used"`
+	ModelVersion      string     `gorm:"column:model_version;type:varchar(50);not null;default:''" json:"model_version"`
+	Version           int        `gorm:"column:version;not null;default:1" json:"version"`
+	EditedAt          *time.Time `gorm:"column:edited_at" json:"edited_at"`
+	GeneratedAt       time.Time  `gorm:"column:generated_at;not null" json:"generated_at"`
+	CreatedAt         time.Time  `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt         time.Time  `gorm:"column:updated_at;not null" json:"updated_at"`
 }
 
 // GetCitations deserializes CitationsJSON into a slice of Citation.
@@ -272,12 +272,22 @@ func (SummaryResult) TableName() string { return "summary_result" }
 
 // SummarySchedule represents a recurring schedule configuration.
 type SummarySchedule struct {
-	ID                int64      `gorm:"primaryKey;autoIncrement" json:"id"`
-	SpaceID           string     `gorm:"column:space_id;type:varchar(64);not null;default:''" json:"space_id"`
-	CreatorID         string     `gorm:"column:creator_id;type:varchar(64);not null" json:"creator_id"`
-	Title             string     `gorm:"column:title;type:varchar(1000);not null;default:''" json:"title"`
-	SummaryMode       int        `gorm:"column:summary_mode;type:tinyint;not null" json:"summary_mode"`
-	CronExpr          string     `gorm:"column:cron_expr;type:varchar(50);not null" json:"cron_expr"`
+	ID             int64  `gorm:"primaryKey;autoIncrement" json:"id"`
+	SpaceID        string `gorm:"column:space_id;type:varchar(64);not null;default:''" json:"space_id"`
+	CreatorID      string `gorm:"column:creator_id;type:varchar(64);not null" json:"creator_id"`
+	Title          string `gorm:"column:title;type:varchar(1000);not null;default:''" json:"title"`
+	SummaryMode    int    `gorm:"column:summary_mode;type:tinyint;not null" json:"summary_mode"`
+	CronExpr       string `gorm:"column:cron_expr;type:varchar(50);not null" json:"cron_expr"`
+	IntervalDays   int    `gorm:"column:interval_days;type:int;not null;default:0" json:"interval_days"`
+	IntervalMonths int    `gorm:"column:interval_months;type:int;not null;default:0" json:"interval_months"`
+	RunTime        string `gorm:"column:run_time;type:varchar(5);not null;default:''" json:"run_time"`
+	// DayOfWeek aligns WEEK mode (interval_days multiple of 7) to a specific
+	// weekday: 1=Mon..7=Sun, 0=unconstrained. Ignored for non-week modes.
+	DayOfWeek int `gorm:"column:day_of_week;type:tinyint;not null;default:0" json:"day_of_week"`
+	// DayOfMonth aligns MONTH mode (interval_months>0) to a specific day:
+	// 1..31 (clamped to month end), 0=unconstrained. Ignored for non-month modes.
+	DayOfMonth        int        `gorm:"column:day_of_month;type:tinyint;not null;default:0" json:"day_of_month"`
+	AnchorDOM         int        `gorm:"column:anchor_dom;type:tinyint;not null;default:0" json:"-"`
 	TimeRangeType     int        `gorm:"column:time_range_type;type:tinyint;not null" json:"time_range_type"`
 	SourceConfig      JSON       `gorm:"column:source_config;type:json" json:"source_config"`
 	ParticipantConfig JSON       `gorm:"column:participant_config;type:json" json:"participant_config"`
