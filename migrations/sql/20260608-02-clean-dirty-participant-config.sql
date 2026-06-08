@@ -20,7 +20,7 @@ WHERE deleted_at IS NULL
       SELECT 1
       FROM JSON_TABLE(
           participant_config,
-          '$[*]' COLUMNS (uid VARCHAR(64) PATH '$.user_id')
+          '$[*]' COLUMNS (uid VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci PATH '$.user_id')
       ) AS jt
       WHERE jt.uid IS NOT NULL
         AND jt.uid <> ''
