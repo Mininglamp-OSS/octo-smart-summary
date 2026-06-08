@@ -37,6 +37,7 @@ func newScheduleTestDB(t *testing.T) *gorm.DB {
 		&model.SummaryTask{},
 		&model.SummarySchedule{},
 		&model.SummaryParticipant{},
+		&model.SummarySource{},
 		&model.SummaryResult{},
 		&model.SummaryChunk{},
 		&model.PersonalResult{},
@@ -247,10 +248,6 @@ func TestDeleteSummary_CreatorCascadeDeletesOwnSchedule(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Toggle: re-enabling a schedule with an invalid recurrence is rejected.
-// ---------------------------------------------------------------------------
-
 func TestToggleSchedule_ReenableInvalidRecurrenceRejected(t *testing.T) {
 	db := newScheduleTestDB(t)
 	r := newScheduleTestRouter(db)
@@ -280,5 +277,92 @@ func TestToggleSchedule_ReenableInvalidRecurrenceRejected(t *testing.T) {
 	})
 	if w.Code == http.StatusOK {
 		t.Fatalf("expected rejection re-enabling invalid-recurrence schedule, got 200: %s", w.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Display order (B1): the latest result wins. A newer scheduled/regenerated
+// result (higher version) must be shown even when an older row was hand-edited,
+// so a scheduled update is never permanently masked by a stale edited row.
+// ---------------------------------------------------------------------------
+
+func TestQueryDisplayResult_NewerScheduledResultWinsOverEditedRow(t *testing.T) {
+	db := newScheduleTestDB(t)
+	taskID := int64(42)
+
+	edited := time.Now()
+	// Older, hand-edited result (lower version).
+	if err := db.Create(&model.SummaryResult{TaskID: taskID, Content: "edited v1", Version: 1, EditedAt: &edited, GeneratedAt: time.Now()}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// Newer scheduled result (higher version, not edited).
+	if err := db.Create(&model.SummaryResult{TaskID: taskID, Content: "scheduled v2", Version: 2, GeneratedAt: time.Now()}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := queryDisplayResult(db, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Content != "scheduled v2" {
+		t.Fatalf("display result = %q, want the newer scheduled result %q (edited row must not mask it)", got.Content, "scheduled v2")
+	}
+}
+
+func TestQueryDisplayResult_EditedRowShownWhenItIsLatest(t *testing.T) {
+	db := newScheduleTestDB(t)
+	taskID := int64(43)
+
+	edited := time.Now()
+	db.Create(&model.SummaryResult{TaskID: taskID, Content: "auto v1", Version: 1, GeneratedAt: time.Now()})
+	// The latest version happens to be the edited one -> it is shown.
+	db.Create(&model.SummaryResult{TaskID: taskID, Content: "edited v2", Version: 2, EditedAt: &edited, GeneratedAt: time.Now()})
+
+	got, err := queryDisplayResult(db, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Content != "edited v2" {
+		t.Fatalf("display result = %q, want latest edited %q", got.Content, "edited v2")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Participant dedup (B3): a create payload with duplicate participant ids must
+// not blow up the (task_id,user_id) unique index; the handler de-duplicates so
+// each participant is inserted once.
+// ---------------------------------------------------------------------------
+
+func TestCreateSummary_DeduplicatesDuplicateParticipants(t *testing.T) {
+	db := newScheduleTestDB(t)
+	// Enforce the production unique constraint in sqlite too, so a missing
+	// dedup would surface as an insert error here.
+	if err := db.Exec("CREATE UNIQUE INDEX uk_part ON summary_participant(task_id, user_id)").Error; err != nil {
+		t.Fatal(err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(middleware.AuthMiddleware(&mockTokenResolver{}), middleware.SpaceMiddleware())
+	th := NewTaskHandler(db, db, "")
+	r.POST("/api/v1/summaries", th.CreateSummary)
+
+	body := map[string]interface{}{
+		"sources": []map[string]interface{}{{"source_type": 1, "source_id": "grp1"}},
+		"participants": []map[string]interface{}{
+			{"user_id": "p1"}, {"user_id": "p1"}, {"user_id": "p2"}, {"user_id": "creator"},
+		},
+		"time_range_type": 2,
+	}
+	w := scheduleReq(t, r, "creator", "s1", http.MethodPost, "/api/v1/summaries", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create with duplicate participants should succeed (deduped), got %d: %s", w.Code, w.Body.String())
+	}
+
+	// p1 must exist exactly once despite being listed twice.
+	var p1Count int64
+	db.Model(&model.SummaryParticipant{}).Where("user_id = ?", "p1").Count(&p1Count)
+	if p1Count != 1 {
+		t.Fatalf("participant p1 count = %d, want 1 (deduped)", p1Count)
 	}
 }

@@ -284,10 +284,18 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		}
 		creatorParticipantID = creatorP.ID
 
+		seenParticipant := map[string]struct{}{effectiveUID: {}}
 		for _, p := range req.Participants {
 			if p.UserID == effectiveUID {
 				continue
 			}
+			// De-duplicate repeated participant ids up front: the
+			// (task_id,user_id) unique index would otherwise turn a duplicate
+			// payload into a 1062 -> 500 instead of a clean insert.
+			if _, dup := seenParticipant[p.UserID]; dup {
+				continue
+			}
+			seenParticipant[p.UserID] = struct{}{}
 			pp := model.SummaryParticipant{
 				TaskID: task.ID,
 				UserID: p.UserID,

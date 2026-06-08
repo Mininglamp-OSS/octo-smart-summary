@@ -755,6 +755,14 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 			effDayOfWeek = 0
 			updates["day_of_week"] = 0
 		}
+		// Switching from week mode (interval_days a multiple of 7) to a non-week
+		// day interval leaves a stale day_of_week that ValidateScheduleAnchors
+		// rejects ("仅周模式支持 day_of_week"). Clear it when the caller did not set
+		// it explicitly, mirroring the month-switch case above.
+		if req.DayOfWeek == nil && effIntervalDays > 0 && effIntervalDays%7 != 0 && effDayOfWeek != 0 {
+			effDayOfWeek = 0
+			updates["day_of_week"] = 0
+		}
 		if req.DayOfMonth == nil && effIntervalDays > 0 && effDayOfMonth != 0 {
 			effDayOfMonth = 0
 			updates["day_of_month"] = 0
@@ -910,6 +918,77 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 					return errLiveBindingDuplicate
 				}
 				return err
+			}
+		}
+		// TOCTOU fix: the effective recurrence values and the recomputed
+		// next_run_at / anchor_dom above were derived from `sched`, read WITHOUT a
+		// lock at the top of the handler. A concurrent UpdateSchedule on the same
+		// row could have changed interval_days / interval_months / run_time /
+		// day_of_week / day_of_month in between, so recompute from the FOR UPDATE
+		// locked snapshot for every field the caller did not explicitly send, then
+		// rewrite next_run_at / anchor_dom before persisting.
+		if schedChanged {
+			lEffCron := ""
+			lEffIntervalDays := effIntervalDays
+			lEffIntervalMonths := effIntervalMonths
+			lEffRunTime := effRunTime
+			lEffDayOfWeek := effDayOfWeek
+			lEffDayOfMonth := effDayOfMonth
+			if req.IntervalDays == nil {
+				lEffIntervalDays = lockedSched.IntervalDays
+			}
+			if req.IntervalMonths == nil {
+				lEffIntervalMonths = lockedSched.IntervalMonths
+			}
+			if req.RunTime == nil {
+				lEffRunTime = lockedSched.RunTime
+			}
+			if req.DayOfWeek == nil {
+				lEffDayOfWeek = lockedSched.DayOfWeek
+			}
+			if req.DayOfMonth == nil {
+				lEffDayOfMonth = lockedSched.DayOfMonth
+			}
+			// Re-apply the interval-only normalization (drop cron, clear stale
+			// anchors) against the locked base so the same invariants hold.
+			if req.DayOfWeek == nil && lEffIntervalMonths > 0 && lEffDayOfWeek != 0 {
+				lEffDayOfWeek = 0
+			}
+			if req.DayOfWeek == nil && lEffIntervalDays > 0 && lEffIntervalDays%7 != 0 && lEffDayOfWeek != 0 {
+				lEffDayOfWeek = 0
+			}
+			if req.DayOfMonth == nil && lEffIntervalDays > 0 && lEffDayOfMonth != 0 {
+				lEffDayOfMonth = 0
+			}
+			if err := service.ValidateIntervalForWrite(lEffCron, lEffIntervalDays, lEffIntervalMonths); err != nil {
+				return service.NewBizError(40011, err.Error(), http.StatusBadRequest)
+			}
+			if err := service.ValidateScheduleAnchors(lEffCron, lEffIntervalDays, lEffIntervalMonths, lEffDayOfWeek, lEffDayOfMonth); err != nil {
+				return service.NewBizError(40011, err.Error(), http.StatusBadRequest)
+			}
+			recomputeNow := timezone.Now()
+			lFinalAnchorDOM := lockedSched.AnchorDOM
+			lAnchorDOM, lWriteAnchorDOM := anchorDOMForMonthlyUpdate(lockedSched, lEffIntervalMonths, lEffDayOfMonth, req.DayOfMonth, recomputeNow)
+			if lWriteAnchorDOM {
+				lFinalAnchorDOM = lAnchorDOM
+			}
+			lNextRun, err := service.NextRunInitial(
+				lEffCron,
+				lEffIntervalDays,
+				lEffIntervalMonths,
+				lEffRunTime,
+				lEffDayOfWeek,
+				effectiveScheduleDayOfMonth(lEffIntervalMonths, lEffDayOfMonth, lFinalAnchorDOM),
+				recomputeNow,
+			)
+			if err != nil {
+				return service.NewBizError(40011, err.Error(), http.StatusBadRequest)
+			}
+			updates["day_of_week"] = lEffDayOfWeek
+			updates["day_of_month"] = lEffDayOfMonth
+			updates["next_run_at"] = lNextRun
+			if lWriteAnchorDOM {
+				updates["anchor_dom"] = lFinalAnchorDOM
 			}
 		}
 		if err := tx.Model(&model.SummarySchedule{}).
