@@ -649,3 +649,138 @@ func TestClaimAndCreateScheduledTask_MissingBoundTaskSkipsWithoutCreating(t *tes
 		t.Fatalf("expected next_run_at advanced, got %v", updated.NextRunAt)
 	}
 }
+
+// TestClaimAndCreateScheduledTask_MultiPersonTaskSkipped verifies the Method A
+// guard: a bound task with >1 participant (a team task driven by the human meta
+// flow) is NOT reset/overwritten by the scheduler. The claim CAS still advances
+// next_run_at (expected re-skip next cycle), but task state, participants and
+// existing results must be left untouched so the human meta link is not broken.
+func TestClaimAndCreateScheduledTask_MultiPersonTaskSkipped(t *testing.T) {
+	db := setupSchedulerTestDB(t)
+	now := timezone.Now()
+	due := now.Add(-time.Minute)
+
+	sched := model.SummarySchedule{
+		SpaceID:       "space1",
+		CreatorID:     "creator1",
+		Title:         "Daily",
+		SummaryMode:   model.ModeByPerson,
+		IntervalDays:  1,
+		RunTime:       "09:00",
+		TimeRangeType: 2,
+		IsActive:      1,
+		NextRunAt:     &due,
+	}
+	if err := db.Create(&sched).Error; err != nil {
+		t.Fatalf("create schedule: %v", err)
+	}
+
+	oldStart := now.Add(-48 * time.Hour)
+	oldEnd := now.Add(-24 * time.Hour)
+	errMsg := "previous"
+	task := model.SummaryTask{
+		TaskNo:         "task-multi-1",
+		SpaceID:        sched.SpaceID,
+		CreatorID:      sched.CreatorID,
+		Title:          "Team Summary",
+		SummaryMode:    model.ModeByPerson,
+		TimeRangeStart: oldStart,
+		TimeRangeEnd:   oldEnd,
+		Status:         model.StatusCompleted,
+		TriggerType:    model.TriggerManual,
+		RetryCount:     2,
+		ScheduleID:     &sched.ID,
+	}
+	task.ErrorMessage = &errMsg
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	// Two participants => team task.
+	for i, uid := range []string{"creator1", "user2"} {
+		p := model.SummaryParticipant{
+			TaskID:      task.ID,
+			UserID:      uid,
+			UserName:    uid,
+			Status:      model.ParticipantCompleted,
+			ConfirmedAt: &now,
+		}
+		if err := db.Create(&p).Error; err != nil {
+			t.Fatalf("create participant %d: %v", i, err)
+		}
+		pr := model.PersonalResult{
+			TaskID:           task.ID,
+			ParticipantRefID: p.ID,
+			UserID:           uid,
+			Content:          "old personal " + uid,
+			WorkerStatus:     model.PersonalStatusCompleted,
+			GeneratedAt:      &now,
+		}
+		if err := db.Create(&pr).Error; err != nil {
+			t.Fatalf("create personal result %d: %v", i, err)
+		}
+	}
+
+	result := model.SummaryResult{
+		TaskID:       task.ID,
+		Content:      "old team summary",
+		ModelVersion: "old-model",
+		Version:      1,
+		GeneratedAt:  now.Add(-time.Hour),
+	}
+	if err := db.Create(&result).Error; err != nil {
+		t.Fatalf("create summary result: %v", err)
+	}
+
+	taskID, claimed, err := claimAndCreateScheduledTask(db, sched, now)
+	if err != nil {
+		t.Fatalf("claim err: %v", err)
+	}
+	// claimed=true (CAS advanced next_run_at) but no task overwrite => taskID==0.
+	if !claimed {
+		t.Fatalf("expected claimed=true (CAS should advance next_run_at)")
+	}
+	if taskID != 0 {
+		t.Fatalf("taskID=%d want 0 (multi-person task must be skipped, not reset)", taskID)
+	}
+
+	// Task must be UNCHANGED: still Completed, same time range, retry/error intact.
+	var reloaded model.SummaryTask
+	if err := db.First(&reloaded, task.ID).Error; err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	if reloaded.Status != model.StatusCompleted {
+		t.Fatalf("task status=%d want %d (must not be reset to pending)", reloaded.Status, model.StatusCompleted)
+	}
+	if !reloaded.TimeRangeStart.Equal(oldStart) || !reloaded.TimeRangeEnd.Equal(oldEnd) {
+		t.Fatalf("time range changed: got [%v,%v] want [%v,%v]", reloaded.TimeRangeStart, reloaded.TimeRangeEnd, oldStart, oldEnd)
+	}
+	if reloaded.RetryCount != 2 {
+		t.Fatalf("retry_count=%d want 2 (must be untouched)", reloaded.RetryCount)
+	}
+
+	// Personal results must NOT be cleared.
+	var pr model.PersonalResult
+	if err := db.Where("task_id = ? AND user_id = ?", task.ID, "user2").First(&pr).Error; err != nil {
+		t.Fatalf("reload personal result: %v", err)
+	}
+	if pr.Content != "old personal user2" {
+		t.Fatalf("personal result content cleared: %q", pr.Content)
+	}
+
+	// Existing summary result must survive.
+	var resCount int64
+	db.Model(&model.SummaryResult{}).Where("task_id = ?", task.ID).Count(&resCount)
+	if resCount != 1 {
+		t.Fatalf("summary result count=%d want 1 (must not be deleted)", resCount)
+	}
+
+	// next_run_at must still have been advanced by the claim CAS.
+	var updated model.SummarySchedule
+	if err := db.First(&updated, sched.ID).Error; err != nil {
+		t.Fatalf("reload schedule: %v", err)
+	}
+	if updated.NextRunAt == nil || !updated.NextRunAt.After(due) {
+		t.Fatalf("expected next_run_at advanced, got %v", updated.NextRunAt)
+	}
+}

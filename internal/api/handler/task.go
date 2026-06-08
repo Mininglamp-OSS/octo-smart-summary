@@ -824,10 +824,36 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 		}
 
 		if liveTask.ScheduleID != nil {
-			if err := tx.Model(&model.SummarySchedule{}).
-				Where("id = ? AND deleted_at IS NULL", *liveTask.ScheduleID).
-				Update("deleted_at", &now).Error; err != nil {
-				return err
+			// Cascade soft-delete of the bound schedule must respect the same
+			// ownership rule as DeleteSchedule (schedule.go: only the schedule
+			// creator may delete, else 40004). Without this check a mere task
+			// participant could delete the task and silently take down another
+			// user's schedule. We only cascade when the caller is the schedule's
+			// creator; otherwise we just unbind (clear schedule_id) so the task
+			// delete still succeeds but the victim's schedule survives.
+			userID := middleware.GetUserID(c)
+			var sched model.SummarySchedule
+			if err := tx.Where("id = ? AND deleted_at IS NULL", *liveTask.ScheduleID).
+				First(&sched).Error; err != nil {
+				if !errors.Is(err, gorm.ErrRecordNotFound) {
+					return err
+				}
+				// schedule already gone; nothing to cascade
+			} else if sched.CreatorID == userID {
+				if err := tx.Model(&model.SummarySchedule{}).
+					Where("id = ? AND deleted_at IS NULL", sched.ID).
+					Update("deleted_at", &now).Error; err != nil {
+					return err
+				}
+			} else {
+				// Not the schedule creator: do not delete someone else's schedule.
+				// Unbind it from this task so the task delete is consistent.
+				if err := tx.Model(&model.SummaryTask{}).
+					Where("id = ?", liveTask.ID).
+					Update("schedule_id", nil).Error; err != nil {
+					return err
+				}
+				log.Printf("[task] DeleteSummary: task %d caller %s is not schedule %d creator; unbinding instead of cascade-deleting", liveTask.ID, userID, sched.ID)
 			}
 		}
 

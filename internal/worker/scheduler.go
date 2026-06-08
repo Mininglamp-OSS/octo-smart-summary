@@ -97,6 +97,7 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 	start, end := service.ComputeTimeRange(sched.TimeRangeType, now)
 
 	var task model.SummaryTask
+	requeued := false
 
 	if err := db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -115,6 +116,29 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 			return nil
 		}
 
+		// Method A guard: scheduled summary is single-person only this version.
+		// Multi-person (team) tasks are driven by the human meta flow
+		// (manual initiate + confirm + submit) and must NOT be reset/overwritten
+		// by the scheduler -- doing so resets participants, clears personal
+		// results and routes the task into the team meta link with no human
+		// confirmation, so meta never converges. We count participants on the
+		// locked bound task and skip any multi-person task here. The claim CAS
+		// above already advanced next_run_at, so this row is simply skipped this
+		// cycle (and will be re-claimed + re-skipped next cycle). That empty
+		// re-claim is EXPECTED, not a bug -- it is the cost of keeping team
+		// tasks out of the scheduled-reset path until team scheduling ships.
+		var participantCount int64
+		if err := tx.Model(&model.SummaryParticipant{}).
+			Where("task_id = ?", task.ID).
+			Count(&participantCount).Error; err != nil {
+			return err
+		}
+		if participantCount > 1 {
+			log.Printf("[scheduler] schedule %d bound task %d is multi-person (%d participants); scheduled summary not supported for team tasks this version, skipping (next_run_at already advanced; expected re-skip next cycle)", sched.ID, task.ID, participantCount)
+			return nil
+		}
+
+		requeued = true
 		if err := syncScheduledTaskConfig(tx, sched, task, now); err != nil {
 			return err
 		}
@@ -167,6 +191,12 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 		return 0, true, err
 	}
 
+	// Only report a real requeue when we actually reset the task. Skipped cases
+	// (no bound task, still processing, or multi-person guard) return taskID=0 so
+	// scanPendingSchedules does not log a misleading "requeued task" line.
+	if !requeued {
+		return 0, true, nil
+	}
 	return task.ID, true, nil
 }
 
