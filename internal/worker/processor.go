@@ -16,20 +16,22 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timing"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var callbackClient = &http.Client{Timeout: 5 * time.Second}
 
 // Processor polls the DB for pending tasks and dispatches them to the pool.
 type Processor struct {
-	db          *gorm.DB
-	imDB        *gorm.DB
-	pool        *WorkerPool
-	llm         *service.LLMClient
-	cfg         *config.Config
-	stopCh      chan struct{}
-	triggerCh   chan model.WorkerTriggerRequest
-	meta        *MetaProcessor
+	db         *gorm.DB
+	imDB       *gorm.DB
+	pool       *WorkerPool
+	llm        *service.LLMClient
+	cfg        *config.Config
+	stopCh     chan struct{}
+	triggerCh  chan model.WorkerTriggerRequest
+	meta       *MetaProcessor
+	createPRFn func(tx *gorm.DB, pr *model.PersonalResult) error
 }
 
 // NewProcessor creates a new task processor.
@@ -178,7 +180,37 @@ func (p *Processor) processTask(task model.SummaryTask) {
 
 	// Success — all tasks are BY_PERSON
 	var participantCount int64
-	p.db.Model(&model.SummaryParticipant{}).Where("task_id = ?", task.ID).Count(&participantCount)
+	if err := p.db.Model(&model.SummaryParticipant{}).Where("task_id = ?", task.ID).Count(&participantCount).Error; err != nil {
+		log.Printf("[processor] task %d count participants failed: %v", task.ID, err)
+		errMsg := err.Error()
+		newRetry := task.RetryCount + 1
+		newStatus := model.StatusPending
+		if newRetry >= p.cfg.WorkerMaxRetry {
+			newStatus = model.StatusFailed
+		}
+		casResult := p.db.Model(&model.SummaryTask{}).
+			Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
+			Updates(map[string]interface{}{
+				"status":              newStatus,
+				"retry_count":         newRetry,
+				"error_message":       errMsg,
+				"processing_deadline": nil,
+			})
+		if casResult.Error != nil {
+			log.Printf("[processor] task %d update to failed/retry failed: %v", task.ID, casResult.Error)
+			return
+		}
+		if casResult.RowsAffected == 0 {
+			log.Printf("[processor] task %d status changed during processing (likely cancelled), skipping failure update", task.ID)
+			return
+		}
+		p.sendCallback(model.TaskEvent{
+			TaskID:  task.ID,
+			Status:  newStatus,
+			Message: errMsg,
+		})
+		return
+	}
 
 	// Defensive bootstrap: scheduled tasks (and legacy tasks reset for re-run)
 	// may have no participant rows. Without at least the creator participant +
@@ -186,33 +218,40 @@ func (p *Processor) processTask(task model.SummaryTask) {
 	// dispatch and the task is stuck in Processing forever. Create them here
 	// (idempotently) so the personal pipeline can run end-to-end.
 	if participantCount == 0 {
-		now := timezone.Now()
-		creatorP := model.SummaryParticipant{
-			TaskID:      task.ID,
-			UserID:      task.CreatorID,
-			UserName:    service.ResolveUserName(task.CreatorID),
-			Status:      model.ParticipantAccepted,
-			ConfirmedAt: &now,
-		}
-		if err := p.db.Create(&creatorP).Error; err != nil {
-			log.Printf("[processor] task %d bootstrap participant failed: %v", task.ID, err)
-		} else {
-			creatorPR := model.PersonalResult{
-				TaskID:           task.ID,
-				ParticipantRefID: creatorP.ID,
-				UserID:           task.CreatorID,
-				WorkerStatus:     model.PersonalStatusPending,
-				CreatedAt:        now,
-				UpdatedAt:        now,
+		creatorParticipantID, err := p.bootstrapCreatorParticipant(task)
+		if err != nil {
+			log.Printf("[processor] task %d bootstrap creator artifacts failed: %v", task.ID, err)
+			errMsg := err.Error()
+			newRetry := task.RetryCount + 1
+			newStatus := model.StatusPending
+			if newRetry >= p.cfg.WorkerMaxRetry {
+				newStatus = model.StatusFailed
 			}
-			if err := p.db.Create(&creatorPR).Error; err != nil {
-				log.Printf("[processor] task %d bootstrap personal_result failed: %v", task.ID, err)
-			} else {
-				p.db.Model(&creatorP).Update("personal_result_id", creatorPR.ID)
-				participantCount = 1
-				log.Printf("[processor] task %d bootstrapped creator participant %d", task.ID, creatorP.ID)
+			casResult := p.db.Model(&model.SummaryTask{}).
+				Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
+				Updates(map[string]interface{}{
+					"status":              newStatus,
+					"retry_count":         newRetry,
+					"error_message":       errMsg,
+					"processing_deadline": nil,
+				})
+			if casResult.Error != nil {
+				log.Printf("[processor] task %d update to failed/retry failed: %v", task.ID, casResult.Error)
+				return
 			}
+			if casResult.RowsAffected == 0 {
+				log.Printf("[processor] task %d status changed during processing (likely cancelled), skipping failure update", task.ID)
+				return
+			}
+			p.sendCallback(model.TaskEvent{
+				TaskID:  task.ID,
+				Status:  newStatus,
+				Message: errMsg,
+			})
+			return
 		}
+		participantCount = 1
+		log.Printf("[processor] task %d bootstrapped creator participant %d", task.ID, creatorParticipantID)
 	}
 
 	if participantCount <= 1 {
@@ -270,6 +309,92 @@ func (p *Processor) processTask(task model.SummaryTask) {
 		})
 		log.Printf("[processor] task %d multi-person, processing (participants pending confirm)", task.ID)
 	}
+}
+
+func (p *Processor) bootstrapCreatorParticipant(task model.SummaryTask) (int64, error) {
+	now := timezone.Now()
+	creatorName := service.ResolveUserName(task.CreatorID)
+	var participant model.SummaryParticipant
+
+	err := p.db.Transaction(func(tx *gorm.DB) error {
+		participant = model.SummaryParticipant{
+			TaskID:      task.ID,
+			UserID:      task.CreatorID,
+			UserName:    creatorName,
+			Status:      model.ParticipantAccepted,
+			ConfirmedAt: &now,
+		}
+		result := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "task_id"}, {Name: "user_id"}},
+			DoNothing: true,
+		}).Create(&participant)
+		if result.Error != nil {
+			return fmt.Errorf("upsert participant: %w", result.Error)
+		}
+		if result.RowsAffected == 0 {
+			if err := tx.Where("task_id = ? AND user_id = ?", task.ID, task.CreatorID).First(&participant).Error; err != nil {
+				return fmt.Errorf("load existing participant: %w", err)
+			}
+		}
+
+		participantUpdates := map[string]interface{}{}
+		if participant.UserName == "" {
+			participantUpdates["user_name"] = creatorName
+		}
+		if participant.Status != model.ParticipantAccepted {
+			participantUpdates["status"] = model.ParticipantAccepted
+		}
+		if participant.ConfirmedAt == nil {
+			participantUpdates["confirmed_at"] = now
+		}
+		if len(participantUpdates) > 0 {
+			if err := tx.Model(&model.SummaryParticipant{}).Where("id = ?", participant.ID).Updates(participantUpdates).Error; err != nil {
+				return fmt.Errorf("normalize participant: %w", err)
+			}
+		}
+
+		pr := model.PersonalResult{
+			TaskID:           task.ID,
+			ParticipantRefID: participant.ID,
+			UserID:           task.CreatorID,
+			WorkerStatus:     model.PersonalStatusPending,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}
+		result = tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "task_id"}, {Name: "participant_ref_id"}},
+			DoNothing: true,
+		})
+		if p.createPRFn != nil {
+			if err := p.createPRFn(result, &pr); err != nil {
+				return fmt.Errorf("upsert personal_result: %w", err)
+			}
+		} else {
+			result = result.Create(&pr)
+			if err := result.Error; err != nil {
+				return fmt.Errorf("upsert personal_result: %w", err)
+			}
+		}
+		if result.RowsAffected == 0 {
+			if err := tx.Where("task_id = ? AND participant_ref_id = ?", task.ID, participant.ID).First(&pr).Error; err != nil {
+				return fmt.Errorf("load existing personal_result: %w", err)
+			}
+		}
+
+		if participant.PersonalResultID == nil || *participant.PersonalResultID != pr.ID {
+			if err := tx.Model(&model.SummaryParticipant{}).
+				Where("id = ? AND (personal_result_id IS NULL OR personal_result_id <> ?)", participant.ID, pr.ID).
+				Update("personal_result_id", pr.ID).Error; err != nil {
+				return fmt.Errorf("link participant personal_result: %w", err)
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return participant.ID, nil
 }
 
 func (p *Processor) executePipeline(task model.SummaryTask) error {

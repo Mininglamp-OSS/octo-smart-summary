@@ -884,8 +884,8 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 			c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
 			return
 		}
-		if errors.Is(err, errRebindConcurrentModified) {
-			c.JSON(http.StatusConflict, apiResponse{Code: 40916, Message: "绑定状态被并发修改，请重试"})
+		if isScheduleRetryableConflict(err) {
+			writeRetryableRebindConflict(c)
 			return
 		}
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})

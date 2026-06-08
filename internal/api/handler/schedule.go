@@ -87,6 +87,25 @@ func isMySQLDuplicateKey(err error) bool {
 	return errors.Is(err, gorm.ErrDuplicatedKey)
 }
 
+func isMySQLRetryableTxError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var myErr *mysqldriver.MySQLError
+	if !errors.As(err, &myErr) {
+		return false
+	}
+	return myErr.Number == 1205 || myErr.Number == 1213
+}
+
+func isScheduleRetryableConflict(err error) bool {
+	return errors.Is(err, errRebindConcurrentModified) || isMySQLRetryableTxError(err)
+}
+
+func writeRetryableRebindConflict(c *gin.Context) {
+	c.JSON(http.StatusConflict, apiResponse{Code: 40916, Message: "绑定状态被并发修改，请重试"})
+}
+
 // 40015 user-facing message for the multi-person guard.
 const teamScheduleNotSupportedMsg = "定时总结暂不支持多人/团队任务"
 
@@ -224,6 +243,31 @@ func lockScheduleForUpdate(tx *gorm.DB, scheduleID int64, spaceID string) (model
 		Where("id = ? AND space_id = ? AND deleted_at IS NULL", scheduleID, spaceID).
 		First(&locked).Error
 	return locked, err
+}
+
+func lockOptionalScheduleForUpdate(tx *gorm.DB, scheduleID int64) (*model.SummarySchedule, error) {
+	var locked model.SummarySchedule
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND deleted_at IS NULL", scheduleID).
+		First(&locked).Error
+	switch {
+	case err == nil:
+		return &locked, nil
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		return nil, nil
+	default:
+		return nil, err
+	}
+}
+
+func orderedScheduleLockIDs(targetID int64, oldScheduleID *int64) (int64, *int64) {
+	if oldScheduleID == nil || *oldScheduleID == targetID {
+		return targetID, nil
+	}
+	if targetID < *oldScheduleID {
+		return targetID, oldScheduleID
+	}
+	return *oldScheduleID, &targetID
 }
 
 // loadBoundTaskForScheduleUpdate validates the schedule->task live binding on the
@@ -493,8 +537,8 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		case errors.Is(txErr, errLiveBindingDuplicate):
 			c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "该定时已绑定其它总结，不能重复绑定"})
 			return
-		case errors.Is(txErr, errRebindConcurrentModified):
-			c.JSON(http.StatusConflict, apiResponse{Code: 40916, Message: "绑定状态被并发修改，请重试"})
+		case isScheduleRetryableConflict(txErr):
+			writeRetryableRebindConflict(c)
 			return
 		case errors.Is(txErr, errMultiPersonNotSupported):
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40015, Message: teamScheduleNotSupportedMsg})
@@ -764,13 +808,7 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		// Reused below for the soft-delete; locked here, before the task, to keep the
 		// whole tx schedule->task (matching the scheduler).
 		var lockedOldSched *model.SummarySchedule
-
-		// Lock the target schedule first: serializes concurrent binds and anchors
-		// the schedule->task lock order.
-		lockedSched, err := lockScheduleForUpdate(tx, sched.ID, spaceID)
-		if err != nil {
-			return err
-		}
+		var lockedSched model.SummarySchedule
 		if req.Scope == "task" {
 			if req.TaskID == nil {
 				return errTaskScopeMissingTaskID
@@ -789,20 +827,35 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 				cand := *peekedOldID
 				oldScheduleID = &cand
 			}
+		}
 
-			if oldScheduleID != nil {
-				var oldSched model.SummarySchedule
-				if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-					Where("id = ? AND deleted_at IS NULL", *oldScheduleID).
-					First(&oldSched).Error; err != nil {
-					if !errors.Is(err, gorm.ErrRecordNotFound) {
-						return err
-					}
-				} else {
-					lockedOldSched = &oldSched
+		firstScheduleID, secondScheduleID := orderedScheduleLockIDs(sched.ID, oldScheduleID)
+		lockScheduleByID := func(scheduleID int64) error {
+			if scheduleID == sched.ID {
+				locked, err := lockScheduleForUpdate(tx, sched.ID, spaceID)
+				if err != nil {
+					return err
 				}
+				lockedSched = locked
+				return nil
 			}
+			locked, err := lockOptionalScheduleForUpdate(tx, scheduleID)
+			if err != nil {
+				return err
+			}
+			lockedOldSched = locked
+			return nil
+		}
+		if err := lockScheduleByID(firstScheduleID); err != nil {
+			return err
+		}
+		if secondScheduleID != nil {
+			if err := lockScheduleByID(*secondScheduleID); err != nil {
+				return err
+			}
+		}
 
+		if req.Scope == "task" {
 			task, err = loadTaskForTaskScope(tx, spaceID, userID, *req.TaskID)
 			if err != nil {
 				return err
@@ -899,8 +952,8 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		case errors.Is(txErr, errLiveBindingDuplicate):
 			c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "该定时已绑定其它总结，不能重复绑定"})
 			return
-		case errors.Is(txErr, errRebindConcurrentModified):
-			c.JSON(http.StatusConflict, apiResponse{Code: 40916, Message: "绑定状态被并发修改，请重试"})
+		case isScheduleRetryableConflict(txErr):
+			writeRetryableRebindConflict(c)
 			return
 		case errors.Is(txErr, errMultiPersonNotSupported):
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40015, Message: teamScheduleNotSupportedMsg})
