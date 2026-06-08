@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/gin-gonic/gin"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -89,7 +90,30 @@ var (
 	// of {task.CreatorID}. Any participant whose UserID != task.CreatorID (the
 	// exact set the worker would inflate past single-person) is rejected here.
 	errMultiPersonNotSupported = errors.New("scheduled summary not supported for multi-person/team tasks")
+
+	// errLiveBindingDuplicate maps a MySQL 1062 hit on uk_live_schedule_binding to
+	// a clean 409 instead of a raw 500.
+	errLiveBindingDuplicate = errors.New("scope=task schedule live-binding unique index conflict (1062)")
+
+	// errRebindConcurrentModified: the non-locking pre-read of task.schedule_id
+	// went stale (a concurrent rebind changed it before we locked the task).
+	// Retryable.
+	errRebindConcurrentModified = errors.New("scope=task concurrent rebind detected, please retry")
 )
+
+// isMySQLDuplicateKey reports whether err is (or wraps) a MySQL 1062 duplicate
+// key. We match the raw driver error because TranslateError is off, so
+// gorm.ErrDuplicatedKey is not reliably returned.
+func isMySQLDuplicateKey(err error) bool {
+	if err == nil {
+		return false
+	}
+	var myErr *mysqldriver.MySQLError
+	if errors.As(err, &myErr) && myErr.Number == 1062 {
+		return true
+	}
+	return errors.Is(err, gorm.ErrDuplicatedKey)
+}
 
 // teamScheduleNotSupportedMsg is the user-facing (Chinese) message returned for
 // the multi-person fail-closed guard. Pairs with code 40015 so the front-end
@@ -163,6 +187,47 @@ func storedParticipantConfigSubsetOfCreator(raw model.JSON, creatorID string) bo
 		return false
 	}
 	return participantsSubsetOfCreator(stored, creatorID)
+}
+
+// validateEffectiveParticipantsSubsetOfCreator is the single post-load check that
+// the participant set actually taking effect (req if sent, else stored config)
+// is a subset of {creatorID}. creatorID must be the loaded task.CreatorID.
+func validateEffectiveParticipantsSubsetOfCreator(reqParticipants []participantReq, storedConfig model.JSON, creatorID string) error {
+	if reqParticipants != nil {
+		if !participantsSubsetOfCreator(reqParticipants, creatorID) {
+			return errMultiPersonNotSupported
+		}
+		return nil
+	}
+	if !storedParticipantConfigSubsetOfCreator(storedConfig, creatorID) {
+		return errMultiPersonNotSupported
+	}
+	return nil
+}
+
+// peekTaskScheduleID reads only task.schedule_id WITHOUT locking, so the caller
+// can FOR UPDATE the schedule rows before locking the task (keeps the tx
+// schedule->task). The value is a candidate, re-validated after the task lock.
+func peekTaskScheduleID(tx *gorm.DB, spaceID, userID string, taskID int64) (*int64, error) {
+	var row struct {
+		ScheduleID *int64
+	}
+	err := tx.Model(&model.SummaryTask{}).
+		Select("schedule_id").
+		Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).
+		Scan(&row).Error
+	if err != nil {
+		return nil, err
+	}
+	return row.ScheduleID, nil
+}
+
+// int64PtrEqual reports whether two *int64 hold equal values (both nil => equal).
+func int64PtrEqual(a, b *int64) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }
 
 // lockScheduleForUpdate (PR#62 r5 Blocker1a / J2 lock-order) takes a FOR UPDATE
@@ -290,77 +355,85 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		if req.TaskID == nil {
 			return errTaskScopeMissingTaskID
 		}
+
+		// Lock schedules before the task (schedule->task), so pre-read the task's
+		// schedule_id without a lock, then lock that existing schedule first.
+		peekedExisting, err := peekTaskScheduleID(tx, spaceID, userID, *req.TaskID)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errTaskScopeInvalidTask
+			}
+			return err
+		}
+
+		var existing model.SummarySchedule
+		haveExisting := false
+		if peekedExisting != nil {
+			err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ? AND space_id = ? AND deleted_at IS NULL", *peekedExisting, spaceID).
+				First(&existing).Error
+			switch {
+			case err == nil:
+				haveExisting = true
+			case errors.Is(err, gorm.ErrRecordNotFound):
+				// stale/deleted schedule; treat as none.
+			default:
+				return err
+			}
+		}
+
 		task, err := loadTaskForTaskScope(tx, spaceID, userID, *req.TaskID)
 		if err != nil {
 			return err
 		}
 
-		// 方案A r4 Bug1: reject any configured participant that is not the task
-		// creator. req.Participants is exactly what gets serialized into
-		// participant_config (below) and read back by the worker, which prepends
-		// task.CreatorID. So the only single-person-safe config is participants ⊆
-		// {task.CreatorID}. Anything else would make the worker inflate the
-		// effective set past 1 and route the task into the unsupported team branch.
+		// TOCTOU: bail out retryable if the binding changed after the pre-read.
+		if !int64PtrEqual(task.ScheduleID, peekedExisting) {
+			return errRebindConcurrentModified
+		}
+
+		// Single-person guard: configured participants must be a subset of {creator}.
 		if !participantsSubsetOfCreator(req.Participants, task.CreatorID) {
 			return errMultiPersonNotSupported
 		}
 
-		if task.ScheduleID != nil {
-			var existing model.SummarySchedule
-			err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-				Where("id = ? AND space_id = ? AND deleted_at IS NULL", *task.ScheduleID, spaceID).
-				First(&existing).Error
-			switch {
-			case err == nil:
-				var boundCount int64
-				if err := tx.Model(&model.SummaryTask{}).
-					Clauses(clause.Locking{Strength: "UPDATE"}).
-					Where("schedule_id = ? AND deleted_at IS NULL AND id <> ?", existing.ID, task.ID).
-					Count(&boundCount).Error; err != nil {
-					return err
-				}
-				if boundCount > 0 {
-					return errTaskScopeScheduleBound
-				}
-				if existing.CreatorID != userID {
-					return service.NewBizError(40004, "无权限修改", http.StatusForbidden)
-				}
-				// Bug1 (PR#62 Jerry-Xin r3): when the detail page rebuilds a
-				// schedule, GetSummary hides the schedule_id for an inactive
-				// binding, so the front-end re-enters via this create path and we
-				// reuse the existing (possibly inactive) schedule. Re-activate it
-				// here (is_active=1) so the scheduler picks it up again; otherwise
-				// the request succeeds and returns next_run_at but the job never
-				// fires. next_run_at uses NextRunInitial (first-run semantics,
-				// same as the fresh-create path) so today's legal first run is not
-				// skipped.
-				updates := map[string]interface{}{
-					"title":              sched.Title,
-					"cron_expr":          sched.CronExpr,
-					"interval_days":      sched.IntervalDays,
-					"interval_months":    sched.IntervalMonths,
-					"run_time":           sched.RunTime,
-					"day_of_week":        sched.DayOfWeek,
-					"day_of_month":       sched.DayOfMonth,
-					"time_range_type":    sched.TimeRangeType,
-					"source_config":      sched.SourceConfig,
-					"participant_config": sched.ParticipantConfig,
-					"next_run_at":        nextRun,
-					"is_active":          1,
-				}
-				if err := tx.Model(&model.SummarySchedule{}).
-					Where("id = ?", existing.ID).
-					Updates(updates).Error; err != nil {
-					return err
-				}
-				resultScheduleID = existing.ID
-				return nil
-			case errors.Is(err, gorm.ErrRecordNotFound):
-				// The task points to a stale/deleted schedule; create a fresh one
-				// and rebind below.
-			default:
+		if haveExisting {
+			var boundCount int64
+			if err := tx.Model(&model.SummaryTask{}).
+				Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("schedule_id = ? AND deleted_at IS NULL AND id <> ?", existing.ID, task.ID).
+				Count(&boundCount).Error; err != nil {
 				return err
 			}
+			if boundCount > 0 {
+				return errTaskScopeScheduleBound
+			}
+			if existing.CreatorID != userID {
+				return service.NewBizError(40004, "无权限修改", http.StatusForbidden)
+			}
+			// Reuse the (possibly inactive) schedule and re-activate it so the
+			// scheduler picks it up; first-run semantics via nextRun.
+			updates := map[string]interface{}{
+				"title":              sched.Title,
+				"cron_expr":          sched.CronExpr,
+				"interval_days":      sched.IntervalDays,
+				"interval_months":    sched.IntervalMonths,
+				"run_time":           sched.RunTime,
+				"day_of_week":        sched.DayOfWeek,
+				"day_of_month":       sched.DayOfMonth,
+				"time_range_type":    sched.TimeRangeType,
+				"source_config":      sched.SourceConfig,
+				"participant_config": sched.ParticipantConfig,
+				"next_run_at":        nextRun,
+				"is_active":          1,
+			}
+			if err := tx.Model(&model.SummarySchedule{}).
+				Where("id = ?", existing.ID).
+				Updates(updates).Error; err != nil {
+				return err
+			}
+			resultScheduleID = existing.ID
+			return nil
 		}
 
 		if err := tx.Create(&sched).Error; err != nil {
@@ -369,6 +442,9 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		if err := tx.Model(&model.SummaryTask{}).
 			Where("id = ? AND space_id = ?", task.ID, spaceID).
 			Update("schedule_id", sched.ID).Error; err != nil {
+			if isMySQLDuplicateKey(err) {
+				return errLiveBindingDuplicate
+			}
 			return err
 		}
 		resultScheduleID = sched.ID
@@ -384,6 +460,12 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 			return
 		case errors.Is(txErr, errTaskScopeScheduleBound):
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "该定时已绑定其它总结，不能重复绑定"})
+			return
+		case errors.Is(txErr, errLiveBindingDuplicate):
+			c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "该定时已绑定其它总结，不能重复绑定"})
+			return
+		case errors.Is(txErr, errRebindConcurrentModified):
+			c.JSON(http.StatusConflict, apiResponse{Code: 40916, Message: "绑定状态被并发修改，请重试"})
 			return
 		case errors.Is(txErr, errMultiPersonNotSupported):
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40015, Message: teamScheduleNotSupportedMsg})
@@ -638,15 +720,12 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 	txErr := h.db.Transaction(func(tx *gorm.DB) error {
 		var task model.SummaryTask
 		var oldScheduleID *int64
-		// PR#62 r5 (Blocker1a + J2 lock-order): lock the TARGET schedule row FOR
-		// UPDATE first, BEFORE loading/locking the task. This (1) serializes all
-		// concurrent binds against this schedule so the boundCount check below is
-		// race-free even without a DB unique constraint, and (2) establishes the
-		// schedule->task lock order that matches the scheduler
-		// (worker/scheduler.go locks schedule then bound task), removing the
-		// previous task->schedule vs schedule->task deadlock window. We re-read the
-		// stored config under this lock so the Blocker2 stored-config guard below
-		// validates a consistent snapshot.
+		// Reused below for the soft-delete; locked here, before the task, to keep the
+		// whole tx schedule->task (matching the scheduler).
+		var lockedOldSched *model.SummarySchedule
+
+		// Lock the target schedule first: serializes concurrent binds and anchors
+		// the schedule->task lock order.
 		lockedSched, err := lockScheduleForUpdate(tx, sched.ID, spaceID)
 		if err != nil {
 			return err
@@ -655,32 +734,56 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 			if req.TaskID == nil {
 				return errTaskScopeMissingTaskID
 			}
+
+			// Non-locking pre-read of the task's schedule_id so we can lock the old
+			// schedule BEFORE the task. Candidate; re-validated after the task lock.
+			peekedOldID, err := peekTaskScheduleID(tx, spaceID, userID, *req.TaskID)
+			if err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return errTaskScopeInvalidTask
+				}
+				return err
+			}
+			if peekedOldID != nil && *peekedOldID != sched.ID {
+				cand := *peekedOldID
+				oldScheduleID = &cand
+			}
+
+			if oldScheduleID != nil {
+				var oldSched model.SummarySchedule
+				if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+					Where("id = ? AND deleted_at IS NULL", *oldScheduleID).
+					First(&oldSched).Error; err != nil {
+					if !errors.Is(err, gorm.ErrRecordNotFound) {
+						return err
+					}
+				} else {
+					lockedOldSched = &oldSched
+				}
+			}
+
 			task, err = loadTaskForTaskScope(tx, spaceID, userID, *req.TaskID)
 			if err != nil {
 				return err
 			}
-			// PR#62 r5 Blocker2 (lml2468 Y1-bis): fail-closed multi-person guard on
-			// the participant set that will ACTUALLY take effect for this bind.
-			//   - req.Participants != nil  -> validated at the top of the handler
-			//     (errMultiPersonNotSupported / 40015) against req.Participants.
-			//   - req.Participants == nil   -> the bind reuses the schedule's STORED
-			//     participant_config, which the top-level check skips entirely. We now
-			//     validate that stored config here, under the schedule's FOR UPDATE
-			//     lock, with the identical口径 (subset of {creator}). creator basis is
-			//     userID: loadTaskForTaskScope already enforced task.CreatorID == userID
-			//     and sched.CreatorID == userID was enforced above, so a legal bind has
-			//     task.CreatorID == sched.CreatorID == userID. Placing the check here
-			//     (inside the tx, after loadTaskForTaskScope, only when scope==task)
-			//     guarantees a pure non-binding field update is never falsely rejected,
-			//     while any bind of a schedule whose stored config contains a
-			//     non-creator is refused (40015) before schedule_id is written.
-			if req.Participants == nil && !storedParticipantConfigSubsetOfCreator(lockedSched.ParticipantConfig, userID) {
-				return errMultiPersonNotSupported
-			}
+
+			// TOCTOU: if the binding changed between the pre-read and the task lock,
+			// the schedules we locked no longer match; bail out retryable rather than
+			// locking a new schedule after the task lock.
+			var lockedOldID *int64
 			if task.ScheduleID != nil && *task.ScheduleID != sched.ID {
-				oldID := *task.ScheduleID
-				oldScheduleID = &oldID
+				oid := *task.ScheduleID
+				lockedOldID = &oid
 			}
+			if !int64PtrEqual(lockedOldID, oldScheduleID) {
+				return errRebindConcurrentModified
+			}
+
+			// Single post-load single-person guard against the loaded task's creator.
+			if err := validateEffectiveParticipantsSubsetOfCreator(req.Participants, lockedSched.ParticipantConfig, task.CreatorID); err != nil {
+				return err
+			}
+
 			var boundCount int64
 			if err := tx.Model(&model.SummaryTask{}).
 				Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -697,6 +800,9 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 			if err := tx.Model(&model.SummaryTask{}).
 				Where("id = ? AND space_id = ?", task.ID, spaceID).
 				Update("schedule_id", sched.ID).Error; err != nil {
+				if isMySQLDuplicateKey(err) {
+					return errLiveBindingDuplicate
+				}
 				return err
 			}
 		}
@@ -705,54 +811,26 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 			Updates(updates).Error; err != nil {
 			return err
 		}
-		if oldScheduleID != nil {
+		if lockedOldSched != nil {
 			now := timezone.Now()
-			// Bug2 (PR#62 Jerry-Xin r3): rebinding a task moves it off the old
-			// schedule and soft-deletes that schedule. This must respect the
-			// same ownership + exclusivity rule as DeleteSummary's cascade
-			// (task.go DeleteSummary). Without it a caller could soft-delete a
-			// schedule they do not own, or one still bound to another task.
-			// The current task has already been rebound to sched.ID above, so
-			// the old schedule is unbound from this task already; we only soft
-			// delete it when (1) the caller is its creator AND (2) no other
-			// live task still binds it. Otherwise we leave the old schedule
-			// alone (the task is rebound either way).
-			//
-			// Bug4 (PR#62 r4 lml2468 J2): read oldSched FOR UPDATE so the row is
-			// locked for the whole window below. Previously a plain First() left a
-			// race between the otherBound count and the soft-delete: a concurrent
-			// rebind could attach another task to oldSched after we counted 0 and
-			// before we soft-deleted, deleting a schedule that just became bound
-			// again. Locking the row serializes lock+count+soft-delete in one
-			// transaction window (same FOR UPDATE pattern used elsewhere here).
-			var oldSched model.SummarySchedule
-			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-				Where("id = ? AND deleted_at IS NULL", *oldScheduleID).
-				First(&oldSched).Error; err != nil {
-				if !errors.Is(err, gorm.ErrRecordNotFound) {
+			// Soft-delete the old schedule only when the caller owns it and no other
+			// live task still binds it. Reuses the lock taken above.
+			oldSched := *lockedOldSched
+			var otherBound int64
+			if err := tx.Model(&model.SummaryTask{}).
+				Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("schedule_id = ? AND deleted_at IS NULL", oldSched.ID).
+				Count(&otherBound).Error; err != nil {
+				return err
+			}
+			if oldSched.CreatorID == userID && otherBound == 0 {
+				if err := tx.Model(&model.SummarySchedule{}).
+					Where("id = ? AND deleted_at IS NULL", oldSched.ID).
+					Update("deleted_at", &now).Error; err != nil {
 					return err
 				}
-				// old schedule already gone; nothing to soft-delete
 			} else {
-				var otherBound int64
-				if err := tx.Model(&model.SummaryTask{}).
-					Clauses(clause.Locking{Strength: "UPDATE"}).
-					Where("schedule_id = ? AND deleted_at IS NULL", oldSched.ID).
-					Count(&otherBound).Error; err != nil {
-					return err
-				}
-				if oldSched.CreatorID == userID && otherBound == 0 {
-					if err := tx.Model(&model.SummarySchedule{}).
-						Where("id = ? AND deleted_at IS NULL", oldSched.ID).
-						Update("deleted_at", &now).Error; err != nil {
-						return err
-					}
-				} else {
-					// Not the creator, or still bound by another live task: do
-					// not delete someone else's / still-in-use schedule. The
-					// task is already rebound, so just leave the old schedule.
-					log.Printf("[handler] UpdateSchedule: old schedule %d not soft-deleted (caller=%s creator=%s otherBound=%d); unbind-only", oldSched.ID, userID, oldSched.CreatorID, otherBound)
-				}
+				log.Printf("[handler] UpdateSchedule: old schedule %d not soft-deleted (caller=%s creator=%s otherBound=%d); unbind-only", oldSched.ID, userID, oldSched.CreatorID, otherBound)
 			}
 		}
 		if nr, ok := updates["next_run_at"].(time.Time); ok {
@@ -772,6 +850,12 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 			return
 		case errors.Is(txErr, errTaskScopeScheduleBound):
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "该定时已绑定其它总结，不能重复绑定"})
+			return
+		case errors.Is(txErr, errLiveBindingDuplicate):
+			c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "该定时已绑定其它总结，不能重复绑定"})
+			return
+		case errors.Is(txErr, errRebindConcurrentModified):
+			c.JSON(http.StatusConflict, apiResponse{Code: 40916, Message: "绑定状态被并发修改，请重试"})
 			return
 		case errors.Is(txErr, errMultiPersonNotSupported):
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40015, Message: teamScheduleNotSupportedMsg})

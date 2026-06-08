@@ -38,7 +38,7 @@ func mustParticipantConfig(t *testing.T, users ...[2]string) model.JSON {
 // Blocker2.1: req.Participants == nil but stored config contains a NON-creator
 // participant => bind must be rejected 400 / 40015 and the task must stay
 // unbound (schedule_id not written).
-func TestUpdateSchedule_StoredConfigMultiPerson_RejectedOnBind(t *testing.T) {
+func TestPR62Round5_StoredConfigMultiPerson_RejectedOnBind(t *testing.T) {
 	db := setupScheduleDB(t)
 	h := NewScheduleHandler(db)
 	r := setupScheduleRouter(h)
@@ -98,7 +98,7 @@ func TestUpdateSchedule_StoredConfigMultiPerson_RejectedOnBind(t *testing.T) {
 
 // Blocker2.2: req.Participants == nil and stored config is EMPTY => bind PASSES
 // (the worker would only have {creator}).
-func TestUpdateSchedule_StoredConfigEmpty_BindPasses(t *testing.T) {
+func TestPR62Round5_StoredConfigEmpty_BindPasses(t *testing.T) {
 	db := setupScheduleDB(t)
 	h := NewScheduleHandler(db)
 	r := setupScheduleRouter(h)
@@ -143,7 +143,7 @@ func TestUpdateSchedule_StoredConfigEmpty_BindPasses(t *testing.T) {
 
 // Blocker2.3: req.Participants == nil and stored config contains ONLY the
 // creator => bind PASSES.
-func TestUpdateSchedule_StoredConfigCreatorOnly_BindPasses(t *testing.T) {
+func TestPR62Round5_StoredConfigCreatorOnly_BindPasses(t *testing.T) {
 	db := setupScheduleDB(t)
 	h := NewScheduleHandler(db)
 	r := setupScheduleRouter(h)
@@ -190,7 +190,7 @@ func TestUpdateSchedule_StoredConfigCreatorOnly_BindPasses(t *testing.T) {
 // Blocker2.4 (no false positive): a pure NON-binding field update (req.Scope
 // not "task") on a schedule whose stored config has a non-creator must NOT be
 // rejected -- the stored-config guard only fires when an actual bind happens.
-func TestUpdateSchedule_StoredConfigMultiPerson_NonBindingUpdateAllowed(t *testing.T) {
+func TestPR62Round5_StoredConfigMultiPerson_NonBindingUpdateAllowed(t *testing.T) {
 	db := setupScheduleDB(t)
 	h := NewScheduleHandler(db)
 	r := setupScheduleRouter(h)
@@ -227,7 +227,7 @@ func TestUpdateSchedule_StoredConfigMultiPerson_NonBindingUpdateAllowed(t *testi
 // (SQLite test driver: the locking clause is a no-op, but the boundCount check
 // is exercised sequentially exactly as it runs after the lock is acquired in
 // MySQL. We assert the invariant: at most one live task bound per schedule.)
-func TestUpdateSchedule_OneToOne_SecondBindRejected(t *testing.T) {
+func TestPR62Round5_OneToOne_SecondBindRejected(t *testing.T) {
 	db := setupScheduleDB(t)
 	h := NewScheduleHandler(db)
 	r := setupScheduleRouter(h)
@@ -294,7 +294,7 @@ func TestUpdateSchedule_OneToOne_SecondBindRejected(t *testing.T) {
 // generated key (live_schedule_id = schedule_id only while deleted_at IS NULL
 // AND schedule_id IS NOT NULL, else NULL) by replaying the same CASE expression
 // in sqlite and asserting the uniqueness behavior it is meant to produce.
-func TestLiveScheduleBindingKey_Logic(t *testing.T) {
+func TestPR62Round5_LiveScheduleBindingKey_Logic(t *testing.T) {
 	// Emulate the generated key for the relevant rows.
 	type tcase struct {
 		name        string
