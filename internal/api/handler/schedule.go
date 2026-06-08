@@ -977,6 +977,13 @@ func (h *ScheduleHandler) ToggleSchedule(c *gin.Context) {
 
 	updates := map[string]interface{}{}
 	if req.IsActive {
+		// r7 Blocker2: re-enable is the 4th single-person entry point. A schedule
+		// disabled with a dirty stored config (non-creator member) must not be
+		// reactivated, else the scheduler inflates it to multi-person.
+		if !storedParticipantConfigSubsetOfCreator(sched.ParticipantConfig, userID) {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40015, Message: teamScheduleNotSupportedMsg})
+			return
+		}
 		// CRITICAL: recompute next_run_at for ALL recurrence types on re-enable.
 		// Previously only cron was recomputed, so an interval task (cron_expr
 		// empty) kept its stale, already-past next_run_at and fired immediately
