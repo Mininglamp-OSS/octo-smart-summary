@@ -41,7 +41,14 @@ type Message struct {
 type LLMCallFn func(ctx context.Context, prompt string) (string, error)
 
 // GetUserChannels discovers all channels (group + DM) for a user. (Layer 1)
-func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB) ([]ChannelInfo, error) {
+//
+// selectedThreadIDs scopes the archived-thread relaxation: only threads whose
+// channel id (group_no____short_id) appears here are allowed when their status
+// is Archived (2). When the slice is empty, only Active (status=1) threads are
+// discovered. Deleted threads (status=3) are never returned. This keeps
+// auto/background summaries (no explicit sources) free of archived threads
+// while letting an explicitly-selected archived thread survive discovery.
+func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB, selectedThreadIDs ...string) ([]ChannelInfo, error) {
 	if imDB == nil {
 		return nil, fmt.Errorf("IM database not available")
 	}
@@ -115,19 +122,30 @@ func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB) ([]ChannelI
 		SpaceID     string `gorm:"column:space_id"`
 	}
 	var threadChannels []threadRow
-	err = imDB.WithContext(ctx).Raw(`
+	// Active threads (status=1) are always discovered. Archived threads
+	// (status=2) are only discovered when explicitly selected by the caller,
+	// scoped via selectedThreadIDs. Deleted threads (status=3) are never
+	// returned (always excluded by enumerating allowed statuses).
+	threadStatusCond := "t.status = 1"
+	threadArgs := []interface{}{uid}
+	if len(selectedThreadIDs) > 0 {
+		threadStatusCond = "(t.status = 1 OR (t.status = 2 AND CONCAT(t.group_no, '____', t.short_id) IN ?))"
+		threadArgs = append(threadArgs, selectedThreadIDs)
+	}
+	threadQuery := `
 		SELECT CONCAT(t.group_no, '____', t.short_id) AS channel_id,
 		       5 AS channel_type,
 		       CONCAT(t.name, ' · ', g.name) AS channel_name,
 		       COALESCE(g.space_id, '') AS space_id
 		FROM thread t
-		INNER JOIN `+"`group`"+` g ON g.group_no COLLATE utf8mb4_unicode_ci = t.group_no
+		INNER JOIN ` + "`group`" + ` g ON g.group_no COLLATE utf8mb4_unicode_ci = t.group_no
 		INNER JOIN thread_member tm ON tm.thread_id = t.id
 		WHERE tm.uid = ?
-		  AND t.status = 1
+		  AND ` + threadStatusCond + `
 		  AND g.status = 1
 		ORDER BY t.updated_at DESC
-	`, uid).Scan(&threadChannels).Error
+	`
+	err = imDB.WithContext(ctx).Raw(threadQuery, threadArgs...).Scan(&threadChannels).Error
 	if err != nil {
 		log.Printf("[pipeline] query thread channels error: %v", err)
 	}
@@ -204,6 +222,36 @@ func mapFrontendSourceType(frontendType int) int {
 	default:
 		return frontendType
 	}
+}
+
+// sourceType extracts the integer source_type from a specifiedSources entry,
+// handling both int and float64 (JSON-decoded) representations.
+func sourceType(s map[string]interface{}) int {
+	if st, ok := s["source_type"].(int); ok {
+		return st
+	}
+	if st, ok := s["source_type"].(float64); ok {
+		return int(st)
+	}
+	return 0
+}
+
+// selectedThreadChannelIDs returns the channel ids of explicitly-selected thread
+// sources (frontend source_type=2). These scope the archived-thread relaxation in
+// GetUserChannels so that only threads the user actually picked can be archived;
+// auto/background summaries (no explicit sources) get an empty slice and never
+// surface archived threads.
+func selectedThreadChannelIDs(specifiedSources []map[string]interface{}) []string {
+	var ids []string
+	for _, s := range specifiedSources {
+		if mapFrontendSourceType(sourceType(s)) != 5 {
+			continue
+		}
+		if id, ok := s["source_id"].(string); ok && id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // ApplySourceConstraints filters channels to only those specified. (Layer 2)
@@ -352,7 +400,12 @@ func FetchMessagesFromChannel(ctx context.Context, channelID string, channelType
 
 // IntersectParticipantChannels filters channels to only those where both
 // the creator and all participants are members. (Layer 1.5)
-func IntersectParticipantChannels(ctx context.Context, creatorChannels []ChannelInfo, participantUIDs []string, imDB *gorm.DB) ([]ChannelInfo, error) {
+//
+// selectedThreadIDs is threaded into each participant's GetUserChannels call with
+// the same scope as Layer 1, so an explicitly-selected archived thread that the
+// creator can see is not dropped just because the participant lookup defaulted to
+// status=1-only discovery.
+func IntersectParticipantChannels(ctx context.Context, creatorChannels []ChannelInfo, participantUIDs []string, imDB *gorm.DB, selectedThreadIDs ...string) ([]ChannelInfo, error) {
 	if len(participantUIDs) == 0 {
 		return creatorChannels, nil
 	}
@@ -365,7 +418,7 @@ func IntersectParticipantChannels(ctx context.Context, creatorChannels []Channel
 
 	// For each participant, get their channels and intersect
 	for _, uid := range participantUIDs {
-		pChannels, err := GetUserChannels(ctx, uid, imDB)
+		pChannels, err := GetUserChannels(ctx, uid, imDB, selectedThreadIDs...)
 		if err != nil {
 			return nil, fmt.Errorf("get channels for participant %s: %w", uid, err)
 		}
@@ -563,7 +616,11 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 
 	// Layer 1: channel discovery
 	l1Start := time.Now()
-	userChannels, err := GetUserChannels(ctx, creatorUID, imDB)
+	// Scope archived-thread discovery to explicitly-selected thread sources so
+	// an archived thread the user picked survives, while auto/background
+	// summaries (no explicit sources) keep status=1 and never leak archived.
+	selectedThreads := selectedThreadChannelIDs(specifiedSources)
+	userChannels, err := GetUserChannels(ctx, creatorUID, imDB, selectedThreads...)
 	if err != nil {
 		return nil, fmt.Errorf("channel discovery: %w", err)
 	}
@@ -572,7 +629,7 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 
 	// Layer 1.5: intersect with participant channels
 	l15Start := time.Now()
-	userChannels, err = IntersectParticipantChannels(ctx, userChannels, participantUIDs, imDB)
+	userChannels, err = IntersectParticipantChannels(ctx, userChannels, participantUIDs, imDB, selectedThreads...)
 	if err != nil {
 		return nil, fmt.Errorf("intersect participant channels: %w", err)
 	}
@@ -660,13 +717,7 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 	l45Start := time.Now()
 	onlyDMSources := len(specifiedSources) > 0
 	for _, s := range specifiedSources {
-		st := 0
-		if v, ok := s["source_type"].(int); ok {
-			st = v
-		} else if v, ok := s["source_type"].(float64); ok {
-			st = int(v)
-		}
-		if st != 3 { // not DM
+		if sourceType(s) != 3 { // not DM
 			onlyDMSources = false
 			break
 		}

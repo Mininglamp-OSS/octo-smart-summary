@@ -120,6 +120,9 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 
 	keyword := c.Query("keyword")
 	chatType := c.Query("chat_type") // "group", "direct", or "" = all
+	// include_archived: when true, threads with status=2 (Archived) are also
+	// returned. Defaults to false. Deleted threads (status=3) are NEVER returned.
+	includeArchived := c.Query("include_archived") == "true" || c.Query("include_archived") == "1"
 
 	// Resolve current user from context (set by AuthMiddleware).
 	currentUID, _ := c.Get("user_id")
@@ -155,6 +158,7 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 				"chat_type":    "group",
 				"name":         g.Name,
 				"member_count": nil,
+				"is_archived":  false,
 			})
 		}
 	}
@@ -165,12 +169,21 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 			ShortID string `gorm:"column:short_id"`
 			Name    string `gorm:"column:name"`
 			GroupNo string `gorm:"column:group_no"`
+			Status  int    `gorm:"column:status"`
 		}
 		var threads []imThread
 		q := h.imDB.Table("thread t").
-			Select("DISTINCT t.short_id, t.name, t.group_no").
-			Joins("INNER JOIN `group` g ON g.group_no" + h.collate + " = t.group_no").
-			Where("t.status = 1 AND g.status = 1 AND t.message_count > 0")
+			Select("DISTINCT t.short_id, t.name, t.group_no, t.status").
+			Joins("INNER JOIN `group` g ON g.group_no" + h.collate + " = t.group_no")
+		// Default: only Active threads (status=1). When include_archived is set,
+		// also return Archived threads (status=2). Deleted (status=3) is never
+		// included. Parent group must be active (g.status=1) and the thread must
+		// have messages.
+		if includeArchived {
+			q = q.Where("t.status IN (1, 2) AND g.status = 1 AND t.message_count > 0")
+		} else {
+			q = q.Where("t.status = 1 AND g.status = 1 AND t.message_count > 0")
+		}
 		if currentUIDStr != "" {
 			// Use group_member instead of thread_member so that all threads in the
 			// user's groups are returned, not just threads the user has posted in.
@@ -191,6 +204,7 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 				"name":            t.Name,
 				"member_count":    nil,
 				"parent_group_no": t.GroupNo,
+				"is_archived":     t.Status == 2,
 			})
 		}
 	}
@@ -238,6 +252,7 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 				"name":         name,
 				"member_count": nil,
 				"is_bot":       d.Robot == 1,
+				"is_archived":  false,
 			})
 		}
 	}

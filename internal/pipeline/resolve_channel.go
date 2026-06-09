@@ -329,8 +329,15 @@ func filterByOwnership(ctx context.Context, candidates []ChannelInfo, creatorUID
 			}
 			if len(threadChannelIDs) > 0 {
 				var ids []string
+				// status IN (1, 2) relaxes the default status=1 to also admit
+				// archived threads. This is defense-in-depth: filterByOwnership only
+				// runs when no explicit sources are specified, and in that path Layer 1
+				// has already excluded archived threads, so this branch never actually
+				// sees an archived candidate today. It is kept so the ownership filter
+				// stays correct if archived threads ever reach it, and so the
+				// Deleted-exclusion guarantee (status=3 never matches) holds regardless.
 				if err := imDB.WithContext(ctx).Raw(
-					"SELECT CONCAT(group_no, '____', short_id) FROM thread WHERE creator_uid = ? AND CONCAT(group_no, '____', short_id) IN ? AND status = 1",
+					"SELECT CONCAT(group_no, '____', short_id) FROM thread WHERE creator_uid = ? AND CONCAT(group_no, '____', short_id) IN ? AND status IN (1, 2)",
 					creatorUID, threadChannelIDs,
 				).Pluck("CONCAT(group_no, '____', short_id)", &ids).Error; err != nil {
 					log.Printf("[pipeline] filterByOwnership: query creator thread error: %v", err)
@@ -375,10 +382,14 @@ func filterByOwnership(ctx context.Context, candidates []ChannelInfo, creatorUID
 			}
 			if len(threadChannelIDs) > 0 {
 				var ids []string
+				// status IN (1, 2) here is defense-in-depth for the same reason as the
+				// creator branch above: archived threads do not reach filterByOwnership
+				// in the real pipeline, but admitting status=2 keeps the filter correct
+				// if they ever do, while status=3 (Deleted) stays excluded.
 				if err := imDB.WithContext(ctx).Raw(
 					"SELECT CONCAT(t.group_no, '____', t.short_id) FROM thread t "+
 						"INNER JOIN thread_member tm ON tm.thread_id = t.id "+
-						"WHERE tm.uid = ? AND t.creator_uid != ? AND CONCAT(t.group_no, '____', t.short_id) IN ? AND t.status = 1",
+						"WHERE tm.uid = ? AND t.creator_uid != ? AND CONCAT(t.group_no, '____', t.short_id) IN ? AND t.status IN (1, 2)",
 					creatorUID, creatorUID, threadChannelIDs,
 				).Pluck("CONCAT(t.group_no, '____', t.short_id)", &ids).Error; err != nil {
 					log.Printf("[pipeline] filterByOwnership: query member thread error: %v", err)
