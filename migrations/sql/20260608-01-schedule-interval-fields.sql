@@ -1,17 +1,6 @@
 -- +migrate Up
--- Scheduled summary: recurrence configuration for summary_schedule.
---
--- Adds the interval-based recurrence model (alongside the legacy cron_expr):
---   interval_days   : >0 => run every N days (e.g. 14 = bi-weekly); 0 = unused
---   interval_months : >0 => run every N calendar months (AddDate); 0 = unused
---   run_time        : HH:MM (Asia/Shanghai) time-of-day for interval modes;
---                     '' = inherit the anchor's time-of-day; ignored by cron
---   day_of_week     : week mode (interval_days multiple of 7) weekday anchor,
---                     1=Mon..7=Sun, 0=unconstrained
---   day_of_month    : month mode (interval_months>0) day anchor, 1..31
---                     (clamped to month end at runtime), 0=unconstrained
---   anchor_dom      : persisted original day-of-month so monthly recompute does
---                     not drift after a short month clamps the date
+-- Scheduled summary: interval-based recurrence fields for summary_schedule
+-- (alongside legacy cron_expr).
 ALTER TABLE `summary_schedule`
     ADD COLUMN `interval_days`   INT     NOT NULL DEFAULT 0  COMMENT '间隔天数: 0=不用, >0=每 N 天(如14=每两周)' AFTER `cron_expr`,
     ADD COLUMN `interval_months` INT     NOT NULL DEFAULT 0  COMMENT '间隔月数: 0=不用, >0=每 N 个自然月' AFTER `interval_days`,
