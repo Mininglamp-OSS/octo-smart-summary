@@ -54,7 +54,12 @@ var resolveTopicTargetTool = service.Tool{
 // ResolveTopicTarget uses LLM Function Call to semantically resolve the target person
 // referenced in the topic. Returns targetUIDs for FilterWithContext.
 // Returns nil when topic has no specific target or on any failure (caller skips filter).
-func ResolveTopicTarget(ctx context.Context, topic string, nameMap map[string]string, defaultUID string, toolCallFn LLMToolCallFn) []string {
+//
+// hasExplicitSource indicates the user explicitly chose the source channel(s). When true,
+// a pure self-reference (no concrete person named) must NOT narrow down to the creator —
+// this keeps person narrow symmetric with channel narrow, which is also skipped when the
+// source is explicitly specified. A concrete named person still narrows as usual.
+func ResolveTopicTarget(ctx context.Context, topic string, nameMap map[string]string, defaultUID string, hasExplicitSource bool, toolCallFn LLMToolCallFn) []string {
 	if topic == "" || toolCallFn == nil {
 		return nil
 	}
@@ -143,6 +148,10 @@ func ResolveTopicTarget(ctx context.Context, topic string, nameMap map[string]st
 	}
 
 	if len(parsed.UIDs) == 0 && parsed.IncludeSelf {
+		if hasExplicitSource {
+			log.Printf("[pipeline] ResolveTopicTarget: pure self-reference with explicit source, skipping person narrow, reason=%s", parsed.Reasoning)
+			return nil
+		}
 		log.Printf("[pipeline] ResolveTopicTarget: self-reference topic, reason=%s", parsed.Reasoning)
 		return []string{defaultUID}
 	}
@@ -162,9 +171,13 @@ func ResolveTopicTarget(ctx context.Context, topic string, nameMap map[string]st
 	}
 
 	if len(validUIDs) == 0 {
-		if parsed.IncludeSelf {
+		if parsed.IncludeSelf && !hasExplicitSource {
 			log.Printf("[pipeline] ResolveTopicTarget: all UIDs invalid but include_self=true, using creator")
 			return []string{defaultUID}
+		}
+		if parsed.IncludeSelf {
+			log.Printf("[pipeline] ResolveTopicTarget: all UIDs invalid, include_self=true but explicit source, skipping person narrow")
+			return nil
 		}
 		log.Printf("[pipeline] ResolveTopicTarget: all UIDs invalid, fallback to no target")
 		return nil

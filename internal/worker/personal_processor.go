@@ -324,9 +324,12 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	log.Printf("[personal-worker] batchResolveUserNames took %dms (%d names)",
 		time.Since(resolveStart).Milliseconds(), len(nameMap))
 
-	// Resolve topic target via LLM Function Call
-	targetUIDs := pipeline.ResolveTopicTarget(ctx, task.Title, nameMap, userID, toolCallFn)
-	log.Printf("[personal-worker] topic target resolved: %v (creator=%s)", targetUIDs, userID)
+	// Resolve topic target via LLM Function Call.
+	// hasExplicitSource keeps person narrow symmetric with channel narrow: when the user
+	// explicitly chose the source(s), a pure self-reference must not narrow to the creator.
+	hasExplicitSource := len(sources) > 0
+	targetUIDs := pipeline.ResolveTopicTarget(ctx, task.Title, nameMap, userID, hasExplicitSource, toolCallFn)
+	log.Printf("[personal-worker] topic target resolved: %v (creator=%s, explicitSource=%v)", targetUIDs, userID, hasExplicitSource)
 
 	// Apply context window filter (signature changed: userID → targetUIDs)
 	filterStart := time.Now()
@@ -335,6 +338,17 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		userMessages = pipeline.FilterWithContext(messages, targetUIDs, p.cfg.ContextWindow)
 		log.Printf("[personal-worker] FilterWithContext took %dms (%d → %d messages, targets=%v)",
 			time.Since(filterStart).Milliseconds(), len(messages), len(userMessages), targetUIDs)
+		// Empty fallback: target person(s) had no messages in the selected source(s).
+		// Only fall back when the user explicitly chose the source(s): they picked a
+		// source and named someone who happened not to speak there, so returning all
+		// fetched messages beats "no chat data". For non-explicit-source self queries
+		// (e.g. "我最近说了什么" with no creator messages) we keep the old behavior and
+		// let the len(userMessages)==0 check below return noRelevantContentMessage.
+		if len(userMessages) == 0 && hasExplicitSource {
+			log.Printf("[personal-worker] target(s) %v had no messages in selected source(s), falling back to all %d messages",
+				targetUIDs, len(messages))
+			userMessages = messages
+		}
 	} else {
 		userMessages = messages
 		log.Printf("[personal-worker] no specific target, using all %d messages (took %dms)",

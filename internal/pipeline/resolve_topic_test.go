@@ -28,7 +28,7 @@ func TestResolveTopicTarget_IncludeSelf_MeAndAlice(t *testing.T) {
 		Reasoning:   "主题'我和Alice聊了什么'包含第一人称参与者",
 	})
 
-	result := ResolveTopicTarget(context.Background(), "我和Alice聊了什么", nameMap, "creator_uid", stubFn)
+	result := ResolveTopicTarget(context.Background(), "我和Alice聊了什么", nameMap, "creator_uid", false, stubFn)
 
 	if len(result) != 2 {
 		t.Fatalf("expected 2 UIDs, got %d: %v", len(result), result)
@@ -62,7 +62,7 @@ func TestResolveTopicTarget_IncludeSelf_False(t *testing.T) {
 		Reasoning:   "主题'老王的发言'只关注老王",
 	})
 
-	result := ResolveTopicTarget(context.Background(), "老王的发言", nameMap, "creator_uid", stubFn)
+	result := ResolveTopicTarget(context.Background(), "老王的发言", nameMap, "creator_uid", false, stubFn)
 
 	if len(result) != 1 {
 		t.Fatalf("expected 1 UID, got %d: %v", len(result), result)
@@ -85,7 +85,7 @@ func TestResolveTopicTarget_IncludeSelf_MultiplePersons(t *testing.T) {
 		Reasoning:   "主题'我和多人的讨论'包含第一人称参与者",
 	})
 
-	result := ResolveTopicTarget(context.Background(), "我和多人的讨论", nameMap, "creator_uid", stubFn)
+	result := ResolveTopicTarget(context.Background(), "我和多人的讨论", nameMap, "creator_uid", false, stubFn)
 
 	if len(result) != 3 {
 		t.Fatalf("expected 3 UIDs, got %d: %v", len(result), result)
@@ -115,7 +115,7 @@ func TestResolveTopicTarget_IncludeSelf_NoDuplicate(t *testing.T) {
 		Reasoning:   "LLM已返回creator_uid",
 	})
 
-	result := ResolveTopicTarget(context.Background(), "我和Alice聊了什么", nameMap, "creator_uid", stubFn)
+	result := ResolveTopicTarget(context.Background(), "我和Alice聊了什么", nameMap, "creator_uid", false, stubFn)
 
 	if len(result) != 2 {
 		t.Fatalf("expected 2 UIDs (no duplicate), got %d: %v", len(result), result)
@@ -142,7 +142,7 @@ func TestResolveTopicTarget_IncludeSelf_ZeroValue_BackwardCompat(t *testing.T) {
 		Reasoning: "主题指向Bob",
 	})
 
-	result := ResolveTopicTarget(context.Background(), "Bob的发言", nameMap, "creator_uid", stubFn)
+	result := ResolveTopicTarget(context.Background(), "Bob的发言", nameMap, "creator_uid", false, stubFn)
 
 	if len(result) != 1 {
 		t.Fatalf("expected 1 UID (backward compat, include_self defaults false), got %d: %v", len(result), result)
@@ -164,7 +164,7 @@ func TestResolveTopicTarget_NoTarget_GeneralTopic(t *testing.T) {
 		Reasoning:   "主题'看看最近在聊什么'不指向特定成员",
 	})
 
-	result := ResolveTopicTarget(context.Background(), "看看最近在聊什么", nameMap, "creator_uid", stubFn)
+	result := ResolveTopicTarget(context.Background(), "看看最近在聊什么", nameMap, "creator_uid", false, stubFn)
 
 	if result != nil {
 		t.Fatalf("expected nil for general topic, got %v", result)
@@ -183,7 +183,7 @@ func TestResolveTopicTarget_NoTarget_SummarizeAll(t *testing.T) {
 		Reasoning:   "主题'总结这些群在聊些什么'不指向特定成员",
 	})
 
-	result := ResolveTopicTarget(context.Background(), "总结这些群在聊些什么", nameMap, "creator_uid", stubFn)
+	result := ResolveTopicTarget(context.Background(), "总结这些群在聊些什么", nameMap, "creator_uid", false, stubFn)
 
 	if result != nil {
 		t.Fatalf("expected nil for summarize-all topic, got %v", result)
@@ -202,7 +202,7 @@ func TestResolveTopicTarget_SelfReference(t *testing.T) {
 		Reasoning:   "主题'我最近说了什么'是自我指代",
 	})
 
-	result := ResolveTopicTarget(context.Background(), "我最近说了什么", nameMap, "creator_uid", stubFn)
+	result := ResolveTopicTarget(context.Background(), "我最近说了什么", nameMap, "creator_uid", false, stubFn)
 
 	if len(result) != 1 {
 		t.Fatalf("expected 1 UID for self-reference, got %d: %v", len(result), result)
@@ -224,7 +224,7 @@ func TestResolveTopicTarget_AllUIDsInvalid_IncludeSelf(t *testing.T) {
 		Reasoning:   "LLM returned invalid UIDs but include_self is true",
 	})
 
-	result := ResolveTopicTarget(context.Background(), "我和某人聊了什么", nameMap, "creator_uid", stubFn)
+	result := ResolveTopicTarget(context.Background(), "我和某人聊了什么", nameMap, "creator_uid", false, stubFn)
 
 	if len(result) != 1 {
 		t.Fatalf("expected 1 UID (creator), got %d: %v", len(result), result)
@@ -246,7 +246,7 @@ func TestResolveTopicTarget_NoSemanticMatch_AliceNotCarol(t *testing.T) {
 		Reasoning:   "Alice与成员Carol之间没有语义关联，不算匹配",
 	})
 
-	result := ResolveTopicTarget(context.Background(), "Alice的发言", nameMap, "creator_uid", stubFn)
+	result := ResolveTopicTarget(context.Background(), "Alice的发言", nameMap, "creator_uid", false, stubFn)
 
 	if result != nil {
 		t.Fatalf("expected nil when topic name has no semantic match in members, got %v", result)
@@ -265,7 +265,7 @@ func TestResolveTopicTarget_SemanticMatch_Nickname(t *testing.T) {
 		Reasoning:   "老王中的'王'与王明的'王'存在语义关联",
 	})
 
-	result := ResolveTopicTarget(context.Background(), "老王的发言", nameMap, "creator_uid", stubFn)
+	result := ResolveTopicTarget(context.Background(), "老王的发言", nameMap, "creator_uid", false, stubFn)
 
 	if len(result) != 1 {
 		t.Fatalf("expected 1 UID, got %d: %v", len(result), result)
@@ -287,7 +287,7 @@ func TestResolveTopicTarget_SemanticMatch_BilingualName(t *testing.T) {
 		Reasoning:   "Tom是汤姆的英文形式，语义关联明确",
 	})
 
-	result := ResolveTopicTarget(context.Background(), "Tom说了什么", nameMap, "creator_uid", stubFn)
+	result := ResolveTopicTarget(context.Background(), "Tom说了什么", nameMap, "creator_uid", false, stubFn)
 
 	if len(result) != 1 {
 		t.Fatalf("expected 1 UID, got %d: %v", len(result), result)
@@ -303,7 +303,7 @@ func TestResolveTopicTarget_EmptyTopic(t *testing.T) {
 	}
 	stubFn := mockToolCallFn(TopicResolveResult{})
 
-	result := ResolveTopicTarget(context.Background(), "", nameMap, "creator_uid", stubFn)
+	result := ResolveTopicTarget(context.Background(), "", nameMap, "creator_uid", false, stubFn)
 
 	if result != nil {
 		t.Fatalf("expected nil for empty topic, got %v", result)
@@ -319,9 +319,125 @@ func TestResolveTopicTarget_LLMError(t *testing.T) {
 		return "", fmt.Errorf("LLM service unavailable")
 	}
 
-	result := ResolveTopicTarget(context.Background(), "Alice的观点", nameMap, "creator_uid", errorFn)
+	result := ResolveTopicTarget(context.Background(), "Alice的观点", nameMap, "creator_uid", false, errorFn)
 
 	if result != nil {
 		t.Fatalf("expected nil on LLM error, got %v", result)
+	}
+}
+
+// --- issue #87: explicit source must not narrow on pure self-reference ---
+
+// Case (a): explicit source + pure self-reference (include_self, empty uids) +
+// hasExplicitSource=true → return nil (skip person narrow, no creator fallback).
+func TestResolveTopicTarget_ExplicitSource_SelfReference_SkipsNarrow(t *testing.T) {
+	nameMap := map[string]string{
+		"creator_uid": "我",
+		"alice_uid":   "Alice",
+	}
+	// "总结这个群的信息" misread by the LLM as self-reference.
+	stubFn := mockToolCallFn(TopicResolveResult{
+		HasTarget:   true,
+		UIDs:        []string{},
+		IncludeSelf: true,
+		Reasoning:   "误判为自我指代",
+	})
+
+	result := ResolveTopicTarget(context.Background(), "总结这个群的信息", nameMap, "creator_uid", true, stubFn)
+
+	if result != nil {
+		t.Fatalf("expected nil (skip person narrow) with explicit source + self-reference, got %v", result)
+	}
+}
+
+// Case (b): no explicit source + pure self-reference + hasExplicitSource=false →
+// return [creatorUID] (original behavior preserved).
+func TestResolveTopicTarget_NoExplicitSource_SelfReference_ReturnsCreator(t *testing.T) {
+	nameMap := map[string]string{
+		"creator_uid": "我",
+		"alice_uid":   "Alice",
+	}
+	stubFn := mockToolCallFn(TopicResolveResult{
+		HasTarget:   true,
+		UIDs:        []string{},
+		IncludeSelf: true,
+		Reasoning:   "主题'我最近说了什么'是自我指代",
+	})
+
+	result := ResolveTopicTarget(context.Background(), "我最近说了什么", nameMap, "creator_uid", false, stubFn)
+
+	if len(result) != 1 || result[0] != "creator_uid" {
+		t.Fatalf("expected [creator_uid] without explicit source, got %v", result)
+	}
+}
+
+// Case (c): explicit source + concrete named person (valid uid) → return that UID
+// (narrowing still applies when a real person is named).
+func TestResolveTopicTarget_ExplicitSource_NamedPerson_Narrows(t *testing.T) {
+	nameMap := map[string]string{
+		"creator_uid": "我",
+		"wang_uid":    "老王",
+	}
+	stubFn := mockToolCallFn(TopicResolveResult{
+		HasTarget:   true,
+		UIDs:        []string{"wang_uid"},
+		IncludeSelf: false,
+		Reasoning:   "主题'老王说了什么'指向老王",
+	})
+
+	result := ResolveTopicTarget(context.Background(), "老王说了什么", nameMap, "creator_uid", true, stubFn)
+
+	if len(result) != 1 || result[0] != "wang_uid" {
+		t.Fatalf("expected [wang_uid] with explicit source + named person, got %v", result)
+	}
+}
+
+// Explicit source + all-invalid UIDs + include_self → must not fall back to creator.
+func TestResolveTopicTarget_ExplicitSource_AllUIDsInvalid_IncludeSelf_SkipsNarrow(t *testing.T) {
+	nameMap := map[string]string{
+		"creator_uid": "我",
+		"alice_uid":   "Alice",
+	}
+	stubFn := mockToolCallFn(TopicResolveResult{
+		HasTarget:   true,
+		UIDs:        []string{"unknown_uid"},
+		IncludeSelf: true,
+		Reasoning:   "无效UID但include_self",
+	})
+
+	result := ResolveTopicTarget(context.Background(), "我和某人聊了什么", nameMap, "creator_uid", true, stubFn)
+
+	if result != nil {
+		t.Fatalf("expected nil (no creator fallback) with explicit source, got %v", result)
+	}
+}
+
+// Explicit source + concrete named other person (valid uid) + include_self → must
+// return that person's UID AND keep the creator appended. Locks the validUIDs-non-empty
+// + IncludeSelf branch: explicit source narrows to the named person but a first-person
+// participant still pulls the creator in.
+func TestResolveTopicTarget_ExplicitSource_NamedPerson_IncludeSelf_KeepsCreator(t *testing.T) {
+	nameMap := map[string]string{
+		"creator_uid": "我",
+		"wang_uid":    "老王",
+	}
+	stubFn := mockToolCallFn(TopicResolveResult{
+		HasTarget:   true,
+		UIDs:        []string{"wang_uid"},
+		IncludeSelf: true,
+		Reasoning:   "主题'我和老王聊了什么'包含老王与第一人称参与者",
+	})
+
+	result := ResolveTopicTarget(context.Background(), "我和老王聊了什么", nameMap, "creator_uid", true, stubFn)
+
+	// validUIDs starts as [wang_uid]; creator is appended → [wang_uid, creator_uid].
+	if len(result) != 2 {
+		t.Fatalf("expected 2 UIDs (named person + creator), got %d: %v", len(result), result)
+	}
+	if result[0] != "wang_uid" {
+		t.Errorf("expected wang_uid first, got %s", result[0])
+	}
+	if result[1] != "creator_uid" {
+		t.Errorf("expected creator_uid appended second, got %s", result[1])
 	}
 }
