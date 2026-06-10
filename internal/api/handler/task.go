@@ -354,49 +354,76 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 
 	userID := middleware.GetUserID(c)
 
-	query := h.db.Model(&model.SummaryTask{}).
-		Where("space_id = ? AND deleted_at IS NULL AND (creator_id = ? OR id IN (SELECT task_id FROM summary_participant WHERE user_id = ?))",
-			spaceID, userID, userID)
+	// Build the shared filter fragment (applied identically to the folded COUNT and
+	// the folded page query). All business filters live INSIDE the window subquery
+	// so "latest per schedule" is computed over the already-filtered set.
+	whereSQL := "space_id = ? AND deleted_at IS NULL AND (creator_id = ? OR id IN (SELECT task_id FROM summary_participant WHERE user_id = ?))"
+	args := []interface{}{spaceID, userID, userID}
 
 	if s := c.Query("status"); s != "" {
 		if v, err := strconv.Atoi(s); err == nil {
-			query = query.Where("status = ?", v)
+			whereSQL += " AND status = ?"
+			args = append(args, v)
 		}
 	}
 	if s := c.Query("trigger_type"); s != "" {
 		if v, err := strconv.Atoi(s); err == nil {
-			query = query.Where("trigger_type = ?", v)
+			whereSQL += " AND trigger_type = ?"
+			args = append(args, v)
 		}
 	}
 	if s := c.Query("keyword"); s != "" {
-		query = query.Where("title LIKE ?", "%"+s+"%")
+		whereSQL += " AND title LIKE ?"
+		args = append(args, "%"+s+"%")
 	}
 	if s := c.Query("origin_channel_id"); s != "" {
-		query = query.Where("origin_channel_id = ?", s)
+		whereSQL += " AND origin_channel_id = ?"
+		args = append(args, s)
 	}
 	if s := c.Query("created_after"); s != "" {
 		if t, err := time.Parse(time.RFC3339, s); err == nil {
-			query = query.Where("created_at >= ?", t)
+			whereSQL += " AND created_at >= ?"
+			args = append(args, t)
 		}
 	}
 	if s := c.Query("created_before"); s != "" {
 		if t, err := time.Parse(time.RFC3339, s); err == nil {
-			query = query.Where("created_at <= ?", t)
+			whereSQL += " AND created_at <= ?"
+			args = append(args, t)
 		}
 	}
 
-	var total int64
-	query.Count(&total)
-
 	sortBy := c.DefaultQuery("sort_by", "created_at")
 	sortOrder := c.DefaultQuery("sort_order", "desc")
-	orderClause := sortBy + " " + sortOrder
 	if sortBy != "created_at" && sortBy != "updated_at" {
-		orderClause = "created_at desc"
+		sortBy = "created_at"
 	}
+	if strings.ToLower(sortOrder) != "asc" {
+		sortOrder = "desc"
+	}
+	orderClause := sortBy + " " + sortOrder
+
+	// Folding (1->N): scheduled tasks fold by schedule_id (only the latest run per
+	// schedule shows); manual tasks (schedule_id IS NULL) each form their own group.
+	// The grouping key MUST namespace the two id spaces apart: summary_schedule.id and
+	// summary_task.id are independent auto-increment sequences with overlapping value
+	// ranges, so a bare COALESCE(schedule_id, id) collides a manual task id=N with a
+	// scheduled group schedule_id=N and wrongly folds them together (dropping rows).
+	// Prefix the key by type ('t' for manual task id, 's' for schedule id) to keep the
+	// namespaces fully separate. "Latest per group" uses id DESC (monotonic -> stable,
+	// unlike created_at which can tie at the same second). Pagination + total are
+	// computed AFTER folding (rn = 1).
+	innerSQL := "SELECT *, ROW_NUMBER() OVER (PARTITION BY (CASE WHEN schedule_id IS NULL THEN CONCAT('t', id) ELSE CONCAT('s', schedule_id) END) ORDER BY id DESC) AS rn FROM summary_task WHERE " + whereSQL
+
+	var total int64
+	countSQL := "SELECT COUNT(*) FROM (" + innerSQL + ") sub WHERE sub.rn = 1"
+	h.db.Raw(countSQL, args...).Scan(&total)
+
+	pageSQL := "SELECT * FROM (" + innerSQL + ") sub WHERE sub.rn = 1 ORDER BY " + orderClause + " LIMIT ? OFFSET ?"
+	pageArgs := append(append([]interface{}{}, args...), pageSize, (page-1)*pageSize)
 
 	var tasks []model.SummaryTask
-	query.Order(orderClause).Offset((page - 1) * pageSize).Limit(pageSize).Find(&tasks)
+	h.db.Raw(pageSQL, pageArgs...).Scan(&tasks)
 
 	items := make([]gin.H, 0, len(tasks))
 	for _, t := range tasks {
@@ -438,6 +465,16 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			creatorName = service.ResolveUserName(t.CreatorID)
 		}
 
+		// Expose schedule_id on list items so the frontend can detect a scheduled
+		// task by its bound schedule (the authoritative signal) instead of relying
+		// on trigger_type. A manual task that later gets a scheduled-update added
+		// keeps trigger_type=MANUAL until the scheduler actually runs, so
+		// trigger_type alone misses "scheduled but not yet executed" tasks.
+		var scheduleIDOut interface{}
+		if t.ScheduleID != nil {
+			scheduleIDOut = *t.ScheduleID
+		}
+
 		items = append(items, gin.H{
 			"task_id":             t.ID,
 			"task_no":             t.TaskNo,
@@ -445,6 +482,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			"summary_mode":        t.SummaryMode,
 			"status":              t.Status,
 			"trigger_type":        t.TriggerType,
+			"schedule_id":         scheduleIDOut,
 			"time_range_start":    t.TimeRangeStart.Format(time.RFC3339),
 			"time_range_end":      t.TimeRangeEnd.Format(time.RFC3339),
 			"sources":             srcList,
@@ -926,37 +964,44 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 		}
 
 		if liveTask.ScheduleID != nil {
-			// Cascade soft-delete of the bound schedule must respect the same
-			// ownership rule as DeleteSchedule (schedule.go: only the schedule
-			// creator may delete, else 40004). Without this check a mere task
-			// participant could delete the task and silently take down another
-			// user's schedule. We only cascade when the caller is the schedule's
-			// creator; otherwise we just unbind (clear schedule_id) so the task
-			// delete still succeeds but the victim's schedule survives.
+			// 1->N group delete (Boss product decision): deleting a SCHEDULED summary
+			// row from the list = soft-delete the WHOLE group (all tasks under that
+			// schedule) + stop the schedule. Only the schedule creator may do this
+			// (same ownership rule as DeleteSchedule); a mere participant must not take
+			// down another user's whole schedule, so a non-creator only deletes their
+			// own single task (unbind + pause the schedule).
 			userID := middleware.GetUserID(c)
 			if lockedSched == nil {
-				// schedule already gone; nothing to cascade
+				// schedule already gone; fall through to single-task soft-delete below.
 			} else if lockedSched.CreatorID == userID {
+				// Stop the schedule.
 				if err := tx.Model(&model.SummarySchedule{}).
 					Where("id = ? AND deleted_at IS NULL", lockedSched.ID).
 					Update("deleted_at", &now).Error; err != nil {
 					return err
 				}
-			} else {
-				// Not the schedule creator: do not delete someone else's schedule.
-				// Unbind it from this task and pause it to avoid an active orphan.
+				// Soft-delete EVERY live task in the group in one batch UPDATE (never
+				// loop per-row; a long-lived schedule may own thousands of tasks).
+				// schedule_id is preserved (no unbind) so deleted history stays
+				// attributable; subtables are left intact (no soft-delete column).
 				if err := tx.Model(&model.SummaryTask{}).
-					Where("id = ?", liveTask.ID).
-					Update("schedule_id", nil).Error; err != nil {
+					Where("schedule_id = ? AND deleted_at IS NULL", lockedSched.ID).
+					Updates(map[string]interface{}{
+						"status":     -1,
+						"deleted_at": now,
+					}).Error; err != nil {
 					return err
 				}
-				if err := tx.Model(&model.SummarySchedule{}).
-					Where("id = ? AND deleted_at IS NULL", lockedSched.ID).
-					Update("is_active", 0).Error; err != nil {
-					return err
-				}
-				log.Printf("[task] DeleteSummary: task %d caller %s is not schedule %d creator; unbinding instead of cascade-deleting", liveTask.ID, userID, lockedSched.ID)
-				log.Printf("[task] DeleteSummary: schedule %d auto-paused after non-creator unbind to prevent idle scans", lockedSched.ID)
+				// The whole group (including liveTask) is now soft-deleted; done.
+				return nil
+			} else {
+				// Not the schedule creator (a mere participant): forbid the delete
+				// entirely (Option A). Previously this branch unbound the task and
+				// paused (is_active=0) someone else's schedule, which let a participant
+				// silently disable the creator's scheduled summary -- a privilege
+				// escalation. Return 403 so the tx rolls back and nothing is touched.
+				log.Printf("[task] DeleteSummary: task %d caller %s is not schedule %d creator; denying (403)", liveTask.ID, userID, lockedSched.ID)
+				return service.NewBizError(40006, "仅创建者可删除该定时总结", http.StatusForbidden)
 			}
 		}
 
@@ -965,6 +1010,11 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 			"deleted_at": now,
 		}).Error
 	}); err != nil {
+		var be *service.BizError
+		if errors.As(err, &be) {
+			bizErr(c, be)
+			return
+		}
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
 			return

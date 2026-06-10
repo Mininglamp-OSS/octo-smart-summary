@@ -63,7 +63,7 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 		return 0, false, nil
 	}
 
-	var task model.SummaryTask
+	var newTask model.SummaryTask
 	claimed := false
 	requeued := false
 
@@ -125,115 +125,105 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 		}
 		claimed = true
 
+		// 1->N model: find the LATEST task under this schedule only to enforce the
+		// overlap guard. We no longer reuse/reset it -- each run INSERTs a brand-new
+		// task. ErrRecordNotFound (no task yet) is fine: the very first run has no
+		// predecessor, so there is nothing to overlap with.
+		var latest model.SummaryTask
+		hasLatest := false
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("schedule_id = ? AND deleted_at IS NULL", lockedSched.ID).
 			Order("id DESC").
-			First(&task).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				// Structurally broken (persistent): a schedule is created bound to a
-				// live task, so "no live bound task" means the task was deleted/unbound
-				// after creation. Such a schedule can never produce a summary and would
-				// otherwise re-scan + re-skip forever while freezing last_run_at (window
-				// grows unbounded). Disable it (same treatment as invalid recurrence)
-				// and alert. The FOR UPDATE re-read above already confirmed there is no
-				// live bound task within this locked tx, so this is not a rebind race.
-				log.Printf("[scheduler] ALERT schedule %d has no live bound task (deleted/unbound after creation); disabling + notifying creator", lockedSched.ID)
-				if err := tx.Model(&model.SummarySchedule{}).
-					Where("id = ?", lockedSched.ID).
-					Update("is_active", 0).Error; err != nil {
-					return err
-				}
-				// NOTE: creator notification is a follow-up. sendCallback lives on
-				// *Processor and is not reachable from this standalone scheduler
-				// function; wiring it cleanly is tracked separately. The ALERT log
-				// above records the disable + reason for now.
-				return nil
+			First(&latest).Error; err != nil {
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
 			}
-			return err
+		} else {
+			hasLatest = true
 		}
 
-		if task.Status == model.StatusProcessing {
-			// Transient: the previous run is still Processing. Skip WITHOUT advancing
-			// last_run_at -- the window is preserved and covered by the next cycle once
-			// the in-flight run finishes (stuck runs are recovered via the
-			// processing_deadline lease / scanStuckTasks).
-			log.Printf("[scheduler] schedule %d task %d still processing; skipping overlapping overwrite (last_run_at preserved)", lockedSched.ID, task.ID)
+		// Overlap guard: skip creating a new run if ANY non-terminal task already
+		// exists under this schedule (status IN Pending/WaitingConfirm/Processing,
+		// not soft-deleted). Previously this only checked whether the LATEST task was
+		// Processing -- but scanStuckTasks revives an expired Processing run back to
+		// Pending, so the latest could be Pending (not Processing) while still being a
+		// live placeholder; the old guard then created a SECOND executable task for
+		// the same schedule/window (duplicate-execution race, no DB unique key).
+		// Treating every non-terminal status as an occupying placeholder closes that
+		// gap. Skip WITHOUT advancing last_run_at (same transient-overlap semantics):
+		// the window is preserved and covered by the next cycle once the in-flight run
+		// reaches a terminal state. A task hitting WorkerMaxRetry is marked Failed
+		// (terminal) by scanStuckTasks, which naturally releases this skip -- so it
+		// never blocks the schedule permanently.
+		var liveCount int64
+		if err := tx.Model(&model.SummaryTask{}).
+			Where("schedule_id = ? AND deleted_at IS NULL AND status IN ?",
+				lockedSched.ID,
+				[]int{model.StatusPending, model.StatusWaitingConfirm, model.StatusProcessing}).
+			Count(&liveCount).Error; err != nil {
+			return err
+		}
+		if liveCount > 0 {
+			log.Printf("[scheduler] schedule %d has %d non-terminal task(s); skipping overlapping new task (last_run_at preserved)", lockedSched.ID, liveCount)
 			return nil
 		}
 
-		// Scheduled summary is single-person only this version. A bound task that
-		// became multi-person after creation is structurally unsupported for
-		// scheduling and would re-scan + re-skip forever while freezing last_run_at.
-		// Disable + alert (same as the no-bound-task case).
-		var participantCount int64
-		if err := tx.Model(&model.SummaryParticipant{}).
-			Where("task_id = ?", task.ID).
-			Count(&participantCount).Error; err != nil {
+		// Scheduled summary is single-person only this version. If the schedule's
+		// participant config went multi-person it is structurally unsupported for
+		// scheduling. Guard against the schedule config (not a bound task, since under
+		// 1->N each run is fresh). >1 distinct configured users (excluding the implicit
+		// creator dedup) => disable + alert.
+		if multiPerson, err := scheduleConfigMultiPerson(lockedSched); err != nil {
 			return err
-		}
-		if participantCount > 1 {
-			log.Printf("[scheduler] ALERT schedule %d bound task %d is multi-person (%d participants); scheduled summary not supported for team tasks, disabling + notifying creator", lockedSched.ID, task.ID, participantCount)
+		} else if multiPerson {
+			log.Printf("[scheduler] ALERT schedule %d participant config is multi-person; scheduled summary not supported for team tasks, disabling + notifying creator", lockedSched.ID)
 			if err := tx.Model(&model.SummarySchedule{}).
 				Where("id = ?", lockedSched.ID).
 				Update("is_active", 0).Error; err != nil {
 				return err
 			}
-			// NOTE: creator notification is a follow-up (see no-bound-task note above).
+			// NOTE: creator notification is a follow-up.
 			return nil
 		}
 
 		requeued = true
-		if err := syncScheduledTaskConfig(tx, lockedSched, task, now); err != nil {
+
+		// INSERT a brand-new task for this run (1->N). Title/origin/space carry over
+		// from the schedule; the rest is a fresh Pending scheduled task.
+		newTask = model.SummaryTask{
+			TaskNo:          service.GenerateTaskNo(),
+			SpaceID:         lockedSched.SpaceID,
+			CreatorID:       lockedSched.CreatorID,
+			Title:           lockedSched.Title,
+			SummaryMode:     lockedSched.SummaryMode,
+			TimeRangeStart:  start,
+			TimeRangeEnd:    end,
+			Status:          model.StatusPending,
+			TriggerType:     model.TriggerScheduled,
+			ScheduleID:      &lockedSched.ID,
+			CreatedAt:       now,
+			UpdatedAt:       now,
+		}
+		if hasLatest {
+			// Preserve origin channel from the previous run so the new summary keeps
+			// the same delivery context.
+			newTask.OriginChannelID = latest.OriginChannelID
+			newTask.OriginChannelType = latest.OriginChannelType
+		}
+		if err := tx.Create(&newTask).Error; err != nil {
 			return err
 		}
 
-		if err := tx.Model(&model.SummaryParticipant{}).
-			Where("task_id = ?", task.ID).
-			Updates(map[string]interface{}{
-				"status":            model.ParticipantAccepted,
-				"confirmed_at":      now,
-				"worker_started_at": nil,
-			}).Error; err != nil {
+		// Rebuild the three subtables (source / participant / personal_result) from
+		// the schedule config -- the new task_id starts with no children.
+		if err := buildScheduledTaskChildren(tx, lockedSched, newTask, now); err != nil {
 			return err
 		}
 
-		if err := tx.Model(&model.PersonalResult{}).
-			Where("task_id = ?", task.ID).
-			Updates(map[string]interface{}{
-				"worker_status":    model.PersonalStatusPending,
-				"content":          "",
-				"citations_json":   "",
-				"msg_count":        0,
-				"total_token_used": 0,
-				"model_version":    "",
-				"error_message":    nil,
-				"submitted_at":     nil,
-				"generated_at":     nil,
-				"edited_at":        nil,
-			}).Error; err != nil {
-			return err
-		}
-
-		if err := tx.Model(&model.SummaryTask{}).
-			Where("id = ?", task.ID).
-			Updates(map[string]interface{}{
-				"time_range_start":    start,
-				"time_range_end":      end,
-				"status":              model.StatusPending,
-				"trigger_type":        model.TriggerScheduled,
-				"retry_count":         0,
-				"error_message":       nil,
-				"processing_deadline": nil,
-				"confirm_deadline":    nil,
-				"schedule_id":         lockedSched.ID,
-			}).Error; err != nil {
-			return err
-		}
-
-		// Advance last_run_at ONLY now that the task is actually requeued to run.
-		// This is the fix: the type=4 incremental window anchor moves only on a real
-		// run, never on a business skip, so a skipped interval's messages are still
-		// covered by the next window instead of being permanently dropped.
+		// Advance last_run_at ONLY now that the new task is actually created to run.
+		// The type=4 incremental window anchor moves only on a real run, never on a
+		// business skip, so a skipped interval's messages are still covered by the
+		// next window instead of being permanently dropped.
 		if err := tx.Model(&model.SummarySchedule{}).
 			Where("id = ?", lockedSched.ID).
 			Update("last_run_at", now).Error; err != nil {
@@ -251,13 +241,38 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 		return 0, false, nil
 	}
 
-	// Only report a real requeue when we actually reset the task. Skipped cases
-	// (no bound task, still processing, or multi-person guard) return taskID=0 so
-	// scanPendingSchedules does not log a misleading "requeued task" line.
+	// Only report a real requeue when we actually created a new task. Skipped cases
+	// (still processing or multi-person guard) return taskID=0 so scanPendingSchedules
+	// does not log a misleading "requeued task" line.
 	if !requeued {
 		return 0, true, nil
 	}
-	return task.ID, true, nil
+	return newTask.ID, true, nil
+}
+
+// scheduleConfigMultiPerson reports whether a schedule's participant config
+// resolves to more than one distinct user (the implicit creator counts once).
+// Scheduled summaries are single-person this version.
+func scheduleConfigMultiPerson(sched model.SummarySchedule) (bool, error) {
+	if len(sched.ParticipantConfig) == 0 {
+		return false, nil
+	}
+	var participants []struct {
+		UserID string `json:"user_id"`
+	}
+	if err := json.Unmarshal(sched.ParticipantConfig, &participants); err != nil {
+		return false, nil
+	}
+	users := map[string]struct{}{}
+	if sched.CreatorID != "" {
+		users[sched.CreatorID] = struct{}{}
+	}
+	for _, p := range participants {
+		if p.UserID != "" {
+			users[p.UserID] = struct{}{}
+		}
+	}
+	return len(users) > 1, nil
 }
 
 // scanConfirmTimeouts auto-declines participants still in WaitingConfirm

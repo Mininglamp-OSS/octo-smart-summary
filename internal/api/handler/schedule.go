@@ -270,25 +270,22 @@ func orderedScheduleLockIDs(targetID int64, oldScheduleID *int64) (int64, *int64
 	return *oldScheduleID, &targetID
 }
 
-// loadBoundTaskForScheduleUpdate validates the schedule->task live binding on the
-// non-rebind update path. We reject orphaned/inconsistent schedules instead of
-// mutating detached config: once the live task is gone, the caller must refresh
-// and repair/recreate the schedule rather than editing a stale row in place.
+// loadBoundTaskForScheduleUpdate validates the schedule->task binding on the
+// non-rebind update/toggle path. Under the 1->N model a schedule owns many tasks
+// (full run history), so we no longer require "exactly one"; we load the LATEST
+// live bound task and validate ownership/consistency against it. The latest task
+// is the representative used for the single-person guard and creator check.
 func loadBoundTaskForScheduleUpdate(tx *gorm.DB, lockedSched model.SummarySchedule, userID string) (model.SummaryTask, error) {
-	var tasks []model.SummaryTask
+	var task model.SummaryTask
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("schedule_id = ? AND deleted_at IS NULL", lockedSched.ID).
-		Order("id ASC").
-		Find(&tasks).Error; err != nil {
+		Order("id DESC").
+		First(&task).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return model.SummaryTask{}, service.NewBizError(40008, "定时配置已失去绑定，请刷新后重试", http.StatusNotFound)
+		}
 		return model.SummaryTask{}, err
 	}
-	if len(tasks) == 0 {
-		return model.SummaryTask{}, service.NewBizError(40008, "定时配置已失去绑定，请刷新后重试", http.StatusNotFound)
-	}
-	if len(tasks) > 1 {
-		return model.SummaryTask{}, service.NewBizError(40008, "定时配置绑定关系异常，请刷新后重试", http.StatusConflict)
-	}
-	task := tasks[0]
 	if task.SpaceID != lockedSched.SpaceID || task.ScheduleID == nil || *task.ScheduleID != lockedSched.ID {
 		return model.SummaryTask{}, service.NewBizError(40008, "定时配置绑定关系异常，请刷新后重试", http.StatusConflict)
 	}
@@ -448,16 +445,8 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 			if err != nil {
 				return service.NewBizError(40010, "无效的调度配置: "+err.Error(), http.StatusUnprocessableEntity)
 			}
-			var boundCount int64
-			if err := tx.Model(&model.SummaryTask{}).
-				Clauses(clause.Locking{Strength: "UPDATE"}).
-				Where("schedule_id = ? AND deleted_at IS NULL AND id <> ?", existing.ID, task.ID).
-				Count(&boundCount).Error; err != nil {
-				return err
-			}
-			if boundCount > 0 {
-				return errTaskScopeScheduleBound
-			}
+			// 1->N: a schedule legitimately owns many tasks (run history), so we no
+			// longer reject reusing a schedule that already has other bound tasks.
 			if existing.CreatorID != userID {
 				return service.NewBizError(40004, "无权限修改", http.StatusForbidden)
 			}
@@ -894,16 +883,7 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 				return err
 			}
 
-			var boundCount int64
-			if err := tx.Model(&model.SummaryTask{}).
-				Clauses(clause.Locking{Strength: "UPDATE"}).
-				Where("schedule_id = ? AND deleted_at IS NULL AND id <> ?", sched.ID, task.ID).
-				Count(&boundCount).Error; err != nil {
-				return err
-			}
-			if boundCount > 0 {
-				return errTaskScopeScheduleBound
-			}
+			// 1->N: a schedule may own many tasks (history); no "already bound" rejection.
 		} else {
 			if _, err := loadBoundTaskForScheduleUpdate(tx, lockedSched, userID); err != nil {
 				return err
@@ -1143,9 +1123,18 @@ func (h *ScheduleHandler) DeleteSchedule(c *gin.Context) {
 		for _, task := range boundTasks {
 			taskIDs = append(taskIDs, task.ID)
 		}
+		// 1->N: soft-delete the WHOLE group of bound tasks (do NOT unbind). One batch
+		// UPDATE, same tx as the schedule soft-delete -- a long-lived schedule can own
+		// thousands of tasks, so never loop per-row. schedule_id is preserved on every
+		// row so the deleted history stays attributable to its schedule. Subtables
+		// (result/chunk/participant/personal_result) are left intact: they have no
+		// soft-delete column and hard-deleting them would lose history.
 		return tx.Model(&model.SummaryTask{}).
 			Where("id IN ?", taskIDs).
-			Update("schedule_id", nil).Error
+			Updates(map[string]interface{}{
+				"status":     -1,
+				"deleted_at": now,
+			}).Error
 	})
 	if txErr != nil {
 		var biz *service.BizError

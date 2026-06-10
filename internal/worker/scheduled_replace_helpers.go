@@ -35,6 +35,111 @@ func syncScheduledTaskConfig(tx *gorm.DB, sched model.SummarySchedule, task mode
 	return nil
 }
 
+// buildScheduledTaskChildren creates the source / participant / personal_result
+// subtable rows for a freshly INSERTed scheduled task. Under the 1->N model every
+// run is a brand-new task_id, so its three subtables start empty and must be
+// rebuilt from the schedule config (the source of truth). This is the same shape
+// as syncScheduledTaskConfig but assumes no pre-existing children (no deletes) and
+// always materializes the creator participant even when ParticipantConfig is empty.
+func buildScheduledTaskChildren(tx *gorm.DB, sched model.SummarySchedule, task model.SummaryTask, now time.Time) error {
+	if err := buildScheduledTaskSources(tx, task.ID, sched.SourceConfig); err != nil {
+		return err
+	}
+	if err := buildScheduledTaskParticipants(tx, task, sched.ParticipantConfig, now); err != nil {
+		return err
+	}
+	return nil
+}
+
+func buildScheduledTaskSources(tx *gorm.DB, taskID int64, raw model.JSON) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	var sources []scheduleSourceConfig
+	if err := json.Unmarshal(raw, &sources); err != nil {
+		return service.NewBizError(40000, "定时来源配置无效", http.StatusBadRequest)
+	}
+	for _, src := range sources {
+		if src.SourceID == "" {
+			return fmt.Errorf("scheduled source_id is required")
+		}
+		sourceName := src.SourceName
+		if sourceName == "" {
+			sourceName = service.ResolveSourceNameWithType(src.SourceID, src.SourceType, nil)
+		}
+		if err := tx.Create(&model.SummarySource{
+			TaskID:     taskID,
+			SourceType: src.SourceType,
+			SourceID:   src.SourceID,
+			SourceName: sourceName,
+		}).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func buildScheduledTaskParticipants(tx *gorm.DB, task model.SummaryTask, raw model.JSON, now time.Time) error {
+	var participants []scheduleParticipantConfig
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &participants); err != nil {
+			return service.NewBizError(40000, "定时参与者配置无效", http.StatusBadRequest)
+		}
+	}
+
+	desired := make([]scheduleParticipantConfig, 0, len(participants)+1)
+	seen := make(map[string]struct{}, len(participants)+1)
+	appendUser := func(userID, userName string) {
+		if userID == "" {
+			return
+		}
+		if _, ok := seen[userID]; ok {
+			return
+		}
+		seen[userID] = struct{}{}
+		if userName == "" {
+			userName = service.ResolveUserName(userID)
+		}
+		desired = append(desired, scheduleParticipantConfig{UserID: userID, UserName: userName})
+	}
+
+	// Always materialize the creator participant, even with empty ParticipantConfig:
+	// a scheduled (single-person) task must have its creator as a participant or the
+	// personal worker has nothing to run.
+	appendUser(task.CreatorID, "")
+	for _, participant := range participants {
+		appendUser(participant.UserID, participant.UserName)
+	}
+
+	for _, participant := range desired {
+		row := model.SummaryParticipant{
+			TaskID:      task.ID,
+			UserID:      participant.UserID,
+			UserName:    participant.UserName,
+			Status:      model.ParticipantAccepted,
+			ConfirmedAt: &now,
+		}
+		if err := tx.Create(&row).Error; err != nil {
+			return err
+		}
+		pr := model.PersonalResult{
+			TaskID:           task.ID,
+			ParticipantRefID: row.ID,
+			UserID:           participant.UserID,
+			WorkerStatus:     model.PersonalStatusPending,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}
+		if err := tx.Create(&pr).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&row).Update("personal_result_id", pr.ID).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func syncScheduledTaskSources(tx *gorm.DB, taskID int64, raw model.JSON) error {
 	if len(raw) == 0 {
 		return nil

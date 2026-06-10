@@ -137,36 +137,54 @@ func TestClaim_OverlapSkipPreservesLastRunAt(t *testing.T) {
 	}
 }
 
-// No bound live task (structurally broken, persistent): disable the schedule, preserve last_run_at.
-func TestClaim_NoBoundTaskDisablesSchedule(t *testing.T) {
+// No prior task under the schedule (1->N first run, or after a group delete):
+// this is NORMAL, not a broken binding. claim must CREATE a brand-new task,
+// advance last_run_at, and keep the schedule active.
+func TestClaim_NoPriorTaskCreatesFirstTask(t *testing.T) {
 	db := newSchedulerTestDB(t)
 	old := time.Now().UTC().Add(-48 * time.Hour)
 	sched := seedDueSchedule(t, db, &old)
-	// no bound task seeded
+	// no prior task seeded
 
 	now := time.Now().UTC()
-	_, claimed, err := claimAndCreateScheduledTask(db, sched, now, 30)
+	taskID, claimed, err := claimAndCreateScheduledTask(db, sched, now, 30)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if !claimed {
-		t.Fatalf("expected claimed=true")
+	if !claimed || taskID == 0 {
+		t.Fatalf("first run should create a task, got claimed=%v taskID=%d", claimed, taskID)
 	}
 	got := reloadSchedule(t, db, sched.ID)
-	if got.IsActive != 0 {
-		t.Errorf("no-bound-task should disable schedule, got is_active=%d", got.IsActive)
+	if got.IsActive != 1 {
+		t.Errorf("first run must keep schedule active, got is_active=%d", got.IsActive)
 	}
-	if got.LastRunAt == nil || !got.LastRunAt.Equal(old) {
-		t.Errorf("last_run_at must be preserved (no run produced), got %v want %v", got.LastRunAt, old)
+	if got.LastRunAt == nil || got.LastRunAt.Before(now.Add(-time.Second)) {
+		t.Errorf("last_run_at should advance to ~now on first run, got %v", got.LastRunAt)
+	}
+	// The new task must have its creator participant + personal_result rebuilt from
+	// schedule config (single-person: just the creator).
+	var pCount, prCount int64
+	db.Model(&model.SummaryParticipant{}).Where("task_id = ?", taskID).Count(&pCount)
+	db.Model(&model.PersonalResult{}).Where("task_id = ?", taskID).Count(&prCount)
+	if pCount != 1 || prCount != 1 {
+		t.Errorf("new task subtables not rebuilt: participants=%d personal_results=%d, want 1/1", pCount, prCount)
 	}
 }
 
-// Multi-person bound task (structurally unsupported, persistent): disable the schedule.
-func TestClaim_MultiPersonDisablesSchedule(t *testing.T) {
+// A schedule whose participant_config resolves to multiple distinct users is
+// structurally unsupported for scheduling (single-person this version): disable
+// the schedule and preserve last_run_at.
+func TestClaim_MultiPersonConfigDisablesSchedule(t *testing.T) {
 	db := newSchedulerTestDB(t)
 	old := time.Now().UTC().Add(-48 * time.Hour)
 	sched := seedDueSchedule(t, db, &old)
-	seedBoundTask(t, db, sched.ID, model.StatusCompleted, 2) // 2 participants
+	// creator u1 + another user u2 in participant_config -> multi-person.
+	sched.ParticipantConfig = model.JSON(`[{"user_id":"u2"}]`)
+	if err := db.Model(&model.SummarySchedule{}).Where("id = ?", sched.ID).
+		Update("participant_config", sched.ParticipantConfig).Error; err != nil {
+		t.Fatalf("set participant_config: %v", err)
+	}
+	seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
 
 	now := time.Now().UTC()
 	_, claimed, err := claimAndCreateScheduledTask(db, sched, now, 30)
@@ -178,7 +196,7 @@ func TestClaim_MultiPersonDisablesSchedule(t *testing.T) {
 	}
 	got := reloadSchedule(t, db, sched.ID)
 	if got.IsActive != 0 {
-		t.Errorf("multi-person should disable schedule, got is_active=%d", got.IsActive)
+		t.Errorf("multi-person config should disable schedule, got is_active=%d", got.IsActive)
 	}
 	if got.LastRunAt == nil || !got.LastRunAt.Equal(old) {
 		t.Errorf("last_run_at must be preserved (no run produced), got %v want %v", got.LastRunAt, old)

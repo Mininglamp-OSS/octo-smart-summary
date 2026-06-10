@@ -100,7 +100,7 @@ func (p *Processor) poll() {
 	for i := 0; i < 10; i++ {
 		// Step 1: find a candidate pending task
 		var candidate model.SummaryTask
-		if err := p.db.Where("status = ? AND retry_count < ? AND (processing_deadline IS NULL OR processing_deadline < ?)",
+		if err := p.db.Where("status = ? AND retry_count < ? AND (processing_deadline IS NULL OR processing_deadline < ?) AND deleted_at IS NULL",
 			model.StatusPending, p.cfg.WorkerMaxRetry, now).
 			Order("id ASC").Limit(1).First(&candidate).Error; err != nil {
 			return // no pending tasks
