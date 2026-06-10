@@ -142,13 +142,29 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 			hasLatest = true
 		}
 
-		if hasLatest && latest.Status == model.StatusProcessing {
-			// Transient overlap: the previous run is still Processing. Skip WITHOUT
-			// advancing last_run_at -- the window is preserved and covered by the next
-			// cycle once the in-flight run finishes. Stuck/expired Processing runs are
-			// recovered by scanStuckTasks (overlap expiry is its responsibility, not
-			// claim's). This is the only same-window dedup defense (no DB unique key).
-			log.Printf("[scheduler] schedule %d latest task %d still processing; skipping overlapping new task (last_run_at preserved)", lockedSched.ID, latest.ID)
+		// Overlap guard: skip creating a new run if ANY non-terminal task already
+		// exists under this schedule (status IN Pending/WaitingConfirm/Processing,
+		// not soft-deleted). Previously this only checked whether the LATEST task was
+		// Processing -- but scanStuckTasks revives an expired Processing run back to
+		// Pending, so the latest could be Pending (not Processing) while still being a
+		// live placeholder; the old guard then created a SECOND executable task for
+		// the same schedule/window (duplicate-execution race, no DB unique key).
+		// Treating every non-terminal status as an occupying placeholder closes that
+		// gap. Skip WITHOUT advancing last_run_at (same transient-overlap semantics):
+		// the window is preserved and covered by the next cycle once the in-flight run
+		// reaches a terminal state. A task hitting WorkerMaxRetry is marked Failed
+		// (terminal) by scanStuckTasks, which naturally releases this skip -- so it
+		// never blocks the schedule permanently.
+		var liveCount int64
+		if err := tx.Model(&model.SummaryTask{}).
+			Where("schedule_id = ? AND deleted_at IS NULL AND status IN ?",
+				lockedSched.ID,
+				[]int{model.StatusPending, model.StatusWaitingConfirm, model.StatusProcessing}).
+			Count(&liveCount).Error; err != nil {
+			return err
+		}
+		if liveCount > 0 {
+			log.Printf("[scheduler] schedule %d has %d non-terminal task(s); skipping overlapping new task (last_run_at preserved)", lockedSched.ID, liveCount)
 			return nil
 		}
 

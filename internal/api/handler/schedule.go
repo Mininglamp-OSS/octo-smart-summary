@@ -1131,7 +1131,10 @@ func (h *ScheduleHandler) DeleteSchedule(c *gin.Context) {
 		// soft-delete column and hard-deleting them would lose history.
 		return tx.Model(&model.SummaryTask{}).
 			Where("id IN ?", taskIDs).
-			Update("deleted_at", &now).Error
+			Updates(map[string]interface{}{
+				"status":     -1,
+				"deleted_at": now,
+			}).Error
 	})
 	if txErr != nil {
 		var biz *service.BizError
