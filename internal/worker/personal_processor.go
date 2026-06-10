@@ -23,8 +23,40 @@ func escapeCitationMarkers(content string) string {
 
 const noRelevantContentMessage = "在当前范围内未找到与主题相关的聊天记录。"
 
+const noSelfMessagesMessage = "你在所选范围内没有发言记录。"
+
+// decidePersonalMessages chooses which messages feed the summary after target
+// filtering, and decides whether to early-return a user-facing message instead.
+//
+//	len(targetUIDs)==0                      → all messages, no early message (no target)
+//	filtered non-empty                      → filtered messages (normal narrow)
+//	filtered empty + targetUIDs==[creator]  → nil + noSelfMessagesMessage (true first-person
+//	                                          query, creator never spoke → tell the user plainly)
+//	filtered empty + other targets          → all messages (named someone who didn't speak in
+//	                                          this source; whole source beats "no data")
+func decidePersonalMessages(targetUIDs []string, creatorUID string, all, filtered []pipeline.Message) (msgs []pipeline.Message, earlyMsg string) {
+	if len(targetUIDs) == 0 {
+		return all, ""
+	}
+	if len(filtered) > 0 {
+		return filtered, ""
+	}
+	if len(targetUIDs) == 1 && targetUIDs[0] == creatorUID {
+		return nil, noSelfMessagesMessage
+	}
+	return all, ""
+}
+
+// isEmptyPlaceholder reports whether content is one of the "no usable result"
+// placeholder messages (no relevant content, or the creator had no messages in
+// the selected source). These must not overwrite a previous valid scheduled result.
+func isEmptyPlaceholder(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	return trimmed == noRelevantContentMessage || trimmed == noSelfMessagesMessage
+}
+
 func shouldSkipScheduledPlaceholderResult(triggerType int, content string) bool {
-	return triggerType == model.TriggerScheduled && strings.TrimSpace(content) == noRelevantContentMessage
+	return triggerType == model.TriggerScheduled && isEmptyPlaceholder(content)
 }
 
 func completedPersonalResultUpdates(pr model.PersonalResult, content string, citations []model.Citation, msgCount, totalTokens int, modelVer string, genAt time.Time, skipContent bool) map[string]interface{} {
@@ -325,29 +357,28 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		time.Since(resolveStart).Milliseconds(), len(nameMap))
 
 	// Resolve topic target via LLM Function Call.
-	// hasExplicitSource keeps person narrow symmetric with channel narrow: when the user
-	// explicitly chose the source(s), a pure self-reference must not narrow to the creator.
-	hasExplicitSource := len(sources) > 0
-	targetUIDs := pipeline.ResolveTopicTarget(ctx, task.Title, nameMap, userID, hasExplicitSource, toolCallFn)
-	log.Printf("[personal-worker] topic target resolved: %v (creator=%s, explicitSource=%v)", targetUIDs, userID, hasExplicitSource)
+	targetUIDs := pipeline.ResolveTopicTarget(ctx, task.Title, nameMap, userID, toolCallFn)
+	log.Printf("[personal-worker] topic target resolved: %v (creator=%s)", targetUIDs, userID)
 
 	// Apply context window filter (signature changed: userID → targetUIDs)
 	filterStart := time.Now()
 	var userMessages []pipeline.Message
+	var earlyMsg string
 	if len(targetUIDs) > 0 {
-		userMessages = pipeline.FilterWithContext(messages, targetUIDs, p.cfg.ContextWindow)
+		filtered := pipeline.FilterWithContext(messages, targetUIDs, p.cfg.ContextWindow)
 		log.Printf("[personal-worker] FilterWithContext took %dms (%d → %d messages, targets=%v)",
-			time.Since(filterStart).Milliseconds(), len(messages), len(userMessages), targetUIDs)
-		// Empty fallback: target person(s) had no messages in the selected source(s).
-		// Only fall back when the user explicitly chose the source(s): they picked a
-		// source and named someone who happened not to speak there, so returning all
-		// fetched messages beats "no chat data". For non-explicit-source self queries
-		// (e.g. "我最近说了什么" with no creator messages) we keep the old behavior and
-		// let the len(userMessages)==0 check below return noRelevantContentMessage.
-		if len(userMessages) == 0 && hasExplicitSource {
+			time.Since(filterStart).Milliseconds(), len(messages), len(filtered), targetUIDs)
+		userMessages, earlyMsg = decidePersonalMessages(targetUIDs, userID, messages, filtered)
+		if earlyMsg != "" {
+			// True first-person query and the creator has no messages in the selected
+			// source(s): tell the user plainly instead of falling back to the whole source.
+			log.Printf("[personal-worker] creator %s had no messages in selected source(s), returning self-empty notice", userID)
+			return earlyMsg, nil, 0, 0, p.llm.ModelVersion(), nil
+		}
+		if len(filtered) == 0 {
+			// Named other person(s) didn't speak in this source → whole source beats "no data".
 			log.Printf("[personal-worker] target(s) %v had no messages in selected source(s), falling back to all %d messages",
 				targetUIDs, len(messages))
-			userMessages = messages
 		}
 	} else {
 		userMessages = messages
@@ -375,6 +406,13 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		if userMessages[i].IsTargetUser {
 			targetMsgCount++
 		}
+	}
+	// F1: untrimmed / fallback paths never set IsTargetUser, so targetMsgCount stays 0
+	// even though every message is effectively in scope. Normalize to the full count so
+	// Reduce and persistence see the real number. True-narrow paths have ≥1 IsTargetUser
+	// and are unaffected.
+	if targetMsgCount == 0 {
+		targetMsgCount = len(userMessages)
 	}
 
 	// Token-aware chunking — resolve budget via explicit config / per-model default / global fallback
