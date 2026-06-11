@@ -91,7 +91,7 @@ func TestClaim_RequeueAdvancesLastRunAt(t *testing.T) {
 	seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
 
 	now := time.Now().UTC()
-	taskID, claimed, err := claimAndCreateScheduledTask(db, sched, now, 30)
+	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestClaim_OverlapSkipPreservesLastRunAt(t *testing.T) {
 	seedBoundTask(t, db, sched.ID, model.StatusProcessing, 1)
 
 	now := time.Now().UTC()
-	taskID, claimed, err := claimAndCreateScheduledTask(db, sched, now, 30)
+	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestClaim_NoPriorTaskCreatesFirstTask(t *testing.T) {
 	// no prior task seeded
 
 	now := time.Now().UTC()
-	taskID, claimed, err := claimAndCreateScheduledTask(db, sched, now, 30)
+	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -187,7 +187,7 @@ func TestClaim_MultiPersonConfigDisablesSchedule(t *testing.T) {
 	seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
 
 	now := time.Now().UTC()
-	_, claimed, err := claimAndCreateScheduledTask(db, sched, now, 30)
+	_, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}

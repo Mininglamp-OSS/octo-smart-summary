@@ -19,10 +19,10 @@ import (
 var schedulerHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
 // StartScheduler starts the 4 cron scan jobs (every 60s).
-func StartScheduler(db *gorm.DB, maxRetry int, workerTriggerURL string, maxWindowDays int) *cron.Cron {
+func StartScheduler(db *gorm.DB, imDB *gorm.DB, maxRetry int, workerTriggerURL string, maxWindowDays int) *cron.Cron {
 	c := cron.New()
 
-	c.AddFunc("@every 60s", func() { scanPendingSchedules(db, maxWindowDays) })
+	c.AddFunc("@every 60s", func() { scanPendingSchedules(db, imDB, maxWindowDays) })
 	c.AddFunc("@every 60s", func() { scanConfirmTimeouts(db) })
 	c.AddFunc("@every 60s", func() { scanStuckTasks(db, maxRetry) })
 	c.AddFunc("@every 60s", func() { scanStuckPersonalTasks(db, workerTriggerURL) })
@@ -33,7 +33,7 @@ func StartScheduler(db *gorm.DB, maxRetry int, workerTriggerURL string, maxWindo
 }
 
 // scanPendingSchedules requeues bound tasks from due schedules.
-func scanPendingSchedules(db *gorm.DB, maxWindowDays int) {
+func scanPendingSchedules(db *gorm.DB, imDB *gorm.DB, maxWindowDays int) {
 	now := timezone.Now()
 	var schedules []model.SummarySchedule
 	err := db.Where("is_active = 1 AND next_run_at <= ? AND deleted_at IS NULL", now).Find(&schedules).Error
@@ -43,7 +43,7 @@ func scanPendingSchedules(db *gorm.DB, maxWindowDays int) {
 	}
 
 	for _, sched := range schedules {
-		taskID, claimed, err := claimAndCreateScheduledTask(db, sched, now, maxWindowDays)
+		taskID, claimed, err := claimAndCreateScheduledTask(db, imDB, sched, now, maxWindowDays)
 		if err != nil {
 			log.Printf("[scheduler] create task for schedule %d: %v", sched.ID, err)
 			continue
@@ -58,7 +58,7 @@ func scanPendingSchedules(db *gorm.DB, maxWindowDays int) {
 	}
 }
 
-func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now time.Time, maxWindowDays int) (int64, bool, error) {
+func claimAndCreateScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.SummarySchedule, now time.Time, maxWindowDays int) (int64, bool, error) {
 	if sched.NextRunAt == nil {
 		return 0, false, nil
 	}
@@ -216,7 +216,7 @@ func claimAndCreateScheduledTask(db *gorm.DB, sched model.SummarySchedule, now t
 
 		// Rebuild the three subtables (source / participant / personal_result) from
 		// the schedule config -- the new task_id starts with no children.
-		if err := buildScheduledTaskChildren(tx, lockedSched, newTask, now); err != nil {
+		if err := buildScheduledTaskChildren(tx, imDB, lockedSched, newTask, now); err != nil {
 			return err
 		}
 

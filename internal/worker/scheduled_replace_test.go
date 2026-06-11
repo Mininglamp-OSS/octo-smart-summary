@@ -166,3 +166,55 @@ func TestSyncScheduledTaskParticipants_AlwaysIncludesCreatorAndDedups(t *testing
 		t.Errorf("participant = %+v, want creator/accepted", parts[0])
 	}
 }
+
+// buildScheduledTaskSources must persist the source_name carried in the
+// schedule config verbatim (the fix for the dropped-name bug). It must NOT
+// degrade a config-provided real name into the fallback placeholder.
+func TestBuildScheduledTaskSources_UsesConfigSourceName(t *testing.T) {
+	db := newReplaceTestDB(t)
+	if err := db.AutoMigrate(&model.SummarySource{}); err != nil {
+		t.Fatalf("migrate source: %v", err)
+	}
+	taskID := seedProcessingTask(t, db)
+
+	// Config carries the real group name -> it must be stored as-is.
+	raw := model.JSON(`[{"source_type":1,"source_id":"group-abcdef123456","source_name":"真实群名(群聊)"}]`)
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		// imDB=nil on purpose: with a config name present the resolver must
+		// never be consulted, so nil is irrelevant here.
+		return buildScheduledTaskSources(tx, nil, taskID, raw)
+	}); err != nil {
+		t.Fatalf("build sources: %v", err)
+	}
+
+	var src model.SummarySource
+	db.Where("task_id = ?", taskID).First(&src)
+	if src.SourceName != "真实群名(群聊)" {
+		t.Errorf("source_name = %q, want config name %q", src.SourceName, "真实群名(群聊)")
+	}
+}
+
+// When the config has no source_name and no IM DB is available, the function
+// falls back to the placeholder name (documents the legacy degradation path so
+// the fallback contract is locked in).
+func TestBuildScheduledTaskSources_FallbackWhenNoNameAndNoIMDB(t *testing.T) {
+	db := newReplaceTestDB(t)
+	if err := db.AutoMigrate(&model.SummarySource{}); err != nil {
+		t.Fatalf("migrate source: %v", err)
+	}
+	taskID := seedProcessingTask(t, db)
+
+	raw := model.JSON(`[{"source_type":1,"source_id":"group-abcdef123456"}]`)
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		return buildScheduledTaskSources(tx, nil, taskID, raw)
+	}); err != nil {
+		t.Fatalf("build sources: %v", err)
+	}
+
+	var src model.SummarySource
+	db.Where("task_id = ?", taskID).First(&src)
+	want := "来源-group-ab(群聊)"
+	if src.SourceName != want {
+		t.Errorf("source_name = %q, want fallback %q", src.SourceName, want)
+	}
+}

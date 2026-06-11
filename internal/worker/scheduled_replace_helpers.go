@@ -25,8 +25,8 @@ type scheduleParticipantConfig struct {
 	UserName string `json:"user_name"`
 }
 
-func syncScheduledTaskConfig(tx *gorm.DB, sched model.SummarySchedule, task model.SummaryTask, now time.Time) error {
-	if err := syncScheduledTaskSources(tx, task.ID, sched.SourceConfig); err != nil {
+func syncScheduledTaskConfig(tx *gorm.DB, imDB *gorm.DB, sched model.SummarySchedule, task model.SummaryTask, now time.Time) error {
+	if err := syncScheduledTaskSources(tx, imDB, task.ID, sched.SourceConfig); err != nil {
 		return err
 	}
 	if err := syncScheduledTaskParticipants(tx, task, sched.ParticipantConfig, now); err != nil {
@@ -41,8 +41,8 @@ func syncScheduledTaskConfig(tx *gorm.DB, sched model.SummarySchedule, task mode
 // rebuilt from the schedule config (the source of truth). This is the same shape
 // as syncScheduledTaskConfig but assumes no pre-existing children (no deletes) and
 // always materializes the creator participant even when ParticipantConfig is empty.
-func buildScheduledTaskChildren(tx *gorm.DB, sched model.SummarySchedule, task model.SummaryTask, now time.Time) error {
-	if err := buildScheduledTaskSources(tx, task.ID, sched.SourceConfig); err != nil {
+func buildScheduledTaskChildren(tx *gorm.DB, imDB *gorm.DB, sched model.SummarySchedule, task model.SummaryTask, now time.Time) error {
+	if err := buildScheduledTaskSources(tx, imDB, task.ID, sched.SourceConfig); err != nil {
 		return err
 	}
 	if err := buildScheduledTaskParticipants(tx, task, sched.ParticipantConfig, now); err != nil {
@@ -51,7 +51,7 @@ func buildScheduledTaskChildren(tx *gorm.DB, sched model.SummarySchedule, task m
 	return nil
 }
 
-func buildScheduledTaskSources(tx *gorm.DB, taskID int64, raw model.JSON) error {
+func buildScheduledTaskSources(tx *gorm.DB, imDB *gorm.DB, taskID int64, raw model.JSON) error {
 	if len(raw) == 0 {
 		return nil
 	}
@@ -65,7 +65,7 @@ func buildScheduledTaskSources(tx *gorm.DB, taskID int64, raw model.JSON) error 
 		}
 		sourceName := src.SourceName
 		if sourceName == "" {
-			sourceName = service.ResolveSourceNameWithType(src.SourceID, src.SourceType, nil)
+			sourceName = service.ResolveSourceNameWithType(src.SourceID, src.SourceType, imDB)
 		}
 		if err := tx.Create(&model.SummarySource{
 			TaskID:     taskID,
@@ -140,7 +140,7 @@ func buildScheduledTaskParticipants(tx *gorm.DB, task model.SummaryTask, raw mod
 	return nil
 }
 
-func syncScheduledTaskSources(tx *gorm.DB, taskID int64, raw model.JSON) error {
+func syncScheduledTaskSources(tx *gorm.DB, imDB *gorm.DB, taskID int64, raw model.JSON) error {
 	if len(raw) == 0 {
 		return nil
 	}
@@ -158,7 +158,7 @@ func syncScheduledTaskSources(tx *gorm.DB, taskID int64, raw model.JSON) error {
 		}
 		sourceName := src.SourceName
 		if sourceName == "" {
-			sourceName = service.ResolveSourceNameWithType(src.SourceID, src.SourceType, nil)
+			sourceName = service.ResolveSourceNameWithType(src.SourceID, src.SourceType, imDB)
 		}
 		if err := tx.Create(&model.SummarySource{
 			TaskID:     taskID,
