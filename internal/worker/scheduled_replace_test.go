@@ -20,6 +20,7 @@ func newReplaceTestDB(t *testing.T) *gorm.DB {
 		&model.SummaryResult{},
 		&model.SummaryChunk{},
 		&model.SummaryParticipant{},
+		&model.SummarySource{},
 		&model.PersonalResult{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
@@ -119,6 +120,28 @@ func TestSaveLatestResult_ScheduledKeepsHandEditedResult(t *testing.T) {
 	db.Model(&model.SummaryResult{}).Where("task_id = ? AND edited_at IS NOT NULL", taskID).Count(&editedCount)
 	if editedCount != 1 {
 		t.Errorf("hand-edited result count = %d, want 1", editedCount)
+	}
+}
+
+func TestBuildScheduledTaskSources_PreservesConfiguredSourceName(t *testing.T) {
+	db := newReplaceTestDB(t)
+	raw := model.JSON(`[{"source_type":1,"source_id":"grp1____space1","source_name":"研发群(群聊)"}]`)
+
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		return buildScheduledTaskSources(tx, 42, raw)
+	}); err != nil {
+		t.Fatalf("build scheduled sources: %v", err)
+	}
+
+	var source model.SummarySource
+	if err := db.Where("task_id = ?", 42).First(&source).Error; err != nil {
+		t.Fatal(err)
+	}
+	if source.SourceName != "研发群(群聊)" {
+		t.Fatalf("source_name = %q, want %q", source.SourceName, "研发群(群聊)")
+	}
+	if source.SourceID != "grp1____space1" || source.SourceType != model.SourceGroup {
+		t.Fatalf("source = %+v, want group source grp1____space1", source)
 	}
 }
 
