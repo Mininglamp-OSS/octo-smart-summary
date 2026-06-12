@@ -189,7 +189,8 @@ func getPeerUID(channelID, selfUID string) string {
 }
 
 // NormalizeDMChannelID converts a logical DM channel id (peerUID or peer@self)
-// into the storage-layer format: max(uid1,uid2)@min(uid1,uid2).
+// into the storage-layer format: min(uid1,uid2)@max(uid1,uid2).
+// WuKongIM stores DM channel IDs with the lexicographically smaller UID first.
 // For non-DM channels (channelType != 1), returns input unchanged.
 func NormalizeDMChannelID(channelID string, selfUID string, channelType int) string {
 	if channelType != 1 {
@@ -203,7 +204,7 @@ func NormalizeDMChannelID(channelID string, selfUID string, channelType int) str
 		a = channelID
 		b = selfUID
 	}
-	if a < b {
+	if a > b {
 		a, b = b, a
 	}
 	return a + "@" + b
