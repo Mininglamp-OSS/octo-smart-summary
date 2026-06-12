@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"log"
 	"sort"
 	"strings"
@@ -189,7 +190,8 @@ func getPeerUID(channelID, selfUID string) string {
 }
 
 // NormalizeDMChannelID converts a logical DM channel id (peerUID or peer@self)
-// into the storage-layer format: max(uid1,uid2)@min(uid1,uid2).
+// into the storage-layer format used by WuKongIM: the UID whose CRC32 hash is
+// larger comes first.  This mirrors WuKongIM's GetFakeChannelIDWith algorithm.
 // For non-DM channels (channelType != 1), returns input unchanged.
 func NormalizeDMChannelID(channelID string, selfUID string, channelType int) string {
 	if channelType != 1 {
@@ -203,10 +205,12 @@ func NormalizeDMChannelID(channelID string, selfUID string, channelType int) str
 		a = channelID
 		b = selfUID
 	}
-	if a < b {
-		a, b = b, a
+	ha := crc32.ChecksumIEEE([]byte(a))
+	hb := crc32.ChecksumIEEE([]byte(b))
+	if ha > hb {
+		return a + "@" + b
 	}
-	return a + "@" + b
+	return b + "@" + a
 }
 
 // mapFrontendSourceType maps frontend source_type to backend channelType.
