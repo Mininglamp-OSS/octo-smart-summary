@@ -168,6 +168,80 @@ func TestCreateSchedule_BindsUnscheduledTask(t *testing.T) {
 	}
 }
 
+func TestCreateSchedule_PreservesSourceNameInConfig(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouter(db)
+	taskID := seedScheduleTask(t, db, "T1", "s1", "u1")
+
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID, "interval_days": 1, "run_time": "09:00",
+		"sources": []map[string]interface{}{
+			{"source_type": model.SourceGroup, "source_id": "grp1____s1", "source_name": "研发群(群聊)"},
+		},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 creating schedule, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var task model.SummaryTask
+	if err := db.First(&task, taskID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if task.ScheduleID == nil {
+		t.Fatal("task should be bound to a schedule after create")
+	}
+	assertScheduleSourceName(t, db, *task.ScheduleID, "研发群(群聊)")
+}
+
+func TestUpdateSchedule_PreservesSourceNameInConfig(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouter(db)
+	taskID := seedScheduleTask(t, db, "T1", "s1", "u1")
+
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID, "interval_days": 1, "run_time": "09:00",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create schedule: %d %s", w.Code, w.Body.String())
+	}
+	var task model.SummaryTask
+	if err := db.First(&task, taskID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if task.ScheduleID == nil {
+		t.Fatal("task should be bound to a schedule after create")
+	}
+
+	w = scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(*task.ScheduleID), map[string]interface{}{
+		"scope": "task", "task_id": taskID,
+		"sources": []map[string]interface{}{
+			{"source_type": model.SourceGroup, "source_id": "grp2____s1", "source_name": "产品群(群聊)"},
+		},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("update schedule: %d %s", w.Code, w.Body.String())
+	}
+	assertScheduleSourceName(t, db, *task.ScheduleID, "产品群(群聊)")
+}
+
+func assertScheduleSourceName(t *testing.T, db *gorm.DB, scheduleID int64, want string) {
+	t.Helper()
+	var sched model.SummarySchedule
+	if err := db.First(&sched, scheduleID).Error; err != nil {
+		t.Fatal(err)
+	}
+	var sources []sourceReq
+	if err := json.Unmarshal(sched.SourceConfig, &sources); err != nil {
+		t.Fatalf("unmarshal source_config: %v", err)
+	}
+	if len(sources) != 1 {
+		t.Fatalf("source_config entries = %d, want 1", len(sources))
+	}
+	if sources[0].SourceName != want {
+		t.Fatalf("source_name = %q, want %q; raw config: %s", sources[0].SourceName, want, string(sched.SourceConfig))
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Single-person invariant: scheduled summary rejects multi-person tasks.
 // ---------------------------------------------------------------------------
