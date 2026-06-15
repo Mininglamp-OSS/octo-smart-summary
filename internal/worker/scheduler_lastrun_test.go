@@ -229,9 +229,68 @@ func TestClaim_MultiPersonConfigDisablesSchedule(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// FEATURE_TEAM_SCHEDULE flag at claim time (merged from team_schedule_p0_test.go).
-// ---------------------------------------------------------------------------
+// 🔴 REGRESSION (finding 2): the V5 OBJECT-form participant_config
+// {"participants":[...],"confirm_gate_passed":...} must still be detected as
+// multi-person at claim time. The old scheduleConfigMultiPerson Unmarshal'd into a
+// bare array, FAILED on the object form, and returned false -> the
+// FEATURE_TEAM_SCHEDULE-off multi-person guard was silently bypassed (a CONFIRM
+// multi-person schedule was wrongly treated as single-person and kept running).
+func TestClaim_MultiPersonV5ObjectConfig_FlagOff_StillDisables(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	sched := seedDueSchedule(t, db, &old)
+	// V5 object form: creator u1 + u2 -> multi-person.
+	sched.ParticipantConfig = model.JSON(`{"participants":[{"user_id":"u1","confirmed":true},{"user_id":"u2","confirmed":true}],"confirm_gate_passed":true}`)
+	if err := db.Model(&model.SummarySchedule{}).Where("id = ?", sched.ID).
+		Update("participant_config", sched.ParticipantConfig).Error; err != nil {
+		t.Fatalf("set participant_config: %v", err)
+	}
+	seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
+
+	now := time.Now().UTC()
+	_, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30, false /* flag off */)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if !claimed {
+		t.Fatalf("expected claimed=true")
+	}
+	got := reloadSchedule(t, db, sched.ID)
+	if got.IsActive != 0 {
+		t.Errorf("V5 object-form multi-person config (flag off) must disable schedule, got is_active=%d", got.IsActive)
+	}
+	if got.LastRunAt == nil || !got.LastRunAt.Equal(old) {
+		t.Errorf("last_run_at must be preserved (no run produced), got %v want %v", got.LastRunAt, old)
+	}
+}
+
+// Counterpart: a V5 object-form config that is creator-only must NOT be treated
+// as multi-person (single-person scheduled runs continue under flag off).
+func TestClaim_CreatorOnlyV5ObjectConfig_FlagOff_NotDisabled(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	sched := seedDueSchedule(t, db, &old)
+	// V5 object form: only the creator u1.
+	sched.ParticipantConfig = model.JSON(`{"participants":[{"user_id":"u1","confirmed":true}],"confirm_gate_passed":true}`)
+	if err := db.Model(&model.SummarySchedule{}).Where("id = ?", sched.ID).
+		Update("participant_config", sched.ParticipantConfig).Error; err != nil {
+		t.Fatalf("set participant_config: %v", err)
+	}
+	seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
+
+	now := time.Now().UTC()
+	_, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30, false /* flag off */)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if !claimed {
+		t.Fatalf("expected claimed=true")
+	}
+	got := reloadSchedule(t, db, sched.ID)
+	if got.IsActive != 1 {
+		t.Errorf("creator-only V5 object config must NOT disable schedule, got is_active=%d", got.IsActive)
+	}
+}
 
 // With FEATURE_TEAM_SCHEDULE on, a multi-person schedule must NOT be disabled at
 // claim time; it must produce a brand-new task whose subtables include every
@@ -350,61 +409,164 @@ func TestClaim_AutoRequeue_AllParticipantsAccepted_DispatchSelectsAll(t *testing
 	}
 }
 
-// CONFIRM (confirm_policy=1) requeue path: only the creator is pre-Accepted; the
-// other configured participants must stay Pending awaiting human Accept, and AUTO
-// dispatch must NOT pick them up (it selects only the creator). This guards the
-// fix from over-reaching (it must NOT blindly Accept everyone under CONFIRM).
-func TestClaim_ConfirmRequeue_OnlyCreatorAccepted_DispatchSelectsCreatorOnly(t *testing.T) {
+// seedDueScheduleV5Confirm seeds a CONFIRM (confirm_policy=1) schedule with a V5
+// object-form participant_config where `confirmedUserIDs` are pre-confirmed and
+// every other configured user (plus the creator unless listed) is confirmed=false.
+// `allUserIDs` is the configured participant roster (excluding the implicit creator).
+func seedDueScheduleV5Confirm(t *testing.T, db *gorm.DB, lastRunAt *time.Time, allUserIDs []string, confirmedUserIDs ...string) model.SummarySchedule {
+	t.Helper()
+	sched := seedDueSchedule(t, db, lastRunAt) // creator is u1
+	confirmedSet := map[string]struct{}{}
+	for _, u := range confirmedUserIDs {
+		confirmedSet[u] = struct{}{}
+	}
+	cfg := model.ScheduleParticipantConfig{Participants: []model.ScheduleParticipantEntry{}}
+	add := func(uid string) {
+		_, c := confirmedSet[uid]
+		cfg.Participants = append(cfg.Participants, model.ScheduleParticipantEntry{UserID: uid, Confirmed: c})
+	}
+	add("u1") // creator always in roster (Q2)
+	for _, u := range allUserIDs {
+		if u == "u1" {
+			continue
+		}
+		add(u)
+	}
+	cfg.RecomputeGate("u1")
+	raw, err := cfg.Marshal()
+	if err != nil {
+		t.Fatalf("marshal v5 cfg: %v", err)
+	}
+	if err := db.Model(&model.SummarySchedule{}).Where("id = ?", sched.ID).
+		Updates(map[string]interface{}{"confirm_policy": model.SchedConfirmRequire, "participant_config": raw}).Error; err != nil {
+		t.Fatalf("set v5 cfg: %v", err)
+	}
+	return reloadSchedule(t, db, sched.ID)
+}
+
+// V5 §4.3/方案乙: a CONFIRM round materializes ONLY confirmed members (creator
+// included per Q2 — the creator is NOT auto-accepted). Here u1(creator)+u2 are
+// confirmed and u3 is not, so the round must build exactly 2 Accepted participants
+// (u1,u2) and skip u3 entirely (no participant, no personal_result).
+func TestClaim_ConfirmV5_PartialConfirm_OnlyConfirmedMaterialized(t *testing.T) {
 	db := newSchedulerTestDB(t)
 	old := time.Now().UTC().Add(-48 * time.Hour)
-	// CONFIRM (confirm_policy=1) + creator u1 + u2 + u3 configured.
-	sched := seedDueScheduleWithPolicy(t, db, &old, model.SchedConfirmRequire, "u2", "u3")
+	sched := seedDueScheduleV5Confirm(t, db, &old, []string{"u2", "u3"}, "u1", "u2")
 	seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
 
 	now := time.Now().UTC()
-	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30, true /* featureTeamSchedule */)
+	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30, true)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	if !claimed || taskID == 0 {
-		t.Fatalf("CONFIRM requeue should still create a task, got claimed=%v taskID=%d", claimed, taskID)
+		t.Fatalf("partial-confirm round should create a task, got claimed=%v taskID=%d", claimed, taskID)
 	}
 
-	var total, accepted, pending int64
+	var total, accepted int64
 	db.Model(&model.SummaryParticipant{}).Where("task_id = ?", taskID).Count(&total)
 	db.Model(&model.SummaryParticipant{}).
 		Where("task_id = ? AND status = ?", taskID, model.ParticipantAccepted).Count(&accepted)
-	db.Model(&model.SummaryParticipant{}).
-		Where("task_id = ? AND status = ?", taskID, model.ParticipantPending).Count(&pending)
-	if total != 3 {
-		t.Fatalf("want 3 participants, got %d", total)
+	if total != 2 || accepted != 2 {
+		t.Fatalf("V5 partial confirm: want 2 Accepted participants (u1,u2), got total=%d accepted=%d", total, accepted)
 	}
-	if accepted != 1 {
-		t.Errorf("CONFIRM requeue: only creator must be Accepted, got accepted=%d (want 1)", accepted)
+	// u3 (unconfirmed) must NOT exist this round (方案乙).
+	var u3 int64
+	db.Model(&model.SummaryParticipant{}).Where("task_id = ? AND user_id = ?", taskID, "u3").Count(&u3)
+	if u3 != 0 {
+		t.Errorf("unconfirmed u3 must not be materialized this round, got %d rows", u3)
 	}
-	if pending != 2 {
-		t.Errorf("CONFIRM requeue: non-creator participants must be Pending, got pending=%d (want 2)", pending)
+	// personal_result count must equal accepted (2), one per confirmed member.
+	var prs int64
+	db.Model(&model.PersonalResult{}).Where("task_id = ?", taskID).Count(&prs)
+	if prs != 2 {
+		t.Errorf("want 2 personal_result rows (one per confirmed), got %d", prs)
 	}
-
-	// The creator participant must be u1 and Accepted.
-	var creator model.SummaryParticipant
-	if err := db.Where("task_id = ? AND user_id = ?", taskID, "u1").First(&creator).Error; err != nil {
-		t.Fatalf("load creator participant: %v", err)
-	}
-	if creator.Status != model.ParticipantAccepted {
-		t.Errorf("creator must be Accepted under CONFIRM, got status=%d", creator.Status)
-	}
-
-	// AUTO dispatch (gated to AUTO) must select only the creator under CONFIRM:
-	// scheduledAutoDispatchTargets keys off ParticipantAccepted, so it returns just
-	// the one Accepted creator -- the non-creator Pending participants are NOT run
-	// until they confirm via the API.
+	// AUTO dispatch is gated to AUTO; CONFIRM uses the same Accepted selector via the
+	// processor path. The two Accepted members are the dispatch roster.
 	targets, err := scheduledAutoDispatchTargets(db, taskID)
 	if err != nil {
 		t.Fatalf("dispatch targets: %v", err)
 	}
-	if len(targets) != 1 {
-		t.Errorf("CONFIRM requeue: dispatch selector must pick only the Accepted creator, got %d: %v", len(targets), targets)
+	if len(targets) != 2 {
+		t.Errorf("V5 partial confirm: dispatch roster must be the 2 confirmed members, got %d: %v", len(targets), targets)
+	}
+}
+
+// V5 §4.3/Q2: when NOBODY (creator included) has confirmed, the whole round is
+// skipped — the freshly created task is Cancelled, no participants/personal_results
+// are built, and no result is produced. (creator is no longer auto-accepted.)
+func TestClaim_ConfirmV5_ZeroConfirmed_RoundSkipped(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	// u1(creator)+u2+u3 all unconfirmed.
+	sched := seedDueScheduleV5Confirm(t, db, &old, []string{"u2", "u3"} /* none confirmed */)
+	seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
+
+	now := time.Now().UTC()
+	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30, true)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	// The round is claimed (next_run_at advances) but produces no runnable task.
+	if !claimed {
+		t.Fatalf("zero-confirmed round should still claim (advance next_run), got claimed=%v", claimed)
+	}
+	if taskID != 0 {
+		t.Fatalf("zero-confirmed round must report taskID=0 (skipped), got %d", taskID)
+	}
+	// The created-then-cancelled task must have NO participants / personal_results.
+	var task model.SummaryTask
+	if err := db.Where("schedule_id = ?", sched.ID).Order("id DESC").First(&task).Error; err != nil {
+		t.Fatalf("load latest task: %v", err)
+	}
+	if task.Status != model.StatusCancelled {
+		t.Errorf("zero-confirmed round task must be Cancelled, got status=%d", task.Status)
+	}
+	var parts, prs int64
+	db.Model(&model.SummaryParticipant{}).Where("task_id = ?", task.ID).Count(&parts)
+	db.Model(&model.PersonalResult{}).Where("task_id = ?", task.ID).Count(&prs)
+	if parts != 0 || prs != 0 {
+		t.Errorf("zero-confirmed round must build no children, got participants=%d personal_results=%d", parts, prs)
+	}
+}
+
+// V5 §4.1: a fully-confirmed schedule (gate passed) runs every round WITHOUT any
+// re-confirmation — the confirm state is read straight off the schedule, so two
+// consecutive claims both materialize the full Accepted roster (一次性确认后多轮免确认).
+func TestClaim_ConfirmV5_AllConfirmed_MultiRoundNoReconfirm(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	old := time.Now().UTC().Add(-72 * time.Hour)
+	sched := seedDueScheduleV5Confirm(t, db, &old, []string{"u2"}, "u1", "u2") // all confirmed
+	seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
+
+	runRound := func(label string) int64 {
+		now := time.Now().UTC()
+		taskID, claimed, err := claimAndCreateScheduledTask(db, nil, reloadSchedule(t, db, sched.ID), now, 30, true)
+		if err != nil {
+			t.Fatalf("%s claim: %v", label, err)
+		}
+		if !claimed || taskID == 0 {
+			t.Fatalf("%s: all-confirmed round should create a task, got claimed=%v taskID=%d", label, claimed, taskID)
+		}
+		var accepted int64
+		db.Model(&model.SummaryParticipant{}).
+			Where("task_id = ? AND status = ?", taskID, model.ParticipantAccepted).Count(&accepted)
+		if accepted != 2 {
+			t.Errorf("%s: want 2 Accepted (u1,u2) without re-confirm, got %d", label, accepted)
+		}
+		// Mark the task terminal so the next round is not skipped by the overlap guard.
+		db.Model(&model.SummaryTask{}).Where("id = ?", taskID).Update("status", model.StatusCompleted)
+		// Force the schedule due again for the next round.
+		past := time.Now().UTC().Add(-48 * time.Hour)
+		db.Model(&model.SummarySchedule{}).Where("id = ?", sched.ID).Update("next_run_at", past)
+		return taskID
+	}
+
+	t1 := runRound("round1")
+	t2 := runRound("round2")
+	if t1 == t2 {
+		t.Fatalf("each round must create a distinct task, got %d twice", t1)
 	}
 }
 

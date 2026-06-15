@@ -382,6 +382,8 @@ func newScheduleTestRouterWithFlag(db *gorm.DB, featureTeamSchedule bool) *gin.E
 	r.POST("/api/v1/summary-schedules", sh.CreateSchedule)
 	r.PUT("/api/v1/summary-schedules/:id", sh.UpdateSchedule)
 	r.PUT("/api/v1/summary-schedules/:id/toggle", sh.ToggleSchedule)
+	r.POST("/api/v1/summary-schedules/:id/confirm", sh.ConfirmSchedule)
+	r.GET("/api/v1/summary-schedules/:id", sh.GetSchedule)
 	return r
 }
 
@@ -804,5 +806,329 @@ func TestAccept_TerminalPersonalResult_NotReset(t *testing.T) {
 		Where("task_id = ? AND participant_ref_id = ?", task.ID, part.ID).Count(&cnt)
 	if cnt != 1 {
 		t.Fatalf("personal_result count = %d, want 1", cnt)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// V5 one-time confirm (schedule-level) handler tests.
+// ---------------------------------------------------------------------------
+
+// loadV5Cfg reads a schedule's participant_config in the V5 normalized form.
+func loadV5Cfg(t *testing.T, db *gorm.DB, schedID int64) model.ScheduleParticipantConfig {
+	t.Helper()
+	var s model.SummarySchedule
+	if err := db.First(&s, schedID).Error; err != nil {
+		t.Fatalf("load schedule %d: %v", schedID, err)
+	}
+	return model.ParseScheduleParticipantConfig(s.ParticipantConfig)
+}
+
+// createV5ConfirmSchedule binds a multi-person task to a CONFIRM schedule (flag on)
+// and returns the schedule id. participant_config is persisted in V5 object form
+// with creator+others all confirmed=false.
+func createV5ConfirmSchedule(t *testing.T, db *gorm.DB, r *gin.Engine) int64 {
+	t.Helper()
+	taskID := seedScheduleTask(t, db, "TC", "s1", "u1")
+	db.Create(&model.SummaryParticipant{TaskID: taskID, UserID: "u2", UserName: "B"})
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID, "interval_days": 1, "run_time": "09:00",
+		"participants":   []map[string]interface{}{{"user_id": "u2", "user_name": "B"}},
+		"confirm_policy": 1,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create v5 confirm schedule: %d %s", w.Code, w.Body.String())
+	}
+	var sched model.SummarySchedule
+	if err := db.Where("creator_id = ?", "u1").First(&sched).Error; err != nil {
+		t.Fatalf("load schedule: %v", err)
+	}
+	return sched.ID
+}
+
+// V5 item 6: confirm_policy=1 multi-person create persists V5 object-form config
+// with creator(u1)+u2 both confirmed=false and gate not passed.
+func TestCreateSchedule_V5_ConfirmPolicyPersistsObjectForm(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouterWithFlag(db, true)
+	schedID := createV5ConfirmSchedule(t, db, r)
+
+	var sched model.SummarySchedule
+	db.First(&sched, schedID)
+	if sched.ConfirmPolicy != model.SchedConfirmRequire {
+		t.Fatalf("confirm_policy not persisted, got %d", sched.ConfirmPolicy)
+	}
+	cfg := model.ParseScheduleParticipantConfig(sched.ParticipantConfig)
+	if cfg.FindParticipant("u1") == nil || cfg.FindParticipant("u2") == nil {
+		t.Fatalf("creator+u2 must be in roster, got %+v", cfg.Participants)
+	}
+	if cfg.IsConfirmed("u1") || cfg.IsConfirmed("u2") {
+		t.Errorf("nobody should be confirmed at create, got %+v", cfg.Participants)
+	}
+	if cfg.ConfirmGatePassed {
+		t.Errorf("gate must be false at create")
+	}
+}
+
+// V5 item 4: ConfirmSchedule writes confirmed=true for the caller; gate passes
+// only after EVERY roster member (creator included, Q2) confirms.
+func TestConfirmSchedule_OneTime_GateAfterAll(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouterWithFlag(db, true)
+	schedID := createV5ConfirmSchedule(t, db, r)
+
+	// u2 confirms first -> u2 confirmed, gate still false (creator not yet).
+	w := scheduleReq(t, r, "u2", "s1", http.MethodPost, "/api/v1/summary-schedules/"+sid(schedID)+"/confirm", map[string]interface{}{})
+	if w.Code != http.StatusOK {
+		t.Fatalf("u2 confirm: %d %s", w.Code, w.Body.String())
+	}
+	cfg := loadV5Cfg(t, db, schedID)
+	if !cfg.IsConfirmed("u2") || cfg.IsConfirmed("u1") {
+		t.Fatalf("after u2 confirm: u2 true, u1 false; got %+v", cfg.Participants)
+	}
+	if cfg.ConfirmGatePassed {
+		t.Errorf("gate must NOT pass until creator confirms (Q2)")
+	}
+
+	// creator confirms -> gate passes.
+	w2 := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules/"+sid(schedID)+"/confirm", map[string]interface{}{})
+	if w2.Code != http.StatusOK {
+		t.Fatalf("u1 confirm: %d %s", w2.Code, w2.Body.String())
+	}
+	cfg = loadV5Cfg(t, db, schedID)
+	if !cfg.ConfirmGatePassed {
+		t.Fatalf("gate must pass after all confirmed, got %+v", cfg)
+	}
+
+	// Idempotent re-confirm.
+	w3 := scheduleReq(t, r, "u2", "s1", http.MethodPost, "/api/v1/summary-schedules/"+sid(schedID)+"/confirm", map[string]interface{}{})
+	if w3.Code != http.StatusOK {
+		t.Fatalf("idempotent re-confirm: %d %s", w3.Code, w3.Body.String())
+	}
+}
+
+// V5 item 4: a non-roster user cannot confirm.
+func TestConfirmSchedule_NonMemberRejected(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouterWithFlag(db, true)
+	schedID := createV5ConfirmSchedule(t, db, r)
+
+	w := scheduleReq(t, r, "stranger", "s1", http.MethodPost, "/api/v1/summary-schedules/"+sid(schedID)+"/confirm", map[string]interface{}{})
+	if w.Code == http.StatusOK {
+		t.Fatalf("non-member confirm must be rejected, got 200")
+	}
+}
+
+// createAutoMultiSchedule binds a multi-person AUTO schedule (confirm_policy=0,
+// flag on) with creator u1 + u2 and returns its id. AUTO schedules have no
+// confirm step, but membership must still be enforced on the confirm endpoint.
+func createAutoMultiSchedule(t *testing.T, db *gorm.DB, r *gin.Engine) int64 {
+	t.Helper()
+	taskID := seedScheduleTask(t, db, "TA", "s1", "u1")
+	db.Create(&model.SummaryParticipant{TaskID: taskID, UserID: "u2", UserName: "B"})
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID, "interval_days": 1, "run_time": "09:00",
+		"participants":   []map[string]interface{}{{"user_id": "u2", "user_name": "B"}},
+		"confirm_policy": 0,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create auto multi schedule: %d %s", w.Code, w.Body.String())
+	}
+	var sched model.SummarySchedule
+	if err := db.Where("creator_id = ?", "u1").First(&sched).Error; err != nil {
+		t.Fatalf("load schedule: %v", err)
+	}
+	return sched.ID
+}
+
+// 🟠 REGRESSION (finding 4): ConfirmSchedule on an AUTO schedule previously
+// returned 200 BEFORE any membership check, so a non-member could call confirm on
+// an AUTO schedule and get a success. Membership must now be enforced ahead of the
+// AUTO fast-path: a non-member gets a 4xx (not 200).
+func TestConfirmSchedule_AUTO_NonMemberRejected(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouterWithFlag(db, true)
+	schedID := createAutoMultiSchedule(t, db, r)
+
+	// Sanity: it is an AUTO schedule.
+	var sched model.SummarySchedule
+	db.First(&sched, schedID)
+	if sched.ConfirmPolicy != model.SchedConfirmAuto {
+		t.Fatalf("expected AUTO schedule, got confirm_policy=%d", sched.ConfirmPolicy)
+	}
+
+	w := scheduleReq(t, r, "stranger", "s1", http.MethodPost, "/api/v1/summary-schedules/"+sid(schedID)+"/confirm", map[string]interface{}{})
+	if w.Code == http.StatusOK {
+		t.Fatalf("non-member confirm on AUTO schedule must be rejected, got 200: %s", w.Body.String())
+	}
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("non-member AUTO confirm want 403, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// Counterpart: a roster MEMBER confirming an AUTO schedule still succeeds (no-op
+// success) — the membership check must not break the legitimate AUTO path.
+func TestConfirmSchedule_AUTO_MemberStillSucceeds(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouterWithFlag(db, true)
+	schedID := createAutoMultiSchedule(t, db, r)
+
+	for _, uid := range []string{"u1", "u2"} {
+		w := scheduleReq(t, r, uid, "s1", http.MethodPost, "/api/v1/summary-schedules/"+sid(schedID)+"/confirm", map[string]interface{}{})
+		if w.Code != http.StatusOK {
+			t.Fatalf("member %s confirm on AUTO schedule must succeed, got %d: %s", uid, w.Code, w.Body.String())
+		}
+	}
+}
+
+// V5 item 5 / Q3: a member change (participant_config update) keeps existing
+// members' confirm state and only resets NEW members; the gate is recomputed.
+func TestUpdateSchedule_V5_MemberChange_OnlyNewReconfirm(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouterWithFlag(db, true)
+	schedID := createV5ConfirmSchedule(t, db, r)
+
+	// Fully confirm (u2 then u1) so gate passes.
+	scheduleReq(t, r, "u2", "s1", http.MethodPost, "/api/v1/summary-schedules/"+sid(schedID)+"/confirm", map[string]interface{}{})
+	scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules/"+sid(schedID)+"/confirm", map[string]interface{}{})
+	if !loadV5Cfg(t, db, schedID).ConfirmGatePassed {
+		t.Fatalf("precondition: gate must be passed")
+	}
+
+	// Add a new member u3 (keep u2). Q3: u2 stays confirmed, u3 is new -> false,
+	// gate drops.
+	wu := scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(schedID), map[string]interface{}{
+		"participants": []map[string]interface{}{
+			{"user_id": "u2", "user_name": "B"},
+			{"user_id": "u3", "user_name": "C"},
+		},
+	})
+	if wu.Code != http.StatusOK {
+		t.Fatalf("member-change update: %d %s", wu.Code, wu.Body.String())
+	}
+	cfg := loadV5Cfg(t, db, schedID)
+	if !cfg.IsConfirmed("u2") {
+		t.Errorf("Q3: existing member u2 must KEEP its confirm state")
+	}
+	if !cfg.IsConfirmed("u1") {
+		t.Errorf("Q3: creator (unchanged) must keep confirm state")
+	}
+	if cfg.IsConfirmed("u3") {
+		t.Errorf("Q3: newly added u3 must start unconfirmed")
+	}
+	if cfg.ConfirmGatePassed {
+		t.Errorf("gate must drop when a new unconfirmed member is added")
+	}
+}
+
+// V5 item 5 / §4.2: converting an AUTO schedule to CONFIRM (policy change) triggers
+// a FULL re-confirm — every member (creator included) is reset to unconfirmed.
+func TestUpdateSchedule_V5_AutoToConfirm_FullReconfirm(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouterWithFlag(db, true)
+
+	// Create an AUTO multi-person schedule (confirm_policy=0 explicit).
+	taskID := seedScheduleTask(t, db, "TA", "s1", "u1")
+	db.Create(&model.SummaryParticipant{TaskID: taskID, UserID: "u2", UserName: "B"})
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID, "interval_days": 1, "run_time": "09:00",
+		"participants":   []map[string]interface{}{{"user_id": "u2", "user_name": "B"}},
+		"confirm_policy": 0,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create auto schedule: %d %s", w.Code, w.Body.String())
+	}
+	var sched model.SummarySchedule
+	db.Where("creator_id = ?", "u1").First(&sched)
+	if sched.ConfirmPolicy != model.SchedConfirmAuto {
+		t.Fatalf("precondition: AUTO, got %d", sched.ConfirmPolicy)
+	}
+
+	// Convert to CONFIRM.
+	wu := scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(sched.ID), map[string]interface{}{
+		"confirm_policy": 1,
+	})
+	if wu.Code != http.StatusOK {
+		t.Fatalf("auto->confirm update: %d %s", wu.Code, wu.Body.String())
+	}
+	var got model.SummarySchedule
+	db.First(&got, sched.ID)
+	if got.ConfirmPolicy != model.SchedConfirmRequire {
+		t.Fatalf("confirm_policy must be CONFIRM after conversion, got %d", got.ConfirmPolicy)
+	}
+	cfg := model.ParseScheduleParticipantConfig(got.ParticipantConfig)
+	if cfg.FindParticipant("u1") == nil || cfg.FindParticipant("u2") == nil {
+		t.Fatalf("roster must contain creator+u2, got %+v", cfg.Participants)
+	}
+	if cfg.IsConfirmed("u1") || cfg.IsConfirmed("u2") {
+		t.Errorf("§4.2: auto->confirm must reset ALL members to unconfirmed, got %+v", cfg.Participants)
+	}
+	if cfg.ConfirmGatePassed {
+		t.Errorf("gate must be false after full re-confirm reset")
+	}
+}
+
+// V5 §4.2: re-activating a CONFIRM schedule (is_active 0->1 via toggle) triggers a
+// full re-confirm of all members.
+func TestToggleSchedule_V5_Reactivate_FullReconfirm(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouterWithFlag(db, true)
+	schedID := createV5ConfirmSchedule(t, db, r)
+
+	// Confirm everyone so gate passes.
+	scheduleReq(t, r, "u2", "s1", http.MethodPost, "/api/v1/summary-schedules/"+sid(schedID)+"/confirm", map[string]interface{}{})
+	scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules/"+sid(schedID)+"/confirm", map[string]interface{}{})
+	if !loadV5Cfg(t, db, schedID).ConfirmGatePassed {
+		t.Fatalf("precondition: gate passed")
+	}
+
+	// Deactivate then re-activate.
+	scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(schedID)+"/toggle", map[string]interface{}{"is_active": false})
+	wt := scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(schedID)+"/toggle", map[string]interface{}{"is_active": true})
+	if wt.Code != http.StatusOK {
+		t.Fatalf("re-activate: %d %s", wt.Code, wt.Body.String())
+	}
+	cfg := loadV5Cfg(t, db, schedID)
+	if cfg.IsConfirmed("u1") || cfg.IsConfirmed("u2") {
+		t.Errorf("§4.2: re-activation must reset all confirm state, got %+v", cfg.Participants)
+	}
+	if cfg.ConfirmGatePassed {
+		t.Errorf("gate must drop after re-activation reset")
+	}
+}
+
+// 🟠 REGRESSION (finding 3): storedParticipantConfigSubsetOfCreator /
+// validateEffectiveParticipantsSubsetOfCreator must normalize the V5 object-form
+// participant_config. Previously the bare-array Unmarshal failed on the object
+// form and the function fell into the fail-closed (unsafe) path, wrongly
+// rejecting Update/Toggle of a CREATOR-ONLY V5 schedule when
+// FEATURE_TEAM_SCHEDULE is off.
+func TestStoredParticipantConfigSubsetOfCreator_V5ObjectForm(t *testing.T) {
+	creator := "u1"
+
+	// Creator-only V5 object form -> subset of {creator} -> PASS (true).
+	creatorOnly := model.JSON(`{"participants":[{"user_id":"u1","confirmed":false}],"confirm_gate_passed":false}`)
+	if !storedParticipantConfigSubsetOfCreator(creatorOnly, creator) {
+		t.Fatalf("creator-only V5 object config must be a subset of {creator} (not fail-closed)")
+	}
+
+	// Multi-person V5 object form -> NOT a subset -> false.
+	multi := model.JSON(`{"participants":[{"user_id":"u1"},{"user_id":"u2"}],"confirm_gate_passed":false}`)
+	if storedParticipantConfigSubsetOfCreator(multi, creator) {
+		t.Fatalf("multi-person V5 object config must NOT be a subset of {creator}")
+	}
+
+	// Empty config -> subset (PASS).
+	if !storedParticipantConfigSubsetOfCreator(model.JSON(``), creator) {
+		t.Fatalf("empty config must be a subset of {creator}")
+	}
+
+	// validateEffectiveParticipantsSubsetOfCreator (flag off, req nil -> uses
+	// stored config): creator-only object form must NOT error.
+	if err := validateEffectiveParticipantsSubsetOfCreator(false, nil, creatorOnly, creator); err != nil {
+		t.Fatalf("creator-only V5 object config must pass the subset guard (flag off), got %v", err)
+	}
+	// multi-person stored config must error.
+	if err := validateEffectiveParticipantsSubsetOfCreator(false, nil, multi, creator); err == nil {
+		t.Fatalf("multi-person V5 object config must be rejected by the subset guard (flag off)")
 	}
 }

@@ -64,6 +64,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		v1.PUT("/summary-schedules/:id", schedH.UpdateSchedule)
 		v1.DELETE("/summary-schedules/:id", schedH.DeleteSchedule)
 		v1.PUT("/summary-schedules/:id/toggle", schedH.ToggleSchedule)
+		v1.POST("/summary-schedules/:id/confirm", schedH.ConfirmSchedule)
 	}
 
 	// P2 routes: strict auth required

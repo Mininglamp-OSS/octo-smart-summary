@@ -41,14 +41,16 @@ func syncScheduledTaskConfig(tx *gorm.DB, imDB *gorm.DB, sched model.SummarySche
 // rebuilt from the schedule config (the source of truth). This is the same shape
 // as syncScheduledTaskConfig but assumes no pre-existing children (no deletes) and
 // always materializes the creator participant even when ParticipantConfig is empty.
-func buildScheduledTaskChildren(tx *gorm.DB, imDB *gorm.DB, sched model.SummarySchedule, task model.SummaryTask, now time.Time) error {
+//
+// Returns the number of Accepted participants materialized. For a V5 CONFIRM
+// schedule this is the count of already-confirmed members this round; 0 means the
+// whole round must be skipped (nobody confirmed, including the creator — §4.3/Q2),
+// and the caller terminates the task without producing a result.
+func buildScheduledTaskChildren(tx *gorm.DB, imDB *gorm.DB, sched model.SummarySchedule, task model.SummaryTask, now time.Time) (int, error) {
 	if err := buildScheduledTaskSources(tx, imDB, task.ID, sched.SourceConfig); err != nil {
-		return err
+		return 0, err
 	}
-	if err := buildScheduledTaskParticipants(tx, task, sched.ParticipantConfig, sched.ConfirmPolicy, now); err != nil {
-		return err
-	}
-	return nil
+	return buildScheduledTaskParticipants(tx, task, sched.ParticipantConfig, sched.ConfirmPolicy, now)
 }
 
 func buildScheduledTaskSources(tx *gorm.DB, imDB *gorm.DB, taskID int64, raw model.JSON) error {
@@ -80,100 +82,129 @@ func buildScheduledTaskSources(tx *gorm.DB, imDB *gorm.DB, taskID int64, raw mod
 }
 
 // buildScheduledTaskParticipants materializes the participant + personal_result
-// rows for a freshly INSERTed scheduled task. The initial participant status is
-// driven by the schedule's confirm_policy so the two run modes stay consistent:
+// rows for a freshly INSERTed scheduled task. Behaviour is driven by the
+// schedule's confirm_policy:
 //
 //   - AUTO (confirm_policy==SchedConfirmAuto): every participant (creator AND
 //     configured others) is pre-Accepted with ConfirmedAt set. There is no human
-//     confirmation step, so the AUTO dispatch path (scheduledAutoDispatchTargets,
-//     which selects status==Accepted && worker_status==Pending) can pick up the
-//     whole roster and actually run it. This was the real bug: a non-AUTO-aware
-//     build that left non-creator participants in a non-Accepted state silently
-//     made AUTO dispatch select nobody, so a scheduled multi-person AUTO run never
-//     produced any personal_result.
-//   - CONFIRM (confirm_policy==SchedConfirmRequire, and any other non-AUTO policy
-//     this version): only the creator is pre-Accepted; configured others start
-//     ParticipantPending and must individually Accept via the API before they run.
-//     AUTO dispatch deliberately does NOT pick them up (it is gated to AUTO only),
-//     preserving the human-confirmation semantics.
+//     confirmation step, so the AUTO dispatch path picks up the whole roster.
+//     (Unchanged from the pre-V5 single-person fix.)
 //
-// The creator is ALWAYS Accepted regardless of policy (the creator implicitly
-// confirms by owning the schedule), matching bootstrapCreatorParticipant and the
-// manual-task creator-direct-start behavior.
-func buildScheduledTaskParticipants(tx *gorm.DB, task model.SummaryTask, raw model.JSON, confirmPolicy int, now time.Time) error {
-	var participants []scheduleParticipantConfig
-	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &participants); err != nil {
-			return service.NewBizError(40000, "定时参与者配置无效", http.StatusBadRequest)
-		}
-	}
-
-	// AUTO pre-accepts the whole roster; non-AUTO (CONFIRM) leaves non-creator
-	// participants Pending for human confirmation. Default-to-CONFIRM on any
-	// unknown policy is the safe side (don't auto-run un-confirmed people).
+//   - CONFIRM (V5 one-time / schedule-level confirm, any non-AUTO policy): the
+//     schedule's participant_config carries an embedded confirm state per member
+//     (model.ParseScheduleParticipantConfig). This round materializes ONLY members
+//     that have already confirmed (creator included — Q2: the creator is NOT
+//     auto-accepted anymore, it must confirm too) as Accepted + personal_result
+//     (方案乙). Un-confirmed members (including an un-confirmed creator) are NOT
+//     materialized this round: no participant row, no personal_result, no PR, no
+//     dispatch, not counted in meta. If ZERO members are confirmed (creator
+//     included) the whole round is skipped — no children are built and the caller
+//     terminates the task without producing a result (§4.3 / Q2).
+//
+// Returns the number of Accepted participants actually materialized so the caller
+// can detect a zero-confirmed CONFIRM round and skip it.
+func buildScheduledTaskParticipants(tx *gorm.DB, task model.SummaryTask, raw model.JSON, confirmPolicy int, now time.Time) (int, error) {
 	autoAccept := confirmPolicy == model.SchedConfirmAuto
 
-	desired := make([]scheduleParticipantConfig, 0, len(participants)+1)
-	seen := make(map[string]struct{}, len(participants)+1)
-	appendUser := func(userID, userName string) {
-		if userID == "" {
-			return
-		}
-		if _, ok := seen[userID]; ok {
-			return
-		}
-		seen[userID] = struct{}{}
-		if userName == "" {
-			userName = service.ResolveUserName(userID)
-		}
-		desired = append(desired, scheduleParticipantConfig{UserID: userID, UserName: userName})
+	if autoAccept {
+		return buildScheduledTaskParticipantsAuto(tx, task, raw, now)
 	}
+	return buildScheduledTaskParticipantsConfirm(tx, task, raw, now)
+}
 
-	// Always materialize the creator participant, even with empty ParticipantConfig:
-	// a scheduled (single-person) task must have its creator as a participant or the
-	// personal worker has nothing to run.
-	appendUser(task.CreatorID, "")
-	for _, participant := range participants {
-		appendUser(participant.UserID, participant.UserName)
-	}
+// buildScheduledTaskParticipantsAuto pre-accepts the whole roster (creator +
+// configured others). The participant_config may be in the legacy bare-array
+// shape or the V5 object shape; both normalize through
+// model.ParseScheduleParticipantConfig.
+func buildScheduledTaskParticipantsAuto(tx *gorm.DB, task model.SummaryTask, raw model.JSON, now time.Time) (int, error) {
+	cfg := model.ParseScheduleParticipantConfig(raw)
+	roster := cfg.EffectiveUserIDs(task.CreatorID) // creator always included
+	nameOf := buildParticipantNameLookup(cfg)
 
-	for _, participant := range desired {
-		// Creator is always Accepted; others follow confirm_policy.
-		isCreator := participant.UserID == task.CreatorID
-		status := model.ParticipantAccepted
-		var confirmedAt *time.Time = &now
-		if !isCreator && !autoAccept {
-			// CONFIRM policy, non-creator: stays Pending until the participant
-			// Accepts via the API. No ConfirmedAt yet.
-			status = model.ParticipantPending
-			confirmedAt = nil
+	count := 0
+	for _, uid := range roster {
+		if err := materializeAcceptedParticipant(tx, task, uid, nameOf(uid), now); err != nil {
+			return count, err
 		}
-		row := model.SummaryParticipant{
-			TaskID:      task.ID,
-			UserID:      participant.UserID,
-			UserName:    participant.UserName,
-			Status:      status,
-			ConfirmedAt: confirmedAt,
+		count++
+	}
+	return count, nil
+}
+
+// buildScheduledTaskParticipantsConfirm implements the V5 CONFIRM 方案乙 dispatch:
+// only already-confirmed members (creator included) are materialized as Accepted
+// this round; un-confirmed members are skipped entirely.
+func buildScheduledTaskParticipantsConfirm(tx *gorm.DB, task model.SummaryTask, raw model.JSON, now time.Time) (int, error) {
+	cfg := model.ParseScheduleParticipantConfig(raw)
+	// Make sure the creator is part of the confirm roster (Q2). EnsureCreatorEntry
+	// only mutates the in-memory copy; the persisted schedule config is the source
+	// of truth and is reset/updated via the confirm API / UpdateSchedule.
+	cfg.EnsureCreatorEntry(task.CreatorID)
+	nameOf := buildParticipantNameLookup(cfg)
+
+	count := 0
+	for _, uid := range cfg.EffectiveUserIDs(task.CreatorID) {
+		if !cfg.IsConfirmed(uid) {
+			// 方案乙: un-confirmed member (incl. un-confirmed creator) is NOT part of
+			// this round — no participant, no personal_result, no dispatch, no meta.
+			continue
 		}
-		if err := tx.Create(&row).Error; err != nil {
-			return err
+		if err := materializeAcceptedParticipant(tx, task, uid, nameOf(uid), now); err != nil {
+			return count, err
 		}
-		pr := model.PersonalResult{
-			TaskID:           task.ID,
-			ParticipantRefID: row.ID,
-			UserID:           participant.UserID,
-			WorkerStatus:     model.PersonalStatusPending,
-			CreatedAt:        now,
-			UpdatedAt:        now,
-		}
-		if err := tx.Create(&pr).Error; err != nil {
-			return err
-		}
-		if err := tx.Model(&row).Update("personal_result_id", pr.ID).Error; err != nil {
-			return err
+		count++
+	}
+	// count==0 (§4.3 / Q2): nobody confirmed (creator included) — the caller skips
+	// the whole round (terminates the task without a result).
+	return count, nil
+}
+
+// buildParticipantNameLookup returns a resolver that prefers the config-supplied
+// user_name and falls back to service.ResolveUserName.
+func buildParticipantNameLookup(cfg model.ScheduleParticipantConfig) func(string) string {
+	names := make(map[string]string, len(cfg.Participants))
+	for _, p := range cfg.Participants {
+		if p.UserName != "" {
+			names[p.UserID] = p.UserName
 		}
 	}
-	return nil
+	return func(uid string) string {
+		if n, ok := names[uid]; ok && n != "" {
+			return n
+		}
+		return service.ResolveUserName(uid)
+	}
+}
+
+// materializeAcceptedParticipant creates one Accepted participant + its pending
+// personal_result and back-links personal_result_id (the shared shape used by
+// both the AUTO and CONFIRM build paths).
+func materializeAcceptedParticipant(tx *gorm.DB, task model.SummaryTask, userID, userName string, now time.Time) error {
+	if userID == "" {
+		return nil
+	}
+	row := model.SummaryParticipant{
+		TaskID:      task.ID,
+		UserID:      userID,
+		UserName:    userName,
+		Status:      model.ParticipantAccepted,
+		ConfirmedAt: &now,
+	}
+	if err := tx.Create(&row).Error; err != nil {
+		return err
+	}
+	pr := model.PersonalResult{
+		TaskID:           task.ID,
+		ParticipantRefID: row.ID,
+		UserID:           userID,
+		WorkerStatus:     model.PersonalStatusPending,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	if err := tx.Create(&pr).Error; err != nil {
+		return err
+	}
+	return tx.Model(&row).Update("personal_result_id", pr.ID).Error
 }
 
 func syncScheduledTaskSources(tx *gorm.DB, imDB *gorm.DB, taskID int64, raw model.JSON) error {
@@ -213,33 +244,25 @@ func syncScheduledTaskParticipants(tx *gorm.DB, task model.SummaryTask, raw mode
 		return nil
 	}
 
-	var participants []scheduleParticipantConfig
-	if err := json.Unmarshal(raw, &participants); err != nil {
-		return service.NewBizError(40000, "定时参与者配置无效", http.StatusBadRequest)
-	}
+	// V5 §3.1: participant_config is the object form
+	// {"participants":[...],"confirm_gate_passed":...}. Normalize through the single
+	// parser so the V5 object form (and every legacy array shape) is handled; the
+	// old bare-array Unmarshal failed on the V5 object form and returned a
+	// "定时参与者配置无效" error for any V5 schedule.
+	cfg := model.ParseScheduleParticipantConfig(raw)
+	roster := cfg.EffectiveUserIDs(task.CreatorID) // creator always included, deduped
+	nameOf := buildParticipantNameLookup(cfg)
 
-	desired := make([]scheduleParticipantConfig, 0, len(participants)+1)
-	seen := make(map[string]struct{}, len(participants)+1)
-	appendUser := func(userID, userName string) {
-		if userID == "" {
-			return
-		}
-		if _, ok := seen[userID]; ok {
-			return
-		}
-		seen[userID] = struct{}{}
-		if userName == "" {
-			userName = service.ResolveUserName(userID)
+	desired := make([]scheduleParticipantConfig, 0, len(roster))
+	for _, uid := range roster {
+		name := nameOf(uid)
+		if name == "" {
+			name = service.ResolveUserName(uid)
 		}
 		desired = append(desired, scheduleParticipantConfig{
-			UserID:   userID,
-			UserName: userName,
+			UserID:   uid,
+			UserName: name,
 		})
-	}
-
-	appendUser(task.CreatorID, "")
-	for _, participant := range participants {
-		appendUser(participant.UserID, participant.UserName)
 	}
 
 	if err := tx.Where("task_id = ?", task.ID).Delete(&model.PersonalResult{}).Error; err != nil {

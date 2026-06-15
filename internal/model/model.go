@@ -208,10 +208,19 @@ type ContextMsg struct {
 }
 
 // TeamCitation represents a [Pn] reference in a team summary pointing to a participant.
+//
+// PersonalResultID / TaskID are V5 §6.2 convenience fields: they let the frontend
+// jump straight from a [Pn] badge to the author's single-person report without an
+// extra lookup. They are OPTIONAL (Q4: the frontend can also match by user_id in
+// the members list). team_citations_json is mediumtext, so adding these fields is
+// backward compatible — no DDL. omitempty keeps old rows (and the user_id-only
+// match path) working unchanged.
 type TeamCitation struct {
-	Index    int    `json:"index"`
-	UserID   string `json:"user_id"`
-	UserName string `json:"user_name"`
+	Index            int    `json:"index"`
+	UserID           string `json:"user_id"`
+	UserName         string `json:"user_name"`
+	PersonalResultID int64  `json:"personal_result_id,omitempty"`
+	TaskID           int64  `json:"task_id,omitempty"`
 }
 
 // SummaryResult represents the final summary output.

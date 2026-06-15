@@ -466,3 +466,23 @@ func TestTruncateRunes(t *testing.T) {
 		t.Errorf("short text should not be truncated")
 	}
 }
+
+// V5 §6.2 / item 7: extractTeamCitations must carry the optional convenience
+// fields personal_result_id and task_id so the frontend can jump straight to the
+// author's single-person report.
+func TestExtractTeamCitations_CarriesPersonalResultAndTaskID(t *testing.T) {
+	indexed := []indexedParticipant{
+		{Index: 1, UserID: "u1", Name: "A", PersonalResultID: 101, TaskID: 9},
+		{Index: 2, UserID: "u2", Name: "B", PersonalResultID: 202, TaskID: 9},
+	}
+	got := extractTeamCitations("blah [P1] and [P2] done", indexed)
+	if len(got) != 2 {
+		t.Fatalf("want 2 team citations, got %d", len(got))
+	}
+	if got[0].PersonalResultID != 101 || got[0].TaskID != 9 {
+		t.Errorf("P1 missing convenience fields: %+v", got[0])
+	}
+	if got[1].PersonalResultID != 202 || got[1].TaskID != 9 {
+		t.Errorf("P2 missing convenience fields: %+v", got[1])
+	}
+}

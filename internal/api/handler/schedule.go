@@ -50,8 +50,13 @@ type createScheduleReq struct {
 	TimeRangeType  int              `json:"time_range_type"`
 	Sources        []sourceReq      `json:"sources"`
 	Participants   []participantReq `json:"participants"`
-	Scope          string           `json:"scope,omitempty"`
-	TaskID         *int64           `json:"task_id,omitempty"`
+	// ConfirmPolicy: 0=AUTO (no confirm), 1=CONFIRM (V5 one-time schedule-level
+	// confirm). Pointer so "not sent" is distinguishable from an explicit 0; the
+	// handler defaults multi-person schedules to CONFIRM. confirm_lead_minutes is
+	// intentionally NOT accepted (deprecated under V5 — one-time confirm has no lead).
+	ConfirmPolicy *int   `json:"confirm_policy"`
+	Scope         string `json:"scope,omitempty"`
+	TaskID        *int64 `json:"task_id,omitempty"`
 }
 
 type updateScheduleReq struct {
@@ -65,6 +70,7 @@ type updateScheduleReq struct {
 	TimeRangeType  *int             `json:"time_range_type"`
 	Sources        []sourceReq      `json:"sources,omitempty"`
 	Participants   []participantReq `json:"participants,omitempty"`
+	ConfirmPolicy  *int             `json:"confirm_policy"`
 	Scope          string           `json:"scope,omitempty"`
 	TaskID         *int64           `json:"task_id,omitempty"`
 }
@@ -144,6 +150,88 @@ func participantsSubsetOfCreator(reqParticipants []participantReq, creatorID str
 	return true
 }
 
+// resolveCreateConfirmPolicy resolves the V5 confirm_policy for CreateSchedule.
+// An explicit request value wins (clamped to known constants). Otherwise a
+// multi-person schedule (any configured participant other than the creator)
+// defaults to CONFIRM (1) and a single-person schedule defaults to AUTO (0).
+func resolveCreateConfirmPolicy(reqPolicy *int, participants []participantReq, creatorID string) int {
+	if reqPolicy != nil {
+		if *reqPolicy == model.SchedConfirmAuto {
+			return model.SchedConfirmAuto
+		}
+		return model.SchedConfirmRequire
+	}
+	if participantsSubsetOfCreator(participants, creatorID) {
+		return model.SchedConfirmAuto
+	}
+	return model.SchedConfirmRequire
+}
+
+// buildInitialConfirmConfig builds the V5 object-form participant_config for a
+// CONFIRM schedule at create time: every member (creator included, Q2) starts
+// confirmed=false and the gate is not passed. The creator is always present so
+// it also gets a confirm toggle and is never auto-accepted.
+func buildInitialConfirmConfig(participants []participantReq, creatorID string) (model.JSON, error) {
+	cfg := model.ScheduleParticipantConfig{Participants: []model.ScheduleParticipantEntry{}}
+	seen := map[string]struct{}{}
+	add := func(uid, name string) {
+		if uid == "" {
+			return
+		}
+		if _, ok := seen[uid]; ok {
+			return
+		}
+		seen[uid] = struct{}{}
+		cfg.Participants = append(cfg.Participants, model.ScheduleParticipantEntry{
+			UserID:    uid,
+			UserName:  name,
+			Confirmed: false,
+		})
+	}
+	add(creatorID, "")
+	for _, p := range participants {
+		add(p.UserID, p.UserName)
+	}
+	cfg.RecomputeGate(creatorID)
+	return cfg.Marshal()
+}
+
+// mergeConfirmRoster implements V5/Q3 "member change only re-confirms new members":
+// it rebuilds the confirm roster from the new participant list (req), PRESERVING the
+// confirm state of members still present in `stored`, defaulting members not in
+// `stored` (newly added) to confirmed=false, and always keeping the creator. The
+// caller recomputes the gate. Members removed from the roster naturally drop their
+// confirm state.
+func mergeConfirmRoster(stored model.ScheduleParticipantConfig, participants []participantReq, creatorID string) model.ScheduleParticipantConfig {
+	out := model.ScheduleParticipantConfig{Participants: []model.ScheduleParticipantEntry{}}
+	seen := map[string]struct{}{}
+	add := func(uid, name string) {
+		if uid == "" {
+			return
+		}
+		if _, ok := seen[uid]; ok {
+			return
+		}
+		seen[uid] = struct{}{}
+		entry := model.ScheduleParticipantEntry{UserID: uid, UserName: name, Confirmed: false}
+		if prev := stored.FindParticipant(uid); prev != nil {
+			// Existing member: keep its confirm state (Q3).
+			entry.Confirmed = prev.Confirmed
+			entry.ConfirmedAt = prev.ConfirmedAt
+			if entry.UserName == "" {
+				entry.UserName = prev.UserName
+			}
+		}
+		out.Participants = append(out.Participants, entry)
+	}
+	// Creator is always part of the roster (Q2).
+	add(creatorID, "")
+	for _, p := range participants {
+		add(p.UserID, p.UserName)
+	}
+	return out
+}
+
 // storedParticipantConfigSubsetOfCreator applies participantsSubsetOfCreator to a schedule's
 // stored participant_config, so a bind reusing stored config (req.Participants==nil) is also
 // rejected when it contains a non-creator. Empty config is a subset (PASS).
@@ -151,14 +239,18 @@ func storedParticipantConfigSubsetOfCreator(raw model.JSON, creatorID string) bo
 	if len(raw) == 0 {
 		return true
 	}
-	var stored []participantReq
-	if err := json.Unmarshal(raw, &stored); err != nil {
-		// Unparseable stored config is treated as unsafe (fail-closed): we cannot
-		// prove it is single-person, so refuse to bind. This mirrors the worker,
-		// which would also fail to deserialize and skip the cycle.
-		return false
+	// V5 §3.1: participant_config is the object form
+	// {"participants":[...],"confirm_gate_passed":...}. Use the single normalizer
+	// so the V5 object form parses correctly; the old bare-array Unmarshal failed
+	// on the object form and fell into the fail-closed path, wrongly rejecting
+	// creator-only V5 schedules when FEATURE_TEAM_SCHEDULE is off.
+	cfg := model.ParseScheduleParticipantConfig(raw)
+	for _, uid := range cfg.EffectiveUserIDs(creatorID) {
+		if uid != creatorID {
+			return false
+		}
 	}
-	return participantsSubsetOfCreator(stored, creatorID)
+	return true
 }
 
 // validateEffectiveParticipantsSubsetOfCreator is the single post-load check that
@@ -373,6 +465,19 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		participantConfig = b
 	}
 
+	// V5 confirm_policy resolution. Multi-person schedules default to CONFIRM
+	// (one-time, schedule-level confirm); single-person (subset-of-creator) defaults
+	// to AUTO. An explicit confirm_policy in the request always wins.
+	confirmPolicy := resolveCreateConfirmPolicy(req.ConfirmPolicy, req.Participants, userID)
+	// For a CONFIRM schedule, persist participant_config in the V5 object form with an
+	// embedded confirm state (all members confirmed=false, creator included per Q2,
+	// gate not passed). AUTO keeps the legacy bare-array shape (normalized on read).
+	if confirmPolicy != model.SchedConfirmAuto {
+		if normalized, err := buildInitialConfirmConfig(req.Participants, userID); err == nil {
+			participantConfig = normalized
+		}
+	}
+
 	sched := model.SummarySchedule{
 		SpaceID:           spaceID,
 		CreatorID:         userID,
@@ -387,6 +492,7 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		TimeRangeType:     req.TimeRangeType,
 		SourceConfig:      sourceConfig,
 		ParticipantConfig: participantConfig,
+		ConfirmPolicy:     confirmPolicy,
 	}
 
 	if req.Scope != "task" {
@@ -478,6 +584,7 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 				"time_range_type":    sched.TimeRangeType,
 				"source_config":      sched.SourceConfig,
 				"participant_config": sched.ParticipantConfig,
+				"confirm_policy":     sched.ConfirmPolicy,
 				"next_run_at":        nextRun,
 				"is_active":          1,
 			}
@@ -587,6 +694,7 @@ func (h *ScheduleHandler) ListSchedules(c *gin.Context) {
 			"time_range_type":    s.TimeRangeType,
 			"source_config":      s.SourceConfig,
 			"participant_config": s.ParticipantConfig,
+			"confirm_policy":     s.ConfirmPolicy,
 			"is_active":          s.IsActive,
 			"created_at":         s.CreatedAt.Format(time.RFC3339),
 		}
@@ -630,6 +738,7 @@ func (h *ScheduleHandler) GetSchedule(c *gin.Context) {
 		"time_range_type":    sched.TimeRangeType,
 		"source_config":      sched.SourceConfig,
 		"participant_config": sched.ParticipantConfig,
+		"confirm_policy":     sched.ConfirmPolicy,
 		"is_active":          sched.IsActive,
 		"created_at":         sched.CreatedAt.Format(time.RFC3339),
 	}
@@ -641,6 +750,94 @@ func (h *ScheduleHandler) GetSchedule(c *gin.Context) {
 	}
 
 	ok(c, item)
+}
+
+// ConfirmSchedule handles POST /api/v1/summary-schedules/:id/confirm
+//
+// V5 §4 (one-time, schedule-level confirm): the caller confirms participation in
+// THIS schedule (not a per-round task). It read-modify-writes the schedule's
+// participant_config under a FOR UPDATE row lock (竞态-2 defense, serializes with
+// UpdateSchedule), setting the caller's confirmed=true / confirmed_at=now. When
+// every roster member (creator included, Q2) is confirmed, confirm_gate_passed is
+// set true. Idempotent: confirming again is a no-op success. AUTO schedules need
+// no confirmation (returns success without changing state).
+func (h *ScheduleHandler) ConfirmSchedule(c *gin.Context) {
+	spaceID := middleware.GetSpaceID(c)
+	userID := middleware.GetUserID(c)
+	schedID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid schedule id"})
+		return
+	}
+
+	var sched model.SummarySchedule
+	if err := h.db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", schedID, spaceID).First(&sched).Error; err != nil {
+		bizErr(c, service.NewBizError(40008, "定时配置不存在", http.StatusNotFound))
+		return
+	}
+
+	var gatePassed bool
+	txErr := h.db.Transaction(func(tx *gorm.DB) error {
+		lockedSched, err := lockScheduleForUpdate(tx, schedID, spaceID)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return service.NewBizError(40008, "定时配置不存在", http.StatusNotFound)
+			}
+			return err
+		}
+
+		cfg := model.ParseScheduleParticipantConfig(lockedSched.ParticipantConfig)
+		cfg.EnsureCreatorEntry(lockedSched.CreatorID)
+
+		// The caller must be part of the roster (creator or a configured
+		// participant) REGARDLESS of confirm policy. This membership check runs
+		// before the AUTO fast-path so a non-member can never get a 200 from
+		// confirm (previously AUTO returned success before any membership check,
+		// letting outsiders probe/confirm AUTO schedules).
+		entry := cfg.FindParticipant(userID)
+		if entry == nil {
+			return service.NewBizError(40003, "你不在该定时的参与名单中", http.StatusForbidden)
+		}
+
+		// AUTO schedules have no confirm step: a roster member calling confirm is a
+		// no-op success (gate is implicitly passed), but we only reach here after
+		// proving membership above.
+		if lockedSched.ConfirmPolicy == model.SchedConfirmAuto {
+			gatePassed = true
+			return nil
+		}
+
+		if !entry.Confirmed {
+			now := timezone.Now()
+			entry.Confirmed = true
+			entry.ConfirmedAt = &now
+		}
+		cfg.RecomputeGate(lockedSched.CreatorID)
+		gatePassed = cfg.ConfirmGatePassed
+
+		marshaled, err := cfg.Marshal()
+		if err != nil {
+			return err
+		}
+		return tx.Model(&model.SummarySchedule{}).
+			Where("id = ?", lockedSched.ID).
+			Update("participant_config", marshaled).Error
+	})
+	if txErr != nil {
+		if biz, ok := txErr.(*service.BizError); ok {
+			bizErr(c, biz)
+			return
+		}
+		log.Printf("[handler] ConfirmSchedule error: %v", txErr)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: txErr.Error()})
+		return
+	}
+
+	ok(c, gin.H{
+		"schedule_id":         schedID,
+		"confirmed":           true,
+		"confirm_gate_passed": gatePassed,
+	})
 }
 
 // UpdateSchedule handles PUT /api/v1/summary-schedules/:id
@@ -815,9 +1012,15 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		b, _ := json.Marshal(req.Sources)
 		updates["source_config"] = model.JSON(b)
 	}
-	if req.Participants != nil {
-		b, _ := json.Marshal(req.Participants)
-		updates["participant_config"] = model.JSON(b)
+	// participant_config / confirm_policy reset+merge is done INSIDE the tx where the
+	// FOR UPDATE-locked stored config is available (so we can preserve existing
+	// confirm state under Q3). See the confirm-state block below.
+	if req.ConfirmPolicy != nil {
+		if *req.ConfirmPolicy == model.SchedConfirmAuto {
+			updates["confirm_policy"] = model.SchedConfirmAuto
+		} else {
+			updates["confirm_policy"] = model.SchedConfirmRequire
+		}
 	}
 
 	resultScheduleID := sched.ID
@@ -985,6 +1188,71 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 			updates["next_run_at"] = lNextRun
 			if lWriteAnchorDOM {
 				updates["anchor_dom"] = lFinalAnchorDOM
+			}
+		}
+
+		// V5 confirm-state reset/merge (§4.2 / §4.3 / Q3). Computed from the FOR UPDATE
+		// locked stored config so concurrent confirm-API writes are serialized.
+		//
+		// Effective confirm_policy after this update (req wins, else stored).
+		effConfirmPolicy := lockedSched.ConfirmPolicy
+		if req.ConfirmPolicy != nil {
+			if *req.ConfirmPolicy == model.SchedConfirmAuto {
+				effConfirmPolicy = model.SchedConfirmAuto
+			} else {
+				effConfirmPolicy = model.SchedConfirmRequire
+			}
+		}
+
+		// Detect a manual->scheduled / re-activation transition. UpdateSchedule
+		// re-activates an inactive schedule (CreateSchedule reuse sets is_active=1; the
+		// reuse path goes through CreateSchedule, but an UpdateSchedule that flips an
+		// inactive schedule active is treated as "turning it (back) into a live timer").
+		// Per §4.2 this triggers a FULL re-confirm (every member, creator AND others,
+		// confirmed=false). We approximate "became scheduled/active" as: stored is_active
+		// != 1 and this update keeps/sets it usable. is_active is not directly settable
+		// via UpdateSchedule (ToggleSchedule owns that), so the only full-reset trigger
+		// here is the AUTO->CONFIRM policy switch (manual/auto schedule converted to a
+		// confirm-required one).
+		policyBecameConfirm := effConfirmPolicy != model.SchedConfirmAuto &&
+			lockedSched.ConfirmPolicy == model.SchedConfirmAuto
+
+		if effConfirmPolicy == model.SchedConfirmAuto {
+			// AUTO: persist participants as the legacy bare-array shape (if sent). No
+			// confirm state under AUTO.
+			if req.Participants != nil {
+				b, _ := json.Marshal(req.Participants)
+				updates["participant_config"] = model.JSON(b)
+			}
+		} else {
+			// CONFIRM: maintain the V5 object-form participant_config with embedded
+			// confirm state.
+			creatorID := lockedSched.CreatorID
+			stored := model.ParseScheduleParticipantConfig(lockedSched.ParticipantConfig)
+
+			var newCfg model.ScheduleParticipantConfig
+			if req.Participants != nil {
+				// Member change (Q3): rebuild the roster from req.Participants, preserving
+				// the confirm state of members still present, defaulting NEW members to
+				// confirmed=false, then recompute the gate. The creator is always kept.
+				newCfg = mergeConfirmRoster(stored, req.Participants, creatorID)
+			} else {
+				// No member change: start from the stored confirm roster (normalized).
+				newCfg = stored
+				newCfg.EnsureCreatorEntry(creatorID)
+			}
+
+			if policyBecameConfirm {
+				// §4.2 manual/auto -> confirm conversion: FULL re-confirm. Reset EVERY
+				// member (creator included) to confirmed=false and clear confirmed_at.
+				for i := range newCfg.Participants {
+					newCfg.Participants[i].Confirmed = false
+					newCfg.Participants[i].ConfirmedAt = nil
+				}
+			}
+			newCfg.RecomputeGate(creatorID)
+			if marshaled, err := newCfg.Marshal(); err == nil {
+				updates["participant_config"] = marshaled
 			}
 		}
 		if err := tx.Model(&model.SummarySchedule{}).
@@ -1221,6 +1489,22 @@ func (h *ScheduleHandler) ToggleSchedule(c *gin.Context) {
 				}
 				if err := validateEffectiveParticipantsSubsetOfCreator(h.featureTeamSchedule, nil, lockedSched.ParticipantConfig, task.CreatorID); err != nil {
 					return err
+				}
+				// V5 §4.2: re-activating a CONFIRM schedule (is_active 0->1) triggers a FULL
+				// re-confirm — every member (creator included, Q2) must confirm again for
+				// this activation. Reset confirm state inside the same row lock so it does
+				// not race the confirm API. AUTO schedules carry no confirm state.
+				if lockedSched.ConfirmPolicy != model.SchedConfirmAuto {
+					cfg := model.ParseScheduleParticipantConfig(lockedSched.ParticipantConfig)
+					cfg.EnsureCreatorEntry(lockedSched.CreatorID)
+					for i := range cfg.Participants {
+						cfg.Participants[i].Confirmed = false
+						cfg.Participants[i].ConfirmedAt = nil
+					}
+					cfg.RecomputeGate(lockedSched.CreatorID)
+					if marshaled, err := cfg.Marshal(); err == nil {
+						updates["participant_config"] = marshaled
+					}
 				}
 				nextRun, err := service.NextRunInitial(
 					lockedSched.CronExpr,

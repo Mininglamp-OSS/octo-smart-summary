@@ -218,9 +218,29 @@ func claimAndCreateScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.Summary
 		}
 
 		// Rebuild the three subtables (source / participant / personal_result) from
-		// the schedule config -- the new task_id starts with no children.
-		if err := buildScheduledTaskChildren(tx, imDB, lockedSched, newTask, now); err != nil {
+		// the schedule config -- the new task_id starts with no children. The returned
+		// count is the number of Accepted participants materialized this round.
+		//
+		// V5 §4.3/Q2: for a CONFIRM schedule where NOBODY (creator included) has
+		// confirmed yet, no children are built (acceptedCount==0). The round is skipped:
+		// the freshly-created task is terminated (Cancelled) so it produces no result,
+		// does not occupy the overlap guard, and is not picked up by the processor. The
+		// next cycle re-checks the confirm list (already-advanced next_run_at avoids a
+		// busy re-scan). last_run_at is NOT advanced for a skipped round so a type=4
+		// incremental window is preserved.
+		acceptedCount, err := buildScheduledTaskChildren(tx, imDB, lockedSched, newTask, now)
+		if err != nil {
 			return err
+		}
+		if acceptedCount == 0 {
+			log.Printf("[scheduler] schedule %d: CONFIRM round has zero confirmed participants; skipping round (task %d cancelled, no result, last_run_at preserved)", lockedSched.ID, newTask.ID)
+			if err := tx.Model(&model.SummaryTask{}).
+				Where("id = ?", newTask.ID).
+				Update("status", model.StatusCancelled).Error; err != nil {
+				return err
+			}
+			requeued = false
+			return nil
 		}
 
 		// Advance last_run_at ONLY now that the new task is actually created to run.
@@ -260,34 +280,32 @@ func scheduleConfigMultiPerson(sched model.SummarySchedule) (bool, error) {
 	if len(sched.ParticipantConfig) == 0 {
 		return false, nil
 	}
-	var participants []struct {
-		UserID string `json:"user_id"`
-	}
-	if err := json.Unmarshal(sched.ParticipantConfig, &participants); err != nil {
-		return false, nil
-	}
-	users := map[string]struct{}{}
-	if sched.CreatorID != "" {
-		users[sched.CreatorID] = struct{}{}
-	}
-	for _, p := range participants {
-		if p.UserID != "" {
-			users[p.UserID] = struct{}{}
-		}
-	}
-	return len(users) > 1, nil
+	// V5 §3.1: participant_config is now an object form
+	// {"participants":[...],"confirm_gate_passed":...}. Use the single
+	// normalizer so the V5 object form (and every legacy array shape) is parsed
+	// consistently; the old bare-array Unmarshal failed on the V5 object form and
+	// silently returned false, bypassing the FEATURE_TEAM_SCHEDULE-off guard.
+	cfg := model.ParseScheduleParticipantConfig(sched.ParticipantConfig)
+	return len(cfg.EffectiveUserIDs(sched.CreatorID)) > 1, nil
 }
 
 // scanConfirmTimeouts auto-declines participants still in WaitingConfirm
 // past the task's confirm_deadline.
+//
+// V5/Q5: scheduled runs no longer use a per-round confirm window (confirm is a
+// one-time, schedule-level event and scheduled tasks never write
+// confirm_deadline), so this scan is restricted to MANUAL tasks. A scheduled
+// task can never produce a WaitingConfirm participant under V5, so excluding
+// trigger_type=scheduled here is a no-op safety net that also ignores any legacy
+// scheduled row that might still carry a confirm_deadline.
 func scanConfirmTimeouts(db *gorm.DB) {
 	now := timezone.Now()
 
-	// Find tasks with confirm_deadline passed that still have WaitingConfirm participants
+	// Find MANUAL tasks with confirm_deadline passed that still have WaitingConfirm participants
 	var taskIDs []int64
 	db.Model(&model.SummaryTask{}).
-		Where("confirm_deadline < ? AND confirm_deadline IS NOT NULL AND deleted_at IS NULL AND status NOT IN (?, ?, ?)",
-			now, model.StatusCompleted, model.StatusFailed, model.StatusCancelled).
+		Where("confirm_deadline < ? AND confirm_deadline IS NOT NULL AND deleted_at IS NULL AND trigger_type = ? AND status NOT IN (?, ?, ?)",
+			now, model.TriggerManual, model.StatusCompleted, model.StatusFailed, model.StatusCancelled).
 		Pluck("id", &taskIDs)
 
 	if len(taskIDs) == 0 {

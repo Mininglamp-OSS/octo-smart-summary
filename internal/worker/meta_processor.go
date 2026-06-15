@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timing"
+	"gorm.io/gorm"
 )
 
 // MetaProcessor handles meta-summary generation with debounce and mutex.
@@ -87,25 +88,46 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 
 		log.Printf("[meta-worker] processing task %d", taskID)
 
-		// Count accepted (non-declined, non-pending) participants
-		var totalAccepted int64
-		m.proc.db.Model(&model.SummaryParticipant{}).
-			Where("task_id = ? AND status NOT IN (?, ?)", taskID, model.ParticipantPending, model.ParticipantDeclined).
-			Count(&totalAccepted)
-
-		// Query all submitted personal results
-		var submitted []model.PersonalResult
-		m.proc.db.Where("task_id = ? AND submitted_at IS NOT NULL", taskID).Find(&submitted)
-
-		if len(submitted) == 0 {
-			log.Printf("[meta-worker] task %d: no submitted results", taskID)
+		// V5 §4.4 completion gate (terminal-state based, prevents Failed dead-wait):
+		// instead of a pure submitted>=accepted count, require every IN-ROSTER
+		// (accepted, i.e. status NOT IN Pending/Declined) participant to have reached
+		// a TERMINAL state — submitted_at IS NOT NULL OR its personal_result
+		// worker_status==Failed. A Failed member just doesn't contribute its part this
+		// round; it must NOT block aggregation forever (old pure-count code dead-waited).
+		submitted, ready := metaCompletionReady(m.proc.db, taskID)
+		if !ready {
+			// Not every accepted participant is terminal yet. Whether or not anyone
+			// has submitted, we must keep the task in Processing and wait for the
+			// stragglers (or for their personal_result to flip to Failed).
+			log.Printf("[meta-worker] task %d: %d submitted but not all accepted participants reached terminal state, waiting",
+				taskID, len(submitted))
 			return
 		}
-
-		allSubmitted := int64(len(submitted)) >= totalAccepted
-		if !allSubmitted {
-			log.Printf("[meta-worker] task %d: %d/%d participants submitted, waiting for all",
-				taskID, len(submitted), totalAccepted)
+		if len(submitted) == 0 {
+			// ready==true && submitted==0: every accepted participant reached a
+			// terminal state yet NOBODY produced a usable part this round. The only
+			// way to get here is that all confirmed members permanently Failed
+			// (markPersonalFailed Declined them, emptying the accepted set). There is
+			// nothing to aggregate and never will be — DO NOT just return, or the
+			// task stays Processing forever and the overlap guard keeps blocking
+			// later rounds (the deadlock). Converge the round to a terminal state.
+			//
+			// We use StatusCancelled to match the "zero-confirmation whole round
+			// skip" semantics (scheduler.go uses StatusCancelled for a round that
+			// produced no result): no usable contribution, no meta result, round
+			// ends cleanly so subsequent rounds are not blocked.
+			res := m.proc.db.Model(&model.SummaryTask{}).
+				Where("id = ? AND status = ?", taskID, model.StatusProcessing).
+				Update("status", model.StatusCancelled)
+			if res.Error != nil {
+				log.Printf("[meta-worker] task %d: failed to cancel all-failed round: %v", taskID, res.Error)
+				return
+			}
+			if res.RowsAffected == 0 {
+				log.Printf("[meta-worker] task %d: all accepted participants failed but task no longer Processing, nothing to do", taskID)
+			} else {
+				log.Printf("[meta-worker] task %d: all accepted participants permanently failed and none submitted; round cancelled (no meta result) to avoid Processing dead-wait", taskID)
+			}
 			return
 		}
 
@@ -124,7 +146,13 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 			if name == "" {
 				name = submitted[0].UserID
 			}
-			teamCitations = []model.TeamCitation{{Index: 1, UserID: submitted[0].UserID, UserName: name}}
+			teamCitations = []model.TeamCitation{{
+				Index:            1,
+				UserID:           submitted[0].UserID,
+				UserName:         name,
+				PersonalResultID: submitted[0].ID,
+				TaskID:           taskID,
+			}}
 		} else {
 			// Multiple submissions: call LLM to merge
 			var task model.SummaryTask
@@ -147,7 +175,7 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 				if name == "" {
 					name = pr.UserID
 				}
-				indexed = append(indexed, indexedParticipant{Index: i + 1, UserID: pr.UserID, Name: name})
+				indexed = append(indexed, indexedParticipant{Index: i + 1, UserID: pr.UserID, Name: name, PersonalResultID: pr.ID, TaskID: taskID})
 				participantSummaries = append(participantSummaries, struct{ Name, Summary string }{
 					Name:    name,
 					Summary: pr.Content,
@@ -236,10 +264,54 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 
 var teamCitationRe = regexp.MustCompile(`\[P(\d{1,3})\]`)
 
+// metaCompletionReady implements the V5 §4.4 terminal-state completion gate.
+//
+// It returns the submitted personal_results plus a `ready` flag that is true iff
+// EVERY accepted (in-roster) participant has reached a terminal state:
+//   - submitted_at IS NOT NULL (contributes its part), OR
+//   - its personal_result.worker_status == Failed (this round drops its part,
+//     does NOT block aggregation).
+//
+// "Accepted" = participant.status NOT IN (Pending, Declined): under V5 CONFIRM,
+// un-confirmed members are never materialized as Accepted (方案乙), so they are
+// naturally excluded here and never make meta wait. The old code keyed purely on
+// submitted>=accepted, so a single Failed personal kept submitted below the count
+// forever and meta dead-waited. Keying on terminal state fixes that.
+func metaCompletionReady(db *gorm.DB, taskID int64) ([]model.PersonalResult, bool) {
+	// Submitted personal results (the actual contributors this round).
+	var submitted []model.PersonalResult
+	db.Where("task_id = ? AND submitted_at IS NOT NULL", taskID).Find(&submitted)
+
+	// Accepted (in-roster) participants for this round.
+	var accepted []model.SummaryParticipant
+	db.Where("task_id = ? AND status NOT IN (?, ?)", taskID, model.ParticipantPending, model.ParticipantDeclined).
+		Find(&accepted)
+
+	// Personal results keyed by participant_ref_id, for terminal-state lookup.
+	var prs []model.PersonalResult
+	db.Where("task_id = ?", taskID).Find(&prs)
+	prByRef := make(map[int64]model.PersonalResult, len(prs))
+	for _, pr := range prs {
+		prByRef[pr.ParticipantRefID] = pr
+	}
+
+	// Every accepted participant must be terminal: submitted OR its personal Failed.
+	for _, p := range accepted {
+		pr, ok := prByRef[p.ID]
+		terminal := ok && (pr.SubmittedAt != nil || pr.WorkerStatus == model.PersonalStatusFailed)
+		if !terminal {
+			return submitted, false
+		}
+	}
+	return submitted, true
+}
+
 type indexedParticipant struct {
-	Index  int
-	UserID string
-	Name   string
+	Index            int
+	UserID           string
+	Name             string
+	PersonalResultID int64
+	TaskID           int64
 }
 
 func extractTeamCitations(text string, participants []indexedParticipant) []model.TeamCitation {
@@ -263,9 +335,11 @@ func extractTeamCitations(text string, participants []indexedParticipant) []mode
 		seen[n] = true
 		if p, ok := pMap[n]; ok {
 			result = append(result, model.TeamCitation{
-				Index:    n,
-				UserID:   p.UserID,
-				UserName: p.Name,
+				Index:            n,
+				UserID:           p.UserID,
+				UserName:         p.Name,
+				PersonalResultID: p.PersonalResultID,
+				TaskID:           p.TaskID,
 			})
 		}
 	}
