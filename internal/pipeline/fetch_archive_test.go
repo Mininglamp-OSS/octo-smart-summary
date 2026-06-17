@@ -48,6 +48,16 @@ func setupPipelineImDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open pipeline im db: %v", err)
 	}
+	// A ":memory:" SQLite database is scoped to a single connection. gorm's
+	// default pool may open several, each getting its own empty database, so a
+	// seed write and a later read can land on different connections — the reader
+	// then sees "no such table" / zero rows. Pin the pool to one connection so
+	// every statement in a test shares the same in-memory database. (OCT-51)
+	if sqlDB, sqlErr := db.DB(); sqlErr == nil {
+		sqlDB.SetMaxOpenConns(1)
+	} else {
+		t.Fatalf("get pipeline im sql db: %v", sqlErr)
+	}
 	db.Exec(`CREATE TABLE "group" (group_no TEXT NOT NULL, name TEXT, space_id TEXT, status INTEGER DEFAULT 1, creator TEXT, updated_at INTEGER DEFAULT 0)`)
 	db.Exec(`CREATE TABLE thread (id INTEGER PRIMARY KEY, short_id TEXT, name TEXT, group_no TEXT, status INTEGER DEFAULT 1, message_count INTEGER DEFAULT 0, creator_uid TEXT, updated_at INTEGER DEFAULT 0)`)
 	db.Exec(`CREATE TABLE thread_member (thread_id INTEGER NOT NULL, uid TEXT NOT NULL)`)
