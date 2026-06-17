@@ -217,6 +217,10 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 			EventType: "META_SUMMARY_UPDATED",
 		})
 
+		// Emit the access-gated summary-notify tip (OCT-43). Idempotent via the
+		// notified_at CAS, so dirty re-runs of this loop never double-emit.
+		m.proc.emitSummaryNotify(taskID)
+
 		log.Printf("[meta-worker] task %d meta-summary version %d created (%d participants)",
 			taskID, result.Version, len(submitted))
 

@@ -115,9 +115,14 @@ type SummaryTask struct {
 	OriginChannelType  int        `gorm:"column:origin_channel_type;type:tinyint;not null;default:0" json:"origin_channel_type"`
 	ProcessingDeadline *time.Time `gorm:"column:processing_deadline" json:"processing_deadline"`
 	ConfirmDeadline    *time.Time `gorm:"column:confirm_deadline" json:"confirm_deadline"`
-	CreatedAt          time.Time  `gorm:"column:created_at;not null" json:"created_at"`
-	UpdatedAt          time.Time  `gorm:"column:updated_at;not null" json:"updated_at"`
-	DeletedAt          *time.Time `gorm:"column:deleted_at;index" json:"deleted_at,omitempty"`
+	// NotifiedAt is the crash-safe idempotency anchor for the summary-notify
+	// tip. A single-writer CAS (notified_at IS NULL → now) guarantees
+	// exactly-once emit per task even across worker restarts. NULL = not yet
+	// notified.
+	NotifiedAt *time.Time `gorm:"column:notified_at" json:"notified_at,omitempty"`
+	CreatedAt  time.Time  `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt  time.Time  `gorm:"column:updated_at;not null" json:"updated_at"`
+	DeletedAt  *time.Time `gorm:"column:deleted_at;index" json:"deleted_at,omitempty"`
 }
 
 func (SummaryTask) TableName() string { return "summary_task" }
