@@ -88,8 +88,13 @@ func NewNotifier(db *gorm.DB, cfg *config.Config) Notifier {
 // and post-restart retries are deduplicated even across processes.
 func (n *botNotifier) NotifyCompleted(taskID int64) {
 	now := time.Now().UTC()
+	// deleted_at IS NULL mirrors authorizeTaskAccess: SummaryTask.DeletedAt is a
+	// plain *time.Time (not gorm.DeletedAt), so GORM applies no automatic
+	// soft-delete scoping — the predicate must be explicit. A soft-deleted task
+	// must neither win the CAS nor burn the notified_at anchor, so an undelete
+	// can still notify later.
 	cas := n.db.Model(&model.SummaryTask{}).
-		Where("id = ? AND notified_at IS NULL", taskID).
+		Where("id = ? AND notified_at IS NULL AND deleted_at IS NULL", taskID).
 		Update("notified_at", now)
 	if cas.Error != nil {
 		log.Printf("[notify] task %d notified_at CAS error: %v", taskID, cas.Error)
@@ -103,6 +108,11 @@ func (n *botNotifier) NotifyCompleted(taskID int64) {
 	var task model.SummaryTask
 	if err := n.db.Where("id = ?", taskID).First(&task).Error; err != nil {
 		log.Printf("[notify] task %d load failed after CAS: %v", taskID, err)
+		return
+	}
+	// Defense in depth: the CAS already excludes soft-deleted rows, but bail if
+	// the row was deleted between CAS and load so a deleted task never fans out.
+	if task.DeletedAt != nil {
 		return
 	}
 

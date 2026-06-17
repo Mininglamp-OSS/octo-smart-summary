@@ -220,3 +220,33 @@ func TestNotifyAlreadyNotifiedNoop(t *testing.T) {
 		t.Fatalf("Send called %d times, want 0 for an already-notified task", got)
 	}
 }
+
+// TestNotifyDeletedTaskNoop verifies a soft-deleted task (deleted_at non-null)
+// fires no tip and does NOT burn the notified_at anchor. The API treats a
+// soft-deleted task as nonexistent (authorizeTaskAccess: WHERE deleted_at IS
+// NULL → 404); the notify path must fail closed the same way. Leaving
+// notified_at NULL means a later undelete can still legitimately notify.
+func TestNotifyDeletedTaskNoop(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	taskID := seedNotifyTask(t, db, "creator1", []string{"alice"})
+	deletedAt := time.Now().UTC().Add(-time.Minute)
+	if err := db.Model(&model.SummaryTask{}).Where("id = ?", taskID).Update("deleted_at", deletedAt).Error; err != nil {
+		t.Fatalf("preset deleted_at: %v", err)
+	}
+
+	sender := &recordingSender{}
+	n := &botNotifier{db: db, sender: sender, fromUID: "bot-uid", fromName: "智能总结"}
+	n.NotifyCompleted(taskID)
+
+	if got := atomic.LoadInt32(&sender.calls); got != 0 {
+		t.Fatalf("Send called %d times, want 0 for a soft-deleted task", got)
+	}
+
+	var task model.SummaryTask
+	if err := db.First(&task, taskID).Error; err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	if task.NotifiedAt != nil {
+		t.Errorf("notified_at must stay NULL for a soft-deleted task (anchor not burned), got %v", task.NotifiedAt)
+	}
+}
