@@ -31,6 +31,7 @@ type Processor struct {
 	stopCh     chan struct{}
 	triggerCh  chan model.WorkerTriggerRequest
 	meta       *MetaProcessor
+	notifier   Notifier
 	createPRFn func(tx *gorm.DB, pr *model.PersonalResult) error
 }
 
@@ -46,6 +47,7 @@ func NewProcessor(db, imDB *gorm.DB, pool *WorkerPool, llm *service.LLMClient, c
 		triggerCh: make(chan model.WorkerTriggerRequest, 100),
 	}
 	p.meta = NewMetaProcessor(p)
+	p.notifier = NewNotifier(db, cfg)
 	return p
 }
 

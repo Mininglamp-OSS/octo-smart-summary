@@ -84,6 +84,23 @@ type Config struct {
 
 	// Tool call per-attempt timeout (seconds)
 	ToolCallTimeout int
+
+	// Summary-notify outbound (OCT-43). When a task completes the worker emits
+	// a directed contentType=21 tip to the creator + explicit participants via
+	// octo-server's bot API. Disabled unless NotifyEnabled is true AND both URL
+	// and token are set (see NotifyConfigured).
+	NotifyEnabled   bool   // SUMMARY_NOTIFY_ENABLED master switch
+	NotifyBotAPIURL string // SUMMARY_NOTIFY_BOT_API_URL full endpoint, e.g. http://octo-server:8080/v1/bot/sendMessage
+	NotifyBotToken  string // SUMMARY_NOTIFY_BOT_TOKEN system App-Bot token (app_ prefix) — provisioning is OCT-43 decision #1
+	NotifyBotUID    string // SUMMARY_NOTIFY_BOT_UID stable from_uid surfaced in the payload (server stamps the authoritative from_uid from the token)
+	NotifyBotName   string // SUMMARY_NOTIFY_BOT_NAME stable from_name display string
+}
+
+// NotifyConfigured reports whether the summary-notify emit path is fully
+// configured and enabled. The worker builds a no-op notifier otherwise, so an
+// unconfigured deploy never burns the notified_at idempotency anchor.
+func (c *Config) NotifyConfigured() bool {
+	return c.NotifyEnabled && c.NotifyBotAPIURL != "" && c.NotifyBotToken != ""
 }
 
 func Load() *Config {
@@ -133,6 +150,12 @@ func Load() *Config {
 		ChannelScopeEnabled: envBool("CHANNEL_SCOPE_ENABLED", true),
 
 		ToolCallTimeout: envInt("TOOL_CALL_TIMEOUT", 30),
+
+		NotifyEnabled:   envBool("SUMMARY_NOTIFY_ENABLED", false),
+		NotifyBotAPIURL: envStr("SUMMARY_NOTIFY_BOT_API_URL", ""),
+		NotifyBotToken:  envStr("SUMMARY_NOTIFY_BOT_TOKEN", ""),
+		NotifyBotUID:    envStr("SUMMARY_NOTIFY_BOT_UID", ""),
+		NotifyBotName:   envStr("SUMMARY_NOTIFY_BOT_NAME", "智能总结"),
 	}
 }
 

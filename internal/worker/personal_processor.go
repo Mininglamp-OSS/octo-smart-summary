@@ -220,6 +220,9 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 			Progress: 100,
 			Message:  "总结完成",
 		})
+		// CAS-win: this goroutine transitioned the task to Completed, so emit
+		// the access-gated summary-notify tip exactly once (OCT-43).
+		p.emitSummaryNotify(taskID)
 		log.Printf("[personal-worker] task %d single-person completed directly", taskID)
 	} else {
 		// Multi-person mode: trigger meta-summary to check if all participants completed
