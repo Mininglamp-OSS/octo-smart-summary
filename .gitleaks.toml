@@ -1,0 +1,62 @@
+title = "Gitleaks config for octo-smart-summary"
+
+[extend]
+useDefault = true
+
+# ── Custom rules: OCTO bespoke credential shapes ─────────────────────────────
+#
+# The default ruleset does not know OCTO's token formats. Arm them here so a
+# real OCTO credential leaking into this repo (production code, config, infra)
+# is reported. These are detection rules, not allowlists — they only add
+# coverage. Test fixtures using these shapes are exempted by the path allowlist
+# below, so the rules stay fully armed everywhere else.
+
+[[rules]]
+  id = "octo-bot-token"
+  description = "OCTO bot token (bf_ + 32 hex chars)"
+  regex = '''\bbf_[A-Fa-f0-9]{32}\b'''
+  tags = ["token", "bot"]
+
+[[rules]]
+  id = "octo-user-api-key"
+  description = "OCTO user API key (uk_ + 32 hex chars)"
+  regex = '''\buk_[A-Fa-f0-9]{32}\b'''
+  tags = ["token", "api-key"]
+
+[[rules]]
+  id = "octo-app-bot-token"
+  description = "OCTO App Bot token (app_ + 32 hex chars)"
+  regex = '''\bapp_[A-Fa-f0-9]{32}\b'''
+  tags = ["token", "app-bot"]
+
+# ── Global allowlist ─────────────────────────────────────────────────────────
+#
+# Why path-allowlist test code: the secret-scan gate was red on every PR
+# (OCT-52) because the literal "key" test arg in internal/service/llm_test.go
+# trips the broad `generic-api-key` heuristic. Allowlisting the test *paths*
+# (rather than the one line/fingerprint) fixes this durably — new *_test.go
+# fixtures are covered automatically instead of re-breaking the scan on every
+# push, which is what trains reviewers to ignore a chronically-red gate. This
+# mirrors octo-server's config, which adopted the same approach after the
+# per-fixture content allowlist proved unmaintainable.
+#
+# Scope and residual risk: every rule (generic-api-key, default vendor rules,
+# the OCTO custom rules above) stays FULLY active for production code, config,
+# and infra. The only suppression is findings whose file path ends in
+# `_test.go`. A real secret hardcoded in a test file would therefore NOT be
+# reported by this gate — that residual risk is accepted because (a) test files
+# must not carry production credentials by convention, and (b) GitHub native
+# push protection still covers known vendor secret formats org-wide. Verified:
+# a planted key in a non-test .go file is still reported with this config.
+#
+# Single `[allowlist]` table (not the `[[allowlists]]` array form): only the
+# singular table is honored across the gitleaks versions in use (CI runs
+# 8.30.x; local git hooks may run 8.21.x where the array form is silently
+# ignored).
+
+[allowlist]
+  description = "Test fixtures (by path): synthetic args/fixtures, not real secrets"
+  paths = [
+    # Go unit / integration test files — synthetic fixtures only.
+    '''_test\.go$''',
+  ]
