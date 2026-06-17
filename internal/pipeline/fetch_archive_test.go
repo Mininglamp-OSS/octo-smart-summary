@@ -48,6 +48,18 @@ func setupPipelineImDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open pipeline im db: %v", err)
 	}
+	// Pin the pool to a single connection. go-sqlite3 gives every new connection
+	// to ":memory:" its own empty database, so without this the concurrent Layer 4
+	// fetch goroutines in ResolveAndFetchMessagesForPersonal can grab a freshly
+	// opened (unmigrated) connection and hit "no such table", dropping messages
+	// non-deterministically. One connection => seed and all queries share the same
+	// in-memory DB. (OCT-51)
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("pipeline im db handle: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxIdleConns(1)
 	db.Exec(`CREATE TABLE "group" (group_no TEXT NOT NULL, name TEXT, space_id TEXT, status INTEGER DEFAULT 1, creator TEXT, updated_at INTEGER DEFAULT 0)`)
 	db.Exec(`CREATE TABLE thread (id INTEGER PRIMARY KEY, short_id TEXT, name TEXT, group_no TEXT, status INTEGER DEFAULT 1, message_count INTEGER DEFAULT 0, creator_uid TEXT, updated_at INTEGER DEFAULT 0)`)
 	db.Exec(`CREATE TABLE thread_member (thread_id INTEGER NOT NULL, uid TEXT NOT NULL)`)
