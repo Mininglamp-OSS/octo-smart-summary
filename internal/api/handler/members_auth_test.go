@@ -1228,3 +1228,136 @@ func TestRemoveMember_StripsScheduleParticipantConfig(t *testing.T) {
 		t.Errorf("remove must keep creator1 in schedule participant_config")
 	}
 }
+
+// BE-1: editing one's own personal report on an ALREADY-Completed multi-person
+// BY_PERSON task must revive the task back to Processing (inside the same
+// transaction as the report Update) so the dispatched meta_summary recompute can
+// actually write the new team summary. Without the revive the task stays
+// Completed and the meta worker aborts ("no longer processing before result
+// write"), so the edit never reaches the team summary. FAIL-before/PASS-after.
+func TestPersonalEdit_CompletedTask_RevivesAndRecomputes(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID := seedMultiPersonTask(t, db) // BY_PERSON, Completed, creator + 2 members, each w/ PR
+	tc := newTriggerCapture(t)
+	h := NewPersonalHandler(db, tc.url(), nil)
+	r := setupPersonalEditRouter(h)
+
+	var before model.SummaryTask
+	db.First(&before, taskID)
+	if before.Status != model.StatusCompleted {
+		t.Fatalf("precondition: task must start Completed, got %d", before.Status)
+	}
+
+	body := map[string]interface{}{"content": "member_x EDITED their report after completion"}
+	w := doJSONRequest(r, "PUT", fmt.Sprintf("/api/v1/summaries/%d/personal-edit", taskID), "member_x", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for personal-edit, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var after model.SummaryTask
+	db.First(&after, taskID)
+	if after.Status != model.StatusProcessing {
+		t.Errorf("FAIL-BEFORE/PASS-AFTER: Completed BY_PERSON task must be revived to Processing on personal-edit, got status=%d", after.Status)
+	}
+	if after.ProcessingDeadline == nil || !after.ProcessingDeadline.After(timezone.Now()) {
+		t.Errorf("revived task must have a future processing_deadline, got %v", after.ProcessingDeadline)
+	}
+
+	// The edit itself must have landed.
+	var prX model.PersonalResult
+	db.Where("task_id = ? AND user_id = ?", taskID, "member_x").First(&prX)
+	if prX.Content != "member_x EDITED their report after completion" || prX.EditedAt == nil {
+		t.Errorf("member_x report not updated: content=%q edited_at=%v", prX.Content, prX.EditedAt)
+	}
+
+	// The recompute must be dispatched.
+	if !tc.waitFor("meta_summary", taskID) {
+		t.Errorf("expected a meta_summary trigger after personal-edit revive")
+	}
+}
+
+// 续修1: editing one's own report on a SINGLE-participant Completed BY_PERSON task
+// must NOT revive it (no other members' content to re-aggregate). The task stays
+// Completed; only the meta_summary trigger fires. Mirrors the Accept path's
+// participantCount>1 guard.
+func TestPersonalEdit_SingleParticipant_NoRevive(t *testing.T) {
+	db := setupMembersTestDB(t)
+	now := timezone.Now()
+	task := model.SummaryTask{
+		TaskNo:      "TST-PE-SOLO",
+		SpaceID:     "space1",
+		CreatorID:   "creator1",
+		SummaryMode: model.ModeByPerson,
+		Status:      model.StatusCompleted,
+	}
+	db.Create(&task)
+	db.Create(&model.SummarySource{TaskID: task.ID, SourceType: model.SourceGroup, SourceID: "grp_abc"})
+	// Exactly ONE participant (the creator) with their own PersonalResult.
+	p := model.SummaryParticipant{TaskID: task.ID, UserID: "creator1", UserName: "creator1", Status: model.ParticipantCompleted}
+	db.Create(&p)
+	db.Create(&model.PersonalResult{
+		TaskID:           task.ID,
+		ParticipantRefID: p.ID,
+		UserID:           "creator1",
+		Content:          "creator1 original [1]",
+		CitationsJSON:    `[{"index":1,"sender":"s","content":"c","channel_id":"grp_abc"}]`,
+		WorkerStatus:     model.PersonalStatusCompleted,
+		GeneratedAt:      &now,
+	})
+
+	tc := newTriggerCapture(t)
+	h := NewPersonalHandler(db, tc.url(), nil)
+	r := setupPersonalEditRouter(h)
+
+	body := map[string]interface{}{"content": "creator1 solo edit"}
+	w := doJSONRequest(r, "PUT", fmt.Sprintf("/api/v1/summaries/%d/personal-edit", task.ID), "creator1", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for solo personal-edit, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var after model.SummaryTask
+	db.First(&after, task.ID)
+	if after.Status != model.StatusCompleted {
+		t.Errorf("single-participant Completed task must NOT be revived by personal-edit, got status=%d", after.Status)
+	}
+
+	// The edit itself must still have landed.
+	var prC model.PersonalResult
+	db.Where("task_id = ? AND user_id = ?", task.ID, "creator1").First(&prC)
+	if prC.Content != "creator1 solo edit" || prC.EditedAt == nil {
+		t.Errorf("solo report not updated: content=%q edited_at=%v", prC.Content, prC.EditedAt)
+	}
+}
+
+// BE-3: a personal-edit carrying a space_id that does not match the task's space
+// must be rejected as 40008 ("任务不存在"), identical to a missing task, so task
+// existence is not leaked across spaces.
+func TestPersonalEdit_WrongSpace_Returns404(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID := seedMultiPersonTask(t, db) // task lives in space1
+	h := NewPersonalHandler(db, "", nil)
+	r := setupPersonalEditRouter(h)
+
+	// member_x is a real participant, but presents a different space header.
+	b, _ := json.Marshal(map[string]interface{}{"content": "cross-space edit attempt"})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("PUT", fmt.Sprintf("/api/v1/summaries/%d/personal-edit", taskID), bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Token", "member_x")
+	req.Header.Set("X-Space-Id", "other_space")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for cross-space personal-edit, got %d: %s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("40008")) {
+		t.Errorf("cross-space personal-edit must return code 40008, body=%s", w.Body.String())
+	}
+
+	// The report must NOT have been modified.
+	var prX model.PersonalResult
+	db.Where("task_id = ? AND user_id = ?", taskID, "member_x").First(&prX)
+	if prX.EditedAt != nil || prX.Content != "member_x original [1]" {
+		t.Errorf("cross-space edit must not modify the report: content=%q edited_at=%v", prX.Content, prX.EditedAt)
+	}
+}

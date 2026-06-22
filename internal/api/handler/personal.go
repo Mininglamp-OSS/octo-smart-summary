@@ -3,6 +3,7 @@ package handler
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"strconv"
@@ -29,6 +30,12 @@ var triggerClient = &http.Client{Timeout: 5 * time.Second}
 // instant it picks the task up; this only needs to outlive the async dispatch
 // hop. Kept in sync with the worker's default WORKER_TASK_LEASE_MINUTES (20).
 const acceptReviveLeaseMinutes = 20
+
+// errPersonalResultGone is a sentinel returned from the PersonalEdit transaction
+// when the caller's PersonalResult row was deleted concurrently (e.g. a racing
+// Leave/RemoveMember) between preload and the UPDATE, so 0 rows are affected.
+// The outer handler maps it to 404/40008 rather than a 500.
+var errPersonalResultGone = errors.New("personal result gone")
 
 // PersonalHandler handles P2 by-person endpoints.
 type PersonalHandler struct {
@@ -425,6 +432,17 @@ func (h *PersonalHandler) PersonalEdit(c *gin.Context) {
 		return
 	}
 
+	// BE-3: space isolation + task existence prerequisite. The task must live in
+	// the caller's space; a space mismatch is reported as 40008 ("任务不存在")
+	// exactly like a missing task, so existence is not leaked across spaces. This
+	// also gives BE-1's revive a consistent task-existence guarantee.
+	spaceID := middleware.GetSpaceID(c)
+	var task model.SummaryTask
+	if err := h.db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).First(&task).Error; err != nil {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
+		return
+	}
+
 	// Locate the caller's OWN personal result (task_id + user_id=self). No other
 	// member's row is reachable from here.
 	var pr model.PersonalResult
@@ -440,13 +458,49 @@ func (h *PersonalHandler) PersonalEdit(c *gin.Context) {
 	citationsJSON := tmp.CitationsJSON
 
 	now := timezone.Now()
-	if err := h.db.Model(&model.PersonalResult{}).
-		Where("id = ?", pr.ID).
-		Updates(map[string]interface{}{
-			"content":        req.Content,
-			"citations_json": citationsJSON,
-			"edited_at":      now,
-		}).Error; err != nil {
+	// BE-1: the personal-report Update and the Completed-task revive must run in
+	// ONE transaction, mirroring Leave/RemoveMember. For an already-Completed
+	// multi-person BY_PERSON task the meta worker refuses to write unless the task
+	// is still Processing (meta_processor: aborts "no longer processing before
+	// result write"), so without reviving the task here the edit would never make
+	// it into the team summary. reviveCompletedForRecompute is race-safe + a strict
+	// no-op for any task not Completed / not BY_PERSON.
+	if err := h.db.Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&model.PersonalResult{}).
+			Where("id = ?", pr.ID).
+			Updates(map[string]interface{}{
+				"content":        req.Content,
+				"citations_json": citationsJSON,
+				"edited_at":      now,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		// Concurrency: a racing Leave/RemoveMember may have physically deleted the
+		// preloaded row. 0 rows affected => nothing was edited; roll back and surface
+		// a 404 rather than a false 200.
+		if result.RowsAffected == 0 {
+			return errPersonalResultGone
+		}
+		//续修1: only revive when there is more than one participant. A single-person
+		// Completed BY_PERSON task has no other members' content to re-aggregate, so
+		// reviving it would be a pointless Completed->Processing flip (noise, and out
+		// of step with the Accept path). reviveCompletedForRecompute itself stays
+		// count-agnostic on purpose (Leave/RemoveMember need single-person revive).
+		var participantCount int64
+		if err := tx.Model(&model.SummaryParticipant{}).
+			Where("task_id = ?", taskID).Count(&participantCount).Error; err != nil {
+			return err
+		}
+		if participantCount > 1 {
+			return h.reviveCompletedForRecompute(tx, taskID)
+		}
+		return nil
+	}); err != nil {
+		if errors.Is(err, errPersonalResultGone) {
+			c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "个人总结不存在"})
+			return
+		}
 		log.Printf("[personal] personal-edit update error task=%d user=%s: %v", taskID, userID, err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
 		return
@@ -476,9 +530,10 @@ func (h *PersonalHandler) GetMembers(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, apiResponse{Code: 4010, Message: "authentication required"})
 		return
 	}
+	spaceID := middleware.GetSpaceID(c)
 
 	var task model.SummaryTask
-	if err := h.db.Where("id = ? AND deleted_at IS NULL", taskID).First(&task).Error; err != nil {
+	if err := h.db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).First(&task).Error; err != nil {
 		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
 		return
 	}
@@ -595,7 +650,7 @@ func (h *PersonalHandler) AddMembers(c *gin.Context) {
 	}
 
 	var task model.SummaryTask
-	if err := h.db.Where("id = ? AND deleted_at IS NULL", taskID).First(&task).Error; err != nil {
+	if err := h.db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, middleware.GetSpaceID(c)).First(&task).Error; err != nil {
 		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
 		return
 	}
@@ -746,7 +801,7 @@ func (h *PersonalHandler) Leave(c *gin.Context) {
 	}
 
 	var task model.SummaryTask
-	if err := h.db.Where("id = ? AND deleted_at IS NULL", taskID).First(&task).Error; err != nil {
+	if err := h.db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, middleware.GetSpaceID(c)).First(&task).Error; err != nil {
 		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
 		return
 	}
@@ -834,7 +889,7 @@ func (h *PersonalHandler) RemoveMember(c *gin.Context) {
 	}
 
 	var task model.SummaryTask
-	if err := h.db.Where("id = ? AND deleted_at IS NULL", taskID).First(&task).Error; err != nil {
+	if err := h.db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, middleware.GetSpaceID(c)).First(&task).Error; err != nil {
 		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
 		return
 	}
