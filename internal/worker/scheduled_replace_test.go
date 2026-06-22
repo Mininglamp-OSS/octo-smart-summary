@@ -167,21 +167,24 @@ func TestSyncScheduledTaskParticipants_AlwaysIncludesCreatorAndDedups(t *testing
 	}
 }
 
-// buildScheduledTaskSources must persist the source_name carried in the
-// schedule config verbatim (the fix for the dropped-name bug). It must NOT
-// degrade a config-provided real name into the fallback placeholder.
-func TestBuildScheduledTaskSources_UsesConfigSourceName(t *testing.T) {
+// buildScheduledTaskSources must ALWAYS re-resolve the source_name from the IM
+// DB and never trust the source_name carried in the schedule config (issue #93
+// / #94 follow-up: the schedule-management UI can submit a stale/dirty name,
+// e.g. a raw "groupNo____shortId", so the stored name must stay consistent with
+// the instant-summary path, which also ignores the client value).
+func TestBuildScheduledTaskSources_IgnoresConfigSourceName(t *testing.T) {
 	db := newReplaceTestDB(t)
 	if err := db.AutoMigrate(&model.SummarySource{}); err != nil {
 		t.Fatalf("migrate source: %v", err)
 	}
 	taskID := seedProcessingTask(t, db)
 
-	// Config carries the real group name -> it must be stored as-is.
-	raw := model.JSON(`[{"source_type":1,"source_id":"group-abcdef123456","source_name":"真实群名(群聊)"}]`)
+	// Config carries a dirty/stale name. With imDB=nil the resolver falls back
+	// to the deterministic placeholder; the key assertion is that the stored
+	// name is the RE-RESOLVED value and is NOT the config-supplied dirty value.
+	dirty := "脏值-不可信(群聊)"
+	raw := model.JSON(`[{"source_type":1,"source_id":"group-abcdef123456","source_name":"` + dirty + `"}]`)
 	if err := db.Transaction(func(tx *gorm.DB) error {
-		// imDB=nil on purpose: with a config name present the resolver must
-		// never be consulted, so nil is irrelevant here.
 		return buildScheduledTaskSources(tx, nil, taskID, raw)
 	}); err != nil {
 		t.Fatalf("build sources: %v", err)
@@ -189,8 +192,13 @@ func TestBuildScheduledTaskSources_UsesConfigSourceName(t *testing.T) {
 
 	var src model.SummarySource
 	db.Where("task_id = ?", taskID).First(&src)
-	if src.SourceName != "真实群名(群聊)" {
-		t.Errorf("source_name = %q, want config name %q", src.SourceName, "真实群名(群聊)")
+	if src.SourceName == dirty {
+		t.Errorf("source_name = %q, must NOT trust config dirty value", src.SourceName)
+	}
+	// imDB=nil -> ResolveSourceNameWithType returns the fallback placeholder.
+	want := "来源-group-ab(群聊)"
+	if src.SourceName != want {
+		t.Errorf("source_name = %q, want re-resolved %q", src.SourceName, want)
 	}
 }
 

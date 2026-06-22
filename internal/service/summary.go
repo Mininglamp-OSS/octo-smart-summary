@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"log"
 	"math/rand"
 	"strings"
 
@@ -58,29 +59,50 @@ func ResolveSourceNameWithType(sourceID string, sourceType int, imDB *gorm.DB) s
 			return name + "(群聊)"
 		}
 	case 2: // thread
-		// Thread source_id format: {group_no}____{short_id}
-		// Note: For thread, ____ separates group_no and short_id; both are used
+		// 子区身份是 (group_no, short_id) 联合键；source_id 形如 {group_no}____{short_id}。
+		// 解析严格依赖 source_type==2，不靠 "____" 的出现与否猜测是否为子区
+		// （群 source_id 也可能含 "____{space_id}" 后缀，见 case 1）。
 		parts := strings.SplitN(sourceID, "____", 2)
-		if len(parts) == 2 {
-			groupNo := parts[0]
-			shortID := parts[1]
-			
-			var groupName string
-			_ = imDB.Table("group").Where("group_no = ?", groupNo).Pluck("name", &groupName).Error
-			
-			var threadName string
-			_ = imDB.Table("thread").Where("short_id = ?", shortID).Pluck("name", &threadName).Error
-			
-			if groupName != "" && threadName != "" {
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			// 非法子区 source_id：走确定性兜底，绝不退化成父群名。
+			log.Printf("[service] ResolveSourceNameWithType: malformed thread source_id=%q", sourceID)
+			return fallbackSourceName(sourceID, sourceType)
+		}
+		groupNo := parts[0]
+		shortID := parts[1]
+
+		// 一条 JOIN 同时取子区名与父群名；group_no 跨表比较必须加 COLLATE，
+		// 与 internal/pipeline/fetch.go:141、internal/api/handler/candidates.go:177/190 保持一致。
+		var row struct {
+			ThreadName string `gorm:"column:thread_name"`
+			GroupName  string `gorm:"column:group_name"`
+		}
+		err := imDB.Raw(
+			"SELECT t.name AS thread_name, g.name AS group_name "+
+				"FROM thread t "+
+				"LEFT JOIN `group` g ON g.group_no COLLATE utf8mb4_unicode_ci = t.group_no "+
+				"WHERE t.group_no = ? AND t.short_id = ? "+
+				"LIMIT 1",
+			groupNo, shortID,
+		).Scan(&row).Error
+		if err != nil {
+			// 不再吞错：打日志便于线上定位；返回确定性可区分兜底（含 short_id）。
+			log.Printf("[service] ResolveSourceNameWithType: thread query failed source_id=%q: %v", sourceID, err)
+			return threadFallbackName("", shortID)
+		}
+
+		threadName := strings.TrimSpace(row.ThreadName)
+		groupName := strings.TrimSpace(row.GroupName)
+
+		// 兜底顺序：子区名优先；其次“父群名-占位”；最后纯占位。
+		// 关键：未命名子区永远带 short_id 片段，保证同群多子区互不相同。
+		if threadName != "" {
+			if groupName != "" {
 				return groupName + "-" + threadName + "(子区)"
 			}
-			if threadName != "" {
-				return threadName + "(子区)"
-			}
-			if groupName != "" {
-				return groupName + "(子区)"
-			}
+			return threadName + "(子区)"
 		}
+		return threadFallbackName(groupName, shortID)
 	case 3: // DM (private chat)
 		var name string
 		err := imDB.Table("user").Where("uid = ?", sourceID).Pluck("name", &name).Error
@@ -106,6 +128,20 @@ func fallbackSourceName(sourceID string, sourceType int) string {
 		return "来源-" + sourceID[:8] + suffix
 	}
 	return "来源-" + sourceID + suffix
+}
+
+// threadFallbackName 为“未命名 / 未命中”的子区生成确定性、可区分的占位名。
+// 永远包含 short_id 的前若干位，确保同一父群下的不同子区不会撞名
+// （这正是 #93 的根因：旧逻辑退化成纯父群名导致同群子区全部同名）。
+func threadFallbackName(groupName, shortID string) string {
+	short := shortID
+	if len(short) > 6 {
+		short = short[:6]
+	}
+	if groupName != "" {
+		return groupName + "-子区" + short + "(子区)"
+	}
+	return "子区-" + short + "(子区)"
 }
 
 // ResolveSourceName returns source name from IM DB, fallback to placeholder.

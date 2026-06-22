@@ -65,10 +65,12 @@ func buildScheduledTaskSources(tx *gorm.DB, imDB *gorm.DB, taskID int64, raw mod
 		if src.SourceID == "" {
 			return fmt.Errorf("scheduled source_id is required")
 		}
-		sourceName := src.SourceName
-		if sourceName == "" {
-			sourceName = service.ResolveSourceNameWithType(src.SourceID, src.SourceType, imDB)
-		}
+		// Always resolve the canonical source name from the IM DB; never trust a
+		// client-supplied source_name (the schedule-management UI can submit a raw
+		// group_no/thread id as the "name", e.g. "groupNo____shortId"). Resolving
+		// unconditionally keeps the stored name consistent with the instant-summary
+		// path, which already drops source_name and lets the backend look it up.
+		sourceName := service.ResolveSourceNameWithType(src.SourceID, src.SourceType, imDB)
 		if err := tx.Create(&model.SummarySource{
 			TaskID:     taskID,
 			SourceType: src.SourceType,
@@ -223,10 +225,9 @@ func syncScheduledTaskSources(tx *gorm.DB, imDB *gorm.DB, taskID int64, raw mode
 		if src.SourceID == "" {
 			return fmt.Errorf("scheduled source_id is required")
 		}
-		sourceName := src.SourceName
-		if sourceName == "" {
-			sourceName = service.ResolveSourceNameWithType(src.SourceID, src.SourceType, imDB)
-		}
+		// Always resolve the canonical source name from the IM DB; never trust a
+		// client-supplied source_name (see buildScheduledTaskSources).
+		sourceName := service.ResolveSourceNameWithType(src.SourceID, src.SourceType, imDB)
 		if err := tx.Create(&model.SummarySource{
 			TaskID:     taskID,
 			SourceType: src.SourceType,
