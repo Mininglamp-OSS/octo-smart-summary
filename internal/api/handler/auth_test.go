@@ -212,6 +212,34 @@ func TestDeleteSummary_GroupMemberDenied(t *testing.T) {
 	}
 }
 
+func TestDeleteSummary_NonCreatorForbidden(t *testing.T) {
+	// A4: a NON-creator participant must not be able to delete the whole
+	// multi-person task -- they can only LEAVE it. authorizeTaskAccess lets the
+	// participant through (read/cancel access), but DeleteSummary now rejects any
+	// caller != task.CreatorID with 403 code 40006. participant1 (seeded as a
+	// non-creator participant) is the case under test. Fail-before: participant1's
+	// delete soft-deleted the task (200). Pass-after: 403 + task still live.
+	db, imDB := setupTestDBs(t)
+	taskID := seedTask(t, db, imDB)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupRouter(h)
+
+	w := doRequest(r, "DELETE", fmt.Sprintf("/api/v1/summaries/%d", taskID), "participant1")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for delete by non-creator participant, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp apiResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Code != 40006 {
+		t.Errorf("expected biz code 40006, got %d", resp.Code)
+	}
+	// The task must remain live (not soft-deleted).
+	var task model.SummaryTask
+	if err := db.Where("id = ? AND deleted_at IS NULL", taskID).First(&task).Error; err != nil {
+		t.Errorf("task must stay live after a rejected non-creator delete: %v", err)
+	}
+}
+
 func TestCancelSummary_GroupMemberDenied(t *testing.T) {
 	db, imDB := setupTestDBs(t)
 	h := NewTaskHandler(db, imDB, "")
@@ -347,4 +375,150 @@ func TestListSummaries_ParticipantSeesTask(t *testing.T) {
 	if resp.Data.Total != 1 {
 		t.Errorf("expected total 1 for participant, got %d", resp.Data.Total)
 	}
+}
+
+// --- need2/3/4/7: GetSummary permissions matrix ---
+
+func getPermissions(t *testing.T, w *httptest.ResponseRecorder) map[string]bool {
+	t.Helper()
+	var resp struct {
+		Data struct {
+			Permissions map[string]bool `json:"permissions"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal permissions: %v; body=%s", err, w.Body.String())
+	}
+	return resp.Data.Permissions
+}
+
+func assertPerm(t *testing.T, perms map[string]bool, key string, want bool) {
+	t.Helper()
+	if perms[key] != want {
+		t.Errorf("permission %s = %v, want %v", key, perms[key], want)
+	}
+}
+
+// seedTask gives creator1 (creator) + participant1 (one participant row).
+// Build an explicit MULTI-person task (creator1 + p1 + p2 as participant rows)
+// to verify the creator's permission vector with the <=1 legacy gate exercised.
+func TestGetSummary_PermissionsMultiPersonCreator(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	task := model.SummaryTask{
+		TaskNo:      "TST-PERM-MP",
+		SpaceID:     "space1",
+		CreatorID:   "creator1",
+		SummaryMode: model.ModeByPerson,
+		Status:      model.StatusCompleted,
+	}
+	db.Create(&task)
+	db.Create(&model.SummarySource{TaskID: task.ID, SourceType: model.SourceGroup, SourceID: "grp_abc"})
+	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "creator1", UserName: "Creator", Status: model.ParticipantCompleted})
+	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "participant1", UserName: "P1", Status: model.ParticipantCompleted})
+	h := NewTaskHandler(db, imDB, "")
+	r := setupRouter(h)
+
+	w := doRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d", task.ID), "creator1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	perms := getPermissions(t, w)
+	// creator + multi-person:
+	assertPerm(t, perms, "can_edit_team", true)     // need4: creator, no <=1 gate
+	assertPerm(t, perms, "can_schedule", true)      // creator
+	assertPerm(t, perms, "can_add_member", true)    // need7: creator
+	assertPerm(t, perms, "can_view_schedule", true) // creator IS a participant row here
+	assertPerm(t, perms, "can_edit_personal", true) // creator IS a participant row here
+	// legacy can_edit keeps old semantics: multi-person => false.
+	assertPerm(t, perms, "can_edit", false)
+}
+
+// can_edit_team must also require StatusCompleted (matches PUT /edit which 400s
+// on non-completed tasks); otherwise creator sees an edit button whose save 400s.
+func TestGetSummary_PermissionsCreatorNonCompletedNoEditTeam(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	task := model.SummaryTask{
+		TaskNo:      "TST-PERM-NONCOMP",
+		SpaceID:     "space1",
+		CreatorID:   "creator1",
+		SummaryMode: model.ModeByPerson,
+		Status:      model.StatusProcessing,
+	}
+	db.Create(&task)
+	db.Create(&model.SummarySource{TaskID: task.ID, SourceType: model.SourceGroup, SourceID: "grp_abc"})
+	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "creator1", UserName: "Creator", Status: model.ParticipantAccepted})
+	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "participant1", UserName: "P1", Status: model.ParticipantAccepted})
+	h := NewTaskHandler(db, imDB, "")
+	r := setupRouter(h)
+
+	w := doRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d", task.ID), "creator1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	perms := getPermissions(t, w)
+	// creator but task not completed => can_edit_team must be false (PUT /edit would 400).
+	assertPerm(t, perms, "can_edit_team", false)
+	// scheduling/add-member are task-level configs, still allowed for creator.
+	assertPerm(t, perms, "can_schedule", true)
+	assertPerm(t, perms, "can_add_member", true)
+}
+
+// A plain (non-creator) participant of a multi-person task.
+func TestGetSummary_PermissionsMultiPersonParticipant(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	task := model.SummaryTask{
+		TaskNo:      "TST-PERM-MP2",
+		SpaceID:     "space1",
+		CreatorID:   "creator1",
+		SummaryMode: model.ModeByPerson,
+		Status:      model.StatusCompleted,
+	}
+	db.Create(&task)
+	db.Create(&model.SummarySource{TaskID: task.ID, SourceType: model.SourceGroup, SourceID: "grp_abc"})
+	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "creator1", UserName: "Creator", Status: model.ParticipantCompleted})
+	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "participant1", UserName: "P1", Status: model.ParticipantCompleted})
+	h := NewTaskHandler(db, imDB, "")
+	r := setupRouter(h)
+
+	w := doRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d", task.ID), "participant1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	perms := getPermissions(t, w)
+	assertPerm(t, perms, "can_edit_team", false)    // need4: not creator
+	assertPerm(t, perms, "can_schedule", false)     // not creator
+	assertPerm(t, perms, "can_add_member", false)   // need7: not creator
+	assertPerm(t, perms, "can_view_schedule", true) // need2: any participant
+	assertPerm(t, perms, "can_edit_personal", true) // need3: participant edits own
+	assertPerm(t, perms, "can_edit", false)
+}
+
+// Single-person task where the creator is also the sole participant.
+func TestGetSummary_PermissionsSinglePersonCreator(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	task := model.SummaryTask{
+		TaskNo:      "TST-PERM-SINGLE",
+		SpaceID:     "space1",
+		CreatorID:   "creator1",
+		SummaryMode: model.ModeByPerson,
+		Status:      model.StatusCompleted,
+	}
+	db.Create(&task)
+	db.Create(&model.SummarySource{TaskID: task.ID, SourceType: model.SourceGroup, SourceID: "grp_abc"})
+	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "creator1", UserName: "Creator", Status: model.ParticipantCompleted})
+
+	h := NewTaskHandler(db, imDB, "")
+	r := setupRouter(h)
+
+	w := doRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d", task.ID), "creator1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	perms := getPermissions(t, w)
+	assertPerm(t, perms, "can_edit_team", true)
+	assertPerm(t, perms, "can_schedule", true)
+	assertPerm(t, perms, "can_add_member", true)
+	assertPerm(t, perms, "can_view_schedule", true)  // creator is also the participant
+	assertPerm(t, perms, "can_edit_personal", true)  // creator is also the participant
+	assertPerm(t, perms, "can_edit", true)           // legacy: single-person creator completed
 }

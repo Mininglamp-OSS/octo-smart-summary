@@ -493,9 +493,36 @@ func TestClaim_ConfirmV5_PartialConfirm_OnlyConfirmedMaterialized(t *testing.T) 
 	}
 }
 
-// V5 §4.3/Q2: when NOBODY (creator included) has confirmed, the whole round is
-// skipped — the freshly created task is Cancelled, no participants/personal_results
-// are built, and no result is produced. (creator is no longer auto-accepted.)
+// next_run_at must advance and last_run_at must be preserved on a zero-confirmed
+// soft-deleted round (business skip, not a real run).
+func TestClaim_ConfirmV5_ZeroConfirmed_NextRunAdvancesLastRunPreserved(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	sched := seedDueScheduleV5Confirm(t, db, &old, []string{"u2", "u3"} /* none confirmed */)
+	seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
+
+	now := time.Now().UTC()
+	_, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30, true)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if !claimed {
+		t.Fatalf("expected claimed=true (next_run_at advanced)")
+	}
+	got := reloadSchedule(t, db, sched.ID)
+	if got.LastRunAt == nil || !got.LastRunAt.Equal(old) {
+		t.Errorf("last_run_at must be preserved on zero-confirmed skip, got %v want %v", got.LastRunAt, old)
+	}
+	if got.NextRunAt == nil || !got.NextRunAt.After(now) {
+		t.Errorf("next_run_at should advance on zero-confirmed skip, got %v", got.NextRunAt)
+	}
+}
+
+// V5 §4.3/Q2 (soft-delete behavior): when NOBODY (creator included) has confirmed,
+// the whole round is skipped. The freshly-created placeholder task is SOFT-DELETED
+// (deleted_at set), NOT left as a Cancelled shell -- so it never surfaces in any
+// deleted_at IS NULL query (list/detail). No participants/personal_results are
+// built and no result is produced. (creator is no longer auto-accepted.)
 func TestClaim_ConfirmV5_ZeroConfirmed_RoundSkipped(t *testing.T) {
 	db := newSchedulerTestDB(t)
 	old := time.Now().UTC().Add(-48 * time.Hour)
@@ -515,19 +542,38 @@ func TestClaim_ConfirmV5_ZeroConfirmed_RoundSkipped(t *testing.T) {
 	if taskID != 0 {
 		t.Fatalf("zero-confirmed round must report taskID=0 (skipped), got %d", taskID)
 	}
-	// The created-then-cancelled task must have NO participants / personal_results.
+	// The placeholder task must NOT appear in a deleted_at IS NULL query (list/detail
+	// filter): it has been soft-deleted, so the schedule has zero LIVE tasks beyond
+	// the prior terminal one. Specifically the round's new task must be unfindable
+	// when filtering deleted_at IS NULL.
+	var liveLatest model.SummaryTask
+	err = db.Where("schedule_id = ? AND deleted_at IS NULL AND trigger_type = ?",
+		sched.ID, model.TriggerScheduled).Order("id DESC").First(&liveLatest).Error
+	if err != gorm.ErrRecordNotFound {
+		t.Fatalf("zero-confirmed placeholder must be soft-deleted (unfindable under deleted_at IS NULL), got err=%v task=%+v", err, liveLatest)
+	}
+	// And the row physically still exists but with deleted_at set (Unscoped read).
 	var task model.SummaryTask
 	if err := db.Where("schedule_id = ?", sched.ID).Order("id DESC").First(&task).Error; err != nil {
-		t.Fatalf("load latest task: %v", err)
+		t.Fatalf("load latest task (incl soft-deleted): %v", err)
 	}
-	if task.Status != model.StatusCancelled {
-		t.Errorf("zero-confirmed round task must be Cancelled, got status=%d", task.Status)
+	if task.DeletedAt == nil {
+		t.Errorf("zero-confirmed placeholder must have deleted_at set (soft-deleted), got nil")
 	}
+	// No children built for the skipped round.
 	var parts, prs int64
 	db.Model(&model.SummaryParticipant{}).Where("task_id = ?", task.ID).Count(&parts)
 	db.Model(&model.PersonalResult{}).Where("task_id = ?", task.ID).Count(&prs)
 	if parts != 0 || prs != 0 {
 		t.Errorf("zero-confirmed round must build no children, got participants=%d personal_results=%d", parts, prs)
+	}
+	// summary_source rows are built BEFORE the accepted-count gate, so the
+	// zero-confirm branch must physically clean them up; otherwise they leak as
+	// orphans (parent task only soft-deleted) every skipped round.
+	var srcs int64
+	db.Model(&model.SummarySource{}).Where("task_id = ?", task.ID).Count(&srcs)
+	if srcs != 0 {
+		t.Errorf("zero-confirmed round must leave no orphan summary_source rows, got %d", srcs)
 	}
 }
 

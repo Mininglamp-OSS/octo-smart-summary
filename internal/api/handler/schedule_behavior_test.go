@@ -1132,3 +1132,165 @@ func TestStoredParticipantConfigSubsetOfCreator_V5ObjectForm(t *testing.T) {
 		t.Fatalf("multi-person V5 object config must be rejected by the subset guard (flag off)")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 🐛 REGRESSION: "manual -> scheduled" conversion must NOT drop collaborators.
+//
+// The frontend detail-page "convert to scheduled" flow historically called
+// createSchedule/updateSchedule WITHOUT forwarding participants. With multi-user
+// collaboration enabled (FEATURE_TEAM_SCHEDULE on), participant_config then
+// degenerated to creator-only and the scheduled run lost every collaborator.
+// The backend now backfills the roster from the task's REAL participants.
+// ---------------------------------------------------------------------------
+
+// CreateSchedule on a multi-person task with an EMPTY req.Participants must still
+// persist the full roster (creator + collaborator), defaulting to CONFIRM, with
+// nobody confirmed yet — instead of degenerating to a single-person summary.
+func TestCreateSchedule_ManualToScheduled_BackfillsTaskParticipants(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouterWithFlag(db, true)
+
+	// Multi-person manual task: creator u1 + collaborator Danno.
+	taskID := seedScheduleTask(t, db, "TBF", "s1", "u1")
+	db.Create(&model.SummaryParticipant{TaskID: taskID, UserID: "danno", UserName: "Danno", Status: model.ParticipantAccepted})
+
+	// "Convert to scheduled" with NO participants forwarded (the bug trigger).
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID, "interval_days": 1, "run_time": "09:00",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create schedule: %d %s", w.Code, w.Body.String())
+	}
+
+	var sched model.SummarySchedule
+	if err := db.Where("creator_id = ?", "u1").First(&sched).Error; err != nil {
+		t.Fatalf("load schedule: %v", err)
+	}
+	// Multi-person => default CONFIRM.
+	if sched.ConfirmPolicy != model.SchedConfirmRequire {
+		t.Fatalf("multi-person task must default to CONFIRM, got confirm_policy=%d", sched.ConfirmPolicy)
+	}
+	cfg := model.ParseScheduleParticipantConfig(sched.ParticipantConfig)
+	if cfg.FindParticipant("u1") == nil {
+		t.Errorf("roster must contain creator u1, got %+v", cfg.Participants)
+	}
+	if cfg.FindParticipant("danno") == nil {
+		t.Fatalf("BUG: collaborator Danno dropped from schedule roster (single-person degeneration), got %+v", cfg.Participants)
+	}
+	if len(cfg.Participants) != 2 {
+		t.Fatalf("roster must have exactly 2 members (creator + Danno), got %d: %+v", len(cfg.Participants), cfg.Participants)
+	}
+	if cfg.IsConfirmed("u1") || cfg.IsConfirmed("danno") {
+		t.Errorf("nobody should be confirmed on a fresh manual->scheduled conversion, got %+v", cfg.Participants)
+	}
+	if cfg.ConfirmGatePassed {
+		t.Errorf("gate must be false until all members confirm")
+	}
+}
+
+// Counterpart: a genuinely single-person task (creator only) must NOT be inflated
+// — config stays creator-only and remains AUTO (no false multi-person promotion).
+func TestCreateSchedule_SinglePersonTask_NotInflated(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouterWithFlag(db, true)
+
+	// seedScheduleTask seeds a sole creator participant -> single-person.
+	taskID := seedScheduleTask(t, db, "TSP", "s1", "u1")
+
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID, "interval_days": 1, "run_time": "09:00",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create schedule: %d %s", w.Code, w.Body.String())
+	}
+
+	var sched model.SummarySchedule
+	if err := db.Where("creator_id = ?", "u1").First(&sched).Error; err != nil {
+		t.Fatalf("load schedule: %v", err)
+	}
+	if sched.ConfirmPolicy != model.SchedConfirmAuto {
+		t.Fatalf("single-person task must stay AUTO, got confirm_policy=%d", sched.ConfirmPolicy)
+	}
+	cfg := model.ParseScheduleParticipantConfig(sched.ParticipantConfig)
+	for _, p := range cfg.Participants {
+		if p.UserID != "u1" {
+			t.Fatalf("single-person schedule must not contain non-creator %q, got %+v", p.UserID, cfg.Participants)
+		}
+	}
+}
+
+// Security/correctness: a creator-only task whose request body carries a crafted
+// or stale `participants` entry for a user that is NOT a real task participant
+// must NOT be inflated into a multi-person CONFIRM schedule. The task roster is
+// the sole membership authority; req-only ids are ignored.
+func TestCreateSchedule_SinglePersonTask_StaleReqParticipantIgnored(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouterWithFlag(db, true)
+
+	// Sole creator participant -> genuinely single-person task.
+	taskID := seedScheduleTask(t, db, "TSP", "s1", "u1")
+
+	// Request body injects a non-participant "ghost" id.
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID, "interval_days": 1, "run_time": "09:00",
+		"participants": []map[string]interface{}{{"user_id": "ghost", "user_name": "Ghost"}},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create schedule: %d %s", w.Code, w.Body.String())
+	}
+
+	var sched model.SummarySchedule
+	if err := db.Where("creator_id = ?", "u1").First(&sched).Error; err != nil {
+		t.Fatalf("load schedule: %v", err)
+	}
+	if sched.ConfirmPolicy != model.SchedConfirmAuto {
+		t.Fatalf("stale req participant must NOT promote single-person task to CONFIRM, got confirm_policy=%d", sched.ConfirmPolicy)
+	}
+	cfg := model.ParseScheduleParticipantConfig(sched.ParticipantConfig)
+	for _, p := range cfg.Participants {
+		if p.UserID != "u1" {
+			t.Fatalf("schedule roster must stay creator-only; ghost req id leaked: %+v", cfg.Participants)
+		}
+	}
+}
+
+// UpdateSchedule "manual -> scheduled / convert to CONFIRM" on a multi-person task
+// with an EMPTY req.Participants must also backfill the roster from the task's
+// real participants (parity with CreateSchedule), not degenerate to creator-only.
+func TestUpdateSchedule_ManualToScheduled_BackfillsTaskParticipants(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouterWithFlag(db, true)
+
+	// Multi-person task creator u1 + Danno, first bound as an AUTO schedule
+	// (no participants forwarded, mirroring the degraded create path).
+	taskID := seedScheduleTask(t, db, "TUBF", "s1", "u1")
+	db.Create(&model.SummaryParticipant{TaskID: taskID, UserID: "danno", UserName: "Danno", Status: model.ParticipantAccepted})
+	wc := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID, "interval_days": 1, "run_time": "09:00",
+		"confirm_policy": 0, // force AUTO so the update is the conversion under test
+	})
+	if wc.Code != http.StatusOK {
+		t.Fatalf("create auto schedule: %d %s", wc.Code, wc.Body.String())
+	}
+	var sched model.SummarySchedule
+	db.Where("creator_id = ?", "u1").First(&sched)
+
+	// Convert to CONFIRM via update WITHOUT forwarding participants.
+	wu := scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(sched.ID), map[string]interface{}{
+		"scope": "task", "task_id": taskID, "confirm_policy": 1,
+	})
+	if wu.Code != http.StatusOK {
+		t.Fatalf("update manual->confirm: %d %s", wu.Code, wu.Body.String())
+	}
+
+	cfg := loadV5Cfg(t, db, sched.ID)
+	if cfg.FindParticipant("u1") == nil || cfg.FindParticipant("danno") == nil {
+		t.Fatalf("BUG: update dropped collaborator Danno, got %+v", cfg.Participants)
+	}
+	if len(cfg.Participants) != 2 {
+		t.Fatalf("roster must have creator + Danno, got %d: %+v", len(cfg.Participants), cfg.Participants)
+	}
+	if cfg.IsConfirmed("u1") || cfg.IsConfirmed("danno") {
+		t.Errorf("manual->confirm conversion must reset everyone to unconfirmed, got %+v", cfg.Participants)
+	}
+}

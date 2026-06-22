@@ -1118,3 +1118,179 @@ func TestP0DispatchDeadlock_Idempotent_NoDoubleDispatch(t *testing.T) {
 		t.Fatalf("idempotent dispatch must re-dispatch ONLY the Accepted+Pending participant (p2=%d); got %v", refIDs[2], dispatched)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 🔴 P1 EXPERIENCE FIX: scheduled CONFIRM multi-person must ACTIVELY dispatch.
+//
+// A scheduled CONFIRM task (confirm_policy=1) arrives at the processor with its
+// participants already materialized as confirmed Accepted members (zero-confirm
+// rounds are soft-deleted scheduler-side and never reach here). Before the fix
+// these rounds fell into the non-dispatch "participants pending confirm" branch
+// and only got picked up ~5 min later by scanStuckPersonalTasks, so users saw
+// "生成中" for minutes. processTask must now dispatch every Accepted+Pending
+// personal up front, exactly like the AUTO path -- while MANUAL (non-scheduled)
+// CONFIRM tasks keep waiting for human confirmation.
+// ---------------------------------------------------------------------------
+
+// runProcessTaskScheduled drives the real processTask for a scheduled
+// multi-person task in StatusPending (the row poll() claims) with the given
+// confirm policy, recording which participant_ref_ids got dispatched. The
+// pipeline is stubbed to "0 messages == success".
+func runProcessTaskScheduled(t *testing.T, db *gorm.DB, confirmPolicy int, n int) (model.SummaryTask, []int64, []int64) {
+	t.Helper()
+	now := time.Now().UTC()
+	sched := model.SummarySchedule{
+		SpaceID: "sp", CreatorID: "u1", SummaryMode: model.ModeByPerson,
+		IntervalDays: 1, TimeRangeType: 4, IsActive: 1, ConfirmPolicy: confirmPolicy,
+	}
+	if err := db.Create(&sched).Error; err != nil {
+		t.Fatalf("create schedule: %v", err)
+	}
+	task := model.SummaryTask{
+		TaskNo: "T-SCHED-CONFIRM", SpaceID: "sp", CreatorID: "u1", SummaryMode: model.ModeByPerson,
+		Status: model.StatusPending, TriggerType: model.TriggerScheduled,
+		ScheduleID: &sched.ID, TimeRangeStart: now, TimeRangeEnd: now,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	var refIDs []int64
+	for i := 0; i < n; i++ {
+		part := model.SummaryParticipant{
+			TaskID: task.ID, UserID: userIDForIdx(i), Status: model.ParticipantAccepted,
+			ConfirmedAt: &now,
+		}
+		if err := db.Create(&part).Error; err != nil {
+			t.Fatalf("create participant: %v", err)
+		}
+		pr := model.PersonalResult{
+			TaskID: task.ID, ParticipantRefID: part.ID, UserID: userIDForIdx(i),
+			WorkerStatus: model.PersonalStatusPending,
+		}
+		if err := db.Create(&pr).Error; err != nil {
+			t.Fatalf("create personal_result: %v", err)
+		}
+		db.Model(&part).Update("personal_result_id", pr.ID)
+		refIDs = append(refIDs, part.ID)
+	}
+
+	var dispatched []int64
+	var mu sync.Mutex
+	p := &Processor{
+		db:   db,
+		cfg:  &config.Config{WorkerLeaseMinutes: 20, WorkerMaxRetry: 3},
+		pool: NewWorkerPool(4),
+		dispatchPersonalFn: func(_, refID int64) {
+			mu.Lock()
+			dispatched = append(dispatched, refID)
+			mu.Unlock()
+		},
+		executePipelineFn: func(_ model.SummaryTask) error { return nil },
+	}
+
+	// Claim Pending -> Processing (deadline +20m), then run processTask.
+	res := db.Model(&model.SummaryTask{}).
+		Where("id = ? AND status = ?", task.ID, model.StatusPending).
+		Updates(map[string]interface{}{"status": model.StatusProcessing,
+			"processing_deadline": timezone.Now().Add(20 * time.Minute)})
+	if res.RowsAffected != 1 {
+		t.Fatalf("claim should affect 1 row, got %d", res.RowsAffected)
+	}
+	var claimed model.SummaryTask
+	if err := db.First(&claimed, task.ID).Error; err != nil {
+		t.Fatalf("reload claimed task: %v", err)
+	}
+	p.processTask(claimed)
+
+	mu.Lock()
+	out := append([]int64(nil), dispatched...)
+	mu.Unlock()
+	return task, refIDs, out
+}
+
+// A scheduled CONFIRM (confirm_policy=1) multi-person task must actively dispatch
+// ALL its (already-confirmed) Accepted+Pending participants on the main path --
+// not wait ~5 min for the stuck-personal scan. This is the P1 experience fix.
+func TestScheduledConfirm_MultiPerson_DispatchesAllParticipants(t *testing.T) {
+	db := setupProcessorTestDB(t)
+	_, refIDs, dispatched := runProcessTaskScheduled(t, db, model.SchedConfirmRequire, 2)
+
+	if len(dispatched) != len(refIDs) {
+		t.Fatalf("scheduled CONFIRM multi-person must dispatch ALL %d Accepted+Pending participants up front (not wait for the 5-min stuck scan); got %d: %v", len(refIDs), len(dispatched), dispatched)
+	}
+	want := map[int64]bool{}
+	for _, id := range refIDs {
+		want[id] = true
+	}
+	for _, id := range dispatched {
+		if !want[id] {
+			t.Errorf("dispatched unexpected participant_ref_id %d", id)
+		}
+		delete(want, id)
+	}
+	if len(want) != 0 {
+		t.Errorf("these confirmed participants were never dispatched (would stall ~5min): %v", want)
+	}
+}
+
+// Regression: a MANUAL (non-scheduled) CONFIRM multi-person task must NOT actively
+// dispatch non-creator participants from processTask -- they stay WaitingConfirm
+// until they accept. Only the scheduled path was widened by the P1 fix.
+func TestManualConfirm_MultiPerson_DoesNotDispatch(t *testing.T) {
+	db := setupProcessorTestDB(t)
+	now := time.Now().UTC()
+	task := model.SummaryTask{
+		TaskNo: "T-MANUAL-CONFIRM", SpaceID: "sp", CreatorID: "u1", SummaryMode: model.ModeByPerson,
+		Status: model.StatusPending, TriggerType: model.TriggerManual,
+		TimeRangeStart: now, TimeRangeEnd: now,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	// Two participants with Pending personals (as a manual by-person task looks
+	// before anyone confirms / after creator bootstrap).
+	var refIDs []int64
+	for i := 0; i < 2; i++ {
+		part := model.SummaryParticipant{
+			TaskID: task.ID, UserID: userIDForIdx(i), Status: model.ParticipantAccepted,
+			ConfirmedAt: &now,
+		}
+		if err := db.Create(&part).Error; err != nil {
+			t.Fatalf("create participant: %v", err)
+		}
+		pr := model.PersonalResult{
+			TaskID: task.ID, ParticipantRefID: part.ID, UserID: userIDForIdx(i),
+			WorkerStatus: model.PersonalStatusPending,
+		}
+		if err := db.Create(&pr).Error; err != nil {
+			t.Fatalf("create personal_result: %v", err)
+		}
+		db.Model(&part).Update("personal_result_id", pr.ID)
+		refIDs = append(refIDs, part.ID)
+	}
+
+	var dispatched []int64
+	var mu sync.Mutex
+	p := &Processor{
+		db:   db,
+		cfg:  &config.Config{WorkerLeaseMinutes: 20, WorkerMaxRetry: 3},
+		pool: NewWorkerPool(4),
+		dispatchPersonalFn: func(_, refID int64) {
+			mu.Lock()
+			dispatched = append(dispatched, refID)
+			mu.Unlock()
+		},
+		executePipelineFn: func(_ model.SummaryTask) error { return nil },
+	}
+
+	db.Model(&model.SummaryTask{}).Where("id = ?", task.ID).
+		Updates(map[string]interface{}{"status": model.StatusProcessing,
+			"processing_deadline": timezone.Now().Add(20 * time.Minute)})
+	var claimed model.SummaryTask
+	db.First(&claimed, task.ID)
+	p.processTask(claimed)
+
+	if len(dispatched) != 0 {
+		t.Fatalf("manual (non-scheduled) CONFIRM multi-person must NOT dispatch participants from processTask (they wait for confirmation); got %v", dispatched)
+	}
+}

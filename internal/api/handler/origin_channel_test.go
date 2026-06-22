@@ -44,6 +44,7 @@ func setupOriginRouter(h *TaskHandler) *gin.Engine {
 	r.POST("/api/v1/summaries", h.CreateSummary)
 	r.GET("/api/v1/summaries", h.ListSummaries)
 	r.GET("/api/v1/summaries/:id", h.GetSummary)
+	r.GET("/api/v1/summaries/:id/result", h.GetResult)
 	r.GET("/api/v1/summary-templates", h.GetTemplates)
 	return r
 }
@@ -436,5 +437,260 @@ func TestGetTemplates_ReturnsCorrectStructure(t *testing.T) {
 	ph := placeholders[0].(map[string]interface{})
 	if ph["key"] != "task_name" {
 		t.Errorf("placeholder key: want task_name, got %v", ph["key"])
+	}
+}
+
+// --- Round 2 additions ---
+
+// TestGetSummary_MultiPersonPermissions (B1) constructs a real BY_PERSON task
+// with MULTIPLE participants and a creator, then asserts the permission split:
+//   - can_schedule == true for the creator (task-level config; allowed for
+//     single/multi participant, no Completed requirement implied by participant
+//     count).
+//   - can_edit == false for the creator when len(participants) > 1. The team
+//     edit endpoint (PUT /summaries/:id/edit) rejects multi-person tasks, so
+//     can_edit keeps the len(participants) <= 1 gate to avoid a "visible but
+//     unusable" edit button. can_edit and can_schedule are decoupled.
+func TestGetSummary_MultiPersonPermissions(t *testing.T) {
+	db, imDB := setupOriginTestDB(t)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupOriginRouter(h)
+
+	now := time.Now().UTC()
+	task := model.SummaryTask{
+		TaskNo:         "GET-PERM-001",
+		SpaceID:        "space1",
+		CreatorID:      "creator1",
+		SummaryMode:    model.ModeByPerson,
+		Status:         model.StatusCompleted,
+		TimeRangeStart: now.Add(-24 * time.Hour),
+		TimeRangeEnd:   now,
+	}
+	db.Create(&task)
+	// Multiple participants (> 1) — this is the case the old gate broke.
+	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "creator1", UserName: "C1"})
+	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "participant2", UserName: "P2"})
+	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "participant3", UserName: "P3"})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/summaries/%d", task.ID), nil)
+	req.Header.Set("Token", "creator1")
+	req.Header.Set("X-Space-Id", "space1")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	data := resp["data"].(map[string]interface{})
+	perms, ok := data["permissions"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("permissions missing or wrong type: %v", data["permissions"])
+	}
+
+	if perms["can_schedule"] != true {
+		t.Errorf("creator of multi-person BY_PERSON task must have can_schedule=true, got %v", perms["can_schedule"])
+	}
+	if perms["can_edit"] != false {
+		t.Errorf("creator of multi-person BY_PERSON task must have can_edit=false (team edit endpoint rejects multi-person), got %v", perms["can_edit"])
+	}
+
+	// A non-creator participant must NOT get can_schedule.
+	w2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/summaries/%d", task.ID), nil)
+	req2.Header.Set("Token", "participant2")
+	req2.Header.Set("X-Space-Id", "space1")
+	r.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("expected 200 for participant2, got %d: %s", w2.Code, w2.Body.String())
+	}
+	var resp2 map[string]interface{}
+	json.Unmarshal(w2.Body.Bytes(), &resp2)
+	perms2 := resp2["data"].(map[string]interface{})["permissions"].(map[string]interface{})
+	if perms2["can_schedule"] == true {
+		t.Errorf("non-creator participant must NOT have can_schedule=true, got %v", perms2["can_schedule"])
+	}
+}
+
+// TestGetSummary_ByPersonHidesPlainCitations (B2) asserts that for a BY_PERSON
+// task the detail (GetSummary) result does NOT carry plain citations (raw chat
+// records) while STILL carrying team_citations ([Pn] -> participant). The old
+// handler returned latestResult.GetCitations() unconditionally, leaking other
+// members' chat records to every participant. Fail-before / pass-after.
+func TestGetSummary_ByPersonHidesPlainCitations(t *testing.T) {
+	db, imDB := setupOriginTestDB(t)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupOriginRouter(h)
+
+	now := time.Now().UTC()
+	task := model.SummaryTask{
+		TaskNo:         "GET-PRIV-001",
+		SpaceID:        "space1",
+		CreatorID:      "creator1",
+		SummaryMode:    model.ModeByPerson,
+		Status:         model.StatusCompleted,
+		TimeRangeStart: now.Add(-24 * time.Hour),
+		TimeRangeEnd:   now,
+	}
+	db.Create(&task)
+	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "creator1", UserName: "C1"})
+	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "participant2", UserName: "P2"})
+
+	result := model.SummaryResult{
+		TaskID:      task.ID,
+		Content:     "team summary [P1] referencing message [1]",
+		Version:     1,
+		GeneratedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	result.SetCitations([]model.Citation{{
+		Index:     1,
+		Sender:    "participant2",
+		Content:   "原始聊天记录原文不应被他人看到",
+		ChannelID: "grp_priv",
+	}})
+	result.SetTeamCitations([]model.TeamCitation{
+		{Index: 1, UserID: "participant2", UserName: "P2"},
+	})
+	db.Create(&result)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/summaries/%d", task.ID), nil)
+	req.Header.Set("Token", "creator1")
+	req.Header.Set("X-Space-Id", "space1")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	resultOut := resp["data"].(map[string]interface{})["result"].(map[string]interface{})
+
+	// Plain citations must be empty for BY_PERSON.
+	cits, _ := resultOut["citations"].([]interface{})
+	if len(cits) != 0 {
+		t.Errorf("BY_PERSON GetSummary must NOT expose plain citations, got %d: %v", len(cits), resultOut["citations"])
+	}
+	// team_citations must still be present.
+	tc, ok := resultOut["team_citations"].([]interface{})
+	if !ok || len(tc) != 1 {
+		t.Errorf("BY_PERSON GetSummary must keep team_citations, got %v", resultOut["team_citations"])
+	}
+}
+
+// TestGetResult_ByPersonHidesPlainCitations (B2) — same privacy guarantee on the
+// GetResult endpoint, which also returned GetCitations() unconditionally.
+func TestGetResult_ByPersonHidesPlainCitations(t *testing.T) {
+	db, imDB := setupOriginTestDB(t)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupOriginRouter(h)
+
+	now := time.Now().UTC()
+	task := model.SummaryTask{
+		TaskNo:         "GETR-PRIV-001",
+		SpaceID:        "space1",
+		CreatorID:      "creator1",
+		SummaryMode:    model.ModeByPerson,
+		Status:         model.StatusCompleted,
+		TimeRangeStart: now.Add(-24 * time.Hour),
+		TimeRangeEnd:   now,
+	}
+	db.Create(&task)
+	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "creator1", UserName: "C1"})
+
+	result := model.SummaryResult{
+		TaskID:      task.ID,
+		Content:     "team summary [P1] message [1]",
+		Version:     1,
+		GeneratedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	result.SetCitations([]model.Citation{{
+		Index: 1, Sender: "x", Content: "raw chat leak", ChannelID: "grp",
+	}})
+	result.SetTeamCitations([]model.TeamCitation{
+		{Index: 1, UserID: "creator1", UserName: "C1"},
+	})
+	db.Create(&result)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/summaries/%d/result", task.ID), nil)
+	req.Header.Set("Token", "creator1")
+	req.Header.Set("X-Space-Id", "space1")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	data := resp["data"].(map[string]interface{})
+
+	cits, _ := data["citations"].([]interface{})
+	if len(cits) != 0 {
+		t.Errorf("BY_PERSON GetResult must NOT expose plain citations, got %d: %v", len(cits), data["citations"])
+	}
+	tc, ok := data["team_citations"].([]interface{})
+	if !ok || len(tc) != 1 {
+		t.Errorf("BY_PERSON GetResult must keep team_citations, got %v", data["team_citations"])
+	}
+}
+
+// TestGetSummary_ByGroupKeepsPlainCitations (B2 control) — BY_GROUP tasks have
+// no per-person privacy concern, so plain citations must be preserved.
+func TestGetSummary_ByGroupKeepsPlainCitations(t *testing.T) {
+	db, imDB := setupOriginTestDB(t)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupOriginRouter(h)
+
+	now := time.Now().UTC()
+	// SummaryMode 1 == BY_GROUP (only ModeByPerson=2 is a named constant).
+	task := model.SummaryTask{
+		TaskNo:         "GET-GRP-001",
+		SpaceID:        "space1",
+		CreatorID:      "creator1",
+		SummaryMode:    1,
+		Status:         model.StatusCompleted,
+		TimeRangeStart: now.Add(-24 * time.Hour),
+		TimeRangeEnd:   now,
+	}
+	db.Create(&task)
+
+	result := model.SummaryResult{
+		TaskID:      task.ID,
+		Content:     "group summary message [1]",
+		Version:     1,
+		GeneratedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	result.SetCitations([]model.Citation{{
+		Index: 1, Sender: "x", Content: "group chat citation (ok to show)", ChannelID: "grp",
+	}})
+	db.Create(&result)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/summaries/%d", task.ID), nil)
+	req.Header.Set("Token", "creator1")
+	req.Header.Set("X-Space-Id", "space1")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	resultOut := resp["data"].(map[string]interface{})["result"].(map[string]interface{})
+	cits, _ := resultOut["citations"].([]interface{})
+	if len(cits) != 1 {
+		t.Errorf("BY_GROUP GetSummary must keep plain citations, got %d: %v", len(cits), resultOut["citations"])
 	}
 }

@@ -196,6 +196,89 @@ func buildInitialConfirmConfig(participants []participantReq, creatorID string) 
 	return cfg.Marshal()
 }
 
+// loadTaskParticipantReqs reads the task's in-roster participants (creator +
+// collaborators) from summary_participant and returns them as []participantReq.
+// Declined members are excluded so a member who opted out of the source task does
+// not get re-added to the schedule roster. The creator is always part of the
+// schedule roster regardless (callers seed it), so we keep every non-declined
+// row here as the collaborator source of truth.
+func loadTaskParticipantReqs(tx *gorm.DB, taskID int64) ([]participantReq, error) {
+	var parts []model.SummaryParticipant
+	if err := tx.Model(&model.SummaryParticipant{}).
+		Where("task_id = ? AND status <> ?", taskID, model.ParticipantDeclined).
+		Order("id ASC").
+		Find(&parts).Error; err != nil {
+		return nil, err
+	}
+	out := make([]participantReq, 0, len(parts))
+	for _, p := range parts {
+		if p.UserID == "" {
+			continue
+		}
+		out = append(out, participantReq{UserID: p.UserID, UserName: p.UserName})
+	}
+	return out, nil
+}
+
+// effectiveConfirmParticipants merges the request-supplied participants with the
+// task's real participant roster. Two callers with DIFFERENT membership-authority
+// semantics share it, controlled by allowReqOnlyAdditions:
+//
+//   - CreateSchedule / "manual -> scheduled" (allowReqOnlyAdditions=false): the
+//     task roster is the SOLE membership authority. A conversion that did NOT
+//     forward participants (frontend gap) still captures every collaborator from
+//     the task; req participants ONLY contribute user_name overrides for ids the
+//     task roster already contains. A request can NEVER add a user who is not a
+//     real task participant -- otherwise a creator-only task could be inflated
+//     into a bogus multi-person CONFIRM schedule by a crafted/stale request body.
+//
+//   - UpdateSchedule member-change (Q3) (allowReqOnlyAdditions=true): the request
+//     supplies the edited member list (e.g. adds u3), so req ids not yet in the
+//     task roster are legitimately ADDED; the task roster is still unioned in and
+//     RETAINED, so an explicit-but-partial req cannot silently drop existing task
+//     collaborators. (Note: this means the current implementation does NOT support
+//     removing a task collaborator from the schedule roster via a shrunken req --
+//     task members are always kept. Add an explicit removal semantics + test if
+//     that is ever required.)
+//
+// The union is keyed by user_id; the creator is added by the confirm-config
+// builders, not here.
+func effectiveConfirmParticipants(reqParticipants, taskParticipants []participantReq, allowReqOnlyAdditions bool) []participantReq {
+	nameByID := map[string]string{}
+	for _, p := range reqParticipants {
+		if p.UserID != "" && p.UserName != "" {
+			nameByID[p.UserID] = p.UserName
+		}
+	}
+	seen := map[string]struct{}{}
+	out := make([]participantReq, 0, len(taskParticipants)+len(reqParticipants))
+	add := func(p participantReq) {
+		if p.UserID == "" {
+			return
+		}
+		if _, ok := seen[p.UserID]; ok {
+			return
+		}
+		seen[p.UserID] = struct{}{}
+		if name, ok := nameByID[p.UserID]; ok && name != "" {
+			p.UserName = name
+		}
+		out = append(out, p)
+	}
+	// Task roster first (authoritative membership).
+	for _, p := range taskParticipants {
+		add(p)
+	}
+	// req-only ids are added ONLY for the member-change path (Q3); for the
+	// create/manual->scheduled path they are deliberately ignored.
+	if allowReqOnlyAdditions {
+		for _, p := range reqParticipants {
+			add(p)
+		}
+	}
+	return out
+}
+
 // mergeConfirmRoster implements V5/Q3 "member change only re-confirms new members":
 // it rebuilds the confirm roster from the new participant list (req), PRESERVING the
 // confirm state of members still present in `stored`, defaulting members not in
@@ -547,6 +630,38 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		// Bypassed when team schedules are enabled.
 		if !h.featureTeamSchedule && !participantsSubsetOfCreator(req.Participants, task.CreatorID) {
 			return errMultiPersonNotSupported
+		}
+
+		// Root-cause fix: a "manual -> scheduled" conversion (frontend detail-page
+		// entry) historically called createSchedule WITHOUT forwarding participants,
+		// so participant_config above (computed outside the tx from the possibly-empty
+		// req.Participants) degenerated to creator-only and the scheduled run lost every
+		// collaborator. Now that the task is loaded+locked, rebuild the CONFIRM roster
+		// from the task's REAL participant list (union with any req participants) so the
+		// schedule keeps all collaborators. A genuinely single-person task (creator-only)
+		// stays single-person and is not inflated.
+		taskParts, err := loadTaskParticipantReqs(tx, task.ID)
+		if err != nil {
+			return err
+		}
+		// Create / manual->scheduled: task roster is the SOLE membership authority
+		// (allowReqOnlyAdditions=false) so a crafted/stale req cannot inflate a
+		// creator-only task into a bogus multi-person CONFIRM schedule.
+		effParts := effectiveConfirmParticipants(req.Participants, taskParts, false)
+		// Re-resolve confirm_policy against the effective roster: a multi-person task
+		// with an empty req must still default to CONFIRM (unless explicitly AUTO).
+		confirmPolicy = resolveCreateConfirmPolicy(req.ConfirmPolicy, effParts, task.CreatorID)
+		sched.ConfirmPolicy = confirmPolicy
+		if confirmPolicy != model.SchedConfirmAuto {
+			if normalized, err := buildInitialConfirmConfig(effParts, task.CreatorID); err == nil {
+				sched.ParticipantConfig = normalized
+			}
+		} else if len(effParts) > 0 {
+			// AUTO with a non-empty effective roster: persist the bare-array shape so a
+			// degraded (empty req) AUTO bind still records collaborators.
+			if b, err := json.Marshal(effParts); err == nil {
+				sched.ParticipantConfig = model.JSON(b)
+			}
 		}
 
 		if haveExisting {
@@ -1217,11 +1332,43 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		policyBecameConfirm := effConfirmPolicy != model.SchedConfirmAuto &&
 			lockedSched.ConfirmPolicy == model.SchedConfirmAuto
 
+		// Root-cause fix (parity with CreateSchedule): on the task-scope path, a
+		// "manual -> scheduled / enable timer" conversion may arrive WITHOUT
+		// req.Participants (frontend gap). Backfill the effective roster from the
+		// task's REAL participants so the schedule keeps every collaborator instead of
+		// degenerating to the stored (possibly creator-only) config. Only meaningful
+		// for the task-scope path where `task` is loaded; for scope="" we leave the
+		// stored roster untouched.
+		var taskParts []participantReq
+		if req.Scope == "task" {
+			var lerr error
+			taskParts, lerr = loadTaskParticipantReqs(tx, task.ID)
+			if lerr != nil {
+				return lerr
+			}
+		}
+		// effRosterParticipants is the roster source used below: an explicit req wins
+		// (union with the task roster so an explicit-but-partial req still keeps task
+		// collaborators); otherwise fall back to the task roster alone. nil means
+		// "no roster info available" (non-task-scope, no req) -> keep stored.
+		var effRosterParticipants []participantReq
+		if req.Participants != nil {
+			// Member-change (Q3): the request IS the authoritative new roster, so
+			// req-only ids (e.g. a newly added u3) are legitimately added
+			// (allowReqOnlyAdditions=true), unioned with the task roster.
+			effRosterParticipants = effectiveConfirmParticipants(req.Participants, taskParts, true)
+		} else if len(taskParts) > 0 {
+			// No explicit req roster: pure task-roster backfill (manual->scheduled
+			// gap). task is authoritative; nothing req-only to add.
+			effRosterParticipants = effectiveConfirmParticipants(nil, taskParts, false)
+		}
+
 		if effConfirmPolicy == model.SchedConfirmAuto {
-			// AUTO: persist participants as the legacy bare-array shape (if sent). No
-			// confirm state under AUTO.
-			if req.Participants != nil {
-				b, _ := json.Marshal(req.Participants)
+			// AUTO: persist participants as the legacy bare-array shape. Prefer the
+			// effective roster (req union task) so a degraded (empty req) bind still
+			// records collaborators; fall back to stored when nothing new is known.
+			if effRosterParticipants != nil {
+				b, _ := json.Marshal(effRosterParticipants)
 				updates["participant_config"] = model.JSON(b)
 			}
 		} else {
@@ -1231,11 +1378,12 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 			stored := model.ParseScheduleParticipantConfig(lockedSched.ParticipantConfig)
 
 			var newCfg model.ScheduleParticipantConfig
-			if req.Participants != nil {
-				// Member change (Q3): rebuild the roster from req.Participants, preserving
-				// the confirm state of members still present, defaulting NEW members to
-				// confirmed=false, then recompute the gate. The creator is always kept.
-				newCfg = mergeConfirmRoster(stored, req.Participants, creatorID)
+			if effRosterParticipants != nil {
+				// Member change (Q3): rebuild the roster from the EFFECTIVE participants
+				// (req union task roster), preserving the confirm state of members still
+				// present, defaulting NEW members to confirmed=false, then recompute the
+				// gate. The creator is always kept.
+				newCfg = mergeConfirmRoster(stored, effRosterParticipants, creatorID)
 			} else {
 				// No member change: start from the stored confirm roster (normalized).
 				newCfg = stored

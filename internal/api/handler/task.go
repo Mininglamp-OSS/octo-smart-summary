@@ -426,6 +426,32 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	var tasks []model.SummaryTask
 	h.db.Raw(pageSQL, pageArgs...).Scan(&tasks)
 
+	// FIX2: batch-load participants for ALL listed tasks in ONE query (avoid N+1),
+	// grouped by task_id. The frontend SummaryCard needs task.participants to decide
+	// whether the current user is a participant (to show the "退出" button) and to
+	// surface the "接受/拒绝" buttons for pending invitees; without it isParticipant
+	// is always false. Shape mirrors GetSummary's partList.
+	partsByTask := make(map[int64][]gin.H)
+	if len(tasks) > 0 {
+		taskIDs := make([]int64, 0, len(tasks))
+		for _, t := range tasks {
+			taskIDs = append(taskIDs, t.ID)
+		}
+		var allParts []model.SummaryParticipant
+		h.db.Where("task_id IN ?", taskIDs).Find(&allParts)
+		for _, p := range allParts {
+			item := gin.H{
+				"user_id":   p.UserID,
+				"user_name": p.UserName,
+				"status":    p.Status,
+			}
+			if p.ConfirmedAt != nil {
+				item["confirmed_at"] = p.ConfirmedAt.Format(time.RFC3339)
+			}
+			partsByTask[p.TaskID] = append(partsByTask[p.TaskID], item)
+		}
+	}
+
 	items := make([]gin.H, 0, len(tasks))
 	for _, t := range tasks {
 		var sources []model.SummarySource
@@ -476,6 +502,11 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			scheduleIDOut = *t.ScheduleID
 		}
 
+		parts := partsByTask[t.ID]
+		if parts == nil {
+			parts = []gin.H{}
+		}
+
 		items = append(items, gin.H{
 			"task_id":             t.ID,
 			"task_no":             t.TaskNo,
@@ -484,6 +515,8 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			"status":              t.Status,
 			"trigger_type":        t.TriggerType,
 			"schedule_id":         scheduleIDOut,
+			"creator_id":          t.CreatorID,
+			"participants":        parts,
 			"time_range_start":    t.TimeRangeStart.Format(time.RFC3339),
 			"time_range_end":      t.TimeRangeEnd.Format(time.RFC3339),
 			"sources":             srcList,
@@ -547,9 +580,17 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 
 	var resultOut interface{}
 	if hasResult {
+		// B2 (privacy): for BY_PERSON tasks the team summary's plain citations
+		// contain other members' raw chat messages. Do not ship them to any
+		// participant. team_citations ([Pn], point at people) are kept.
+		// BY_GROUP keeps the original behaviour.
+		plainCitations := latestResult.GetCitations()
+		if task.SummaryMode == model.ModeByPerson {
+			plainCitations = []model.Citation{}
+		}
 		resultOut = gin.H{
 			"content":          latestResult.Content,
-			"citations":        latestResult.GetCitations(),
+			"citations":        plainCitations,
 			"team_citations":   latestResult.GetTeamCitations(),
 			"total_msg_count":  latestResult.TotalMsgCount,
 			"total_token_used": latestResult.TotalTokenUsed,
@@ -565,6 +606,7 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		"title":               task.Title,
 		"summary_mode":        task.SummaryMode,
 		"status":              task.Status,
+		"creator_id":          task.CreatorID,
 		"trigger_type":        task.TriggerType,
 		"time_range_start":    task.TimeRangeStart.Format(time.RFC3339),
 		"time_range_end":      task.TimeRangeEnd.Format(time.RFC3339),
@@ -614,8 +656,39 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 	// Add personal_result and members info
 	userID := middleware.GetUserID(c)
 
-	canEdit := task.CreatorID == userID && task.Status == model.StatusCompleted && len(participants) <= 1
-	resp["permissions"] = gin.H{"can_edit": canEdit}
+	// B1 (permission split):
+	//   can_edit: legacy field, kept for backward-compat with the current frontend.
+	//     Same old semantics (creator + completed + single-participant). The
+	//     frontend is migrating to can_edit_team; do NOT change this value.
+	//   can_edit_team (need4): team SummaryResult edit button. Creator only, with
+	//     the <=1 participant gate REMOVED -- a multi-person creator can now edit the
+	//     team draft (edit.go relaxed the multi-person rejection).
+	//   can_edit_personal (need3): caller may edit their OWN personal report. True
+	//     iff the caller is a participant of this task.
+	//   can_view_schedule (need2): schedule read-only info is visible to ANY
+	//     participant (creator included). Distinct from can_schedule which gates the
+	//     schedule *settings* button.
+	//   can_add_member (need7): "add member" entry, creator only.
+	//   can_schedule (kept): schedule settings button, creator only.
+	isParticipant := false
+	for _, p := range participants {
+		if p.UserID == userID {
+			isParticipant = true
+			break
+		}
+	}
+	isCreator := task.CreatorID == userID
+	canEdit := isCreator && task.Status == model.StatusCompleted && len(participants) <= 1
+	canSchedule := isCreator
+	resp["permissions"] = gin.H{
+		"can_edit":          canEdit,
+		"can_schedule":      canSchedule,
+		"can_edit_team":     isCreator && task.Status == model.StatusCompleted,
+		"can_edit_personal": isParticipant,
+		"can_view_schedule": isParticipant,
+		"can_add_member":    isCreator,
+		"can_remove_member": isCreator,
+	}
 
 	var pr model.PersonalResult
 	personalOut := gin.H{
@@ -679,7 +752,8 @@ func (h *TaskHandler) GetResult(c *gin.Context) {
 		return
 	}
 
-	if _, authorized := h.authorizeTaskAccess(c, taskID); !authorized {
+	task, authorized := h.authorizeTaskAccess(c, taskID)
+	if !authorized {
 		return
 	}
 
@@ -690,9 +764,17 @@ func (h *TaskHandler) GetResult(c *gin.Context) {
 		return
 	}
 
+	// B2 (privacy): BY_PERSON team result must not leak other members' raw
+	// chat citations. Keep BY_GROUP unchanged.
+	plainCitations := result.GetCitations()
+	if task != nil && task.SummaryMode == model.ModeByPerson {
+		plainCitations = []model.Citation{}
+	}
+
 	ok(c, gin.H{
 		"content":          result.Content,
-		"citations":        result.GetCitations(),
+		"citations":        plainCitations,
+		"team_citations":   result.GetTeamCitations(),
 		"total_msg_count":  result.TotalMsgCount,
 		"total_token_used": result.TotalTokenUsed,
 		"model_version":    result.ModelVersion,
@@ -930,6 +1012,18 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 
 	task, authorized := h.authorizeTaskAccess(c, taskID)
 	if !authorized {
+		return
+	}
+
+	// A4: tighten non-creator delete. authorizeTaskAccess lets both the creator and
+	// participants through (read/cancel access). But a mere participant must NOT be
+	// able to soft-delete the WHOLE multi-person task -- they can only LEAVE it
+	// (POST /summaries/:id/leave). Only the creator may delete the task. For a
+	// single-person task creator==caller, so this is a strict no-op there. The
+	// scheduled-group branch below still applies its own schedule-creator rule for
+	// the creator.
+	if middleware.GetUserID(c) != task.CreatorID {
+		c.JSON(http.StatusForbidden, apiResponse{Code: 40006, Message: "非创建者请使用退出多人协作"})
 		return
 	}
 

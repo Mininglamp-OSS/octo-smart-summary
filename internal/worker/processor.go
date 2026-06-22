@@ -311,7 +311,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 		})
 		log.Printf("[processor] task %d single participant, skipping WaitingConfirm", task.ID)
 	} else {
-		isAutoScheduled := task.TriggerType == model.TriggerScheduled && p.scheduleConfirmPolicyIsAuto(task)
+		isScheduledMultiPerson := task.TriggerType == model.TriggerScheduled
 
 		// 🔴 P0 dispatch-deadlock fix.
 		//
@@ -330,21 +330,44 @@ func (p *Processor) processTask(task model.SummaryTask) {
 		// Treating "CAS missed" as "give up, leave it Processing" is the defect -- the
 		// dispatch logic itself is correct, it was just fatally gated.
 		//
-		// FIX (direction A + B): for AUTO scheduled multi-person, decide+dispatch on the
-		// MAIN path up front (idempotent: scheduledAutoDispatchTargets only selects
-		// Accepted participants whose personal_result.worker_status==Pending, so re-entry
-		// never re-dispatches an already-running/finished personal). The deadline refresh
-		// is now best-effort AFTER dispatch and a miss never strands the task. For the
-		// non-AUTO (CONFIRM / human-confirm) path we keep the original guarded CAS, but a
-		// miss re-reads the real status and only returns on a genuine terminal/changed
-		// state -- otherwise it falls through, and the异常 path resets to Pending instead
-		// of leaving the task pinned in Processing.
-		if isAutoScheduled {
+		// FIX (direction A + B): for EVERY scheduled multi-person task (AUTO *and*
+		// CONFIRM), decide+dispatch on the MAIN path up front (idempotent:
+		// scheduledAutoDispatchTargets only selects Accepted participants whose
+		// personal_result.worker_status==Pending, so re-entry never re-dispatches an
+		// already-running/finished personal). The deadline refresh is now best-effort
+		// AFTER dispatch and a miss never strands the task. For the MANUAL (non-scheduled)
+		// multi-person path we keep the original guarded CAS, but a miss re-reads the real
+		// status and only returns on a genuine terminal/changed state -- otherwise it
+		// falls through, and the异常 path resets to Pending instead of leaving the task
+		// pinned in Processing.
+		//
+		// 🔴 P1 EXPERIENCE FIX (why this branch now covers CONFIRM, not just AUTO):
+		// A scheduled CONFIRM task (confirm_policy=1/2) reaches the processor with its
+		// participants ALREADY materialized as confirmed Accepted members --
+		// buildScheduledTaskParticipantsConfirm only writes rows for members who already
+		// confirmed, and a zero-confirmation round is soft-deleted/skipped scheduler-side
+		// and never reaches here. So for a scheduled task there is no "waiting for
+		// confirmation" left to do at processor time -- the round is already locked to its
+		// confirmed roster. Previously these CONFIRM rounds fell into the non-dispatch
+		// "participants pending confirm" branch and only got picked up ~5 min later by
+		// scanStuckPersonalTasks, so users stared at "生成中" for minutes. Driving dispatch
+		// here is SAFE because:
+		//   1. scheduledAutoDispatchTargets is idempotent -- it selects ONLY
+		//      status==Accepted AND pr.worker_status==Pending, so in-flight/finished
+		//      personals are never re-dispatched, and unconfirmed members do not exist as
+		//      participant rows for a CONFIRM scheduled round (so they can't be mis-fired).
+		//   2. MANUAL CONFIRM tasks (TriggerType != TriggerScheduled) are untouched: they
+		//      still fall through to the non-scheduled branch below, where the creator was
+		//      already triggered by the API handler and other members stay WaitingConfirm
+		//      until they accept.
+		//   3. Zero-confirmation scheduled rounds are soft-deleted scheduler-side and
+		//      never reach the processor, so there is nothing to special-case here.
+		if isScheduledMultiPerson {
 			// Dispatch FIRST -- the whole point is that dispatch must not depend on the
 			// fragile CAS. Idempotent selection makes repeated claims safe.
 			targets, err := scheduledAutoDispatchTargets(p.db, task.ID)
 			if err != nil {
-				log.Printf("[processor] task %d select AUTO dispatch targets failed: %v", task.ID, err)
+				log.Printf("[processor] task %d select scheduled dispatch targets failed: %v", task.ID, err)
 			}
 			for _, refID := range targets {
 				p.dispatchPersonal(task.ID, refID)
@@ -360,7 +383,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 					"processing_deadline": timezone.Now().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute),
 				})
 			if casResult.Error != nil {
-				log.Printf("[processor] task %d AUTO deadline refresh failed (dispatch already done): %v", task.ID, casResult.Error)
+				log.Printf("[processor] task %d scheduled deadline refresh failed (dispatch already done): %v", task.ID, casResult.Error)
 			} else if casResult.RowsAffected == 0 {
 				// Status is no longer Processing. If it became terminal (Completed/Failed/
 				// Cancelled) that's fine -- the run is concluding. If it was bounced back to
@@ -369,7 +392,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 				// stranded.
 				var cur model.SummaryTask
 				if err := p.db.Select("status").First(&cur, task.ID).Error; err == nil {
-					log.Printf("[processor] task %d AUTO deadline refresh missed (status=%d); dispatch already issued for %d participant(s)", task.ID, cur.Status, len(targets))
+					log.Printf("[processor] task %d scheduled deadline refresh missed (status=%d); dispatch already issued for %d participant(s)", task.ID, cur.Status, len(targets))
 				}
 			}
 			p.sendCallback(model.TaskEvent{
@@ -378,14 +401,16 @@ func (p *Processor) processTask(task model.SummaryTask) {
 				Progress: 50,
 				Message:  "处理中，自动汇总",
 			})
-			log.Printf("[processor] task %d scheduled AUTO multi-person, dispatched %d participant(s)", task.ID, len(targets))
+			log.Printf("[processor] task %d scheduled multi-person, dispatched %d participant(s)", task.ID, len(targets))
 			return
 		}
 
-		// Non-AUTO multi-person (CONFIRM / human-confirm, P1): Creator already triggered
-		// by the API handler; other participants remain WaitingConfirm until they accept.
-		// We must NOT blindly dispatch everyone here. Keep the guarded deadline-refresh
-		// CAS, but make a miss non-fatal and never leave the task pinned in Processing.
+		// Manual (non-scheduled) multi-person (CONFIRM / human-confirm, P1): Creator
+		// already triggered by the API handler; other participants remain WaitingConfirm
+		// until they accept. We must NOT blindly dispatch everyone here. Keep the guarded
+		// deadline-refresh CAS, but make a miss non-fatal and never leave the task pinned
+		// in Processing. (Scheduled CONFIRM rounds never reach this branch -- they take
+		// the active-dispatch path above, because their roster is already confirmed.)
 		casResult := p.db.Model(&model.SummaryTask{}).
 			Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
 			Updates(map[string]interface{}{

@@ -364,7 +364,10 @@ func TestEditSummary_TaskNotFound(t *testing.T) {
 	}
 }
 
-func TestEditSummary_MultiParticipantRejected(t *testing.T) {
+func TestEditSummary_MultiParticipantCreatorAllowedLegacyName(t *testing.T) {
+	// need4: this used to assert multi-person edits are rejected (400). The product
+	// requirement changed: a multi-person task's CREATOR may now edit the team
+	// SummaryResult. Updated to assert the new pass-after behavior (200).
 	db := setupEditDB(t)
 	taskID, resultID, _ := seedEditableTask(t, db)
 
@@ -383,8 +386,184 @@ func TestEditSummary_MultiParticipantRejected(t *testing.T) {
 	}
 	w := doEditRequest(r, taskID, "creator1", body)
 
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for multi-participant, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Errorf("need4: multi-person creator edit should now be 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestEditSummary_MultiParticipantCreatorAllowed(t *testing.T) {
+	// need4: a multi-person task's CREATOR may now edit the team SummaryResult.
+	// Fail-before: edit.go rejected participantCount>1 with 400. Pass-after: 200.
+	db := setupEditDB(t)
+	taskID, resultID, _ := seedEditableTask(t, db)
+
+	// Make it a genuine multi-person task.
+	db.Create(&model.SummaryParticipant{
+		TaskID:   taskID,
+		UserID:   "participant2",
+		UserName: "P2",
+		Status:   model.ParticipantCompleted,
+	})
+
+	h := NewEditHandler(db)
+	r := setupEditRouter(h)
+
+	body := map[string]interface{}{
+		"content":        "creator edited the TEAM draft for a multi-person task",
+		"base_result_id": resultID,
+	}
+	w := doEditRequest(r, taskID, "creator1", body)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for multi-person creator team edit, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var sr model.SummaryResult
+	db.First(&sr, resultID)
+	if sr.Content != "creator edited the TEAM draft for a multi-person task" {
+		t.Errorf("team SummaryResult content not updated: %q", sr.Content)
+	}
+}
+
+func TestEditSummary_MultiParticipantNonCreatorForbidden(t *testing.T) {
+	// need4: in a multi-person task a non-creator participant must NOT be able to
+	// edit the team SummaryResult.
+	db := setupEditDB(t)
+	taskID, resultID, _ := seedEditableTask(t, db)
+
+	db.Create(&model.SummaryParticipant{
+		TaskID:   taskID,
+		UserID:   "participant2",
+		UserName: "P2",
+		Status:   model.ParticipantCompleted,
+	})
+
+	h := NewEditHandler(db)
+	r := setupEditRouter(h)
+
+	body := map[string]interface{}{
+		"content":        "non-creator tries to edit team draft",
+		"base_result_id": resultID,
+	}
+	w := doEditRequest(r, taskID, "participant2", body)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for non-creator multi-person edit, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestEditSummary_MultiParticipantCreatorNoPersonal(t *testing.T) {
+	// need4 / R4: a multi-person creator who has NO PersonalResult of their own must
+	// still be able to edit the team draft (no 500). Team edit does not write back
+	// to anyone's personal report.
+	db := setupEditDB(t)
+	now := time.Now().UTC()
+
+	task := model.SummaryTask{
+		TaskNo:      "TST-EDIT-MP-NOPR",
+		SpaceID:     "space1",
+		CreatorID:   "creator1",
+		SummaryMode: model.ModeByPerson,
+		Status:      model.StatusCompleted,
+	}
+	db.Create(&task)
+
+	// Two non-creator participants, each with a personal result. Creator has none.
+	p1 := model.SummaryParticipant{TaskID: task.ID, UserID: "member_a", UserName: "A", Status: model.ParticipantCompleted}
+	p2 := model.SummaryParticipant{TaskID: task.ID, UserID: "member_b", UserName: "B", Status: model.ParticipantCompleted}
+	db.Create(&p1)
+	db.Create(&p2)
+	db.Create(&model.PersonalResult{TaskID: task.ID, ParticipantRefID: p1.ID, UserID: "member_a", Content: "a", WorkerStatus: model.PersonalStatusCompleted, GeneratedAt: &now})
+	db.Create(&model.PersonalResult{TaskID: task.ID, ParticipantRefID: p2.ID, UserID: "member_b", Content: "b", WorkerStatus: model.PersonalStatusCompleted, GeneratedAt: &now})
+
+	result := model.SummaryResult{TaskID: task.ID, Content: "team draft", Version: 1, GeneratedAt: now}
+	db.Create(&result)
+
+	h := NewEditHandler(db)
+	r := setupEditRouter(h)
+
+	body := map[string]interface{}{
+		"content":        "creator-edited team draft, no personal of own",
+		"base_result_id": result.ID,
+	}
+	w := doEditRequest(r, task.ID, "creator1", body)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 (no 500) for multi-person creator without personal, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Members' personal results must be untouched (no write-back).
+	var pra model.PersonalResult
+	db.Where("task_id = ? AND user_id = ?", task.ID, "member_a").First(&pra)
+	if pra.Content != "a" || pra.EditedAt != nil {
+		t.Errorf("member_a personal result must be untouched, got content=%q edited_at=%v", pra.Content, pra.EditedAt)
+	}
+}
+
+func TestEditSummary_MultiPersonCreatorPersonalNotClobbered(t *testing.T) {
+	// F1: in a multi-person task the creator is also a participant WITH their own
+	// PersonalResult. Editing the TEAM draft must NOT overwrite the creator's
+	// personal summary. Fail-before: hasPersonal mirrored unconditionally and
+	// clobbered it; pass-after: multi-person edits touch the team SummaryResult only.
+	db := setupEditDB(t)
+	now := time.Now().UTC()
+
+	task := model.SummaryTask{
+		TaskNo:      "TST-EDIT-F1",
+		SpaceID:     "space1",
+		CreatorID:   "creator1",
+		SummaryMode: model.ModeByPerson,
+		Status:      model.StatusCompleted,
+	}
+	db.Create(&task)
+
+	// creator IS a participant and HAS a personal result.
+	cp := model.SummaryParticipant{TaskID: task.ID, UserID: "creator1", UserName: "Creator", Status: model.ParticipantCompleted}
+	db.Create(&cp)
+	creatorPR := model.PersonalResult{
+		TaskID:           task.ID,
+		ParticipantRefID: cp.ID,
+		UserID:           "creator1",
+		Content:          "creator's OWN personal summary -- must survive",
+		WorkerStatus:     model.PersonalStatusCompleted,
+		GeneratedAt:      &now,
+	}
+	db.Create(&creatorPR)
+
+	// second participant -> genuinely multi-person.
+	p2 := model.SummaryParticipant{TaskID: task.ID, UserID: "member_b", UserName: "B", Status: model.ParticipantCompleted}
+	db.Create(&p2)
+	db.Create(&model.PersonalResult{TaskID: task.ID, ParticipantRefID: p2.ID, UserID: "member_b", Content: "b", WorkerStatus: model.PersonalStatusCompleted, GeneratedAt: &now})
+
+	result := model.SummaryResult{TaskID: task.ID, Content: "team draft v1", Version: 1, GeneratedAt: now}
+	db.Create(&result)
+
+	h := NewEditHandler(db)
+	r := setupEditRouter(h)
+
+	body := map[string]interface{}{
+		"content":        "creator edits the TEAM draft",
+		"base_result_id": result.ID,
+	}
+	w := doEditRequest(r, task.ID, "creator1", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// team SummaryResult updated...
+	var sr model.SummaryResult
+	db.First(&sr, result.ID)
+	if sr.Content != "creator edits the TEAM draft" {
+		t.Errorf("team SummaryResult not updated: %q", sr.Content)
+	}
+	// ...but the creator's PersonalResult is UNTOUCHED.
+	var gotPR model.PersonalResult
+	db.First(&gotPR, creatorPR.ID)
+	if gotPR.Content != "creator's OWN personal summary -- must survive" {
+		t.Errorf("creator's PersonalResult was clobbered by team edit: %q", gotPR.Content)
+	}
+	if gotPR.EditedAt != nil {
+		t.Errorf("creator's PersonalResult edited_at must stay nil, got %v", gotPR.EditedAt)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/ws"
@@ -19,6 +20,15 @@ import (
 )
 
 var triggerClient = &http.Client{Timeout: 5 * time.Second}
+
+// acceptReviveLeaseMinutes is the initial processing_deadline lease applied when
+// Accept revives an already-Completed multi-person BY_PERSON task back to
+// Processing (so the stuck-task scanner -- processor.go: status==Processing AND
+// processing_deadline < now -- does not immediately reclaim it before the
+// personal-worker claims and refreshes the deadline). The worker resets this the
+// instant it picks the task up; this only needs to outlive the async dispatch
+// hop. Kept in sync with the worker's default WORKER_TASK_LEASE_MINUTES (20).
+const acceptReviveLeaseMinutes = 20
 
 // PersonalHandler handles P2 by-person endpoints.
 type PersonalHandler struct {
@@ -132,7 +142,65 @@ func (h *PersonalHandler) Accept(c *gin.Context) {
 		}
 
 		// Link personal_result_id back to participant
-		return tx.Model(&participant).Update("personal_result_id", pr.ID).Error
+		if err := tx.Model(&participant).Update("personal_result_id", pr.ID).Error; err != nil {
+			return err
+		}
+
+		// 🔴 "Revive" fix: a member added to an ALREADY-Completed multi-person
+		// BY_PERSON task can never get their personal summary generated. AddMembers
+		// puts the new member on the roster as Pending without touching task.status;
+		// by the time they Accept, the old members have long since aggregated the team
+		// summary and the task is Completed(status=3). Accept here creates their
+		// PersonalResult(Pending) and dispatches personal_summary, but the
+		// personal-worker's task CAS only moves Pending/WaitingConfirm -> Processing
+		// (personal_processor.go L113). A Completed task fails that CAS, its current
+		// status != Processing, and the worker aborts ("not in processing state,
+		// aborting") -- the new member's summary never runs and worker_status stays
+		// Pending forever.
+		//
+		// Fix: when we are actually going to dispatch a NEW personal summary
+		// (!prCompleted), and ONLY for a multi-person BY_PERSON task whose task is
+		// currently Completed, pull the task back to Processing with a CONDITIONAL
+		// UPDATE (... WHERE id=? AND status=Completed). The conditional WHERE makes
+		// this race-safe and a strict no-op for any task NOT in Completed:
+		//   - task still Processing (normal in-flight multi-person add) -> 0 rows,
+		//     left untouched; the worker takes its existing already-Processing branch.
+		//   - single-person / BY_GROUP -> guarded out below, never reset.
+		//   - idempotent repeat Accept (prCompleted / already-Accepted fast-path) ->
+		//     never reaches here, so no repeat reset / dispatch.
+		// personal_processor, once it finishes this member, calls TriggerMetaSummary;
+		// meta's completion gate (every rostered member terminal: submitted_at NOT
+		// NULL OR Failed) then re-aggregates a fresh team-summary version that
+		// includes the new member -- the link is self-consistent.
+		if !prCompleted {
+			var task model.SummaryTask
+			if err := tx.Select("id", "summary_mode").First(&task, taskID).Error; err != nil {
+				return err
+			}
+			if task.SummaryMode == model.ModeByPerson {
+				var participantCount int64
+				if err := tx.Model(&model.SummaryParticipant{}).
+					Where("task_id = ?", taskID).Count(&participantCount).Error; err != nil {
+					return err
+				}
+				if participantCount > 1 {
+					// Race-safe revive: only a Completed task is pulled back. The worker
+					// refreshes processing_deadline the moment it claims, so this initial
+					// lease only has to outlive the dispatch hop; use the standard lease.
+					deadline := now.Add(acceptReviveLeaseMinutes * time.Minute)
+					if err := tx.Model(&model.SummaryTask{}).
+						Where("id = ? AND status = ?", taskID, model.StatusCompleted).
+						Updates(map[string]interface{}{
+							"status":              model.StatusProcessing,
+							"processing_deadline": deadline,
+						}).Error; err != nil {
+						return err
+					}
+				}
+			}
+		}
+
+		return nil
 	})
 	if err != nil {
 		log.Printf("[personal] accept tx error: %v", err)
@@ -318,6 +386,81 @@ func (h *PersonalHandler) Submit(c *gin.Context) {
 	ok(c, gin.H{"status": "submitted"})
 }
 
+// PersonalEdit handles PUT /api/v1/summaries/:id/personal-edit
+//
+// need3 + need6: a participant edits THEIR OWN personal report. The caller can
+// only ever touch the PersonalResult keyed by (task_id, user_id=self) -- there is
+// no way to address another member's row. On success a meta_summary worker
+// trigger is fired so the team summary is recomputed to incorporate the edit
+// (TriggerMetaSummary has its own 100ms debounce). Reuses edit.go's content
+// validation (non-empty, <=maxContentBytes, CleanUnreferencedCitations).
+func (h *PersonalHandler) PersonalEdit(c *gin.Context) {
+	userID := middleware.GetUserID(c)
+	taskID, valid := h.parseTaskID(c)
+	if !valid {
+		return
+	}
+
+	var req struct {
+		Content string `json:"content"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid request body"})
+		return
+	}
+	if strings.TrimSpace(req.Content) == "" {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "content cannot be empty"})
+		return
+	}
+	if len(req.Content) > maxContentBytes {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "content 超过 500KB 限制"})
+		return
+	}
+
+	// Authorization: the caller MUST be a participant of this task. Membership is
+	// keyed on (task_id, user_id=self); a non-participant gets 403.
+	var participant model.SummaryParticipant
+	if err := h.db.Where("task_id = ? AND user_id = ?", taskID, userID).First(&participant).Error; err != nil {
+		c.JSON(http.StatusForbidden, apiResponse{Code: 40003, Message: "你不是该任务的参与者"})
+		return
+	}
+
+	// Locate the caller's OWN personal result (task_id + user_id=self). No other
+	// member's row is reachable from here.
+	var pr model.PersonalResult
+	if err := h.db.Where("task_id = ? AND user_id = ?", taskID, userID).First(&pr).Error; err != nil {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "个人总结不存在"})
+		return
+	}
+
+	citations := pr.GetCitations()
+	cleanedCitations := service.CleanUnreferencedCitations(req.Content, citations)
+	tmp := &model.PersonalResult{}
+	tmp.SetCitations(cleanedCitations)
+	citationsJSON := tmp.CitationsJSON
+
+	now := timezone.Now()
+	if err := h.db.Model(&model.PersonalResult{}).
+		Where("id = ?", pr.ID).
+		Updates(map[string]interface{}{
+			"content":        req.Content,
+			"citations_json": citationsJSON,
+			"edited_at":      now,
+		}).Error; err != nil {
+		log.Printf("[personal] personal-edit update error task=%d user=%s: %v", taskID, userID, err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
+		return
+	}
+
+	// need6: recompute the team summary to incorporate this edit.
+	go h.triggerWorker(model.WorkerTriggerRequest{
+		Type:   "meta_summary",
+		TaskID: taskID,
+	})
+
+	ok(c, gin.H{"edited_at": now.Format(time.RFC3339)})
+}
+
 // GetMembers handles GET /api/v1/summaries/:id/members
 func (h *PersonalHandler) GetMembers(c *gin.Context) {
 	taskID, valid := h.parseTaskID(c)
@@ -381,7 +524,13 @@ func (h *PersonalHandler) GetMembers(c *gin.Context) {
 		if pr, exists := prMap[p.ID]; exists && pr.SubmittedAt != nil {
 			member["submitted_at"] = pr.SubmittedAt.Format(time.RFC3339)
 			member["content"] = pr.Content
-			member["citations"] = pr.GetCitations()
+			// 隐私收口：成员间互看个人总结只下发正文，绝不下发 citations
+			//（citations 含被引用的原始聊天记录原文/上下文/跳转信息）。content
+			// 保留供互看，citations 从源头不出网。自己看自己（p.UserID == userID）
+			// 则额外下发 citations，让引用可点开看详情（与 GetPersonal 一致）。
+			if p.UserID == userID {
+				member["citations"] = pr.GetCitations()
+			}
 		}
 		members = append(members, member)
 	}
@@ -404,4 +553,423 @@ func (h *PersonalHandler) triggerWorker(req model.WorkerTriggerRequest) {
 		return
 	}
 	resp.Body.Close()
+}
+
+// addMembersReq is the body for POST /api/v1/summaries/:id/members.
+type addMembersReq struct {
+	UserIDs []string `json:"user_ids"`
+}
+
+// AddMembers handles POST /api/v1/summaries/:id/members
+//
+// need7 (corrected semantics): the task CREATOR adds new collaborators to a
+// multi-person task by putting them on the roster as UNCONFIRMED / PENDING.
+// Only the NEW members need to confirm; previously-confirmed members are left
+// completely untouched (V5 Q3: "member change marks only new members
+// unconfirmed"). Per NEW member, inside one transaction:
+//   - if the task has a bound schedule, the member is added to
+//     schedule.participant_config as confirmed=false / confirmed_at=null
+//     (V5 embedded confirm state, "pending"); existing confirmed members keep
+//     their state -- never reset.
+//   - a summary_participant(Pending) row is created. NO PersonalResult is
+//     materialized and NO personal_summary is dispatched here.
+//
+// The new member must later hit POST /summaries/:id/accept (PersonalHandler.
+// Accept) themselves, which flips them to Accepted, creates the PersonalResult
+// and dispatches personal_summary; on completion personal_processor fires
+// TriggerMetaSummary, folding them into the team summary.
+//
+// Idempotent: a uid that is already a participant is skipped (no error, no
+// duplicate, no state reset).
+func (h *PersonalHandler) AddMembers(c *gin.Context) {
+	userID := middleware.GetUserID(c)
+	taskID, valid := h.parseTaskID(c)
+	if !valid {
+		return
+	}
+
+	var req addMembersReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid request body"})
+		return
+	}
+
+	var task model.SummaryTask
+	if err := h.db.Where("id = ? AND deleted_at IS NULL", taskID).First(&task).Error; err != nil {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
+		return
+	}
+	if task.CreatorID != userID {
+		c.JSON(http.StatusForbidden, apiResponse{Code: 40003, Message: "仅创建者可添加成员"})
+		return
+	}
+
+	// Dedup + drop blanks from the request roster.
+	seen := make(map[string]struct{}, len(req.UserIDs))
+	want := make([]string, 0, len(req.UserIDs))
+	for _, uid := range req.UserIDs {
+		if uid == "" {
+			continue
+		}
+		if _, ok := seen[uid]; ok {
+			continue
+		}
+		seen[uid] = struct{}{}
+		want = append(want, uid)
+	}
+
+	addedCount := 0
+
+	err := h.db.Transaction(func(tx *gorm.DB) error {
+		// Load existing participants once for idempotency.
+		var existing []model.SummaryParticipant
+		if err := tx.Where("task_id = ?", taskID).Find(&existing).Error; err != nil {
+			return err
+		}
+		existingByUID := make(map[string]bool, len(existing))
+		for _, p := range existing {
+			existingByUID[p.UserID] = true
+		}
+
+		// Load + mutate the schedule participant_config once (if bound). F3: take a
+		// row lock (FOR UPDATE) while reading so concurrent AddMembers calls on the
+		// same schedule serialize the read-modify-write of participant_config and
+		// cannot lose each other's JSON edits. Same pattern as V5 UpdateSchedule's
+		// lockedSched (schedule.go).
+		var sched model.SummarySchedule
+		hasSched := false
+		if task.ScheduleID != nil {
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ? AND deleted_at IS NULL", *task.ScheduleID).First(&sched).Error; err == nil {
+				hasSched = true
+			}
+		}
+		cfg := model.ParseScheduleParticipantConfig(sched.ParticipantConfig)
+		schedDirty := false
+
+		for _, uid := range want {
+			if existingByUID[uid] {
+				// Already a member (any state) -> skip entirely. Never reset an
+				// existing/confirmed member (V5 Q3: only NEW members go pending).
+				continue
+			}
+
+			name := service.ResolveUserName(uid)
+			if name == "" {
+				name = uid // fall back to uid when unresolved
+			}
+
+			// ① schedule participant_config: NEW member is added UNCONFIRMED
+			//    (confirmed=false / confirmed_at=null). Existing entries are left as-is.
+			if hasSched {
+				if cfg.FindParticipant(uid) == nil {
+					cfg.Participants = append(cfg.Participants, model.ScheduleParticipantEntry{
+						UserID:    uid,
+						UserName:  name,
+						Confirmed: false,
+					})
+					schedDirty = true
+				}
+			}
+
+			// ② create a PENDING participant. No PersonalResult, no dispatch -- the
+			//    member must Accept themselves to generate their personal summary.
+			//    F2: concurrency-safe create. Two racing AddMembers calls could both
+			//    miss the existence check above and both Create -> unique-key collision
+			//    on uk(task_id,user_id) -> 500. Upsert with DoNothing on conflict, then
+			//    only count it as newly-added (RowsAffected==1) when this call actually
+			//    inserted the row. A conflict means another writer already added them:
+			//    idempotent skip, no error.
+			row := model.SummaryParticipant{
+				TaskID:   taskID,
+				UserID:   uid,
+				UserName: name,
+				Status:   model.ParticipantPending,
+			}
+			res := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "task_id"}, {Name: "user_id"}},
+				DoNothing: true,
+			}).Create(&row)
+			if res.Error != nil {
+				return res.Error
+			}
+			existingByUID[uid] = true
+			if res.RowsAffected == 0 {
+				// Lost the race: a concurrent writer already inserted this member.
+				// Idempotent -- do not count, do not re-touch.
+				continue
+			}
+			addedCount++
+		}
+
+		if hasSched && schedDirty {
+			// A newly-added unconfirmed member means the schedule gate is no longer
+			// fully passed; recompute it so it reflects the pending member.
+			cfg.RecomputeGate(task.CreatorID)
+			raw, mErr := cfg.Marshal()
+			if mErr != nil {
+				return mErr
+			}
+			if err := tx.Model(&model.SummarySchedule{}).
+				Where("id = ?", sched.ID).
+				Update("participant_config", raw).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("[personal] add-members tx error task=%d: %v", taskID, err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
+		return
+	}
+
+	// No dispatch here: each new member generates their personal summary only after
+	// they Accept (POST /summaries/:id/accept), which then auto-folds into the team
+	// summary via personal_processor.TriggerMetaSummary.
+	ok(c, gin.H{"added": addedCount})
+}
+
+// Leave handles POST /api/v1/summaries/:id/leave
+//
+// A participant (NOT the creator) leaves a multi-person collaboration. The
+// creator cannot leave -- they must delete the task instead. On success the
+// caller's summary_participant row AND their summary_personal_result row are
+// PHYSICALLY removed (no schema/soft-delete column on the subtables) inside one
+// transaction, then a meta_summary recompute is dispatched so the team summary
+// is re-aggregated WITHOUT the departed member.
+func (h *PersonalHandler) Leave(c *gin.Context) {
+	userID := middleware.GetUserID(c)
+	taskID, valid := h.parseTaskID(c)
+	if !valid {
+		return
+	}
+
+	var task model.SummaryTask
+	if err := h.db.Where("id = ? AND deleted_at IS NULL", taskID).First(&task).Error; err != nil {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
+		return
+	}
+
+	// The creator cannot leave their own collaboration -- they must delete it.
+	if task.CreatorID == userID {
+		c.JSON(http.StatusForbidden, apiResponse{Code: 40003, Message: "创建者不能退出，请使用删除"})
+		return
+	}
+
+	// The caller must actually be a participant.
+	var participant model.SummaryParticipant
+	if err := h.db.Where("task_id = ? AND user_id = ?", taskID, userID).First(&participant).Error; err != nil {
+		c.JSON(http.StatusForbidden, apiResponse{Code: 40003, Message: "你不是该任务的参与者"})
+		return
+	}
+
+	if err := h.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("task_id = ? AND user_id = ?", taskID, userID).
+			Delete(&model.SummaryParticipant{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("task_id = ? AND user_id = ?", taskID, userID).
+			Delete(&model.PersonalResult{}).Error; err != nil {
+			return err
+		}
+
+		// FIX3: the departed member must also be stripped from the bound
+		// schedule's participant_config. Otherwise the next scheduled round
+		// re-materializes them from cfg.EffectiveUserIDs (scheduled_replace_helpers)
+		// and the member "comes back" after leaving. Lock the schedule row
+		// FOR UPDATE (same pattern as AddMembers) so concurrent roster edits
+		// serialize their read-modify-write of the JSON.
+		if task.ScheduleID != nil {
+			if err := h.stripScheduleParticipant(tx, *task.ScheduleID, userID, task.CreatorID); err != nil {
+				return err
+			}
+		}
+
+		// FIX1: a multi-person BY_PERSON task that has already aggregated its
+		// team summary is Completed. The meta worker only writes when the task
+		// is still Processing (meta_processor: aborts if "no longer processing
+		// before result write"), so a plain meta_summary trigger on a Completed
+		// task is a no-op and the departed member's content lingers in the team
+		// summary. Mirror Accept's revive: conditionally pull a Completed
+		// BY_PERSON task back to Processing so the dispatched recompute can run.
+		// The WHERE status=Completed makes this race-safe + a strict no-op for
+		// any task not Completed.
+		if err := h.reviveCompletedForRecompute(tx, taskID); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		log.Printf("[personal] leave tx error task=%d user=%s: %v", taskID, userID, err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
+		return
+	}
+
+	// Recompute the team summary so the departed member is dropped.
+	go h.triggerWorker(model.WorkerTriggerRequest{
+		Type:   "meta_summary",
+		TaskID: taskID,
+	})
+
+	ok(c, gin.H{"left": true})
+}
+
+// RemoveMember handles DELETE /api/v1/summaries/:id/members?uid=<uid>
+//
+// The task CREATOR removes another member from a multi-person collaboration.
+// Only the creator may remove members; the creator cannot be removed (neither
+// by uid nor by self). On success the target member's summary_participant row
+// AND their summary_personal_result row are PHYSICALLY removed inside one
+// transaction, then a meta_summary recompute is dispatched.
+func (h *PersonalHandler) RemoveMember(c *gin.Context) {
+	userID := middleware.GetUserID(c)
+	taskID, valid := h.parseTaskID(c)
+	if !valid {
+		return
+	}
+	uid := c.Query("uid")
+	if uid == "" {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "缺少 uid 参数"})
+		return
+	}
+
+	var task model.SummaryTask
+	if err := h.db.Where("id = ? AND deleted_at IS NULL", taskID).First(&task).Error; err != nil {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
+		return
+	}
+
+	// Only the creator may remove members.
+	if task.CreatorID != userID {
+		c.JSON(http.StatusForbidden, apiResponse{Code: 40003, Message: "仅创建者可移除成员"})
+		return
+	}
+
+	// The creator cannot be removed (whether addressed by uid or as self).
+	if uid == task.CreatorID || uid == userID {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "不能移除创建者"})
+		return
+	}
+
+	// The target must actually be a participant.
+	var participant model.SummaryParticipant
+	if err := h.db.Where("task_id = ? AND user_id = ?", taskID, uid).First(&participant).Error; err != nil {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "该成员不存在"})
+		return
+	}
+
+	if err := h.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("task_id = ? AND user_id = ?", taskID, uid).
+			Delete(&model.SummaryParticipant{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("task_id = ? AND user_id = ?", taskID, uid).
+			Delete(&model.PersonalResult{}).Error; err != nil {
+			return err
+		}
+
+		// FIX3: strip the removed member from the bound schedule's
+		// participant_config so the next scheduled round does not re-materialize
+		// them. (creator is guarded out above, so we never delete the creator's
+		// config entry.)
+		if task.ScheduleID != nil {
+			if err := h.stripScheduleParticipant(tx, *task.ScheduleID, uid, task.CreatorID); err != nil {
+				return err
+			}
+		}
+
+		// FIX1: revive an already-Completed multi-person BY_PERSON task back to
+		// Processing so the dispatched meta_summary recompute can actually write
+		// (see Leave for the full rationale). No-op for non-Completed tasks.
+		if err := h.reviveCompletedForRecompute(tx, taskID); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		log.Printf("[personal] remove-member tx error task=%d uid=%s: %v", taskID, uid, err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
+		return
+	}
+
+	// Recompute the team summary so the removed member is dropped.
+	go h.triggerWorker(model.WorkerTriggerRequest{
+		Type:   "meta_summary",
+		TaskID: taskID,
+	})
+
+	ok(c, gin.H{"removed": true})
+}
+
+// reviveCompletedForRecompute conditionally pulls an already-Completed
+// multi-person BY_PERSON task back to Processing so that a freshly-dispatched
+// meta_summary recompute (after a member leaves / is removed) can actually
+// write its result. The meta worker refuses to write unless the task is still
+// Processing, so without this a Completed task's team summary would never be
+// re-aggregated and the departed member's content would linger.
+//
+// Race-safe by construction: the UPDATE carries WHERE status=Completed, so it is
+// a strict no-op for any task that is NOT Completed (still Processing, Pending,
+// Failed, single-person, etc.). Only ByPerson tasks are revived. Must run inside
+// the caller's delete transaction, after the participant/personal_result rows
+// are removed.
+func (h *PersonalHandler) reviveCompletedForRecompute(tx *gorm.DB, taskID int64) error {
+	var task model.SummaryTask
+	if err := tx.Select("id", "summary_mode").First(&task, taskID).Error; err != nil {
+		return err
+	}
+	if task.SummaryMode != model.ModeByPerson {
+		return nil
+	}
+	// Revive regardless of remaining participant count: even when only the
+	// creator remains, the team summary still has to be re-aggregated to drop
+	// the departed member's content.
+	deadline := timezone.Now().Add(acceptReviveLeaseMinutes * time.Minute)
+	return tx.Model(&model.SummaryTask{}).
+		Where("id = ? AND status = ?", taskID, model.StatusCompleted).
+		Updates(map[string]interface{}{
+			"status":              model.StatusProcessing,
+			"processing_deadline": deadline,
+		}).Error
+}
+
+// stripScheduleParticipant removes targetUID from the bound schedule's
+// participant_config and recomputes its confirm gate, so the next scheduled
+// round does not re-materialize a member who has left / been removed. The
+// schedule row is locked FOR UPDATE (same pattern as AddMembers) so concurrent
+// roster edits serialize their read-modify-write of the JSON. Must run inside
+// the caller's delete transaction.
+func (h *PersonalHandler) stripScheduleParticipant(tx *gorm.DB, scheduleID int64, targetUID, creatorID string) error {
+	var sched model.SummarySchedule
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND deleted_at IS NULL", scheduleID).First(&sched).Error; err != nil {
+		// Schedule gone / soft-deleted -> nothing to strip.
+		if err == gorm.ErrRecordNotFound {
+			return nil
+		}
+		return err
+	}
+
+	cfg := model.ParseScheduleParticipantConfig(sched.ParticipantConfig)
+	out := cfg.Participants[:0]
+	removed := false
+	for _, p := range cfg.Participants {
+		if p.UserID == targetUID {
+			removed = true
+			continue
+		}
+		out = append(out, p)
+	}
+	if !removed {
+		return nil // target not in config -> no write needed
+	}
+	cfg.Participants = out
+	cfg.RecomputeGate(creatorID)
+
+	raw, err := cfg.Marshal()
+	if err != nil {
+		return err
+	}
+	return tx.Model(&model.SummarySchedule{}).
+		Where("id = ?", sched.ID).
+		Update("participant_config", raw).Error
 }

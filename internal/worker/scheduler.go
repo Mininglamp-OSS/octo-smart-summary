@@ -223,20 +223,36 @@ func claimAndCreateScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.Summary
 		//
 		// V5 §4.3/Q2: for a CONFIRM schedule where NOBODY (creator included) has
 		// confirmed yet, no children are built (acceptedCount==0). The round is skipped:
-		// the freshly-created task is terminated (Cancelled) so it produces no result,
-		// does not occupy the overlap guard, and is not picked up by the processor. The
-		// next cycle re-checks the confirm list (already-advanced next_run_at avoids a
-		// busy re-scan). last_run_at is NOT advanced for a skipped round so a type=4
-		// incremental window is preserved.
+		// the freshly-created placeholder task is SOFT-DELETED (deleted_at set) so it
+		// produces no result, never surfaces in any deleted_at IS NULL query (list/
+		// detail), does not occupy the overlap guard, and is not picked up by the
+		// processor. The next cycle re-checks the confirm list (already-advanced
+		// next_run_at avoids a busy re-scan). last_run_at is NOT advanced for a skipped
+		// round so a type=4 incremental window is preserved.
 		acceptedCount, err := buildScheduledTaskChildren(tx, imDB, lockedSched, newTask, now)
 		if err != nil {
 			return err
 		}
 		if acceptedCount == 0 {
-			log.Printf("[scheduler] schedule %d: CONFIRM round has zero confirmed participants; skipping round (task %d cancelled, no result, last_run_at preserved)", lockedSched.ID, newTask.ID)
+			log.Printf("[scheduler] schedule %d: CONFIRM round has zero confirmed participants; skipping round (placeholder task %d soft-deleted, no result, last_run_at preserved)", lockedSched.ID, newTask.ID)
+			// Soft-delete the placeholder task instead of marking it Cancelled, so it
+			// never surfaces in any deleted_at IS NULL query (list/detail). DeletedAt is
+			// a plain *time.Time (not gorm.DeletedAt), so set it explicitly with now to
+			// stay transaction-consistent. The overlap guard ignores it (deleted_at non-
+			// null), next_run_at is already advanced, last_run_at stays put: the plan
+			// silently rolls to the next time point.
+			// Clean up the summary_source child rows already materialized this round.
+			// buildScheduledTaskChildren builds sources BEFORE counting accepted
+			// participants, so on a zero-confirm round the source rows exist while the
+			// parent task is only soft-deleted -- they would become invisible orphans
+			// accumulating every skipped round. SummarySource has no DeletedAt, so this
+			// is a physical delete (correct: they are valueless, unreferenced garbage).
+			if err := tx.Where("task_id = ?", newTask.ID).Delete(&model.SummarySource{}).Error; err != nil {
+				return err
+			}
 			if err := tx.Model(&model.SummaryTask{}).
 				Where("id = ?", newTask.ID).
-				Update("status", model.StatusCancelled).Error; err != nil {
+				Update("deleted_at", now).Error; err != nil {
 				return err
 			}
 			requeued = false
