@@ -2,12 +2,15 @@ package worker
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"gorm.io/gorm"
 )
 
@@ -261,5 +264,204 @@ func TestProcessMetaSummary_NotReadyNoSubmittedStaysProcessing(t *testing.T) {
 	}
 	if task.Status != model.StatusProcessing {
 		t.Fatalf("a not-yet-ready round must stay Processing and wait, got status=%d", task.Status)
+	}
+}
+
+// newOfflineLLM builds an LLMClient with a configured model name but no usable
+// endpoint. The single-submission (no-merge) meta path only reads ModelVersion()
+// and never calls the network, so this keeps those tests offline/deterministic
+// while satisfying the non-nil llm dependency.
+func newOfflineLLM() *service.LLMClient {
+	return service.NewLLMClient("http://127.0.0.1:0", "", "test-model", 1, 0, false, 1)
+}
+
+// seedSubmittedMember creates an Accepted participant + linked, submitted
+// personal_result whose Content is set to the userID (so the produced
+// single-submission meta result is attributable to a specific member). It
+// returns the personal_result id (the contributor's snapshot id) and the
+// participant id. Unlike seedMetaParticipant it surfaces the ids the
+// roster-race test needs to mutate/inspect the roster.
+func seedSubmittedMember(t *testing.T, db *gorm.DB, taskID int64, userID string) (prID, participantID int64) {
+	t.Helper()
+	now := time.Now().UTC()
+	p := model.SummaryParticipant{TaskID: taskID, UserID: userID, Status: model.ParticipantAccepted, ConfirmedAt: &now}
+	if err := db.Create(&p).Error; err != nil {
+		t.Fatalf("seed participant: %v", err)
+	}
+	pr := model.PersonalResult{
+		TaskID:           taskID,
+		ParticipantRefID: p.ID,
+		UserID:           userID,
+		WorkerStatus:     model.PersonalStatusCompleted,
+		Content:          userID, // content tagged with the member so the result is attributable
+		SubmittedAt:      &now,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	if err := db.Create(&pr).Error; err != nil {
+		t.Fatalf("seed personal_result: %v", err)
+	}
+	db.Model(&p).Update("personal_result_id", pr.ID)
+	return pr.ID, p.ID
+}
+
+// P1 LIVENESS (reviewer-found): the roster guard must NOT leave the task stuck in
+// Processing. When saveLatestResultAndCompleteTask aborts with
+// errRosterChangedDuringMerge, processMetaSummary now `continue`s (re-reading the
+// submitted snapshot with the UPDATED roster and re-aggregating in the SAME
+// worker) instead of `return`ing. The earlier `return` skipped the loop-bottom
+// dirty re-run check while the defer wiped the dirty flag, so a member leaving
+// mid-merge could permanently deadlock the task in Processing.
+//
+// This exercises the full converge-in-one-worker path WITHOUT a live LLM by
+// keeping every iteration on the single-submission (no-merge) branch:
+//   pass 1: only A submitted -> snapshot {A}; an afterSnapshot hook then
+//           simulates RemoveMember(A) landing mid-merge: A's personal_result is
+//           deleted (A leaves the committed set) and B is added+submitted, so the
+//           committed contributor set ({B}) no longer equals the snapshot ({A}).
+//   write : saveLatestResultAndCompleteTask sees the mismatch -> aborts with
+//           errRosterChangedDuringMerge -> processMetaSummary `continue`s.
+//   pass 2: hook is now disarmed; submitted re-reads to {B} -> single-submission
+//           result for the UPDATED roster is written -> task Completed.
+// Asserts the task converges (Completed, not stuck Processing), the result
+// reflects the new roster (B, not the departed A), and the loop does not spin.
+func TestProcessMetaSummary_RosterShrankMidMerge_RecomputesAndCompletes(t *testing.T) {
+	db := newReplaceTestDB(t)
+	taskID := seedProcessingTask(t, db)
+
+	// Initial roster: only A submitted.
+	idA, _ := seedSubmittedMember(t, db, taskID, "uA")
+
+	mp := &MetaProcessor{proc: &Processor{db: db, llm: newOfflineLLM(), cfg: &config.Config{}}, debounceTimers: make(map[int64]*time.Timer)}
+
+	var hookFires int32
+	mp.afterSnapshotFn = func(tid int64, snapshot []int64) {
+		// Fire exactly once: simulate RemoveMember(A) committing mid-merge.
+		if atomic.AddInt32(&hookFires, 1) != 1 {
+			return
+		}
+		// First pass snapshot must be exactly {A}.
+		if len(snapshot) != 1 || snapshot[0] != idA {
+			t.Errorf("first-pass snapshot = %v, want [%d] (A)", snapshot, idA)
+		}
+		// A leaves: delete A's submitted personal_result + decline A's participant.
+		if err := db.Where("task_id = ? AND user_id = ?", tid, "uA").Delete(&model.PersonalResult{}).Error; err != nil {
+			t.Errorf("simulate remove A personal_result: %v", err)
+		}
+		if err := db.Model(&model.SummaryParticipant{}).
+			Where("task_id = ? AND user_id = ?", tid, "uA").
+			Update("status", model.ParticipantDeclined).Error; err != nil {
+			t.Errorf("simulate decline A participant: %v", err)
+		}
+		// New roster contributor B submits.
+		seedSubmittedMember(t, db, tid, "uB")
+	}
+
+	mp.processMetaSummary(context.Background(), taskID)
+
+	// Hook must have fired (the roster-abort path was actually taken).
+	if got := atomic.LoadInt32(&hookFires); got < 1 {
+		t.Fatalf("afterSnapshot hook never fired; roster-abort path not exercised")
+	}
+
+	// LIVENESS: task must NOT be stuck in Processing.
+	var task model.SummaryTask
+	if err := db.First(&task, taskID).Error; err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	if task.Status == model.StatusProcessing {
+		t.Fatalf("DEADLOCK: task left in Processing after a member left mid-merge; roster-abort must recompute, not strand the task")
+	}
+	if task.Status != model.StatusCompleted {
+		t.Fatalf("task should converge to Completed with the updated roster, got status=%d", task.Status)
+	}
+
+	// Exactly one meta result, reflecting the UPDATED roster (B), never the
+	// departed A.
+	if n := countResults(t, db, taskID); n != 1 {
+		t.Fatalf("want exactly 1 meta result after convergence, got %d", n)
+	}
+	var res model.SummaryResult
+	if err := db.Where("task_id = ?", taskID).Order("version DESC").First(&res).Error; err != nil {
+		t.Fatalf("load result: %v", err)
+	}
+	if res.Content != "uB" {
+		t.Fatalf("result content = %q, want %q (updated roster, not departed A)", res.Content, "uB")
+	}
+	for _, c := range res.GetTeamCitations() {
+		if c.UserID == "uA" {
+			t.Fatalf("result still cites departed member uA: %+v", res.GetTeamCitations())
+		}
+	}
+}
+
+// Bounded-retry guard: if the roster keeps shrinking on EVERY pass (a pathological
+// livelock), processMetaSummary must give up after maxRosterRetries rather than
+// spin forever. Here the afterSnapshot hook re-arms every pass — it always makes
+// the committed set differ from the snapshot — so every write aborts with
+// errRosterChangedDuringMerge and the loop must terminate via the retry bound.
+func TestProcessMetaSummary_RosterChurnHitsRetryBound(t *testing.T) {
+	db := newReplaceTestDB(t)
+	taskID := seedProcessingTask(t, db)
+
+	// One initial submitted member so pass 1 has a non-empty snapshot (single
+	// submission -> no LLM). The churn hook then keeps exactly one submitted member
+	// per pass while swapping its identity, so the committed set differs from the
+	// snapshot every time and every write aborts with errRosterChangedDuringMerge.
+	seedSubmittedMember(t, db, taskID, "seed")
+
+	mp := &MetaProcessor{proc: &Processor{db: db, llm: newOfflineLLM(), cfg: &config.Config{}}, debounceTimers: make(map[int64]*time.Timer)}
+
+	var fires int32
+	mp.afterSnapshotFn = func(tid int64, snapshot []int64) {
+		// On every pass, churn the roster so committed != snapshot: remove whatever
+		// was snapshotted (delete its personal_result AND decline its participant so
+		// the round stays ready/terminal) and add a fresh submitted contributor. This
+		// guarantees an errRosterChangedDuringMerge on every write -> exercises the
+		// retry bound. Exactly one member stays submitted per pass (single-submission,
+		// no LLM).
+		n := atomic.AddInt32(&fires, 1)
+		if len(snapshot) > 0 {
+			var refIDs []int64
+			db.Model(&model.PersonalResult{}).Where("id IN ?", snapshot).Pluck("participant_ref_id", &refIDs)
+			if err := db.Where("id IN ?", snapshot).Delete(&model.PersonalResult{}).Error; err != nil {
+				t.Errorf("churn delete snapshot: %v", err)
+			}
+			if len(refIDs) > 0 {
+				if err := db.Model(&model.SummaryParticipant{}).Where("id IN ?", refIDs).
+					Update("status", model.ParticipantDeclined).Error; err != nil {
+					t.Errorf("churn decline participant: %v", err)
+				}
+			}
+		}
+		seedSubmittedMember(t, db, tid, "churn-"+strconv.Itoa(int(n)))
+	}
+
+	done := make(chan struct{})
+	go func() {
+		mp.processMetaSummary(context.Background(), taskID)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("processMetaSummary did not terminate under continuous roster churn (livelock); retry bound not enforced")
+	}
+
+	// Must have stopped at the bound, not spun unboundedly. maxRosterRetries=5 ->
+	// the snapshot/abort cycle runs a small bounded number of times.
+	if got := atomic.LoadInt32(&fires); got == 0 {
+		t.Fatalf("hook never fired; churn path not exercised")
+	}
+	if got := atomic.LoadInt32(&fires); got > 12 {
+		t.Fatalf("roster-abort retried %d times; expected bounded (~maxRosterRetries), loop is not bounded", got)
+	}
+
+	// On abort-via-bound the task is left Processing (a fresh trigger will retry
+	// later); the point of THIS test is termination, not completion.
+	var task model.SummaryTask
+	if err := db.First(&task, taskID).Error; err != nil {
+		t.Fatalf("reload task: %v", err)
 	}
 }

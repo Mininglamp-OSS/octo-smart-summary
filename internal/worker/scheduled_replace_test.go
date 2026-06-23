@@ -79,7 +79,7 @@ func TestSaveLatestResult_ScheduledPrunesPriorAutoVersions(t *testing.T) {
 	db.Create(&model.SummaryChunk{TaskID: taskID, ChunkSummary: "old chunk"})
 
 	newRes := &model.SummaryResult{Content: "new", GeneratedAt: time.Now()}
-	if err := saveLatestResultAndCompleteTask(db, taskID, newRes, true); err != nil {
+	if err := saveLatestResultAndCompleteTask(db, taskID, newRes, true, nil); err != nil {
 		t.Fatalf("save scheduled: %v", err)
 	}
 	if got := countResults(t, db, taskID); got != 1 {
@@ -108,7 +108,7 @@ func TestSaveLatestResult_ScheduledKeepsHandEditedResult(t *testing.T) {
 	db.Create(&model.SummaryResult{TaskID: taskID, Content: "user edit", Version: 1, EditedAt: &edited, GeneratedAt: time.Now()})
 
 	newRes := &model.SummaryResult{Content: "auto new", GeneratedAt: time.Now()}
-	if err := saveLatestResultAndCompleteTask(db, taskID, newRes, true); err != nil {
+	if err := saveLatestResultAndCompleteTask(db, taskID, newRes, true, nil); err != nil {
 		t.Fatalf("save scheduled: %v", err)
 	}
 	// Both the hand-edited row and the new row remain.
@@ -129,7 +129,7 @@ func TestSaveLatestResult_ManualKeepsVersionHistory(t *testing.T) {
 	db.Create(&model.SummaryResult{TaskID: taskID, Content: "v1", Version: 1, GeneratedAt: time.Now()})
 
 	newRes := &model.SummaryResult{Content: "v2", GeneratedAt: time.Now()}
-	if err := saveLatestResultAndCompleteTask(db, taskID, newRes, false); err != nil {
+	if err := saveLatestResultAndCompleteTask(db, taskID, newRes, false, nil); err != nil {
 		t.Fatalf("save manual: %v", err)
 	}
 	if got := countResults(t, db, taskID); got != 2 {
@@ -224,5 +224,153 @@ func TestBuildScheduledTaskSources_FallbackWhenNoNameAndNoIMDB(t *testing.T) {
 	want := "来源-group-ab(群聊)"
 	if src.SourceName != want {
 		t.Errorf("source_name = %q, want fallback %q", src.SourceName, want)
+	}
+}
+
+// seedSubmittedContributor inserts a submitted personal_result row (a contributor
+// that participated in the meta aggregation) and returns its ID.
+func seedSubmittedContributor(t *testing.T, db *gorm.DB, taskID int64, userID string) int64 {
+	t.Helper()
+	now := time.Now().UTC()
+	pr := model.PersonalResult{
+		TaskID:       taskID,
+		UserID:       userID,
+		WorkerStatus: model.PersonalStatusCompleted,
+		SubmittedAt:  &now,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	if err := db.Create(&pr).Error; err != nil {
+		t.Fatalf("seed submitted contributor: %v", err)
+	}
+	return pr.ID
+}
+
+// P1 race guard happy path: when the in-memory snapshot of contributors still
+// matches the committed (submitted) rows at write time, the meta result is
+// written and the task is completed.
+func TestSaveLatestResult_RosterUnchanged_Writes(t *testing.T) {
+	db := newReplaceTestDB(t)
+	taskID := seedProcessingTask(t, db)
+
+	idA := seedSubmittedContributor(t, db, taskID, "uA")
+	idB := seedSubmittedContributor(t, db, taskID, "uB")
+	snapshot := []int64{idA, idB}
+
+	newRes := &model.SummaryResult{Content: "team summary", GeneratedAt: time.Now()}
+	if err := saveLatestResultAndCompleteTask(db, taskID, newRes, false, snapshot); err != nil {
+		t.Fatalf("save with unchanged roster should succeed: %v", err)
+	}
+	if got := countResults(t, db, taskID); got != 1 {
+		t.Fatalf("expected 1 written result, got %d", got)
+	}
+	var task model.SummaryTask
+	db.First(&task, taskID)
+	if task.Status != model.StatusCompleted {
+		t.Errorf("task status = %d, want Completed", task.Status)
+	}
+}
+
+// P1 race guard: if a contributor's personal_result is deleted (Leave/RemoveMember)
+// after the snapshot was taken but before the meta write tx commits, the committed
+// set no longer matches the snapshot. The write must abort with
+// errRosterChangedDuringMerge, write NO result, and leave the task Processing (it
+// must NOT be wrongly completed with a stale summary that still contains the
+// departed member).
+func TestSaveLatestResult_RosterShrank_Aborts(t *testing.T) {
+	db := newReplaceTestDB(t)
+	taskID := seedProcessingTask(t, db)
+
+	idA := seedSubmittedContributor(t, db, taskID, "uA")
+	idB := seedSubmittedContributor(t, db, taskID, "uB")
+	snapshot := []int64{idA, idB}
+
+	// Simulate RemoveMember: physically delete contributor B's personal_result
+	// row AFTER the snapshot was captured.
+	if err := db.Delete(&model.PersonalResult{}, idB).Error; err != nil {
+		t.Fatalf("delete contributor B: %v", err)
+	}
+
+	newRes := &model.SummaryResult{Content: "stale summary mentioning uB", GeneratedAt: time.Now()}
+	err := saveLatestResultAndCompleteTask(db, taskID, newRes, false, snapshot)
+	if err != errRosterChangedDuringMerge {
+		t.Fatalf("err = %v, want errRosterChangedDuringMerge", err)
+	}
+	// No SummaryResult written (whole tx rolled back).
+	if got := countResults(t, db, taskID); got != 0 {
+		t.Errorf("stale roster must write no result, got %d", got)
+	}
+	// Task must remain Processing (NOT completed) so the revive-triggered fresh
+	// meta run can recompute from the new roster.
+	var task model.SummaryTask
+	db.First(&task, taskID)
+	if task.Status != model.StatusProcessing {
+		t.Errorf("task status = %d, want still Processing (not completed)", task.Status)
+	}
+}
+
+// TestSaveLatestResult_TaskRowLock_HappyPath asserts that the FOR UPDATE task-row
+// lock added at the very top of saveLatestResultAndCompleteTask's tx (seloption三:
+// minimal row lock to close the residual roster-vs-merge TOCTOU window) does NOT
+// break the normal save+complete flow.
+//
+// LIMITATION (read carefully): the test DB is sqlite, whose GORM dialector silently
+// DROPS clause.Locking{Strength:"UPDATE"} -- the emitted SQL is a plain
+// `SELECT id FROM summary_task WHERE id = ? LIMIT 1` with NO `FOR UPDATE` suffix.
+// So this test can only prove the added statement is harmless (no error, happy path
+// intact) on sqlite. The REAL serialization (save tx vs concurrent Leave/RemoveMember
+// strictly serialized on the task row) only exists against MySQL in production and is
+// NOT exercised here -- sqlite cannot reproduce MySQL FOR UPDATE row-lock semantics.
+func TestSaveLatestResult_TaskRowLock_HappyPath(t *testing.T) {
+	db := newReplaceTestDB(t)
+	taskID := seedProcessingTask(t, db)
+
+	idA := seedSubmittedContributor(t, db, taskID, "uA")
+	idB := seedSubmittedContributor(t, db, taskID, "uB")
+	snapshot := []int64{idA, idB}
+
+	newRes := &model.SummaryResult{Content: "team summary", GeneratedAt: time.Now()}
+	if err := saveLatestResultAndCompleteTask(db, taskID, newRes, false, snapshot); err != nil {
+		t.Fatalf("save with task-row lock should succeed on the happy path: %v", err)
+	}
+	if got := countResults(t, db, taskID); got != 1 {
+		t.Fatalf("expected 1 written result, got %d", got)
+	}
+	var task model.SummaryTask
+	if err := db.First(&task, taskID).Error; err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	if task.Status != model.StatusCompleted {
+		t.Errorf("task status = %d, want Completed after save", task.Status)
+	}
+}
+
+// sameInt64Set is order-independent set equality. It must treat equal sets
+// (regardless of order/duplicates) as equal and reject strict subsets/supersets.
+func TestSameInt64Set(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b []int64
+		want bool
+	}{
+		{"both empty", nil, []int64{}, true},
+		{"equal same order", []int64{1, 2, 3}, []int64{1, 2, 3}, true},
+		{"equal diff order", []int64{3, 1, 2}, []int64{1, 2, 3}, true},
+		{"equal with dup", []int64{1, 2, 2, 3}, []int64{3, 2, 1}, true},
+		{"subset", []int64{1, 2}, []int64{1, 2, 3}, false},
+		{"superset", []int64{1, 2, 3}, []int64{1, 2}, false},
+		{"disjoint", []int64{1, 2}, []int64{3, 4}, false},
+		{"same size diff members", []int64{1, 2, 3}, []int64{1, 2, 4}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sameInt64Set(tc.a, tc.b); got != tc.want {
+				t.Errorf("sameInt64Set(%v, %v) = %v, want %v", tc.a, tc.b, got, tc.want)
+			}
+			// Set equality is symmetric.
+			if got := sameInt64Set(tc.b, tc.a); got != tc.want {
+				t.Errorf("sameInt64Set(%v, %v) [reversed] = %v, want %v", tc.b, tc.a, got, tc.want)
+			}
+		})
 	}
 }

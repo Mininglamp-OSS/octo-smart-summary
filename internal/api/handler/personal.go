@@ -820,6 +820,38 @@ func (h *PersonalHandler) Leave(c *gin.Context) {
 	}
 
 	if err := h.db.Transaction(func(tx *gorm.DB) error {
+		// Global lock order is schedule -> task (matches UpdateSchedule/DeleteSchedule/
+		// scheduler). Acquire the schedule row lock FIRST when this task is schedule-
+		// bound, THEN the task row lock, so this removal cannot deadlock against a
+		// concurrent schedule-side tx that already holds schedule and wants task.
+		// The task row lock additionally serializes this removal against a concurrent
+		// meta-save (saveLatestResultAndCompleteTask) on the same task, closing the
+		// residual roster-vs-merge TOCTOU window.
+		//
+		// FIX5: task.ScheduleID was read OUTSIDE this tx (auth check). A concurrent
+		// CreateSchedule (manual->scheduled) can rebind nil->non-nil in between, which
+		// would make the conditional schedule lock + stripScheduleParticipant below get
+		// skipped, leaving the departed member in participant_config (re-materialized next
+		// scheduled round). Re-peek the live schedule_id (unlocked; preserves schedule->task
+		// order) and bail out retryable on mismatch; the retried call observes the real
+		// binding and strips correctly.
+		livePeek, err := peekTaskScheduleID(tx, middleware.GetSpaceID(c), middleware.GetUserID(c), taskID)
+		if err != nil {
+			return err
+		}
+		if !int64PtrEqual(livePeek, task.ScheduleID) {
+			return errRebindConcurrentModified
+		}
+		if task.ScheduleID != nil {
+			if _, err := lockOptionalScheduleForUpdate(tx, *task.ScheduleID); err != nil {
+				return err
+			}
+		}
+		var lockTask model.SummaryTask
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id").First(&lockTask, taskID).Error; err != nil {
+			return err
+		}
 		if err := tx.Where("task_id = ? AND user_id = ?", taskID, userID).
 			Delete(&model.SummaryParticipant{}).Error; err != nil {
 			return err
@@ -855,6 +887,10 @@ func (h *PersonalHandler) Leave(c *gin.Context) {
 		}
 		return nil
 	}); err != nil {
+		if isScheduleRetryableConflict(err) {
+			writeRetryableRebindConflict(c)
+			return
+		}
 		log.Printf("[personal] leave tx error task=%d user=%s: %v", taskID, userID, err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
 		return
@@ -914,6 +950,38 @@ func (h *PersonalHandler) RemoveMember(c *gin.Context) {
 	}
 
 	if err := h.db.Transaction(func(tx *gorm.DB) error {
+		// Global lock order is schedule -> task (matches UpdateSchedule/DeleteSchedule/
+		// scheduler). Acquire the schedule row lock FIRST when this task is schedule-
+		// bound, THEN the task row lock, so this removal cannot deadlock against a
+		// concurrent schedule-side tx that already holds schedule and wants task.
+		// The task row lock additionally serializes this removal against a concurrent
+		// meta-save (saveLatestResultAndCompleteTask) on the same task, closing the
+		// residual roster-vs-merge TOCTOU window.
+		//
+		// FIX5: task.ScheduleID was read OUTSIDE this tx (auth check). A concurrent
+		// CreateSchedule (manual->scheduled) can rebind nil->non-nil in between, which
+		// would make the conditional schedule lock + stripScheduleParticipant below get
+		// skipped, leaving the removed member in participant_config (re-materialized next
+		// scheduled round). Re-peek the live schedule_id (unlocked; preserves schedule->task
+		// order) and bail out retryable on mismatch; the retried call observes the real
+		// binding and strips correctly.
+		livePeek, err := peekTaskScheduleID(tx, middleware.GetSpaceID(c), middleware.GetUserID(c), taskID)
+		if err != nil {
+			return err
+		}
+		if !int64PtrEqual(livePeek, task.ScheduleID) {
+			return errRebindConcurrentModified
+		}
+		if task.ScheduleID != nil {
+			if _, err := lockOptionalScheduleForUpdate(tx, *task.ScheduleID); err != nil {
+				return err
+			}
+		}
+		var lockTask model.SummaryTask
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id").First(&lockTask, taskID).Error; err != nil {
+			return err
+		}
 		if err := tx.Where("task_id = ? AND user_id = ?", taskID, uid).
 			Delete(&model.SummaryParticipant{}).Error; err != nil {
 			return err
@@ -941,6 +1009,10 @@ func (h *PersonalHandler) RemoveMember(c *gin.Context) {
 		}
 		return nil
 	}); err != nil {
+		if isScheduleRetryableConflict(err) {
+			writeRetryableRebindConflict(c)
+			return
+		}
 		log.Printf("[personal] remove-member tx error task=%d uid=%s: %v", taskID, uid, err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
 		return

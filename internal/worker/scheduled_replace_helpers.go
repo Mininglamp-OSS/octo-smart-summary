@@ -10,9 +10,12 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var errTaskNoLongerProcessing = errors.New("task no longer processing")
+
+var errRosterChangedDuringMerge = errors.New("contributor roster changed during meta merge")
 
 type scheduleSourceConfig struct {
 	SourceType int    `json:"source_type"`
@@ -321,6 +324,28 @@ func markTaskCompleted(tx *gorm.DB, taskID int64) error {
 	return nil
 }
 
+// sameInt64Set reports whether a and b contain exactly the same set of int64
+// values, ignoring order and duplicates.
+func sameInt64Set(a, b []int64) bool {
+	seen := make(map[int64]struct{}, len(a))
+	for _, v := range a {
+		seen[v] = struct{}{}
+	}
+	other := make(map[int64]struct{}, len(b))
+	for _, v := range b {
+		other[v] = struct{}{}
+	}
+	if len(seen) != len(other) {
+		return false
+	}
+	for v := range seen {
+		if _, ok := other[v]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func completeTaskWithoutNewResult(db *gorm.DB, taskID int64) error {
 	return db.Transaction(func(tx *gorm.DB) error {
 		return markTaskCompleted(tx, taskID)
@@ -330,8 +355,47 @@ func completeTaskWithoutNewResult(db *gorm.DB, taskID int64) error {
 // saveLatestResultAndCompleteTask inserts the new result and marks the task Completed.
 // isScheduled gates version retention: scheduled runs keep only the latest result (the bound
 // task is overwritten in place each cycle); manual/normal/team-meta keep full version history.
-func saveLatestResultAndCompleteTask(db *gorm.DB, taskID int64, result *model.SummaryResult, isScheduled bool) error {
+//
+// snapshotContributorIDs is the set of personal_result IDs that participated in the
+// aggregation that produced `result` (the meta worker's in-memory `submitted`
+// snapshot). Inside the write tx the committed contributor set is re-derived and
+// compared; a mismatch (a member left/was removed mid-merge) returns
+// errRosterChangedDuringMerge so the stale result is never written. Pass nil to
+// disable the check (single-person/personal path: one freshly-produced result, no
+// cross-contributor merge to invalidate).
+func saveLatestResultAndCompleteTask(db *gorm.DB, taskID int64, result *model.SummaryResult, isScheduled bool, snapshotContributorIDs []int64) error {
 	return db.Transaction(func(tx *gorm.DB) error {
+		// Serialize against concurrent Leave/RemoveMember on this task: lock the task
+		// row FOR UPDATE so the roster re-check below and the Create/markTaskCompleted
+		// that follow are atomic w.r.t. roster mutations. Closes the residual TOCTOU
+		// where a removal commits between the roster re-check and the result write.
+		var lockTask model.SummaryTask
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id").First(&lockTask, taskID).Error; err != nil {
+			return err
+		}
+
+		// P1 race guard (meta multi-contributor path only): re-derive the committed
+		// contributor set inside the write tx. If a Leave/RemoveMember deleted a
+		// contributor's personal_result after our in-memory `submitted` snapshot was
+		// taken (and revived the task to Processing), the snapshot is stale and
+		// finalContent may still contain the departed member. Abort the write; the
+		// revive already triggered a fresh meta run that will recompute from the new
+		// roster.
+		//
+		// A nil snapshot disables the check (single-person/personal path, which writes
+		// one freshly-produced result and has no cross-contributor merge to invalidate).
+		if snapshotContributorIDs != nil {
+			var committed []int64
+			if err := tx.Where("task_id = ? AND submitted_at IS NOT NULL", taskID).
+				Model(&model.PersonalResult{}).Pluck("id", &committed).Error; err != nil {
+				return err
+			}
+			if !sameInt64Set(snapshotContributorIDs, committed) {
+				return errRosterChangedDuringMerge
+			}
+		}
+
 		nextVer, err := service.GetNextVersion(tx, taskID)
 		if err != nil {
 			return err

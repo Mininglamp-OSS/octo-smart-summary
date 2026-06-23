@@ -29,6 +29,15 @@ type MetaProcessor struct {
 	// Per-task debounce timer
 	debounceMu     sync.Mutex
 	debounceTimers map[int64]*time.Timer
+
+	// afterSnapshotFn, when non-nil, is invoked inside processMetaSummary right after
+	// the per-iteration contributor snapshot is captured but before the result write.
+	// Test-only seam (mirrors Processor.createPRFn / executePipelineFn) used to
+	// deterministically simulate a Leave/RemoveMember landing mid-merge — i.e. the
+	// roster shrinking after the snapshot — so the errRosterChangedDuringMerge ->
+	// recompute (continue) liveness path can be exercised without a live LLM. It
+	// receives the captured snapshot contributor IDs. Production leaves it nil.
+	afterSnapshotFn func(taskID int64, snapshotContributorIDs []int64)
 }
 
 // NewMetaProcessor creates a new MetaProcessor.
@@ -82,6 +91,15 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 		m.metaLocks.Delete(taskID)
 		m.dirtyFlags.Delete(taskID)
 	}()
+
+	// Bounded retries for the roster-recompute loop. When saveLatestResultAndCompleteTask
+	// aborts with errRosterChangedDuringMerge we `continue` to re-read the submitted
+	// snapshot at loop top and re-aggregate with the updated roster (rather than `return`,
+	// which would drop the task in Processing forever after the defer wipes the dirty flag).
+	// This bound only guards the (theoretical) livelock of someone deleting members on
+	// every iteration; normal convergence happens in a single extra pass.
+	const maxRosterRetries = 5
+	rosterRetries := 0
 
 	for {
 		m.clearDirty(taskID)
@@ -215,6 +233,22 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 		}
 		result.SetTeamCitations(teamCitations)
 
+		// P1 race guard: capture the personal_result IDs that actually entered this
+		// aggregation (the `submitted` snapshot taken at loop top). The write tx in
+		// saveLatestResultAndCompleteTask re-derives the committed contributor set and
+		// aborts if a Leave/RemoveMember shrank the roster after this snapshot.
+		snapshotContributorIDs := make([]int64, 0, len(submitted))
+		for _, pr := range submitted {
+			snapshotContributorIDs = append(snapshotContributorIDs, pr.ID)
+		}
+
+		// Test-only hook: simulate a member Leave/RemoveMember committing AFTER the
+		// snapshot was captured but BEFORE the write tx (the exact race the roster
+		// guard defends against). Production leaves afterSnapshotFn nil.
+		if m.afterSnapshotFn != nil {
+			m.afterSnapshotFn(taskID, snapshotContributorIDs)
+		}
+
 		// Best-effort check: don't write result if task is no longer Processing.
 		// This is a best-effort guard; final safety is guaranteed by the task-level CAS below.
 		var taskCheck model.SummaryTask
@@ -233,10 +267,19 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 		} else {
 			isScheduled = metaTask.TriggerType == model.TriggerScheduled
 		}
-		if err := saveLatestResultAndCompleteTask(m.proc.db, taskID, &result, isScheduled); err != nil {
+		if err := saveLatestResultAndCompleteTask(m.proc.db, taskID, &result, isScheduled, snapshotContributorIDs); err != nil {
 			if errors.Is(err, errTaskNoLongerProcessing) {
 				log.Printf("[meta-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
 				return
+			}
+			if errors.Is(err, errRosterChangedDuringMerge) {
+				rosterRetries++
+				if rosterRetries > maxRosterRetries {
+					log.Printf("[meta-worker] task %d: exceeded roster-recompute retries (%d), aborting to avoid livelock", taskID, maxRosterRetries)
+					return
+				}
+				log.Printf("[meta-worker] task %d: contributor roster changed during merge (member left/removed); recomputing with the updated roster (attempt %d)", taskID, rosterRetries)
+				continue // re-read submitted snapshot at loop top and re-aggregate with the new roster
 			}
 			log.Printf("[meta-worker] save result error task=%d: %v", taskID, err)
 			return

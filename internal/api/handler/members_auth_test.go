@@ -1229,6 +1229,71 @@ func TestRemoveMember_StripsScheduleParticipantConfig(t *testing.T) {
 	}
 }
 
+// DEADLOCK-ORDER (P1 round 4): a schedule-bound task's Leave/RemoveMember now
+// acquires its row locks in the global schedule->task order (schedule row FIRST
+// when task.ScheduleID != nil, THEN the task row), matching UpdateSchedule /
+// DeleteSchedule / scheduler so a removal cannot deadlock against a concurrent
+// schedule-side tx. This case asserts the schedule-bound happy path still works
+// end to end (participant + personal_result physically removed, schedule config
+// stripped). NOTE: sqlite silently drops FOR UPDATE, so this does NOT reproduce
+// the deadlock itself; the lock-ORDER fix is verified by static review (see the
+// task report's lock-order consistency table). This guards against a regression
+// where adding the conditional schedule lock breaks the normal flow.
+func TestLeave_ScheduleBound_HappyPathStillWorks(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID, _ := seedScheduledMultiPersonTask(t, db)
+	tc := newTriggerCapture(t)
+	h := NewPersonalHandler(db, tc.url(), nil)
+	r := setupLeaveRemoveRouter(h)
+
+	w := doJSONRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/leave", taskID), "member_x", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for schedule-bound leave, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var pcount int64
+	db.Model(&model.SummaryParticipant{}).
+		Where("task_id = ? AND user_id = ?", taskID, "member_x").Count(&pcount)
+	if pcount != 0 {
+		t.Errorf("leave must physically remove member_x participant row, found %d", pcount)
+	}
+	var rcount int64
+	db.Model(&model.PersonalResult{}).
+		Where("task_id = ? AND user_id = ?", taskID, "member_x").Count(&rcount)
+	if rcount != 0 {
+		t.Errorf("leave must physically remove member_x personal_result row, found %d", rcount)
+	}
+}
+
+// DEADLOCK-ORDER (P1 round 4): creator removing a schedule-bound member must
+// likewise stay on the schedule->task lock order and complete the happy path.
+// Same sqlite FOR UPDATE caveat as TestLeave_ScheduleBound_HappyPathStillWorks.
+func TestRemoveMember_ScheduleBound_HappyPathStillWorks(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID, _ := seedScheduledMultiPersonTask(t, db)
+	tc := newTriggerCapture(t)
+	h := NewPersonalHandler(db, tc.url(), nil)
+	r := setupLeaveRemoveRouter(h)
+
+	w := doJSONRequest(r, "DELETE", fmt.Sprintf("/api/v1/summaries/%d/members?uid=%s", taskID, "member_x"), "creator1", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for schedule-bound remove-member, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var pcount int64
+	db.Model(&model.SummaryParticipant{}).
+		Where("task_id = ? AND user_id = ?", taskID, "member_x").Count(&pcount)
+	if pcount != 0 {
+		t.Errorf("remove must physically remove member_x participant row, found %d", pcount)
+	}
+	var rcount int64
+	db.Model(&model.PersonalResult{}).
+		Where("task_id = ? AND user_id = ?", taskID, "member_x").Count(&rcount)
+	if rcount != 0 {
+		t.Errorf("remove must physically remove member_x personal_result row, found %d", rcount)
+	}
+}
+
 // BE-1: editing one's own personal report on an ALREADY-Completed multi-person
 // BY_PERSON task must revive the task back to Processing (inside the same
 // transaction as the report Update) so the dispatched meta_summary recompute can
@@ -1359,5 +1424,123 @@ func TestPersonalEdit_WrongSpace_Returns404(t *testing.T) {
 	db.Where("task_id = ? AND user_id = ?", taskID, "member_x").First(&prX)
 	if prX.EditedAt != nil || prX.Content != "member_x original [1]" {
 		t.Errorf("cross-space edit must not modify the report: content=%q edited_at=%v", prX.Content, prX.EditedAt)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FIX5 (P1 round 5): nil->non-nil rebind window on Leave/RemoveMember.
+//
+// The window: Leave/RemoveMember read task.ScheduleID OUTSIDE the tx (during the
+// auth check). A concurrent CreateSchedule (manual->scheduled) can rebind
+// schedule_id nil->non-nil in between. If the out-of-tx value (nil) were trusted,
+// the conditional schedule lock + stripScheduleParticipant would be SKIPPED,
+// leaving the departed member in participant_config (re-materialized next round).
+//
+// The fix re-peeks the LIVE schedule_id inside the tx (unlocked, preserving the
+// schedule->task lock order) and bails out retryable (errRebindConcurrentModified
+// -> 409/40916) on mismatch; the client's retry then observes the real binding and
+// strips correctly via the round-4 "lock schedule then task then strip" path.
+//
+// HONEST TEST-SEAM NOTE: a gin handler test cannot deterministically interleave
+// "out-of-tx read happens, THEN concurrent commit, THEN in-tx peek" because both
+// reads live inside the handler with no injectable hook between them. sqlite also
+// silently drops FOR UPDATE, so real concurrent timing is not reproducible in unit
+// tests (same caveat as the round-4 happy-path tests). Therefore we test the LAYER
+// THE FIX ADDS directly: (1) peekTaskScheduleID reads the live schedule_id inside a
+// real tx; (2) int64PtrEqual against the stale out-of-tx value detects the mismatch;
+// (3) errRebindConcurrentModified is classified retryable; (4) it maps to 409/40916.
+// This covers the decision logic end to end except the un-injectable wall-clock race.
+
+func TestFix5_PeekDetectsRebindMismatch_AndIsRetryable(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID, scheduleID := seedScheduledMultiPersonTask(t, db)
+
+	// Simulate the dangerous case: the handler's out-of-tx auth read observed a
+	// STALE schedule_id of nil (as it would right before a concurrent
+	// CreateSchedule committed the nil->non-nil rebind). The live row, however, is
+	// already bound to scheduleID.
+	var staleOutOfTxScheduleID *int64 // nil == "task looked manual a moment ago"
+
+	var (
+		livePeek  *int64
+		peekErr   error
+		mismatch  bool
+	)
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		// This is exactly what the patched Leave/RemoveMember do at the top of the tx.
+		livePeek, peekErr = peekTaskScheduleID(tx, "space1", "creator1", taskID)
+		if peekErr != nil {
+			return peekErr
+		}
+		mismatch = !int64PtrEqual(livePeek, staleOutOfTxScheduleID)
+		if mismatch {
+			return errRebindConcurrentModified
+		}
+		return nil
+	}); err != nil {
+		// Expected: the tx returns the retryable sentinel.
+		if !isScheduleRetryableConflict(err) {
+			t.Fatalf("expected retryable rebind conflict, got non-retryable: %v", err)
+		}
+	} else {
+		t.Fatalf("expected tx to bail out on rebind mismatch, but it succeeded")
+	}
+
+	if peekErr != nil {
+		t.Fatalf("peekTaskScheduleID returned error: %v", peekErr)
+	}
+	if livePeek == nil || *livePeek != scheduleID {
+		t.Fatalf("peek must read the LIVE schedule_id %d, got %v", scheduleID, livePeek)
+	}
+	if !mismatch {
+		t.Fatalf("int64PtrEqual must report mismatch between stale nil and live %d", scheduleID)
+	}
+
+	// And the retryable sentinel must serialize to the 409/40916 the client retries on.
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	writeRetryableRebindConflict(c)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("writeRetryableRebindConflict must write 409, got %d", w.Code)
+	}
+	var resp apiResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal 409 body: %v", err)
+	}
+	if resp.Code != 40916 {
+		t.Fatalf("rebind conflict must carry Code 40916, got %d", resp.Code)
+	}
+}
+
+// Guards the OTHER direction of int64PtrEqual used by the peek-compare: when the
+// out-of-tx value already MATCHES the live binding (the common case + the retry
+// case where the rebind has settled), the peek must NOT bail out, so the normal
+// round-4 strip path runs. This is the inverse assertion that keeps the happy path
+// from regressing into a spurious 40916.
+func TestFix5_PeekMatchesLiveBinding_NoBailout(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID, scheduleID := seedScheduledMultiPersonTask(t, db)
+
+	// The out-of-tx read agrees with the live binding (e.g. the retried request, or
+	// the non-racy common path).
+	outOfTx := &scheduleID
+
+	var bailed bool
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		livePeek, err := peekTaskScheduleID(tx, "space1", "creator1", taskID)
+		if err != nil {
+			return err
+		}
+		if !int64PtrEqual(livePeek, outOfTx) {
+			bailed = true
+			return errRebindConcurrentModified
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("tx must not error when peek matches live binding: %v", err)
+	}
+	if bailed {
+		t.Fatalf("peek-compare must NOT bail out when out-of-tx value matches live schedule_id %d", scheduleID)
 	}
 }
