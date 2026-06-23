@@ -1045,8 +1045,7 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 	// able to soft-delete the WHOLE multi-person task -- they can only LEAVE it
 	// (POST /summaries/:id/leave). Only the creator may delete the task. For a
 	// single-person task creator==caller, so this is a strict no-op there. The
-	// scheduled-group branch below still applies its own schedule-creator rule for
-	// the creator.
+	// scheduled-group branch below still applies its own schedule-creator rule for the creator.
 	if middleware.GetUserID(c) != task.CreatorID {
 		c.JSON(http.StatusForbidden, apiResponse{Code: 40006, Message: "非创建者请使用退出多人协作"})
 		return

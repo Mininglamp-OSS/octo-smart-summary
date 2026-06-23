@@ -241,8 +241,7 @@ func loadTaskParticipantReqs(tx *gorm.DB, taskID int64) ([]participantReq, error
 //     task members are always kept. Add an explicit removal semantics + test if
 //     that is ever required.)
 //
-// The union is keyed by user_id; the creator is added by the confirm-config
-// builders, not here.
+// The union is keyed by user_id; the creator is added by the confirm-config builders, not here.
 func effectiveConfirmParticipants(reqParticipants, taskParticipants []participantReq, allowReqOnlyAdditions bool) []participantReq {
 	nameByID := map[string]string{}
 	for _, p := range reqParticipants {
@@ -283,8 +282,7 @@ func effectiveConfirmParticipants(reqParticipants, taskParticipants []participan
 // it rebuilds the confirm roster from the new participant list (req), PRESERVING the
 // confirm state of members still present in `stored`, defaulting members not in
 // `stored` (newly added) to confirmed=false, and always keeping the creator. The
-// caller recomputes the gate. Members removed from the roster naturally drop their
-// confirm state.
+// caller recomputes the gate. Members removed from the roster naturally drop their confirm state.
 func mergeConfirmRoster(stored model.ScheduleParticipantConfig, participants []participantReq, creatorID string) model.ScheduleParticipantConfig {
 	out := model.ScheduleParticipantConfig{Participants: []model.ScheduleParticipantEntry{}}
 	seen := map[string]struct{}{}
@@ -915,8 +913,7 @@ func (h *ScheduleHandler) ConfirmSchedule(c *gin.Context) {
 		}
 
 		// AUTO schedules have no confirm step: a roster member calling confirm is a
-		// no-op success (gate is implicitly passed), but we only reach here after
-		// proving membership above.
+		// no-op success (gate is implicitly passed), but we only reach here after proving membership above.
 		if lockedSched.ConfirmPolicy == model.SchedConfirmAuto {
 			gatePassed = true
 			return nil
@@ -1327,8 +1324,7 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		// confirmed=false). We approximate "became scheduled/active" as: stored is_active
 		// != 1 and this update keeps/sets it usable. is_active is not directly settable
 		// via UpdateSchedule (ToggleSchedule owns that), so the only full-reset trigger
-		// here is the AUTO->CONFIRM policy switch (manual/auto schedule converted to a
-		// confirm-required one).
+		// here is the AUTO->CONFIRM policy switch (manual/auto schedule converted to a confirm-required one).
 		policyBecameConfirm := effConfirmPolicy != model.SchedConfirmAuto &&
 			lockedSched.ConfirmPolicy == model.SchedConfirmAuto
 
@@ -1337,8 +1333,7 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		// req.Participants (frontend gap). Backfill the effective roster from the
 		// task's REAL participants so the schedule keeps every collaborator instead of
 		// degenerating to the stored (possibly creator-only) config. Only meaningful
-		// for the task-scope path where `task` is loaded; for scope="" we leave the
-		// stored roster untouched.
+		// for the task-scope path where `task` is loaded; for scope="" we leave the stored roster untouched.
 		var taskParts []participantReq
 		if req.Scope == "task" {
 			var lerr error
@@ -1372,8 +1367,7 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 				updates["participant_config"] = model.JSON(b)
 			}
 		} else {
-			// CONFIRM: maintain the V5 object-form participant_config with embedded
-			// confirm state.
+			// CONFIRM: maintain the V5 object-form participant_config with embedded confirm state.
 			creatorID := lockedSched.CreatorID
 			stored := model.ParseScheduleParticipantConfig(lockedSched.ParticipantConfig)
 

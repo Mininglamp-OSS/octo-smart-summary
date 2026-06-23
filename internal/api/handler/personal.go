@@ -169,8 +169,7 @@ func (h *PersonalHandler) Accept(c *gin.Context) {
 			// If the existing row is in a terminal state (Completed/Submitted), don't
 			// reset it -- accept stays idempotent and the worker is not re-triggered
 			// over a finished result. Otherwise make sure worker_status is Pending so
-			// scheduledAutoDispatchTargets (Accepted && worker_status==Pending) can pick
-			// it up for (re)dispatch.
+			// scheduledAutoDispatchTargets (Accepted && worker_status==Pending) can pick it up for (re)dispatch.
 			if pr.WorkerStatus == model.PersonalStatusCompleted || pr.SubmittedAt != nil {
 				prCompleted = true
 			} else if pr.WorkerStatus != model.PersonalStatusPending {
@@ -195,8 +194,7 @@ func (h *PersonalHandler) Accept(c *gin.Context) {
 		// personal-worker's task CAS only moves Pending/WaitingConfirm -> Processing
 		// (personal_processor.go L113). A Completed task fails that CAS, its current
 		// status != Processing, and the worker aborts ("not in processing state,
-		// aborting") -- the new member's summary never runs and worker_status stays
-		// Pending forever.
+		// aborting") -- the new member's summary never runs and worker_status stays Pending forever.
 		//
 		// Fix: when we are actually going to dispatch a NEW personal summary
 		// (!prCompleted), and ONLY for a multi-person BY_PERSON task whose task is
@@ -327,8 +325,7 @@ func (h *PersonalHandler) GetPersonal(c *gin.Context) {
 	// reading any personal_result. A space mismatch is 40008/404 like a missing
 	// task (no existence leak). This runs BEFORE the "no pr -> default" fallback so
 	// a cross-space caller can never coax a default-shaped 200 out of another
-	// space's task; the missing-pr default behaviour for in-space callers is
-	// unchanged.
+	// space's task; the missing-pr default behaviour for in-space callers is unchanged.
 	if !h.requireTaskInSpace(c, taskID) {
 		return
 	}
@@ -687,8 +684,7 @@ type addMembersReq struct {
 // and dispatches personal_summary; on completion personal_processor fires
 // TriggerMetaSummary, folding them into the team summary.
 //
-// Idempotent: a uid that is already a participant is skipped (no error, no
-// duplicate, no state reset).
+// Idempotent: a uid that is already a participant is skipped (no error, no duplicate, no state reset).
 func (h *PersonalHandler) AddMembers(c *gin.Context) {
 	userID := middleware.GetUserID(c)
 	taskID, valid := h.parseTaskID(c)
@@ -750,8 +746,7 @@ func (h *PersonalHandler) AddMembers(c *gin.Context) {
 		// Load + mutate the schedule participant_config once (if bound). F3: take a
 		// row lock (FOR UPDATE) while reading so concurrent AddMembers calls on the
 		// same schedule serialize the read-modify-write of participant_config and
-		// cannot lose each other's JSON edits. Same pattern as V5 UpdateSchedule's
-		// lockedSched (schedule.go).
+		// cannot lose each other's JSON edits. Same pattern as V5 UpdateSchedule's lockedSched (schedule.go).
 		var sched model.SummarySchedule
 		hasSched := false
 		if task.ScheduleID != nil {
@@ -941,8 +936,7 @@ func (h *PersonalHandler) Leave(c *gin.Context) {
 		// task is a no-op and the departed member's content lingers in the team
 		// summary. Mirror Accept's revive: conditionally pull a Completed
 		// BY_PERSON task back to Processing so the dispatched recompute can run.
-		// The WHERE status=Completed makes this race-safe + a strict no-op for
-		// any task not Completed.
+		// The WHERE status=Completed makes this race-safe + a strict no-op for any task not Completed.
 		if err := h.reviveCompletedForRecompute(tx, taskID); err != nil {
 			return err
 		}
@@ -1054,8 +1048,7 @@ func (h *PersonalHandler) RemoveMember(c *gin.Context) {
 
 		// FIX3: strip the removed member from the bound schedule's
 		// participant_config so the next scheduled round does not re-materialize
-		// them. (creator is guarded out above, so we never delete the creator's
-		// config entry.)
+		// them. (creator is guarded out above, so we never delete the creator's config entry.)
 		if task.ScheduleID != nil {
 			if err := h.stripScheduleParticipant(tx, *task.ScheduleID, uid, task.CreatorID); err != nil {
 				return err
@@ -1098,8 +1091,7 @@ func (h *PersonalHandler) RemoveMember(c *gin.Context) {
 // Race-safe by construction: the UPDATE carries WHERE status=Completed, so it is
 // a strict no-op for any task that is NOT Completed (still Processing, Pending,
 // Failed, single-person, etc.). Only ByPerson tasks are revived. Must run inside
-// the caller's delete transaction, after the participant/personal_result rows
-// are removed.
+// the caller's delete transaction, after the participant/personal_result rows are removed.
 func (h *PersonalHandler) reviveCompletedForRecompute(tx *gorm.DB, taskID int64) error {
 	var task model.SummaryTask
 	if err := tx.Select("id", "summary_mode").First(&task, taskID).Error; err != nil {
@@ -1109,8 +1101,7 @@ func (h *PersonalHandler) reviveCompletedForRecompute(tx *gorm.DB, taskID int64)
 		return nil
 	}
 	// Revive regardless of remaining participant count: even when only the
-	// creator remains, the team summary still has to be re-aggregated to drop
-	// the departed member's content.
+	// creator remains, the team summary still has to be re-aggregated to drop the departed member's content.
 	deadline := timezone.Now().Add(acceptReviveLeaseMinutes * time.Minute)
 	return tx.Model(&model.SummaryTask{}).
 		Where("id = ? AND status = ?", taskID, model.StatusCompleted).

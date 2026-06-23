@@ -338,8 +338,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 		// AFTER dispatch and a miss never strands the task. For the MANUAL (non-scheduled)
 		// multi-person path we keep the original guarded CAS, but a miss re-reads the real
 		// status and only returns on a genuine terminal/changed state -- otherwise it
-		// falls through, and the异常 path resets to Pending instead of leaving the task
-		// pinned in Processing.
+		// falls through, and the异常 path resets to Pending instead of leaving the task pinned in Processing.
 		//
 		// 🔴 P1 EXPERIENCE FIX (why this branch now covers CONFIRM, not just AUTO):
 		// A scheduled CONFIRM task (confirm_policy=1/2) reaches the processor with its
@@ -350,8 +349,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 		// confirmation" left to do at processor time -- the round is already locked to its
 		// confirmed roster. Previously these CONFIRM rounds fell into the non-dispatch
 		// "participants pending confirm" branch and only got picked up ~5 min later by
-		// scanStuckPersonalTasks, so users stared at "生成中" for minutes. Driving dispatch
-		// here is SAFE because:
+		// scanStuckPersonalTasks, so users stared at "生成中" for minutes. Driving dispatch here is SAFE because:
 		//   1. scheduledAutoDispatchTargets is idempotent -- it selects ONLY
 		//      status==Accepted AND pr.worker_status==Pending, so in-flight/finished
 		//      personals are never re-dispatched, and unconfirmed members do not exist as
@@ -388,8 +386,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 				// Status is no longer Processing. If it became terminal (Completed/Failed/
 				// Cancelled) that's fine -- the run is concluding. If it was bounced back to
 				// Pending (e.g. a stuck-scan revive), the next claim will re-run idempotently.
-				// Either way we have already dispatched the Pending personals, so we are NOT
-				// stranded.
+				// Either way we have already dispatched the Pending personals, so we are NOT stranded.
 				var cur model.SummaryTask
 				if err := p.db.Select("status").First(&cur, task.ID).Error; err == nil {
 					log.Printf("[processor] task %d scheduled deadline refresh missed (status=%d); dispatch already issued for %d participant(s)", task.ID, cur.Status, len(targets))
@@ -433,8 +430,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 				log.Printf("[processor] task %d reached terminal status %d, skipping dispatch", task.ID, cur.Status)
 				return
 			case model.StatusProcessing:
-				// We still own it (a benign racing deadline write). Fall through to the
-				// waiting-for-confirm path below.
+				// We still own it (a benign racing deadline write). Fall through to the waiting-for-confirm path below.
 			default:
 				// Bounced to Pending/WaitingConfirm by a concurrent revive. Do NOT闷 in
 				// Processing: let the next claim handle it. (No dispatch here -- CONFIRM

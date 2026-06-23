@@ -87,8 +87,7 @@ func buildScheduledTaskSources(tx *gorm.DB, imDB *gorm.DB, taskID int64, raw mod
 }
 
 // buildScheduledTaskParticipants materializes the participant + personal_result
-// rows for a freshly INSERTed scheduled task. Behaviour is driven by the
-// schedule's confirm_policy:
+// rows for a freshly INSERTed scheduled task. Behaviour is driven by the schedule's confirm_policy:
 //
 //   - AUTO (confirm_policy==SchedConfirmAuto): every participant (creator AND
 //     configured others) is pre-Accepted with ConfirmedAt set. There is no human
@@ -119,8 +118,7 @@ func buildScheduledTaskParticipants(tx *gorm.DB, task model.SummaryTask, raw mod
 
 // buildScheduledTaskParticipantsAuto pre-accepts the whole roster (creator +
 // configured others). The participant_config may be in the legacy bare-array
-// shape or the V5 object shape; both normalize through
-// model.ParseScheduleParticipantConfig.
+// shape or the V5 object shape; both normalize through model.ParseScheduleParticipantConfig.
 func buildScheduledTaskParticipantsAuto(tx *gorm.DB, task model.SummaryTask, raw model.JSON, now time.Time) (int, error) {
 	cfg := model.ParseScheduleParticipantConfig(raw)
 	roster := cfg.EffectiveUserIDs(task.CreatorID) // creator always included
@@ -380,8 +378,7 @@ func saveLatestResultAndCompleteTask(db *gorm.DB, taskID int64, result *model.Su
 		// contributor's personal_result after our in-memory `submitted` snapshot was
 		// taken (and revived the task to Processing), the snapshot is stale and
 		// finalContent may still contain the departed member. Abort the write; the
-		// revive already triggered a fresh meta run that will recompute from the new
-		// roster.
+		// revive already triggered a fresh meta run that will recompute from the new roster.
 		//
 		// A nil snapshot disables the check (single-person/personal path, which writes
 		// one freshly-produced result and has no cross-contributor merge to invalidate).

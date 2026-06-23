@@ -22,8 +22,7 @@ type ScheduleParticipantEntry struct {
 
 // ScheduleParticipantConfig is the V5 object form of participant_config:
 // a list of collaborators each carrying its own confirm state, plus a
-// schedule-level gate flag that turns true once EVERY listed member (creator
-// included, Q2) has confirmed.
+// schedule-level gate flag that turns true once EVERY listed member (creator included, Q2) has confirmed.
 type ScheduleParticipantConfig struct {
 	Participants      []ScheduleParticipantEntry `json:"participants"`
 	ConfirmGatePassed bool                       `json:"confirm_gate_passed"`
@@ -153,8 +152,7 @@ func (c *ScheduleParticipantConfig) IsConfirmed(userID string) bool {
 }
 
 // RecomputeGate sets ConfirmGatePassed=true iff every member of the effective
-// roster (creator + configured participants) is confirmed. An empty roster
-// leaves the gate false.
+// roster (creator + configured participants) is confirmed. An empty roster leaves the gate false.
 func (c *ScheduleParticipantConfig) RecomputeGate(creatorID string) {
 	roster := c.EffectiveUserIDs(creatorID)
 	if len(roster) == 0 {
@@ -172,8 +170,7 @@ func (c *ScheduleParticipantConfig) RecomputeGate(creatorID string) {
 
 // EnsureCreatorEntry guarantees the creator is present as a roster entry so the
 // creator also gets a confirm toggle (Q2: creator must confirm too, no longer
-// auto-accepted). It does NOT mark the creator confirmed. Returns true if an
-// entry was added.
+// auto-accepted). It does NOT mark the creator confirmed. Returns true if an entry was added.
 func (c *ScheduleParticipantConfig) EnsureCreatorEntry(creatorID string) bool {
 	if creatorID == "" {
 		return false

@@ -378,8 +378,7 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 			return err
 		}
 		if participantCount <= 1 {
-			// Single-person: keep prior behavior -- reset participant to Accepted and
-			// propagate failure to the task.
+			// Single-person: keep prior behavior -- reset participant to Accepted and propagate failure to the task.
 			if err := tx.Model(participant).Update("status", model.ParticipantAccepted).Error; err != nil {
 				return err
 			}
@@ -430,8 +429,7 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 	}
 
 	if permanentMultiDeclined {
-		// A member is permanently out: re-evaluate meta so the task does not dead-wait
-		// on the now-Declined member.
+		// A member is permanently out: re-evaluate meta so the task does not dead-wait on the now-Declined member.
 		if p.meta != nil {
 			p.meta.TriggerMetaSummary(pr.TaskID)
 		}
