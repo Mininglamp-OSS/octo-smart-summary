@@ -1,0 +1,32 @@
+# gitleaks configuration for octo-smart-summary
+#
+# This file is auto-detected by the org reusable secret-scan workflow
+# (Mininglamp-OSS/.github reusable-secret-scan.yml). When present it is passed
+# via `gitleaks --config .gitleaks.toml`, which REPLACES the built-in config.
+# We therefore extend the default ruleset and only ADD an allowlist; we never
+# weaken or drop the default secret detections.
+[extend]
+useDefault = true
+
+# ---------------------------------------------------------------------------
+# Allowlist: documented false positives only.
+#
+# internal/service/llm_test.go contains LLM model-name string literals passed
+# as the 3rd positional arg to NewLLMClient(...) in unit tests (e.g.
+# "qwen3.6-plus", "deepseek-v4-flash"). gitleaks' generic-api-key heuristic
+# occasionally flags these high-entropy-looking model names as a leaked key
+# (observed: llm_test.go:137 "qwen3.6-plus"). These are not secrets: the file
+# is a *_test.go fixture, the values are model identifiers, and no real
+# credential is present (the apiKey arg is the literal "test-fake-api-key").
+#
+# We scope the exemption to this single test file and the generic-api-key rule
+# so real-secret detection elsewhere is unaffected. Using a path-based rule
+# (not a commit-fingerprint) keeps it stable across rebases / line shifts.
+# ---------------------------------------------------------------------------
+[[rules]]
+id = "generic-api-key"
+[rules.allowlist]
+description = "LLM model-name literals in llm_test.go are not secrets"
+paths = [
+  '''internal/service/llm_test\.go''',
+]
