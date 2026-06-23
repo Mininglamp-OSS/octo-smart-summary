@@ -58,11 +58,44 @@ func (h *PersonalHandler) parseTaskID(c *gin.Context) (int64, bool) {
 	return taskID, true
 }
 
+// requireTaskInSpace enforces P1 cross-space isolation: the task must exist and
+// belong to the caller's space (middleware.GetSpaceID). On a missing task OR a
+// space mismatch it writes 40008/404 ("任务不存在") -- identical to a missing task so
+// task existence is never leaked across spaces -- and returns false. An empty
+// X-Space-Id is rejected fail-closed below before any query, sealing the
+// cross-space path for the (task_id,user_id)-only personal endpoints (Accept /
+// Decline / Submit / GetPersonal). Mirrors authorizeTaskAccess / GetMembers.
+func (h *PersonalHandler) requireTaskInSpace(c *gin.Context, taskID int64) bool {
+	spaceID := middleware.GetSpaceID(c)
+	// fail-closed hard gate: an empty X-Space-Id must NEVER reach the query.
+	// SummaryTask.SpaceID is `not null default ''`, so tasks with space_id='' may
+	// exist; querying `space_id=''` would MATCH them, leaking a cross-space read
+	// (fail-open). Short-circuit to 40008/404 here, independent of data invariant.
+	if spaceID == "" {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
+		return false
+	}
+	var task model.SummaryTask
+	if err := h.db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).First(&task).Error; err != nil {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
+		return false
+	}
+	return true
+}
+
 // Accept handles POST /api/v1/summaries/:id/accept
 func (h *PersonalHandler) Accept(c *gin.Context) {
 	userID := middleware.GetUserID(c)
 	taskID, valid := h.parseTaskID(c)
 	if !valid {
+		return
+	}
+
+	// P1 (cross-space isolation): the task must exist AND live in the caller's
+	// space before any (task_id,user_id) participant lookup; a space mismatch is
+	// reported as 40008/404 like a missing task, so existence is not leaked and a
+	// cross-space accept cannot mutate another space's participant.
+	if !h.requireTaskInSpace(c, taskID) {
 		return
 	}
 
@@ -236,6 +269,11 @@ func (h *PersonalHandler) Decline(c *gin.Context) {
 		return
 	}
 
+	// P1 (cross-space isolation): task must exist in the caller's space first.
+	if !h.requireTaskInSpace(c, taskID) {
+		return
+	}
+
 	var participant model.SummaryParticipant
 	if err := h.db.Where("task_id = ? AND user_id = ?", taskID, userID).First(&participant).Error; err != nil {
 		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "你不是该任务的参与者"})
@@ -285,6 +323,16 @@ func (h *PersonalHandler) GetPersonal(c *gin.Context) {
 		return
 	}
 
+	// P1 (cross-space isolation): the task must exist in the caller's space before
+	// reading any personal_result. A space mismatch is 40008/404 like a missing
+	// task (no existence leak). This runs BEFORE the "no pr -> default" fallback so
+	// a cross-space caller can never coax a default-shaped 200 out of another
+	// space's task; the missing-pr default behaviour for in-space callers is
+	// unchanged.
+	if !h.requireTaskInSpace(c, taskID) {
+		return
+	}
+
 	var pr model.PersonalResult
 	if err := h.db.Where("task_id = ? AND user_id = ?", taskID, userID).First(&pr).Error; err != nil {
 		// Not found → return default
@@ -320,6 +368,11 @@ func (h *PersonalHandler) Submit(c *gin.Context) {
 	userID := middleware.GetUserID(c)
 	taskID, valid := h.parseTaskID(c)
 	if !valid {
+		return
+	}
+
+	// P1 (cross-space isolation): task must exist in the caller's space first.
+	if !h.requireTaskInSpace(c, taskID) {
 		return
 	}
 

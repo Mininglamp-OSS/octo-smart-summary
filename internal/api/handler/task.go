@@ -65,8 +65,23 @@ func (h *TaskHandler) authorizeTaskAccess(c *gin.Context, taskID int64) (*model.
 		return nil, false
 	}
 
+	// P1 (cross-space isolation): scope the load to the caller's space so a task
+	// from another space is reported as 40008 ("任务不存在") exactly like a missing
+	// task, never leaked or read across spaces.
+	spaceID := middleware.GetSpaceID(c)
+	// fail-closed hard gate: an empty X-Space-Id must NEVER reach the query.
+	// SummaryTask.SpaceID is `not null default ''`, so historical/anomalous tasks
+	// with space_id='' may exist; querying `space_id=''` would MATCH them, leaking
+	// a cross-space read (fail-open). Short-circuit to 40008/404 here so empty
+	// space access is denied independent of any data invariant. This seals the
+	// read path for every endpoint that gates through authorizeTaskAccess
+	// (GetSummary/GetResult/Regenerate/DeleteSummary/CancelSummary).
+	if spaceID == "" {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
+		return nil, false
+	}
 	var task model.SummaryTask
-	if err := h.db.Where("id = ? AND deleted_at IS NULL", taskID).First(&task).Error; err != nil {
+	if err := h.db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).First(&task).Error; err != nil {
 		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
 		return nil, false
 	}

@@ -1544,3 +1544,340 @@ func TestFix5_PeekMatchesLiveBinding_NoBailout(t *testing.T) {
 		t.Fatalf("peek-compare must NOT bail out when out-of-tx value matches live schedule_id %d", scheduleID)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// P1 cross-space (space_id) isolation regression tests.
+//
+// Each task is seeded in space1. Calling the same task with a DIFFERENT (or
+// empty) X-Space-Id must 404/40008 -- identical to a missing task -- so a task
+// cannot be read, accepted, submitted, declined, or have its personal report
+// fetched across spaces. FAIL-before (no space_id filter -> the (task_id,user_id)
+// row matched and the call was wrongly let through) / PASS-after (space_id
+// filter makes the task invisible cross-space, so 404).
+// ---------------------------------------------------------------------------
+
+// doWrongSpaceRequest issues a request carrying an explicit X-Space-Id that does
+// NOT match the task's space (so we can exercise the cross-space 404 path; the
+// shared doRequest/doJSONRequest helpers hardcode space1).
+func doWrongSpaceRequest(r *gin.Engine, method, path, userID, spaceID string, body interface{}) *httptest.ResponseRecorder {
+	var b []byte
+	if body != nil {
+		b, _ = json.Marshal(body)
+	}
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(method, path, bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	if userID != "" {
+		req.Header.Set("Token", userID)
+	}
+	if spaceID != "" {
+		req.Header.Set("X-Space-Id", spaceID)
+	}
+	r.ServeHTTP(w, req)
+	return w
+}
+
+func assertCrossSpace404(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for cross-space access, got %d: %s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("40008")) {
+		t.Errorf("cross-space access must return code 40008, body=%s", w.Body.String())
+	}
+}
+
+// setupPersonalActionRouter wires the (task_id,user_id)-only personal endpoints
+// (accept/decline/submit/personal) that gained the F2 space_id pre-check.
+func setupPersonalActionRouter(h *PersonalHandler) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(middleware.AuthMiddleware(&mockTokenResolver{}), middleware.SpaceMiddleware())
+	r.POST("/api/v1/summaries/:id/accept", h.Accept)
+	r.POST("/api/v1/summaries/:id/decline", h.Decline)
+	r.POST("/api/v1/summaries/:id/submit", h.Submit)
+	r.GET("/api/v1/summaries/:id/personal", h.GetPersonal)
+	return r
+}
+
+// P1-F1: GetSummary gates through TaskHandler.authorizeTaskAccess, which now
+// scopes the task load by space_id. A real participant of a space1 task who
+// presents a different X-Space-Id must get 404/40008 (existence not leaked, no
+// cross-space read). FAIL-before: the load was `id = ? AND deleted_at IS NULL`
+// (space-blind) so the cross-space caller saw the task; PASS-after: 404.
+func TestAuthorizeTaskAccess_WrongSpace_Returns404(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	taskID := seedTask(t, db, imDB) // space1, creator1, participant1
+	h := NewTaskHandler(db, imDB, "")
+	r := setupRouter(h) // wires GET /api/v1/summaries/:id -> GetSummary
+
+	// participant1 is genuinely on the roster, but reads with the wrong space.
+	w := doWrongSpaceRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d", taskID), "participant1", "other_space", nil)
+	assertCrossSpace404(t, w)
+
+	// Sanity: the SAME caller with the CORRECT space still gets 200 (no regression).
+	wOK := doRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d", taskID), "participant1")
+	if wOK.Code != http.StatusOK {
+		t.Fatalf("in-space participant must still get 200, got %d: %s", wOK.Code, wOK.Body.String())
+	}
+}
+
+// P1-F1: an EMPTY X-Space-Id now also 404s (space_id='' matches no real task),
+// confirming P1-F3: the empty-space cross-space read path is sealed by F1 with no
+// middleware change.
+func TestAuthorizeTaskAccess_EmptySpace_Returns404(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	taskID := seedTask(t, db, imDB)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupRouter(h)
+
+	w := doWrongSpaceRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d", taskID), "participant1", "", nil)
+	assertCrossSpace404(t, w)
+}
+
+// P1-F2: Accept with a mismatched space must 404/40008 before touching the
+// (task_id,user_id) participant row -- a cross-space caller cannot accept (and
+// thereby mutate) another space's participant. FAIL-before: no space check, the
+// participant lookup succeeded and the accept proceeded; PASS-after: 404 and the
+// participant stays Pending.
+func TestAccept_WrongSpace_Returns404(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID := seedMultiPersonTask(t, db) // space1; member_x is a participant
+	// Force member_x to Pending so a (wrongly) accepted call would visibly flip it.
+	db.Model(&model.SummaryParticipant{}).
+		Where("task_id = ? AND user_id = ?", taskID, "member_x").
+		Update("status", model.ParticipantPending)
+	h := NewPersonalHandler(db, "", nil)
+	r := setupPersonalActionRouter(h)
+
+	w := doWrongSpaceRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/accept", taskID), "member_x", "other_space", nil)
+	assertCrossSpace404(t, w)
+
+	// The participant must NOT have been accepted by the cross-space call.
+	var p model.SummaryParticipant
+	db.Where("task_id = ? AND user_id = ?", taskID, "member_x").First(&p)
+	if p.Status != model.ParticipantPending {
+		t.Errorf("cross-space accept must not mutate participant; status=%d", p.Status)
+	}
+
+	// Sanity: the correct space still accepts (200).
+	wOK := doJSONRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/accept", taskID), "member_x", nil)
+	if wOK.Code != http.StatusOK {
+		t.Fatalf("in-space accept must still 200, got %d: %s", wOK.Code, wOK.Body.String())
+	}
+}
+
+// P1-F2: Decline with a mismatched space must 404/40008 and leave the
+// participant untouched.
+func TestDecline_WrongSpace_Returns404(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID := seedMultiPersonTask(t, db) // space1
+	db.Model(&model.SummaryParticipant{}).
+		Where("task_id = ? AND user_id = ?", taskID, "member_x").
+		Update("status", model.ParticipantPending)
+	h := NewPersonalHandler(db, "", nil)
+	r := setupPersonalActionRouter(h)
+
+	w := doWrongSpaceRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/decline", taskID), "member_x", "other_space", nil)
+	assertCrossSpace404(t, w)
+
+	var p model.SummaryParticipant
+	db.Where("task_id = ? AND user_id = ?", taskID, "member_x").First(&p)
+	if p.Status != model.ParticipantPending {
+		t.Errorf("cross-space decline must not mutate participant; status=%d", p.Status)
+	}
+}
+
+// P1-F2: Submit with a mismatched space must 404/40008 before reading/writing
+// the personal_result row -- so a cross-space caller cannot submit another
+// space's report. FAIL-before: the (task_id,user_id) personal_result lookup
+// succeeded and submit proceeded; PASS-after: 404 and submitted_at stays nil.
+func TestSubmit_WrongSpace_Returns404(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID := seedMultiPersonTask(t, db) // space1; each member has a PR
+	// Make member_x's report completed-but-unsubmitted so a wrongly-allowed submit
+	// would visibly set submitted_at.
+	db.Model(&model.PersonalResult{}).
+		Where("task_id = ? AND user_id = ?", taskID, "member_x").
+		Updates(map[string]interface{}{
+			"worker_status": model.PersonalStatusCompleted,
+			"submitted_at":  nil,
+		})
+	h := NewPersonalHandler(db, "", nil)
+	r := setupPersonalActionRouter(h)
+
+	w := doWrongSpaceRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/submit", taskID), "member_x", "other_space", nil)
+	assertCrossSpace404(t, w)
+
+	var pr model.PersonalResult
+	db.Where("task_id = ? AND user_id = ?", taskID, "member_x").First(&pr)
+	if pr.SubmittedAt != nil {
+		t.Errorf("cross-space submit must not mark the report submitted; submitted_at=%v", pr.SubmittedAt)
+	}
+
+	// Sanity: the correct space still submits (200).
+	wOK := doJSONRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/submit", taskID), "member_x", nil)
+	if wOK.Code != http.StatusOK {
+		t.Fatalf("in-space submit must still 200, got %d: %s", wOK.Code, wOK.Body.String())
+	}
+}
+
+// P1-F2: GetPersonal with a mismatched space must 404/40008 -- the cross-space
+// caller must NOT be able to coax the "no pr -> default-shaped 200" fallback out
+// of another space's task. The in-space missing-pr default behaviour is verified
+// separately to prove the F2 check did not break it.
+func TestGetPersonal_WrongSpace_Returns404(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID := seedMultiPersonTask(t, db) // space1; member_x has a PR
+	h := NewPersonalHandler(db, "", nil)
+	r := setupPersonalActionRouter(h)
+
+	// member_x is a real participant w/ a report, but reads with the wrong space.
+	w := doWrongSpaceRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d/personal", taskID), "member_x", "other_space", nil)
+	assertCrossSpace404(t, w)
+
+	// In-space, the missing-pr default fallback is preserved: a participant with NO
+	// personal_result still gets a default-shaped 200 (behaviour unchanged by F2).
+	now := timezone.Now()
+	soloTask := model.SummaryTask{
+		TaskNo:      "TST-GP-DEFAULT",
+		SpaceID:     "space1",
+		CreatorID:   "creator1",
+		SummaryMode: model.ModeByPerson,
+		Status:      model.StatusCompleted,
+	}
+	db.Create(&soloTask)
+	db.Create(&model.SummaryParticipant{TaskID: soloTask.ID, UserID: "noresult", UserName: "noresult", Status: model.ParticipantPending, CreatedAt: now})
+	wDefault := doJSONRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d/personal", soloTask.ID), "noresult", nil)
+	if wDefault.Code != http.StatusOK {
+		t.Fatalf("in-space participant with no personal_result must still get default 200, got %d: %s", wDefault.Code, wDefault.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// P1-F3 (reviewer follow-up): empty-X-Space-Id fail-closed HARD gate.
+//
+// SummaryTask.SpaceID is `not null default ''` (model.go / baseline migration),
+// so a task with space_id='' CAN exist (historical/anomalous rows). The earlier
+// "empty header -> space_id='' -> 404 naturally" argument is therefore WRONG:
+// without an explicit guard, an empty X-Space-Id (GetSpaceID(c) == "") makes the
+// query `space_id=''` which would MATCH such a task and let the call through
+// (fail-open cross-space read). authorizeTaskAccess / requireTaskInSpace now
+// short-circuit to 40008/404 whenever spaceID=="" BEFORE the query, regardless
+// of any data invariant.
+//
+// These tests SEED a real SpaceID:"" task (+ participant / personal_result) so
+// the distinction is genuine: FAIL-before (no spaceID=="" short-circuit) -> the
+// empty-header query `space_id=''` matches the seeded task and returns 200;
+// PASS-after -> 404/40008. (Unlike TestAuthorizeTaskAccess_EmptySpace_Returns404,
+// which seeds only a space1 task and so passes even without the new guard.)
+// ---------------------------------------------------------------------------
+
+// seedEmptySpaceTask seeds a task whose SpaceID is the empty string, plus a
+// participant and a completed personal_result for `participant1`, mirroring the
+// shape seedTask/seedMultiPersonTask use but with space_id=''.
+func seedEmptySpaceTask(t *testing.T, db *gorm.DB) int64 {
+	t.Helper()
+	now := timezone.Now()
+	task := model.SummaryTask{
+		TaskNo:      "TST-EMPTYSPACE-001",
+		SpaceID:     "", // <-- the anomalous space_id='' row the guard must hide
+		CreatorID:   "creator1",
+		SummaryMode: model.ModeByPerson,
+		Status:      model.StatusCompleted,
+	}
+	db.Create(&task)
+	db.Create(&model.SummarySource{TaskID: task.ID, SourceType: model.SourceGroup, SourceID: "grp_abc"})
+
+	p := model.SummaryParticipant{TaskID: task.ID, UserID: "participant1", UserName: "P1", Status: model.ParticipantCompleted}
+	db.Create(&p)
+	db.Create(&model.PersonalResult{
+		TaskID:           task.ID,
+		ParticipantRefID: p.ID,
+		UserID:           "participant1",
+		Content:          "participant1 original [1]",
+		CitationsJSON:    `[{"index":1,"sender":"s","content":"c","channel_id":"grp_abc"}]`,
+		WorkerStatus:     model.PersonalStatusCompleted,
+		GeneratedAt:      &now,
+	})
+	return task.ID
+}
+
+// P1-F3: authorizeTaskAccess (GetSummary) — a genuine participant of a
+// space_id='' task, calling with NO X-Space-Id header, must STILL get 404/40008.
+// FAIL-before: the empty-header query `space_id=''` matched this seeded task and
+// returned 200 (cross-space read of an anomalous row). PASS-after: the spaceID==""
+// short-circuit 404s before the query.
+func TestAuthorizeTaskAccess_EmptySpaceHeader_EmptySpaceTask_Returns404(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	taskID := seedEmptySpaceTask(t, db)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupRouter(h)
+
+	// participant1 is a real participant of the space_id='' task; no X-Space-Id.
+	w := doWrongSpaceRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d", taskID), "participant1", "", nil)
+	assertCrossSpace404(t, w)
+}
+
+// P1-F3: Accept — empty X-Space-Id against a real participant of a space_id=''
+// task must 404/40008 and must NOT mutate the participant. FAIL-before: the
+// empty-header requireTaskInSpace query matched (space_id='') and the accept
+// proceeded; PASS-after: 404, participant untouched.
+func TestAccept_EmptySpaceHeader_Returns404(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID := seedEmptySpaceTask(t, db)
+	db.Model(&model.SummaryParticipant{}).
+		Where("task_id = ? AND user_id = ?", taskID, "participant1").
+		Update("status", model.ParticipantPending)
+	h := NewPersonalHandler(db, "", nil)
+	r := setupPersonalActionRouter(h)
+
+	w := doWrongSpaceRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/accept", taskID), "participant1", "", nil)
+	assertCrossSpace404(t, w)
+
+	var p model.SummaryParticipant
+	db.Where("task_id = ? AND user_id = ?", taskID, "participant1").First(&p)
+	if p.Status != model.ParticipantPending {
+		t.Errorf("empty-space accept must not mutate participant; status=%d", p.Status)
+	}
+}
+
+// P1-F3: Submit — empty X-Space-Id against a real participant of a space_id=''
+// task must 404/40008 and must NOT mark the report submitted. FAIL-before: the
+// empty-header requireTaskInSpace query matched and submit set submitted_at;
+// PASS-after: 404, submitted_at stays nil.
+func TestSubmit_EmptySpaceHeader_Returns404(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID := seedEmptySpaceTask(t, db)
+	db.Model(&model.PersonalResult{}).
+		Where("task_id = ? AND user_id = ?", taskID, "participant1").
+		Updates(map[string]interface{}{
+			"worker_status": model.PersonalStatusCompleted,
+			"submitted_at":  nil,
+		})
+	h := NewPersonalHandler(db, "", nil)
+	r := setupPersonalActionRouter(h)
+
+	w := doWrongSpaceRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/submit", taskID), "participant1", "", nil)
+	assertCrossSpace404(t, w)
+
+	var pr model.PersonalResult
+	db.Where("task_id = ? AND user_id = ?", taskID, "participant1").First(&pr)
+	if pr.SubmittedAt != nil {
+		t.Errorf("empty-space submit must not mark the report submitted; submitted_at=%v", pr.SubmittedAt)
+	}
+}
+
+// P1-F3: GetPersonal — empty X-Space-Id against a real participant (with a
+// personal_result) of a space_id='' task must 404/40008, not leak the report.
+// FAIL-before: the empty-header requireTaskInSpace query matched and the report
+// was returned; PASS-after: 404.
+func TestGetPersonal_EmptySpaceHeader_Returns404(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID := seedEmptySpaceTask(t, db)
+	h := NewPersonalHandler(db, "", nil)
+	r := setupPersonalActionRouter(h)
+
+	w := doWrongSpaceRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d/personal", taskID), "participant1", "", nil)
+	assertCrossSpace404(t, w)
+}
