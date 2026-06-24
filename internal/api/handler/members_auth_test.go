@@ -1068,6 +1068,208 @@ func TestRemoveMember_CannotRemoveCreator(t *testing.T) {
 	}
 }
 
+// --- FIX-SCHEDULE-ALLROUNDS: under a schedule, the same schedule_id spawns
+//     multiple rounds of summary_task, each with its own participant /
+//     personal_result rows. Leave/RemoveMember must purge the target member from
+//     ALL rounds of that schedule (else the collapsed list still shows them and
+//     "leave/remove does nothing"). Manual (schedule_id=nil) tasks stay
+//     single-round. ---
+
+// seedScheduleMultiRound seeds two rounds of one schedule (first round
+// trigger_type=1 + a later scheduled round trigger_type=2) under schedID, plus,
+// when otherSchedID != 0, one round of a DIFFERENT schedule. Every round gets
+// participant + personal_result rows for creator1 + member_x + member_y. It
+// returns the two task IDs of the primary schedule (firstRound, latestRound).
+func seedScheduleMultiRound(t *testing.T, db *gorm.DB, schedID, otherSchedID int64) (firstRound, latestRound int64) {
+	t.Helper()
+	now := timezone.Now()
+
+	seedRound := func(no string, sid int64, trigger int) int64 {
+		sidCopy := sid
+		task := model.SummaryTask{
+			TaskNo:      no,
+			SpaceID:     "space1",
+			CreatorID:   "creator1",
+			SummaryMode: model.ModeByPerson,
+			Status:      model.StatusCompleted,
+			TriggerType: trigger,
+			ScheduleID:  &sidCopy,
+		}
+		db.Create(&task)
+		db.Create(&model.SummarySource{TaskID: task.ID, SourceType: model.SourceGroup, SourceID: "grp_abc"})
+		for _, uid := range []string{"creator1", "member_x", "member_y"} {
+			p := model.SummaryParticipant{TaskID: task.ID, UserID: uid, UserName: uid, Status: model.ParticipantCompleted}
+			db.Create(&p)
+			db.Create(&model.PersonalResult{
+				TaskID:           task.ID,
+				ParticipantRefID: p.ID,
+				UserID:           uid,
+				Content:          uid + " " + no,
+				WorkerStatus:     model.PersonalStatusCompleted,
+				GeneratedAt:      &now,
+			})
+		}
+		return task.ID
+	}
+
+	firstRound = seedRound("TST-SCH-R1", schedID, model.TriggerManual)    // first round trigger_type=1
+	latestRound = seedRound("TST-SCH-R2", schedID, model.TriggerScheduled) // scheduled round trigger_type=2
+
+	if otherSchedID != 0 {
+		seedRound("TST-SCH-OTHER", otherSchedID, model.TriggerScheduled)
+	}
+	return firstRound, latestRound
+}
+
+func countParticipant(db *gorm.DB, taskID int64, uid string) int64 {
+	var n int64
+	db.Model(&model.SummaryParticipant{}).Where("task_id = ? AND user_id = ?", taskID, uid).Count(&n)
+	return n
+}
+
+func countPersonalResult(db *gorm.DB, taskID int64, uid string) int64 {
+	var n int64
+	db.Model(&model.PersonalResult{}).Where("task_id = ? AND user_id = ?", taskID, uid).Count(&n)
+	return n
+}
+
+func TestLeave_ScheduleDeletesAllRounds(t *testing.T) {
+	// Fail-before: Leave deleted only the latest round's rows, leaving member_x in
+	// the first round -> list still showed them. Pass-after: member_x's
+	// participant + personal_result rows are gone from BOTH rounds, while
+	// creator1/member_y and the OTHER schedule are untouched.
+	db := setupMembersTestDB(t)
+	firstRound, latestRound := seedScheduleMultiRound(t, db, 7001, 7002)
+	// capture the other-schedule round id for cross-schedule assertions.
+	var otherTask model.SummaryTask
+	if err := db.Where("schedule_id = ?", 7002).First(&otherTask).Error; err != nil {
+		t.Fatalf("load other-schedule round: %v", err)
+	}
+	tc := newTriggerCapture(t)
+	h := NewPersonalHandler(db, tc.url(), nil)
+	r := setupLeaveRemoveRouter(h)
+
+	w := doJSONRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/leave", latestRound), "member_x", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for schedule leave, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// member_x purged from BOTH rounds of THIS schedule.
+	if c := countParticipant(db, firstRound, "member_x"); c != 0 {
+		t.Errorf("member_x participant must be deleted from first round, got %d", c)
+	}
+	if c := countParticipant(db, latestRound, "member_x"); c != 0 {
+		t.Errorf("member_x participant must be deleted from latest round, got %d", c)
+	}
+	if c := countPersonalResult(db, firstRound, "member_x"); c != 0 {
+		t.Errorf("member_x personal_result must be deleted from first round, got %d", c)
+	}
+	if c := countPersonalResult(db, latestRound, "member_x"); c != 0 {
+		t.Errorf("member_x personal_result must be deleted from latest round, got %d", c)
+	}
+	// creator + other member untouched in BOTH rounds.
+	for _, rid := range []int64{firstRound, latestRound} {
+		if c := countParticipant(db, rid, "creator1"); c != 1 {
+			t.Errorf("creator1 must remain in round %d, got %d", rid, c)
+		}
+		if c := countParticipant(db, rid, "member_y"); c != 1 {
+			t.Errorf("member_y must remain in round %d, got %d", rid, c)
+		}
+	}
+	// OTHER schedule untouched (no cross-schedule deletion).
+	if c := countParticipant(db, otherTask.ID, "member_x"); c != 1 {
+		t.Errorf("member_x in a DIFFERENT schedule must NOT be deleted, got %d", c)
+	}
+	if c := countPersonalResult(db, otherTask.ID, "member_x"); c != 1 {
+		t.Errorf("member_x personal_result in a DIFFERENT schedule must NOT be deleted, got %d", c)
+	}
+}
+
+func TestRemoveMember_ScheduleDeletesAllRounds(t *testing.T) {
+	// Creator removes member_x on the latest round of a schedule: member_x must be
+	// purged from ALL rounds of that schedule; creator un-removable; cross-schedule
+	// rows untouched. Fail-before only purged the latest round.
+	db := setupMembersTestDB(t)
+	firstRound, latestRound := seedScheduleMultiRound(t, db, 8001, 8002)
+	var otherTask model.SummaryTask
+	if err := db.Where("schedule_id = ?", 8002).First(&otherTask).Error; err != nil {
+		t.Fatalf("load other-schedule round: %v", err)
+	}
+	tc := newTriggerCapture(t)
+	h := NewPersonalHandler(db, tc.url(), nil)
+	r := setupLeaveRemoveRouter(h)
+
+	w := doJSONRequest(r, "DELETE", fmt.Sprintf("/api/v1/summaries/%d/members?uid=%s", latestRound, "member_x"), "creator1", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for schedule remove, got %d: %s", w.Code, w.Body.String())
+	}
+
+	for _, rid := range []int64{firstRound, latestRound} {
+		if c := countParticipant(db, rid, "member_x"); c != 0 {
+			t.Errorf("member_x participant must be deleted from round %d, got %d", rid, c)
+		}
+		if c := countPersonalResult(db, rid, "member_x"); c != 0 {
+			t.Errorf("member_x personal_result must be deleted from round %d, got %d", rid, c)
+		}
+		// creator never deletable.
+		if c := countParticipant(db, rid, "creator1"); c != 1 {
+			t.Errorf("creator1 must remain in round %d, got %d", rid, c)
+		}
+	}
+	// cross-schedule untouched.
+	if c := countParticipant(db, otherTask.ID, "member_x"); c != 1 {
+		t.Errorf("member_x in a DIFFERENT schedule must NOT be deleted, got %d", c)
+	}
+}
+
+func TestLeave_ManualTaskUnchangedSingleRound(t *testing.T) {
+	// Regression: a manual task (schedule_id == nil) leave deletes ONLY that task's
+	// rows. We seed a manual task AND an unrelated schedule round for the same
+	// member; the manual leave must not reach across into the schedule round, and
+	// vice-versa it only deletes the one manual task.
+	db := setupMembersTestDB(t)
+	manualTaskID := seedMultiPersonTask(t, db) // schedule_id == nil
+	firstRound, _ := seedScheduleMultiRound(t, db, 9001, 0)
+	tc := newTriggerCapture(t)
+	h := NewPersonalHandler(db, tc.url(), nil)
+	r := setupLeaveRemoveRouter(h)
+
+	w := doJSONRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/leave", manualTaskID), "member_x", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for manual leave, got %d: %s", w.Code, w.Body.String())
+	}
+	// manual task row deleted.
+	if c := countParticipant(db, manualTaskID, "member_x"); c != 0 {
+		t.Errorf("manual leave must delete member_x in the manual task, got %d", c)
+	}
+	// unrelated schedule round NOT touched.
+	if c := countParticipant(db, firstRound, "member_x"); c != 1 {
+		t.Errorf("manual leave must NOT touch an unrelated schedule round, got %d", c)
+	}
+}
+
+func TestRemoveMember_ManualTaskUnchangedSingleRound(t *testing.T) {
+	// Regression: a manual task remove deletes ONLY that task's rows; an unrelated
+	// schedule round for the same member is untouched.
+	db := setupMembersTestDB(t)
+	manualTaskID := seedMultiPersonTask(t, db) // schedule_id == nil
+	firstRound, _ := seedScheduleMultiRound(t, db, 9101, 0)
+	tc := newTriggerCapture(t)
+	h := NewPersonalHandler(db, tc.url(), nil)
+	r := setupLeaveRemoveRouter(h)
+
+	w := doJSONRequest(r, "DELETE", fmt.Sprintf("/api/v1/summaries/%d/members?uid=%s", manualTaskID, "member_x"), "creator1", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for manual remove, got %d: %s", w.Code, w.Body.String())
+	}
+	if c := countParticipant(db, manualTaskID, "member_x"); c != 0 {
+		t.Errorf("manual remove must delete member_x in the manual task, got %d", c)
+	}
+	if c := countParticipant(db, firstRound, "member_x"); c != 1 {
+		t.Errorf("manual remove must NOT touch an unrelated schedule round, got %d", c)
+	}
+}
+
 // --- FIX1: Leave/RemoveMember must REVIVE an already-Completed multi-person
 //     BY_PERSON task back to Processing so the dispatched meta_summary recompute
 //     can actually write (the meta worker refuses to write a non-Processing

@@ -908,13 +908,38 @@ func (h *PersonalHandler) Leave(c *gin.Context) {
 			Select("id").First(&lockTask, taskID).Error; err != nil {
 			return err
 		}
-		if err := tx.Where("task_id = ? AND user_id = ?", taskID, userID).
-			Delete(&model.SummaryParticipant{}).Error; err != nil {
-			return err
-		}
-		if err := tx.Where("task_id = ? AND user_id = ?", taskID, userID).
-			Delete(&model.PersonalResult{}).Error; err != nil {
-			return err
+		// FIX-SCHEDULE-ALLROUNDS: under a schedule, the same schedule_id spawns
+		// multiple rounds of summary_task (first round trigger_type=1 + each
+		// scheduled round trigger_type=2), and the departing member has a
+		// participant / personal_result row PER ROUND (per task_id). Deleting only
+		// the clicked round's row leaves the member in the OTHER rounds, so the
+		// collapsed-by-schedule list (ListSummaries) still matches them and the
+		// summary keeps showing -- "leave does nothing". So for a schedule-bound
+		// task we delete the member's rows across ALL non-deleted rounds of the
+		// SAME schedule within the SAME space (single IN(SELECT ...) subquery, no
+		// N+1). For a manual task (ScheduleID == nil) behavior is unchanged: delete
+		// only this task_id's rows.
+		if task.ScheduleID != nil {
+			subTaskIDs := tx.Model(&model.SummaryTask{}).
+				Select("id").
+				Where("schedule_id = ? AND space_id = ? AND deleted_at IS NULL", *task.ScheduleID, task.SpaceID)
+			if err := tx.Where("user_id = ? AND task_id IN (?)", userID, subTaskIDs).
+				Delete(&model.SummaryParticipant{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("user_id = ? AND task_id IN (?)", userID, subTaskIDs).
+				Delete(&model.PersonalResult{}).Error; err != nil {
+				return err
+			}
+		} else {
+			if err := tx.Where("task_id = ? AND user_id = ?", taskID, userID).
+				Delete(&model.SummaryParticipant{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("task_id = ? AND user_id = ?", taskID, userID).
+				Delete(&model.PersonalResult{}).Error; err != nil {
+				return err
+			}
 		}
 
 		// FIX3: the departed member must also be stripped from the bound
@@ -1037,13 +1062,35 @@ func (h *PersonalHandler) RemoveMember(c *gin.Context) {
 			Select("id").First(&lockTask, taskID).Error; err != nil {
 			return err
 		}
-		if err := tx.Where("task_id = ? AND user_id = ?", taskID, uid).
-			Delete(&model.SummaryParticipant{}).Error; err != nil {
-			return err
-		}
-		if err := tx.Where("task_id = ? AND user_id = ?", taskID, uid).
-			Delete(&model.PersonalResult{}).Error; err != nil {
-			return err
+		// FIX-SCHEDULE-ALLROUNDS: see Leave for the full rationale. A schedule
+		// spawns multiple rounds (task_id) under one schedule_id and the removed
+		// member has a participant / personal_result row per round. Deleting only
+		// the clicked round leaves them in the other rounds, so the collapsed list
+		// still shows them -- "remove does nothing". For a schedule-bound task,
+		// delete the member's rows across ALL non-deleted rounds of the SAME
+		// schedule in the SAME space (single IN(SELECT ...) subquery, no N+1). For a
+		// manual task (ScheduleID == nil) behavior is unchanged.
+		if task.ScheduleID != nil {
+			subTaskIDs := tx.Model(&model.SummaryTask{}).
+				Select("id").
+				Where("schedule_id = ? AND space_id = ? AND deleted_at IS NULL", *task.ScheduleID, task.SpaceID)
+			if err := tx.Where("user_id = ? AND task_id IN (?)", uid, subTaskIDs).
+				Delete(&model.SummaryParticipant{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("user_id = ? AND task_id IN (?)", uid, subTaskIDs).
+				Delete(&model.PersonalResult{}).Error; err != nil {
+				return err
+			}
+		} else {
+			if err := tx.Where("task_id = ? AND user_id = ?", taskID, uid).
+				Delete(&model.SummaryParticipant{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("task_id = ? AND user_id = ?", taskID, uid).
+				Delete(&model.PersonalResult{}).Error; err != nil {
+				return err
+			}
 		}
 
 		// FIX3: strip the removed member from the bound schedule's
