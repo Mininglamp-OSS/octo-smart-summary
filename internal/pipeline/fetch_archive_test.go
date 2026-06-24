@@ -48,6 +48,13 @@ func setupPipelineImDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open pipeline im db: %v", err)
 	}
+	// Pin to a single connection: a bare ":memory:" SQLite DB is per-connection,
+	// so the schema created below is invisible to any other pooled connection.
+	// Under -shuffle/concurrent fetch the pool can hand out a fresh (empty)
+	// connection, causing flaky "no such table" failures. One conn = one DB.
+	if sqlDB, e := db.DB(); e == nil {
+		sqlDB.SetMaxOpenConns(1)
+	}
 	db.Exec(`CREATE TABLE "group" (group_no TEXT NOT NULL, name TEXT, space_id TEXT, status INTEGER DEFAULT 1, creator TEXT, updated_at INTEGER DEFAULT 0)`)
 	db.Exec(`CREATE TABLE thread (id INTEGER PRIMARY KEY, short_id TEXT, name TEXT, group_no TEXT, status INTEGER DEFAULT 1, message_count INTEGER DEFAULT 0, creator_uid TEXT, updated_at INTEGER DEFAULT 0)`)
 	db.Exec(`CREATE TABLE thread_member (thread_id INTEGER NOT NULL, uid TEXT NOT NULL)`)
