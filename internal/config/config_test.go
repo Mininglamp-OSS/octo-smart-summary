@@ -5,21 +5,24 @@ import (
 )
 
 func TestResolveMapMaxTokens_QwenModels(t *testing.T) {
+	// Note: token limits updated based on 2026-06 model testing (see docs/模型测试结果.md)
+	// - Qwen: 160K+ causes knowledge leakage → reduced to 150K
+	// - DeepSeek: 250K+ causes truncation → reduced to 150K/200K
 	tests := []struct {
 		model string
 		want  int
 	}{
-		{"qwen3.6-max", 400000},
-		{"qwen3.6-plus", 400000},
-		{"qwen3.6-flash", 400000},
-		{"deepseek-v4-flash", 400000},
-		{"deepseek-v4-pro", 400000},
+		{"qwen3.6-max", 150000},
+		{"qwen3.6-plus", 150000},
+		{"qwen3.6-flash", 150000},
+		{"deepseek-v4-flash", 150000},
+		{"deepseek-v4-pro", 200000},
 		{"claude-sonnet-4-6", 150000},
-		{"mlamp/deepseek-v4-flash", 400000},
-		{"tencent/deepseek-v4-pro", 400000},
-		{"Qwen3.6-Max", 400000},
-		{"DEEPSEEK-V4-FLASH", 400000},
-		{"ali/Qwen3.6-Flash", 400000},
+		{"mlamp/deepseek-v4-flash", 150000},
+		{"tencent/deepseek-v4-pro", 200000},
+		{"Qwen3.6-Max", 150000},
+		{"DEEPSEEK-V4-FLASH", 150000},
+		{"ali/Qwen3.6-Flash", 150000},
 		{"kimi-k2.6", 150000},
 		{"kimi-k2.5", 150000},
 		{"mlamp/kimi-k2.6", 150000},

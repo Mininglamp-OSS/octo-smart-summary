@@ -84,6 +84,18 @@ type Config struct {
 
 	// Tool call per-attempt timeout (seconds)
 	ToolCallTimeout int
+
+	// Intent recognition shortcut (skip LLM for simple topics)
+	EnableIntentShortcut bool
+
+	// Hardcoded limits (now configurable)
+	MaxSafetyLimit       int // Max messages per channel before safety truncation, default 100000
+	DefaultTimeRangeDays int // Default time range in days when not specified, default 31
+
+	// Token calculation config
+	SkipMapReduceThreshold int    // Skip Map-Reduce threshold (tokens), env SKIP_MAP_REDUCE_THRESHOLD
+	KimiAPIKey             string // Kimi API key for exact token counting, env KIMI_API_KEY
+	TokenizerHTTPTimeout   int    // HTTP timeout for tokenizer API calls, env TOKENIZER_HTTP_TIMEOUT
 }
 
 func Load() *Config {
@@ -133,6 +145,15 @@ func Load() *Config {
 		ChannelScopeEnabled: envBool("CHANNEL_SCOPE_ENABLED", true),
 
 		ToolCallTimeout: envInt("TOOL_CALL_TIMEOUT", 30),
+
+		EnableIntentShortcut: envBool("ENABLE_INTENT_SHORTCUT", true),
+
+		MaxSafetyLimit:       envInt("MAX_SAFETY_LIMIT", 100000),
+		DefaultTimeRangeDays: envInt("DEFAULT_TIME_RANGE_DAYS", 31),
+
+		SkipMapReduceThreshold: envInt("SKIP_MAP_REDUCE_THRESHOLD", 0),
+		KimiAPIKey:             envStr("KIMI_API_KEY", ""),
+		TokenizerHTTPTimeout:   envInt("TOKENIZER_HTTP_TIMEOUT", 10),
 	}
 }
 
@@ -177,15 +198,19 @@ func envBool(key string, def bool) bool {
 }
 
 // modelMaxTokensDefaults maps LLM model names to their recommended Map-phase token budget.
+// Based on model testing (2026-06): see docs/模型测试结果.md for details.
+// - Qwen: 160K+ causes external knowledge leakage (original novel names)
+// - DeepSeek: 250K+ causes output truncation
+// - Claude: stable up to 300K+, use 150K for cost efficiency
 var modelMaxTokensDefaults = map[string]int{
 	"claude-sonnet-4-6": 150000,
 	"claude-opus-4-6":   150000,
 	"claude-haiku-4-5":  150000,
-	"qwen3.6-max":       400000,
-	"qwen3.6-plus":      400000,
-	"qwen3.6-flash":     400000,
-	"deepseek-v4-flash": 400000,
-	"deepseek-v4-pro":   400000,
+	"qwen3.6-max":       150000, // was 400000, reduced due to knowledge leakage at 160K+
+	"qwen3.6-plus":      150000, // was 400000, reduced due to knowledge leakage at 160K+
+	"qwen3.6-flash":     150000, // was 400000, reduced due to knowledge leakage at 160K+
+	"deepseek-v4-flash": 150000, // was 400000, reduced due to truncation at 250K+
+	"deepseek-v4-pro":   200000, // was 400000, reduced; has rate limiting
 	"kimi-k2":           150000,
 	"kimi_k2":           150000,
 }
@@ -221,4 +246,41 @@ func (c *Config) ResolveCharsPerTokenCJK() int {
 		return 2
 	}
 	return c.CharsPerTokenCJK
+}
+
+// modelSkipThresholdDefaults maps LLM model names to their recommended skip-Map-Reduce token threshold.
+// This is the threshold for skipping Map-Reduce entirely (direct single call).
+// Should be large (e.g., 500K) since modern models support 1M+ context.
+var modelSkipThresholdDefaults = map[string]int{
+	"qwen3.6-max":       500000,
+	"qwen3.6-plus":      500000,
+	"qwen3.6-flash":     500000,
+	"deepseek-v4-flash": 500000,
+	"deepseek-v4-pro":   500000,
+	"claude-sonnet":     500000,
+	"claude-opus":       500000,
+	"claude-haiku":      500000,
+	"gpt-4":             500000,
+	"gpt-4o":            500000,
+	"kimi-k2":           200000, // Kimi 上下文 265K，留余量
+	"kimi_k2":           200000,
+}
+
+const defaultSkipMapReduceThreshold = 500000
+
+// ResolveSkipMapReduceThreshold returns the skip-Map-Reduce token threshold using three-tier fallback:
+// 1. Explicit SkipMapReduceThreshold config (> 0)
+// 2. Per-model default from modelSkipThresholdDefaults
+// 3. Global default (defaultSkipMapReduceThreshold)
+func (c *Config) ResolveSkipMapReduceThreshold() int {
+	if c.SkipMapReduceThreshold > 0 {
+		return c.SkipMapReduceThreshold
+	}
+	model := strings.ToLower(c.LLMModel)
+	for key, v := range modelSkipThresholdDefaults {
+		if strings.Contains(model, key) {
+			return v
+		}
+	}
+	return defaultSkipMapReduceThreshold
 }

@@ -156,7 +156,7 @@ func TestResolveAndFetch_SelectedArchivedThread_ProducesMessages(t *testing.T) {
 	start := time.Now().Add(-24 * time.Hour)
 	end := time.Now().Add(time.Hour)
 
-	msgs, err := ResolveAndFetchMessagesForPersonal(
+	msgs, _, err := ResolveAndFetchMessagesForPersonal(
 		context.Background(), "user1", nil, nil, specifiedSources, "",
 		start, end, db, nil, nil, 1, 0, 2, nil,
 	)
@@ -182,7 +182,7 @@ func TestResolveAndFetch_NoSources_ArchivedExcluded(t *testing.T) {
 	end := time.Now().Add(time.Hour)
 
 	// No explicit sources -> auto discovery -> only the active thread's message.
-	msgs, err := ResolveAndFetchMessagesForPersonal(
+	msgs, _, err := ResolveAndFetchMessagesForPersonal(
 		context.Background(), "user1", nil, nil, nil, "",
 		start, end, db, nil, nil, 1, 0, 2, nil,
 	)
@@ -289,7 +289,7 @@ func TestResolveAndFetch_MultiPerson_SelectedArchivedThread_Retained(t *testing.
 	start := time.Now().Add(-24 * time.Hour)
 	end := time.Now().Add(time.Hour)
 
-	msgs, err := ResolveAndFetchMessagesForPersonal(
+	msgs, _, err := ResolveAndFetchMessagesForPersonal(
 		context.Background(), "user1", []string{"user2"}, nil, specifiedSources, "",
 		start, end, db, nil, nil, 1, 0, 2, nil,
 	)

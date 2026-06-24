@@ -14,11 +14,23 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/auth"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/db"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 )
 
 func main() {
 	cfg := config.Load()
+
+	// Apply config to pipeline package-level variables
+	if cfg.MaxSafetyLimit > 0 {
+		pipeline.MaxSafetyLimit = cfg.MaxSafetyLimit
+	}
+	if cfg.DefaultTimeRangeDays > 0 {
+		pipeline.DefaultTimeRangeDays = cfg.DefaultTimeRangeDays
+	}
+	// EnableIntentShortcut defaults to true, so we always apply it
+	pipeline.EnableIntentShortcut = cfg.EnableIntentShortcut
+
 	config.ValidateRequired(map[string]string{
 		"MYSQL_DSN":          cfg.MySQLDSN,
 		"IM_MYSQL_DSN":       cfg.IMMySQLDSN,
