@@ -939,6 +939,176 @@ func TestAddMembers_ScheduleConfigPendingNewMemberOldUnchanged(t *testing.T) {
 	}
 }
 
+// --- consent-bypass P1 (reviewer yujiawei): AddMembers on an AUTO multi-person
+//     schedule must FLIP confirm_policy AUTO->CONFIRM when it adds an unconfirmed
+//     new member. Otherwise the next scheduled run goes through
+//     buildScheduledTaskParticipantsAuto, which pre-accepts the WHOLE roster
+//     (EffectiveUserIDs) ignoring per-member Confirmed flags -> the new member is
+//     auto-dispatched and their chat summarized without ever Accepting. ---
+
+// helper: build an AUTO multi-person schedule + a task bound to it, with creator1
+// already a member. Returns (schedule, task).
+func setupAutoSchedTaskForFlip(t *testing.T, db *gorm.DB) (model.SummarySchedule, model.SummaryTask) {
+	t.Helper()
+	now := timezone.Now()
+	sched := model.SummarySchedule{
+		SpaceID:     "space1",
+		CreatorID:   "creator1",
+		SummaryMode: model.ModeByPerson,
+		// AUTO multi-person: bare-array participant_config recording the roster.
+		ConfirmPolicy:     model.SchedConfirmAuto,
+		ParticipantConfig: model.JSON(`[{"user_id":"creator1","user_name":"creator1"},{"user_id":"member2","user_name":"member2"}]`),
+		IsActive:          1,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}
+	db.Create(&sched)
+	task := model.SummaryTask{
+		TaskNo:      "TST-FLIP-AUTO",
+		SpaceID:     "space1",
+		CreatorID:   "creator1",
+		SummaryMode: model.ModeByPerson,
+		Status:      model.StatusCompleted,
+		ScheduleID:  &sched.ID,
+	}
+	db.Create(&task)
+	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "creator1", UserName: "creator1", Status: model.ParticipantCompleted})
+	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "member2", UserName: "member2", Status: model.ParticipantCompleted})
+	return sched, task
+}
+
+// FAIL-BEFORE regression: adding an unconfirmed new member to an AUTO multi-person
+// schedule must flip confirm_policy to CONFIRM (SchedConfirmRequire). Without the
+// fix this asserts FAIL because the policy stays AUTO -> next run auto-accepts the
+// whole roster incl. the un-Accepted newcomer (consent bypass).
+func TestAddMembers_AutoSchedule_FlipsToConfirmOnNewMember(t *testing.T) {
+	db := setupMembersTestDB(t)
+	sched, task := setupAutoSchedTaskForFlip(t, db)
+
+	h := NewPersonalHandler(db, "", nil)
+	r := setupPersonalEditRouter(h)
+
+	body := map[string]interface{}{"user_ids": []string{"newcomer1"}}
+	w := doJSONRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/members", task.ID), "creator1", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var got model.SummarySchedule
+	db.First(&got, sched.ID)
+
+	// core consent-bypass fix: policy must have flipped AUTO -> CONFIRM so the next
+	// scheduled run takes the CONFIRM path and waits for the newcomer to Accept.
+	if got.ConfirmPolicy != model.SchedConfirmRequire {
+		t.Fatalf("confirm_policy must flip AUTO->CONFIRM (%d) after adding an unconfirmed member, got %d",
+			model.SchedConfirmRequire, got.ConfirmPolicy)
+	}
+
+	// and the newcomer must be recorded UNCONFIRMED (consent still pending).
+	cfg := model.ParseScheduleParticipantConfig(got.ParticipantConfig)
+	ne := cfg.FindParticipant("newcomer1")
+	if ne == nil || ne.Confirmed {
+		t.Errorf("newcomer1 must be present and UNCONFIRMED, got %+v", ne)
+	}
+}
+
+// NO-REGRESSION ①: an already-CONFIRM schedule adding a member keeps CONFIRM
+// (no spurious change / no side effect from the flip logic).
+func TestAddMembers_ConfirmSchedule_PolicyStaysConfirm(t *testing.T) {
+	db := setupMembersTestDB(t)
+	now := timezone.Now()
+	sched := model.SummarySchedule{
+		SpaceID:           "space1",
+		CreatorID:         "creator1",
+		SummaryMode:       model.ModeByPerson,
+		ConfirmPolicy:     model.SchedConfirmRequire,
+		ParticipantConfig: model.JSON(`{"participants":[{"user_id":"creator1","confirmed":true,"confirmed_at":"2026-06-01T00:00:00Z"}],"confirm_gate_passed":true}`),
+		IsActive:          1,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}
+	db.Create(&sched)
+	task := model.SummaryTask{
+		TaskNo:      "TST-FLIP-CONFIRM",
+		SpaceID:     "space1",
+		CreatorID:   "creator1",
+		SummaryMode: model.ModeByPerson,
+		Status:      model.StatusCompleted,
+		ScheduleID:  &sched.ID,
+	}
+	db.Create(&task)
+	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "creator1", UserName: "creator1", Status: model.ParticipantCompleted})
+
+	h := NewPersonalHandler(db, "", nil)
+	r := setupPersonalEditRouter(h)
+
+	body := map[string]interface{}{"user_ids": []string{"newcomer1"}}
+	w := doJSONRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/members", task.ID), "creator1", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var got model.SummarySchedule
+	db.First(&got, sched.ID)
+	if got.ConfirmPolicy != model.SchedConfirmRequire {
+		t.Errorf("already-CONFIRM schedule must stay CONFIRM (%d), got %d", model.SchedConfirmRequire, got.ConfirmPolicy)
+	}
+}
+
+// NO-REGRESSION ②: a non-schedule (manual) task AddMembers must not touch any
+// schedule and must succeed normally.
+func TestAddMembers_NonSchedule_NoScheduleChange(t *testing.T) {
+	db := setupMembersTestDB(t)
+	task := model.SummaryTask{
+		TaskNo:      "TST-FLIP-MANUAL",
+		SpaceID:     "space1",
+		CreatorID:   "creator1",
+		SummaryMode: model.ModeByPerson,
+		Status:      model.StatusCompleted,
+		// no ScheduleID -> manual task.
+	}
+	db.Create(&task)
+	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "creator1", UserName: "creator1", Status: model.ParticipantCompleted})
+
+	h := NewPersonalHandler(db, "", nil)
+	r := setupPersonalEditRouter(h)
+
+	body := map[string]interface{}{"user_ids": []string{"newcomer1"}}
+	w := doJSONRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/members", task.ID), "creator1", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	// no schedule rows should exist at all.
+	var n int64
+	db.Model(&model.SummarySchedule{}).Count(&n)
+	if n != 0 {
+		t.Errorf("manual task AddMembers must not create/alter any schedule, found %d schedule rows", n)
+	}
+}
+
+// NO-REGRESSION ③: adding an ALREADY-EXISTING member (no new member) to an AUTO
+// schedule must NOT flip the policy (no addedCount/schedDirty -> no flip).
+func TestAddMembers_AutoSchedule_ExistingMember_NoFlip(t *testing.T) {
+	db := setupMembersTestDB(t)
+	sched, task := setupAutoSchedTaskForFlip(t, db)
+
+	h := NewPersonalHandler(db, "", nil)
+	r := setupPersonalEditRouter(h)
+
+	// member2 already exists -> no new member added.
+	body := map[string]interface{}{"user_ids": []string{"member2"}}
+	w := doJSONRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/members", task.ID), "creator1", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var got model.SummarySchedule
+	db.First(&got, sched.ID)
+	if got.ConfirmPolicy != model.SchedConfirmAuto {
+		t.Errorf("AUTO schedule must stay AUTO (%d) when no NEW member is added, got %d", model.SchedConfirmAuto, got.ConfirmPolicy)
+	}
+}
+
 // --- Leave (POST /summaries/:id/leave) + RemoveMember (DELETE
 //     /summaries/:id/members?uid=<uid>): physical removal of participant +
 //     personal_result rows, then a meta_summary recompute. ---

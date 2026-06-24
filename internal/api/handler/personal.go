@@ -834,9 +834,25 @@ func (h *PersonalHandler) AddMembers(c *gin.Context) {
 			if mErr != nil {
 				return mErr
 			}
+			updates := map[string]interface{}{"participant_config": raw}
+			// consent-bypass P1 (reviewer yujiawei): if this schedule is currently AUTO,
+			// adding an UNCONFIRMED new member (schedDirty) must flip it to CONFIRM.
+			// Otherwise the next scheduled run goes through buildScheduledTaskParticipantsAuto,
+			// which pre-accepts the WHOLE roster (EffectiveUserIDs) ignoring per-member
+			// Confirmed flags -> the new member is auto-dispatched and summarized without
+			// ever Accepting. Flipping to CONFIRM routes the next run through the CONFIRM
+			// path so it waits for the newcomer to Accept (mirrors UpdateSchedule's
+			// AUTO->CONFIRM handling in schedule.go). Strict: only when the schedule is
+			// currently AUTO and a new unconfirmed member was actually added. Written in
+			// the SAME tx Update as participant_config (one round-trip, no partial state).
+			if sched.ConfirmPolicy == model.SchedConfirmAuto {
+				updates["confirm_policy"] = model.SchedConfirmRequire
+				// keep the in-memory sched in sync in case later logic reads it.
+				sched.ConfirmPolicy = model.SchedConfirmRequire
+			}
 			if err := tx.Model(&model.SummarySchedule{}).
 				Where("id = ?", sched.ID).
-				Update("participant_config", raw).Error; err != nil {
+				Updates(updates).Error; err != nil {
 				return err
 			}
 		}
