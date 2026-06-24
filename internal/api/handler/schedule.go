@@ -786,6 +786,14 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 // ListSchedules handles GET /api/v1/summary-schedules
 func (h *ScheduleHandler) ListSchedules(c *gin.Context) {
 	spaceID := middleware.GetSpaceID(c)
+	// fail-closed hard gate: GET requests are NOT caught by StrictSpaceMiddleware,
+	// and SpaceID is `not null default ''`, so rows with space_id='' may exist;
+	// querying `space_id=''` would MATCH them, leaking cross-space schedules.
+	// Reject an empty X-Space-Id before any query.
+	if spaceID == "" {
+		bizErr(c, service.NewBizError(40008, "定时配置不存在", http.StatusNotFound))
+		return
+	}
 
 	var schedules []model.SummarySchedule
 	h.db.Where("space_id = ? AND deleted_at IS NULL", spaceID).
@@ -826,6 +834,14 @@ func (h *ScheduleHandler) ListSchedules(c *gin.Context) {
 // GetSchedule handles GET /api/v1/summary-schedules/:id
 func (h *ScheduleHandler) GetSchedule(c *gin.Context) {
 	spaceID := middleware.GetSpaceID(c)
+	// fail-closed hard gate: GET requests are NOT caught by StrictSpaceMiddleware,
+	// and SpaceID is `not null default ''`, so rows with space_id='' may exist;
+	// querying `space_id=''` would MATCH them, leaking a cross-space schedule.
+	// Reject an empty X-Space-Id before any query.
+	if spaceID == "" {
+		bizErr(c, service.NewBizError(40008, "定时配置不存在", http.StatusNotFound))
+		return
+	}
 	schedID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid schedule id"})

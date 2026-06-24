@@ -474,22 +474,27 @@ func (h *PersonalHandler) PersonalEdit(c *gin.Context) {
 		return
 	}
 
-	// Authorization: the caller MUST be a participant of this task. Membership is
-	// keyed on (task_id, user_id=self); a non-participant gets 403.
-	var participant model.SummaryParticipant
-	if err := h.db.Where("task_id = ? AND user_id = ?", taskID, userID).First(&participant).Error; err != nil {
-		c.JSON(http.StatusForbidden, apiResponse{Code: 40003, Message: "你不是该任务的参与者"})
+	// P1 (cross-space isolation): the task must exist AND live in the caller's
+	// space BEFORE any (task_id,user_id) participant lookup -- identical ordering to
+	// Accept. requireTaskInSpace also fail-closes an empty X-Space-Id. Doing this
+	// FIRST seals the cross-space participant-enumeration oracle: previously a
+	// non-participant in another space saw 403/40003 ("你不是该任务的参与者") while a
+	// non-existent/cross-space task saw 404/40008, and that error-code difference
+	// leaked both task existence and the caller's participation across spaces. Now
+	// both empty-space and cross-space uniformly return 40008 ("任务不存在"), and a
+	// genuine in-space non-participant gets the same 40008 "你不是该任务的参与者"
+	// semantics as Accept (no differentiated leak). This also gives BE-1's revive a
+	// consistent task-existence guarantee.
+	if !h.requireTaskInSpace(c, taskID) {
 		return
 	}
 
-	// BE-3: space isolation + task existence prerequisite. The task must live in
-	// the caller's space; a space mismatch is reported as 40008 ("任务不存在")
-	// exactly like a missing task, so existence is not leaked across spaces. This
-	// also gives BE-1's revive a consistent task-existence guarantee.
-	spaceID := middleware.GetSpaceID(c)
-	var task model.SummaryTask
-	if err := h.db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).First(&task).Error; err != nil {
-		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
+	// Authorization: the caller MUST be a participant of this task. Membership is
+	// keyed on (task_id, user_id=self). Mirrors Accept: a non-participant gets the
+	// same 40008 "你不是该任务的参与者" as a missing task so participation is not leaked.
+	var participant model.SummaryParticipant
+	if err := h.db.Where("task_id = ? AND user_id = ?", taskID, userID).First(&participant).Error; err != nil {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "你不是该任务的参与者"})
 		return
 	}
 
@@ -581,6 +586,14 @@ func (h *PersonalHandler) GetMembers(c *gin.Context) {
 		return
 	}
 	spaceID := middleware.GetSpaceID(c)
+	// fail-closed hard gate: GET requests are NOT caught by StrictSpaceMiddleware,
+	// and SummaryTask.SpaceID is `not null default ''`, so rows with space_id='' may
+	// exist; querying `space_id=''` would MATCH them, leaking a cross-space roster.
+	// Reject an empty X-Space-Id before any query (mirrors requireTaskInSpace).
+	if spaceID == "" {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
+		return
+	}
 
 	var task model.SummaryTask
 	if err := h.db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).First(&task).Error; err != nil {

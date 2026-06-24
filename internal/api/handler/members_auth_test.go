@@ -429,6 +429,11 @@ func TestPersonalEdit_OwnSuccessAndMetaTrigger(t *testing.T) {
 }
 
 func TestPersonalEdit_NonParticipantForbidden(t *testing.T) {
+	// BE-1 (check-order fix): an in-space non-participant now gets the SAME
+	// 404/40008 ("你不是该任务的参与者") as Accept, NOT the old 403/40003. The
+	// previous 403-before-space-check leaked task existence + participation across
+	// spaces (40003 vs 40008 oracle); the participant check now runs AFTER
+	// requireTaskInSpace and returns 40008 so participation is not leaked.
 	db := setupMembersTestDB(t)
 	taskID := seedMultiPersonTask(t, db)
 	h := NewPersonalHandler(db, "", nil)
@@ -436,8 +441,14 @@ func TestPersonalEdit_NonParticipantForbidden(t *testing.T) {
 
 	body := map[string]interface{}{"content": "stranger tries to edit"}
 	w := doJSONRequest(r, "PUT", fmt.Sprintf("/api/v1/summaries/%d/personal-edit", taskID), "stranger1", body)
-	if w.Code != http.StatusForbidden {
-		t.Errorf("expected 403 for non-participant personal-edit, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for in-space non-participant personal-edit, got %d: %s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("40008")) {
+		t.Errorf("in-space non-participant must return code 40008 (not the leaky 40003), body=%s", w.Body.String())
+	}
+	if bytes.Contains(w.Body.Bytes(), []byte("40003")) {
+		t.Errorf("in-space non-participant must NOT return the differentiated 40003 leak, body=%s", w.Body.String())
 	}
 }
 
@@ -2176,5 +2187,103 @@ func TestAddMembers_TaskCompleted_Allowed(t *testing.T) {
 	}
 	if p.Status != model.ParticipantPending {
 		t.Errorf("new member must be Pending, got status=%d", p.Status)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// P1 (fixer-104): PersonalEdit check-order + GET empty-space fail-closed gate.
+//
+// Bug 1: PersonalEdit ran the (task_id,user_id) participant check BEFORE the
+// space-isolation check, so a non-participant got 403/40003 ("你不是该任务的参与者")
+// while a missing/cross-space task got 404/40008 -- a cross-space participant-
+// enumeration + existence oracle. The fix moves requireTaskInSpace FIRST (with
+// its spaceID=="" hard gate) and returns 40008 for the in-space non-participant,
+// matching Accept, so neither existence nor participation leaks across spaces.
+//
+// Bug 2: GET endpoints are not caught by StrictSpaceMiddleware and SpaceID is
+// `not null default ''`, so an empty X-Space-Id could match a space_id='' row.
+// GetMembers (here) now hard-gates spaceID=="" -> 40008 before any query.
+// ---------------------------------------------------------------------------
+
+// Bug 1: empty X-Space-Id against a real participant of a space_id='' task must
+// 40008 (not leak the report) -- the requireTaskInSpace empty-space hard gate now
+// runs BEFORE the participant lookup. FAIL-before: the participant check ran
+// first (or the empty-header query matched space_id='') and the edit proceeded;
+// PASS-after: 40008 and the report stays untouched.
+func TestPersonalEdit_EmptySpaceHeader_Returns404(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID := seedEmptySpaceTask(t, db) // space_id='' task, participant1 has a PR
+	h := NewPersonalHandler(db, "", nil)
+	r := setupPersonalEditRouter(h)
+
+	w := doWrongSpaceRequest(r, "PUT", fmt.Sprintf("/api/v1/summaries/%d/personal-edit", taskID),
+		"participant1", "", map[string]interface{}{"content": "empty-space edit attempt"})
+	assertCrossSpace404(t, w)
+
+	// The report must NOT have been modified.
+	var pr model.PersonalResult
+	db.Where("task_id = ? AND user_id = ?", taskID, "participant1").First(&pr)
+	if pr.EditedAt != nil || pr.Content != "participant1 original [1]" {
+		t.Errorf("empty-space edit must not modify the report: content=%q edited_at=%v", pr.Content, pr.EditedAt)
+	}
+}
+
+// Bug 1 (the oracle itself): a NON-participant calling cross-space must get the
+// SAME 40008 as any other miss -- NOT the old 40003 ("你不是该任务的参与者").
+// FAIL-before: the participant check ran first, so a cross-space stranger saw
+// 403/40003 (leaking that the task exists in some other space AND that they are
+// not on its roster), distinguishable from the 40008 a non-existent task gives.
+// PASS-after: requireTaskInSpace 404s first -> uniform 40008, no oracle.
+func TestPersonalEdit_CrossSpaceNonParticipant_Returns404NotLeak(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID := seedMultiPersonTask(t, db) // space1; stranger1 is NOT a participant
+	h := NewPersonalHandler(db, "", nil)
+	r := setupPersonalEditRouter(h)
+
+	w := doWrongSpaceRequest(r, "PUT", fmt.Sprintf("/api/v1/summaries/%d/personal-edit", taskID),
+		"stranger1", "other_space", map[string]interface{}{"content": "cross-space non-participant edit"})
+	assertCrossSpace404(t, w) // asserts 404 + body contains 40008
+	if bytes.Contains(w.Body.Bytes(), []byte("40003")) {
+		t.Errorf("cross-space non-participant must NOT leak the 40003 participant oracle, body=%s", w.Body.String())
+	}
+}
+
+// setupMembersOnlyRouter wires ONLY GET /members so the GetMembers empty-space
+// gate can be exercised in isolation (setupMembersRouter already does this; kept
+// explicit here for the empty-space helper's intent).
+
+// Bug 2: GetMembers with an EMPTY X-Space-Id must 40008 and must NOT return a
+// roster -- the GET path is not behind StrictSpaceMiddleware and space_id=''
+// rows exist, so without the spaceID=="" hard gate the empty-header query
+// `space_id=''` would match the seeded task and leak its member list.
+// FAIL-before: empty header -> roster returned (200); PASS-after: 40008, no roster.
+func TestGetMembers_EmptySpaceHeader_Returns404NoRoster(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID := seedEmptySpaceTask(t, db) // space_id='' task, creator1 + participant1
+	h := NewPersonalHandler(db, "", nil)
+	r := setupMembersRouter(h) // GET /api/v1/summaries/:id/members
+
+	// creator1 is a genuine creator of the space_id='' task, but sends no X-Space-Id.
+	w := doWrongSpaceRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d/members", taskID), "creator1", "", nil)
+	assertCrossSpace404(t, w)
+
+	// The roster must not have leaked through the empty-space request.
+	if bytes.Contains(w.Body.Bytes(), []byte("members")) ||
+		bytes.Contains(w.Body.Bytes(), []byte("participant1")) {
+		t.Errorf("empty-space GetMembers must NOT return the roster, body=%s", w.Body.String())
+	}
+}
+
+// Sanity inverse for Bug 2: the SAME creator with the CORRECT space still gets
+// the roster (200), so the empty-space gate did not over-block in-space reads.
+func TestGetMembers_EmptySpaceGate_NoRegressionInSpace(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID := seedMembersTask(t, db) // space1, creator1 + participant1
+	h := NewPersonalHandler(db, "", nil)
+	r := setupMembersRouter(h)
+
+	w := doRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d/members", taskID), "creator1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("in-space creator must still get 200 roster, got %d: %s", w.Code, w.Body.String())
 	}
 }

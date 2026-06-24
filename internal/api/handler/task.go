@@ -358,6 +358,14 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 // ListSummaries handles GET /api/v1/summaries
 func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	spaceID := middleware.GetSpaceID(c)
+	// fail-closed hard gate: GET requests are NOT caught by StrictSpaceMiddleware,
+	// and SummaryTask.SpaceID is `not null default ''`, so rows with space_id='' may
+	// exist; querying `space_id=''` would MATCH them, leaking cross-space tasks.
+	// Reject an empty X-Space-Id before any query.
+	if spaceID == "" {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
+		return
+	}
 
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
