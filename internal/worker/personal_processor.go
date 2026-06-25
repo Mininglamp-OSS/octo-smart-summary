@@ -205,7 +205,7 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 			result.SetCitations(citations)
 			// Bug3: only scheduled tasks prune old versions in place; manual/normal
 			// single-person runs keep their full version history.
-			if err := saveLatestResultAndCompleteTask(p.db, taskID, &result, isScheduled); err != nil {
+			if err := saveLatestResultAndCompleteTask(p.db, taskID, &result, isScheduled, nil); err != nil {
 				if errors.Is(err, errTaskNoLongerProcessing) {
 					log.Printf("[personal-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
 					return
@@ -222,51 +222,219 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 		})
 		log.Printf("[personal-worker] task %d single-person completed directly", taskID)
 	} else {
-		// Multi-person mode: trigger meta-summary to check if all participants completed
+		// Multi-person mode: trigger meta-summary to check if all participants completed.
+		//
+		// §4.4-2 system back-fill of submitted_at (Blocker-1): the meta completion gate
+		// requires submitted_at IS NOT NULL, but the personal worker only sets
+		// ParticipantCompleted/WorkerStatus=Completed -- it never writes submitted_at
+		// (the only manual writer is /submit). A scheduled multi-person task driven by the
+		// worker alone would therefore have len(submitted)==0 forever => meta dead-waits.
+		// For scheduled (TriggerScheduled) multi-person tasks we back-fill submitted_at +
+		// submit_source=2 (system) when the participant has confirmed (status NOT IN
+		// Pending,Declined -- same gate as meta's totalAccepted), idempotently
+		// (WHERE submitted_at IS NULL, so a racing manual /submit is never overwritten).
+		if task.TriggerType == model.TriggerScheduled {
+			p.backfillScheduledSubmittedAt(taskID, &pr)
+		}
 		p.meta.TriggerMetaSummary(taskID)
 	}
 
 	log.Printf("[personal-worker] completed task=%d user=%s msgs=%d", taskID, participant.UserID, msgCount)
 }
 
+// backfillScheduledSubmittedAt system-back-fills submitted_at for a scheduled
+// multi-person personal result so the meta gate (submitted_at IS NOT NULL) can
+// progress without a manual /submit (§4.4-2). It runs in a single transaction:
+//   - re-reads the participant's current status under the same tx (the confirm
+//     gate must reflect committed state, not the in-memory pr loaded earlier);
+//   - only back-fills when the participant has confirmed: status NOT IN
+//     (Pending, Declined) -- the same set meta's totalAccepted counts;
+//   - is idempotent and race-safe via WHERE submitted_at IS NULL, so a concurrent
+//     manual /submit (submit_source=1) is never overwritten;
+//   - sets submit_source=2 to mark the system origin.
+//
+// participantCount>1 is the caller's branch invariant (this is only reached from
+// the multi-person path), so it is not re-checked here.
+func (p *Processor) backfillScheduledSubmittedAt(taskID int64, pr *model.PersonalResult) {
+	now := timezone.Now()
+	err := p.db.Transaction(func(tx *gorm.DB) error {
+		var status int
+		if err := tx.Model(&model.SummaryParticipant{}).
+			Select("status").
+			Where("id = ?", pr.ParticipantRefID).
+			Scan(&status).Error; err != nil {
+			return err
+		}
+		// Confirmed gate (口径同 meta totalAccepted): skip Pending/Declined.
+		if status == model.ParticipantPending || status == model.ParticipantDeclined {
+			return nil
+		}
+		res := tx.Model(&model.PersonalResult{}).
+			Where("id = ? AND submitted_at IS NULL", pr.ID).
+			Updates(map[string]interface{}{
+				"submitted_at":  now,
+				"submit_source": model.SubmitSourceSystem,
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected > 0 {
+			log.Printf("[personal-worker] task=%d participant=%d system back-filled submitted_at (submit_source=2)", taskID, pr.ParticipantRefID)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("[personal-worker] task=%d participant=%d back-fill submitted_at failed: %v", taskID, pr.ParticipantRefID, err)
+	}
+}
+
 func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *model.SummaryParticipant, errMsg string) {
 	sanitized := sanitizeErrorForUser(errMsg)
 
+	// 🔴 Blocker-3 fix: self-heal vs terminal failure.
+	//
+	// The old markPersonalFailed unconditionally set worker_status=Failed and reset the
+	// participant to Accepted. But the retry scanner (scanStuckPersonalTasks) only
+	// re-triggers personal_result rows whose worker_status==Pending -- a Failed row was
+	// NEVER re-run. Meanwhile meta's totalAccepted still counts that Accepted participant
+	// (status NOT IN Pending,Declined), and the multi-person path (participantCount>1)
+	// does NOT propagate task-level failure, so meta would wait forever for a submit that
+	// never comes -> task stuck until the lease times out.
+	//
+	// New behavior (P0, AUTO path):
+	//   - retry_count < WorkerMaxRetry: increment retry_count and set worker_status back
+	//     to Pending (participant stays Accepted). scanStuckPersonalTasks' M3 sweep (and
+	//     the AUTO dispatch path) then naturally re-runs it -- a transient failure heals.
+	//   - retry_count >= WorkerMaxRetry: set worker_status=Failed (terminal). Propagate so
+	//     meta never dead-waits:
+	//       * single-person: fail the task (unchanged behavior).
+	//       * multi-person: Decline the failed participant so it drops out of meta's
+	//         totalAccepted (status NOT IN Pending,Declined), letting the remaining
+	//         members aggregate; then kick meta to re-evaluate. This keeps the existing
+	//         meta gate intact (no confirmed_set change -- that is P1 scope).
+	maxRetry := p.cfg.WorkerMaxRetry
+	if maxRetry < 1 {
+		maxRetry = 1
+	}
+
 	var shouldNotify bool
+	var willRetry bool
+	var permanentMultiDeclined bool
 	txErr := p.db.Transaction(func(tx *gorm.DB) error {
+		// 🟠 Atomic retry_count increment (no lost updates).
+		//
+		// The old code did a plain Select(retry_count) -> newRetry=current+1 -> write-back
+		// inside the tx, with no FOR UPDATE / no CAS. Two concurrent failure workers (e.g.
+		// after the stuck-scan resets a timed-out Processing row and a second worker is
+		// pulled up) could read the same retry_count and both write back the same newRetry,
+		// so one failure is silently swallowed and WorkerMaxRetry never trips -> infinite
+		// re-runs. Fix: increment in the database atomically (retry_count = retry_count + 1)
+		// then SELECT the post-increment value, so newRetry is the real DB-derived count,
+		// not an application-layer +1. Each concurrent failure strictly accumulates.
+		if err := tx.Model(&model.PersonalResult{}).
+			Where("id = ?", pr.ID).
+			Update("retry_count", gorm.Expr("retry_count + 1")).Error; err != nil {
+			return err
+		}
+		var current model.PersonalResult
+		if err := tx.Select("retry_count").First(&current, pr.ID).Error; err != nil {
+			return err
+		}
+		newRetry := current.RetryCount
+		willRetry = newRetry < maxRetry
+
+		if willRetry {
+			// Transient failure: reset to Pending so the retry scanner re-runs it.
+			// retry_count was already atomically incremented above; only the remaining
+			// columns are written here (do not re-set retry_count to an app-layer value).
+			if err := tx.Model(pr).Updates(map[string]interface{}{
+				"worker_status": model.PersonalStatusPending,
+				"error_message": &sanitized,
+			}).Error; err != nil {
+				return err
+			}
+			// Participant returns to Accepted, clear worker_started_at so the stuck-scan
+			// lease check (worker_started_at < leaseTimeout) does not mis-handle it.
+			if err := tx.Model(participant).Updates(map[string]interface{}{
+				"status":            model.ParticipantAccepted,
+				"worker_started_at": nil,
+			}).Error; err != nil {
+				return err
+			}
+			return nil
+		}
+
+		// Permanent failure: terminal Failed. retry_count already atomically incremented
+		// above (the DB-derived newRetry >= maxRetry), so it is not re-written here.
 		if err := tx.Model(pr).Updates(map[string]interface{}{
 			"worker_status": model.PersonalStatusFailed,
 			"error_message": &sanitized,
 		}).Error; err != nil {
 			return err
 		}
-		if err := tx.Model(participant).Update("status", model.ParticipantAccepted).Error; err != nil {
-			return err
-		}
 
-		// In single-person mode, propagate failure to task level
 		var participantCount int64
 		if err := tx.Model(&model.SummaryParticipant{}).Where("task_id = ?", pr.TaskID).Count(&participantCount).Error; err != nil {
 			return err
 		}
 		if participantCount <= 1 {
+			// Single-person: keep prior behavior -- reset participant to Accepted and propagate failure to the task.
+			if err := tx.Model(participant).Update("status", model.ParticipantAccepted).Error; err != nil {
+				return err
+			}
 			result := tx.Model(&model.SummaryTask{}).
 				Where("id = ? AND status = ?", pr.TaskID, model.StatusProcessing).
 				Updates(map[string]interface{}{
 					"status":        model.StatusFailed,
 					"error_message": &sanitized,
 				})
+			if result.Error != nil {
+				return result.Error
+			}
 			if result.RowsAffected == 0 {
 				log.Printf("[personal-worker] task=%d CAS update skipped (not in Processing state)", pr.TaskID)
 			} else {
 				shouldNotify = true
 			}
+			return nil
 		}
+
+		// Multi-person: Decline the permanently-failed participant so meta's totalAccepted
+		// (status NOT IN Pending,Declined) excludes it and the remaining members can
+		// aggregate. This keeps single/manual paths untouched (they take the branch above).
+		if err := tx.Model(participant).Update("status", model.ParticipantDeclined).Error; err != nil {
+			return err
+		}
+		permanentMultiDeclined = true
 		return nil
 	})
 
 	if txErr != nil {
 		log.Printf("[personal-worker] markPersonalFailed transaction failed: task=%d err=%v", pr.TaskID, txErr)
+		return
+	}
+
+	if willRetry {
+		log.Printf("[personal-worker] task=%d participant=%d personal failed, reset to Pending for retry (retry<%d), msg=%s",
+			pr.TaskID, pr.ParticipantRefID, maxRetry, sanitized)
+		// Re-trigger immediately rather than waiting for the 5-minute stuck scan.
+		if p.pool != nil {
+			ptID := pr.ParticipantRefID
+			taskID := pr.TaskID
+			p.pool.Submit(func() {
+				p.processPersonalSummary(context.Background(), taskID, ptID)
+			})
+		}
+		return
+	}
+
+	if permanentMultiDeclined {
+		// A member is permanently out: re-evaluate meta so the task does not dead-wait on the now-Declined member.
+		if p.meta != nil {
+			p.meta.TriggerMetaSummary(pr.TaskID)
+		}
+		log.Printf("[personal-worker] task=%d participant=%d permanently failed (multi-person), declined + re-kicked meta, msg=%s",
+			pr.TaskID, pr.ParticipantRefID, sanitized)
 		return
 	}
 
@@ -278,7 +446,7 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 			Message:  sanitized,
 		})
 	}
-	log.Printf("[personal-worker] task=%d marked failed, sanitizedMsg=%s", pr.TaskID, sanitized)
+	log.Printf("[personal-worker] task=%d marked failed (terminal), sanitizedMsg=%s", pr.TaskID, sanitized)
 }
 
 func (p *Processor) executePersonalPipeline(ctx context.Context, task model.SummaryTask, userID string) (string, []model.Citation, int, int, string, error) {

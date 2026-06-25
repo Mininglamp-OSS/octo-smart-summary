@@ -35,9 +35,11 @@ type PersonalResult struct {
 	TotalTokenUsed   int        `gorm:"column:total_token_used;not null;default:0" json:"total_token_used"`
 	ModelVersion     string     `gorm:"column:model_version;type:varchar(50);not null;default:''" json:"model_version"`
 	WorkerStatus     int        `gorm:"column:worker_status;type:tinyint;not null;default:0" json:"worker_status"`
+	RetryCount       int        `gorm:"column:retry_count;type:tinyint;not null;default:0" json:"retry_count"`
 	ErrorMessage     *string    `gorm:"column:error_message;type:varchar(500)" json:"error_message"`
 	EditedAt         *time.Time `gorm:"column:edited_at" json:"edited_at"`
 	SubmittedAt      *time.Time `gorm:"column:submitted_at" json:"submitted_at"`
+	SubmitSource     int        `gorm:"column:submit_source;type:tinyint;not null;default:0" json:"submit_source"`
 	GeneratedAt      *time.Time `gorm:"column:generated_at" json:"generated_at"`
 	CreatedAt        time.Time  `gorm:"column:created_at;not null" json:"created_at"`
 	UpdatedAt        time.Time  `gorm:"column:updated_at;not null" json:"updated_at"`

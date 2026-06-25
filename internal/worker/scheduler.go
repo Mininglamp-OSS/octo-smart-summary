@@ -19,10 +19,12 @@ import (
 var schedulerHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
 // StartScheduler starts the 4 cron scan jobs (every 60s).
-func StartScheduler(db *gorm.DB, imDB *gorm.DB, maxRetry int, workerTriggerURL string, maxWindowDays int) *cron.Cron {
+// featureTeamSchedule, when true, lets multi-person schedules through the claim path
+// instead of disabling them (FEATURE_TEAM_SCHEDULE).
+func StartScheduler(db *gorm.DB, imDB *gorm.DB, maxRetry int, workerTriggerURL string, maxWindowDays int, featureTeamSchedule bool) *cron.Cron {
 	c := cron.New()
 
-	c.AddFunc("@every 60s", func() { scanPendingSchedules(db, imDB, maxWindowDays) })
+	c.AddFunc("@every 60s", func() { scanPendingSchedules(db, imDB, maxWindowDays, featureTeamSchedule) })
 	c.AddFunc("@every 60s", func() { scanConfirmTimeouts(db) })
 	c.AddFunc("@every 60s", func() { scanStuckTasks(db, maxRetry) })
 	c.AddFunc("@every 60s", func() { scanStuckPersonalTasks(db, workerTriggerURL) })
@@ -33,7 +35,7 @@ func StartScheduler(db *gorm.DB, imDB *gorm.DB, maxRetry int, workerTriggerURL s
 }
 
 // scanPendingSchedules requeues bound tasks from due schedules.
-func scanPendingSchedules(db *gorm.DB, imDB *gorm.DB, maxWindowDays int) {
+func scanPendingSchedules(db *gorm.DB, imDB *gorm.DB, maxWindowDays int, featureTeamSchedule bool) {
 	now := timezone.Now()
 	var schedules []model.SummarySchedule
 	err := db.Where("is_active = 1 AND next_run_at <= ? AND deleted_at IS NULL", now).Find(&schedules).Error
@@ -43,7 +45,7 @@ func scanPendingSchedules(db *gorm.DB, imDB *gorm.DB, maxWindowDays int) {
 	}
 
 	for _, sched := range schedules {
-		taskID, claimed, err := claimAndCreateScheduledTask(db, imDB, sched, now, maxWindowDays)
+		taskID, claimed, err := claimAndCreateScheduledTask(db, imDB, sched, now, maxWindowDays, featureTeamSchedule)
 		if err != nil {
 			log.Printf("[scheduler] create task for schedule %d: %v", sched.ID, err)
 			continue
@@ -58,7 +60,7 @@ func scanPendingSchedules(db *gorm.DB, imDB *gorm.DB, maxWindowDays int) {
 	}
 }
 
-func claimAndCreateScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.SummarySchedule, now time.Time, maxWindowDays int) (int64, bool, error) {
+func claimAndCreateScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.SummarySchedule, now time.Time, maxWindowDays int, featureTeamSchedule bool) (int64, bool, error) {
 	if sched.NextRunAt == nil {
 		return 0, false, nil
 	}
@@ -168,15 +170,16 @@ func claimAndCreateScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.Summary
 			return nil
 		}
 
-		// Scheduled summary is single-person only this version. If the schedule's
-		// participant config went multi-person it is structurally unsupported for
-		// scheduling. Guard against the schedule config (not a bound task, since under
-		// 1->N each run is fresh). >1 distinct configured users (excluding the implicit
-		// creator dedup) => disable + alert.
+		// Scheduled summary is single-person only unless FEATURE_TEAM_SCHEDULE is on.
+		// If the schedule's participant config went multi-person and the flag is OFF, it
+		// is structurally unsupported for scheduling: disable + alert. When the flag is
+		// ON, multi-person schedules are allowed through to the multi-person execution
+		// path (children built by buildScheduledTaskChildren, all participants Accepted
+		// under AUTO; meta aggregation via the submit-gate back-fill).
 		if multiPerson, err := scheduleConfigMultiPerson(lockedSched); err != nil {
 			return err
-		} else if multiPerson {
-			log.Printf("[scheduler] ALERT schedule %d participant config is multi-person; scheduled summary not supported for team tasks, disabling + notifying creator", lockedSched.ID)
+		} else if multiPerson && !featureTeamSchedule {
+			log.Printf("[scheduler] ALERT schedule %d participant config is multi-person; scheduled summary not supported for team tasks (FEATURE_TEAM_SCHEDULE off), disabling + notifying creator", lockedSched.ID)
 			if err := tx.Model(&model.SummarySchedule{}).
 				Where("id = ?", lockedSched.ID).
 				Update("is_active", 0).Error; err != nil {
@@ -191,18 +194,18 @@ func claimAndCreateScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.Summary
 		// INSERT a brand-new task for this run (1->N). Title/origin/space carry over
 		// from the schedule; the rest is a fresh Pending scheduled task.
 		newTask = model.SummaryTask{
-			TaskNo:          service.GenerateTaskNo(),
-			SpaceID:         lockedSched.SpaceID,
-			CreatorID:       lockedSched.CreatorID,
-			Title:           lockedSched.Title,
-			SummaryMode:     lockedSched.SummaryMode,
-			TimeRangeStart:  start,
-			TimeRangeEnd:    end,
-			Status:          model.StatusPending,
-			TriggerType:     model.TriggerScheduled,
-			ScheduleID:      &lockedSched.ID,
-			CreatedAt:       now,
-			UpdatedAt:       now,
+			TaskNo:         service.GenerateTaskNo(),
+			SpaceID:        lockedSched.SpaceID,
+			CreatorID:      lockedSched.CreatorID,
+			Title:          lockedSched.Title,
+			SummaryMode:    lockedSched.SummaryMode,
+			TimeRangeStart: start,
+			TimeRangeEnd:   end,
+			Status:         model.StatusPending,
+			TriggerType:    model.TriggerScheduled,
+			ScheduleID:     &lockedSched.ID,
+			CreatedAt:      now,
+			UpdatedAt:      now,
 		}
 		if hasLatest {
 			// Preserve origin channel from the previous run so the new summary keeps
@@ -215,9 +218,45 @@ func claimAndCreateScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.Summary
 		}
 
 		// Rebuild the three subtables (source / participant / personal_result) from
-		// the schedule config -- the new task_id starts with no children.
-		if err := buildScheduledTaskChildren(tx, imDB, lockedSched, newTask, now); err != nil {
+		// the schedule config -- the new task_id starts with no children. The returned
+		// count is the number of Accepted participants materialized this round.
+		//
+		// V5 §4.3/Q2: for a CONFIRM schedule where NOBODY (creator included) has
+		// confirmed yet, no children are built (acceptedCount==0). The round is skipped:
+		// the freshly-created placeholder task is SOFT-DELETED (deleted_at set) so it
+		// produces no result, never surfaces in any deleted_at IS NULL query (list/
+		// detail), does not occupy the overlap guard, and is not picked up by the
+		// processor. The next cycle re-checks the confirm list (already-advanced
+		// next_run_at avoids a busy re-scan). last_run_at is NOT advanced for a skipped
+		// round so a type=4 incremental window is preserved.
+		acceptedCount, err := buildScheduledTaskChildren(tx, imDB, lockedSched, newTask, now)
+		if err != nil {
 			return err
+		}
+		if acceptedCount == 0 {
+			log.Printf("[scheduler] schedule %d: CONFIRM round has zero confirmed participants; skipping round (placeholder task %d soft-deleted, no result, last_run_at preserved)", lockedSched.ID, newTask.ID)
+			// Soft-delete the placeholder task instead of marking it Cancelled, so it
+			// never surfaces in any deleted_at IS NULL query (list/detail). DeletedAt is
+			// a plain *time.Time (not gorm.DeletedAt), so set it explicitly with now to
+			// stay transaction-consistent. The overlap guard ignores it (deleted_at non-
+			// null), next_run_at is already advanced, last_run_at stays put: the plan
+			// silently rolls to the next time point.
+			// Clean up the summary_source child rows already materialized this round.
+			// buildScheduledTaskChildren builds sources BEFORE counting accepted
+			// participants, so on a zero-confirm round the source rows exist while the
+			// parent task is only soft-deleted -- they would become invisible orphans
+			// accumulating every skipped round. SummarySource has no DeletedAt, so this
+			// is a physical delete (correct: they are valueless, unreferenced garbage).
+			if err := tx.Where("task_id = ?", newTask.ID).Delete(&model.SummarySource{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Model(&model.SummaryTask{}).
+				Where("id = ?", newTask.ID).
+				Update("deleted_at", now).Error; err != nil {
+				return err
+			}
+			requeued = false
+			return nil
 		}
 
 		// Advance last_run_at ONLY now that the new task is actually created to run.
@@ -257,34 +296,32 @@ func scheduleConfigMultiPerson(sched model.SummarySchedule) (bool, error) {
 	if len(sched.ParticipantConfig) == 0 {
 		return false, nil
 	}
-	var participants []struct {
-		UserID string `json:"user_id"`
-	}
-	if err := json.Unmarshal(sched.ParticipantConfig, &participants); err != nil {
-		return false, nil
-	}
-	users := map[string]struct{}{}
-	if sched.CreatorID != "" {
-		users[sched.CreatorID] = struct{}{}
-	}
-	for _, p := range participants {
-		if p.UserID != "" {
-			users[p.UserID] = struct{}{}
-		}
-	}
-	return len(users) > 1, nil
+	// V5 §3.1: participant_config is now an object form
+	// {"participants":[...],"confirm_gate_passed":...}. Use the single
+	// normalizer so the V5 object form (and every legacy array shape) is parsed
+	// consistently; the old bare-array Unmarshal failed on the V5 object form and
+	// silently returned false, bypassing the FEATURE_TEAM_SCHEDULE-off guard.
+	cfg := model.ParseScheduleParticipantConfig(sched.ParticipantConfig)
+	return len(cfg.EffectiveUserIDs(sched.CreatorID)) > 1, nil
 }
 
 // scanConfirmTimeouts auto-declines participants still in WaitingConfirm
 // past the task's confirm_deadline.
+//
+// V5/Q5: scheduled runs no longer use a per-round confirm window (confirm is a
+// one-time, schedule-level event and scheduled tasks never write
+// confirm_deadline), so this scan is restricted to MANUAL tasks. A scheduled
+// task can never produce a WaitingConfirm participant under V5, so excluding
+// trigger_type=scheduled here is a no-op safety net that also ignores any legacy
+// scheduled row that might still carry a confirm_deadline.
 func scanConfirmTimeouts(db *gorm.DB) {
 	now := timezone.Now()
 
-	// Find tasks with confirm_deadline passed that still have WaitingConfirm participants
+	// Find MANUAL tasks with confirm_deadline passed that still have WaitingConfirm participants
 	var taskIDs []int64
 	db.Model(&model.SummaryTask{}).
-		Where("confirm_deadline < ? AND confirm_deadline IS NOT NULL AND deleted_at IS NULL AND status NOT IN (?, ?, ?)",
-			now, model.StatusCompleted, model.StatusFailed, model.StatusCancelled).
+		Where("confirm_deadline < ? AND confirm_deadline IS NOT NULL AND deleted_at IS NULL AND trigger_type = ? AND status NOT IN (?, ?, ?)",
+			now, model.TriggerManual, model.StatusCompleted, model.StatusFailed, model.StatusCancelled).
 		Pluck("id", &taskIDs)
 
 	if len(taskIDs) == 0 {

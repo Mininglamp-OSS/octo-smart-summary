@@ -22,7 +22,7 @@ func main() {
 	config.ValidateRequired(map[string]string{
 		"MYSQL_DSN":          cfg.MySQLDSN,
 		"IM_MYSQL_DSN":       cfg.IMMySQLDSN,
-		"OCTO_API_URL":     cfg.OctoAPIURL,
+		"OCTO_API_URL":       cfg.OctoAPIURL,
 		"WORKER_TRIGGER_URL": cfg.WorkerTriggerURL,
 	})
 
@@ -83,7 +83,7 @@ func main() {
 	}
 
 	// Public API server
-	publicRouter := router.SetupPublic(summaryDB, imDB, hub, authResolver, cfg.WorkerTriggerURL, cfg.CandidateQueryLimit)
+	publicRouter := router.SetupPublic(summaryDB, imDB, hub, authResolver, cfg.WorkerTriggerURL, cfg.CandidateQueryLimit, cfg.FeatureTeamSchedule)
 	publicSrv := &http.Server{
 		Addr:    ":" + cfg.APIPort,
 		Handler: publicRouter,

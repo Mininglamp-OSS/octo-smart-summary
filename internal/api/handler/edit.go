@@ -71,16 +71,12 @@ func (h *EditHandler) EditSummary(c *gin.Context) {
 		return
 	}
 
-	var participantCount int64
-	if err := h.db.Model(&model.SummaryParticipant{}).Where("task_id = ?", taskID).Count(&participantCount).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
-		return
-	}
-	if participantCount > 1 {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "多人任务不支持编辑"})
-		return
-	}
-
+	// need4: multi-person tasks now allow the CREATOR to edit the *team*
+	// SummaryResult. The old participantCount>1 -> 400 rejection is removed; the
+	// creator-only + Completed gates above remain the sole authorization. Editing
+	// the team draft for a multi-person task does NOT write back into each member's
+	// PersonalResult (R4: team draft and personal contents are intentionally
+	// allowed to diverge once the creator hand-edits the team summary).
 	summaryResult, err := queryDisplayResult(h.db, taskID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "总结结果不存在"})
@@ -92,12 +88,24 @@ func (h *EditHandler) EditSummary(c *gin.Context) {
 		return
 	}
 
-	var personalResult model.PersonalResult
-	if err := h.db.Where("task_id = ? AND user_id = ?", taskID, task.CreatorID).First(&personalResult).Error; err != nil {
-		log.Printf("[edit] PersonalResult not found for task=%d creator=%s: %v", taskID, task.CreatorID, err)
+	// In a single-person task the creator's PersonalResult mirrors the team
+	// SummaryResult and is kept in sync. In a multi-person task the creator may
+	// not even have a PersonalResult (creator-only edits the *team* draft); a
+	// missing row must NOT 500 -- we simply skip the personal write-back.
+	// F1: only a SINGLE-person task mirrors the team edit back into the creator's
+	// PersonalResult. In a multi-person task the creator is usually also a
+	// participant WITH their own PersonalResult; mirroring the team draft into it
+	// would clobber the creator's personal summary. So compute participantCount and
+	// only mirror when <=1 (and a row actually exists). Multi-person team edits
+	// update the team SummaryResult ONLY -- never any PersonalResult (R4).
+	var participantCount int64
+	if err := h.db.Model(&model.SummaryParticipant{}).Where("task_id = ?", taskID).Count(&participantCount).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
 		return
 	}
+	var personalResult model.PersonalResult
+	hasPersonal := participantCount <= 1 &&
+		h.db.Where("task_id = ? AND user_id = ?", taskID, task.CreatorID).First(&personalResult).Error == nil
 
 	if req.Content == summaryResult.Content {
 		var editedAt interface{}
@@ -140,14 +148,19 @@ func (h *EditHandler) EditSummary(c *gin.Context) {
 			return service.NewBizError(40005, "任务状态已变更", http.StatusBadRequest)
 		}
 
-		if err := tx.Model(&model.PersonalResult{}).
-			Where("id = ?", personalResult.ID).
-			Updates(map[string]interface{}{
-				"content":        req.Content,
-				"citations_json": citationsJSON,
-				"edited_at":      now,
-			}).Error; err != nil {
-			return err
+		// F1: mirror into the creator's PersonalResult ONLY for a single-person task
+		// (hasPersonal already encodes participantCount<=1 && row exists). Multi-person
+		// team edits touch the team SummaryResult only, never a PersonalResult (R4).
+		if hasPersonal {
+			if err := tx.Model(&model.PersonalResult{}).
+				Where("id = ?", personalResult.ID).
+				Updates(map[string]interface{}{
+					"content":        req.Content,
+					"citations_json": citationsJSON,
+					"edited_at":      now,
+				}).Error; err != nil {
+				return err
+			}
 		}
 
 		if taskCheck.ScheduleID != nil {

@@ -57,7 +57,7 @@ type Config struct {
 	// (e.g. a long Processing overlap) cannot blow up a single run's message
 	// volume. <=0 disables the cap.
 	ScheduleMaxWindowDays int
-	WorkerCallbackURL    string
+	WorkerCallbackURL     string
 
 	// Message table count
 	MsgTableCount int
@@ -84,6 +84,11 @@ type Config struct {
 
 	// Tool call per-attempt timeout (seconds)
 	ToolCallTimeout int
+
+	// FeatureTeamSchedule gates multi-participant scheduled summaries across both the
+	// API guards and the worker scheduler. Default OFF: API keeps rejecting multi-person
+	// schedules (40015) and the worker keeps disabling multi-person schedules.
+	FeatureTeamSchedule bool
 }
 
 func Load() *Config {
@@ -107,22 +112,22 @@ func Load() *Config {
 		WorkerInternalPort:        envStr("WORKER_INTERNAL_PORT", "8082"),
 		WorkerListenAllInterfaces: envStr("WORKER_LISTEN_ADDR", "0.0.0.0"),
 
-		WorkerMaxConcurrent:  envInt("WORKER_MAX_CONCURRENT_TASKS", 20),
-		WorkerMapConcurrency: envInt("WORKER_MAP_CONCURRENCY", 5),
-		WorkerPollInterval:   envInt("WORKER_POLL_INTERVAL_SECONDS", 2),
-		WorkerLeaseMinutes:   envInt("WORKER_TASK_LEASE_MINUTES", 20),
-		WorkerMaxRetry:       envInt("WORKER_MAX_RETRY", 3),
+		WorkerMaxConcurrent:   envInt("WORKER_MAX_CONCURRENT_TASKS", 20),
+		WorkerMapConcurrency:  envInt("WORKER_MAP_CONCURRENCY", 5),
+		WorkerPollInterval:    envInt("WORKER_POLL_INTERVAL_SECONDS", 2),
+		WorkerLeaseMinutes:    envInt("WORKER_TASK_LEASE_MINUTES", 20),
+		WorkerMaxRetry:        envInt("WORKER_MAX_RETRY", 3),
 		ScheduleMaxWindowDays: envInt("SCHEDULE_MAX_WINDOW_DAYS", 30),
-		WorkerCallbackURL:    envStr("WORKER_API_CALLBACK_URL", ""),
+		WorkerCallbackURL:     envStr("WORKER_API_CALLBACK_URL", ""),
 
 		MsgTableCount: envInt("MSG_TABLE_COUNT", 5),
 
 		ContextWindow:             envInt("CONTEXT_WINDOW", 2),
 		MaxMessagesPerParticipant: envInt("MAX_MESSAGES_PER_PARTICIPANT", 5000),
 		MaxMessagesPerChannel:     envInt("MAX_MESSAGES_PER_CHANNEL", -1),
-		MapMaxTokens:             envInt("MAP_MAX_TOKENS", 0),
-		CharsPerTokenCJK:         envInt("CHARS_PER_TOKEN_CJK", 1),
-		CharsPerTokenASCII:       envInt("CHARS_PER_TOKEN_ASCII", 4),
+		MapMaxTokens:              envInt("MAP_MAX_TOKENS", 0),
+		CharsPerTokenCJK:          envInt("CHARS_PER_TOKEN_CJK", 1),
+		CharsPerTokenASCII:        envInt("CHARS_PER_TOKEN_ASCII", 4),
 
 		WorkerTriggerURL: envStr("WORKER_TRIGGER_URL", ""),
 
@@ -133,6 +138,8 @@ func Load() *Config {
 		ChannelScopeEnabled: envBool("CHANNEL_SCOPE_ENABLED", true),
 
 		ToolCallTimeout: envInt("TOOL_CALL_TIMEOUT", 30),
+
+		FeatureTeamSchedule: envBool("FEATURE_TEAM_SCHEDULE", false),
 	}
 }
 

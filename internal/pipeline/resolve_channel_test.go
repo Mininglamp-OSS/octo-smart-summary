@@ -711,6 +711,11 @@ func TestFilterByOwnership_AllQueriesFail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open sqlite: %v", err)
 	}
+	// Pin to a single connection so the in-memory DB stays consistent across the
+	// connection pool (bare ":memory:" is per-connection); avoids shuffle-order flakiness.
+	if sqlDB, e := db.DB(); e == nil {
+		sqlDB.SetMaxOpenConns(1)
+	}
 
 	candidates := []ChannelInfo{
 		{ChannelID: "g1", ChannelType: 2, ChannelName: "group1"},

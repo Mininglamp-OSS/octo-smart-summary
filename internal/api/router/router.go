@@ -11,7 +11,7 @@ import (
 )
 
 // SetupPublic configures the public API router on :8080.
-func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middleware.TokenResolver, workerTriggerURL string, candidateQueryLimit int) *gin.Engine {
+func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middleware.TokenResolver, workerTriggerURL string, candidateQueryLimit int, featureTeamSchedule bool) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
 
@@ -37,7 +37,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 
 	// API routes
 	taskH := handler.NewTaskHandler(db, imDB, workerTriggerURL)
-	schedH := handler.NewScheduleHandler(db)
+	schedH := handler.NewScheduleHandlerWithFlag(db, featureTeamSchedule)
 	personalH := handler.NewPersonalHandler(db, workerTriggerURL, hub)
 	editH := handler.NewEditHandler(db)
 
@@ -51,6 +51,11 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		v1.GET("/summaries/:id/result", taskH.GetResult)
 		v1.POST("/summaries/:id/regenerate", taskH.Regenerate)
 		v1.PUT("/summaries/:id/edit", editH.EditSummary)
+		// need3/need6: a participant edits their OWN personal report -> triggers team recompute.
+		v1.PUT("/summaries/:id/personal-edit", personalH.PersonalEdit)
+		// need7: creator adds new members as PENDING/unconfirmed; no PersonalResult,
+		// no dispatch -- the new member must Accept to generate their summary.
+		v1.POST("/summaries/:id/members", personalH.AddMembers)
 		v1.DELETE("/summaries/:id", taskH.DeleteSummary)
 		v1.POST("/summaries/:id/cancel", taskH.CancelSummary)
 		v1.GET("/summary-infer", taskH.InferScope)
@@ -64,6 +69,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		v1.PUT("/summary-schedules/:id", schedH.UpdateSchedule)
 		v1.DELETE("/summary-schedules/:id", schedH.DeleteSchedule)
 		v1.PUT("/summary-schedules/:id/toggle", schedH.ToggleSchedule)
+		v1.POST("/summary-schedules/:id/confirm", schedH.ConfirmSchedule)
 	}
 
 	// P2 routes: strict auth required
@@ -76,6 +82,14 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		p2.GET("/summaries/:id/personal", personalH.GetPersonal)
 		p2.POST("/summaries/:id/submit", personalH.Submit)
 		p2.GET("/summaries/:id/members", personalH.GetMembers)
+		// Leave a multi-person collaboration (participant, NOT creator).
+		p2.POST("/summaries/:id/leave", personalH.Leave)
+		// Creator removes a member from a multi-person collaboration. The target
+		// uid is passed as a QUERY param (?uid=...), not a path segment: member ids
+		// are opaque strings and a path segment would break gin routing / decoding
+		// for any id containing reserved chars (e.g. an encoded '/'). Same prefix as
+		// POST .../members (AddMembers); the HTTP method disambiguates.
+		p2.DELETE("/summaries/:id/members", personalH.RemoveMember)
 	}
 
 	return r
