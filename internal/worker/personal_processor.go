@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timing"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/tokenizer"
 	"gorm.io/gorm"
 )
 
@@ -21,12 +22,13 @@ func escapeCitationMarkers(content string) string {
 	return citationRe.ReplaceAllString(content, "($1)")
 }
 
-const noRelevantContentMessage = "在当前范围内未找到与主题相关的聊天记录。"
+const noRelevantContentMessage = pipeline.NoRelevantContentMessage
 
-const noSelfMessagesMessage = "你在所选范围内没有发言记录。"
+const noSelfMessagesMessage = pipeline.NoSelfMessagesMessage
 
-// decidePersonalMessages chooses which messages feed the summary after target
-// filtering, and decides whether to early-return a user-facing message instead.
+// decidePersonalMessages is a compatibility wrapper around pipeline.DecideMessages.
+// It chooses which messages feed the summary after target filtering, and decides
+// whether to early-return a user-facing message instead.
 //
 //	len(targetUIDs)==0                      → all messages, no early message (no target)
 //	filtered non-empty                      → filtered messages (normal narrow)
@@ -35,16 +37,7 @@ const noSelfMessagesMessage = "你在所选范围内没有发言记录。"
 //	filtered empty + other targets          → all messages (named someone who didn't speak in
 //	                                          this source; whole source beats "no data")
 func decidePersonalMessages(targetUIDs []string, creatorUID string, all, filtered []pipeline.Message) (msgs []pipeline.Message, earlyMsg string) {
-	if len(targetUIDs) == 0 {
-		return all, ""
-	}
-	if len(filtered) > 0 {
-		return filtered, ""
-	}
-	if len(targetUIDs) == 1 && targetUIDs[0] == creatorUID {
-		return nil, noSelfMessagesMessage
-	}
-	return all, ""
+	return pipeline.DecideMessages(targetUIDs, creatorUID, all, filtered)
 }
 
 // isEmptyPlaceholder reports whether content is one of the "no usable result"
@@ -505,7 +498,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	}
 
 	fetchStart := time.Now()
-	messages, err := pipeline.ResolveAndFetchMessagesForPersonal(
+	messages, intentResult, err := pipeline.ResolveAndFetchMessagesForPersonal(
 		ctx, userID, nil, nil, specifiedSources, task.Title,
 		task.TimeRangeStart, task.TimeRangeEnd,
 		p.imDB, toolCallFn, llmFn,
@@ -517,16 +510,73 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		return "", nil, 0, 0, "", fmt.Errorf("fetch messages: %w", err)
 	}
 
-	// Resolve sender names (moved before FilterWithContext for ResolveTopicTarget)
+	// Record message retrieval stats
+	tctx := timing.GetContext(taskNo)
+	channelSet := make(map[string]struct{})
+	for _, m := range messages {
+		channelSet[m.ChannelID] = struct{}{}
+	}
+	tctx.Update(func(c *timing.TaskContext) {
+		c.MessagesRetrieved = len(messages)
+		c.ChannelCount = len(channelSet)
+	})
+
+	// Resolve sender names (for display in summary)
 	resolveStart := time.Now()
 	nameMap := p.batchResolveUserNames(messages)
 	timing.Observe(taskNo, "resolve_user_names", resolveStart)
 	log.Printf("[personal-worker] batchResolveUserNames took %dms (%d names)",
 		time.Since(resolveStart).Milliseconds(), len(nameMap))
 
-	// Resolve topic target via LLM Function Call.
-	targetUIDs := pipeline.ResolveTopicTarget(ctx, task.Title, nameMap, userID, toolCallFn)
-	log.Printf("[personal-worker] topic target resolved: %v (creator=%s)", targetUIDs, userID)
+	// Get target person info from unified intent recognition (returned from fetch)
+	var targetUIDs []string
+	if intentResult != nil && !intentResult.Skipped {
+		tctx.Update(func(c *timing.TaskContext) {
+			c.IntentSkipped = false
+			c.IntentLLMCalls = 1 // unified call
+		})
+		targetUIDs = intentResult.TargetPersons.UIDs
+		if intentResult.TargetPersons.IncludeSelf && userID != "" {
+			// Ensure creator is in target list if include_self is true
+			hasCreator := false
+			for _, uid := range targetUIDs {
+				if uid == userID {
+					hasCreator = true
+					break
+				}
+			}
+			if !hasCreator {
+				targetUIDs = append(targetUIDs, userID)
+			}
+		}
+		log.Printf("[personal-worker] topic target from intent: %v (creator=%s)", targetUIDs, userID)
+	} else if intentResult != nil && intentResult.Skipped {
+		tctx.Update(func(c *timing.TaskContext) {
+			c.IntentSkipped = true
+			c.IntentSkipReason = intentResult.SkipReason
+		})
+		timing.RecordSkip(taskNo, "intent_recognition", intentResult.SkipReason)
+		log.Printf("[personal-worker] topic target resolution skipped (%s)", intentResult.SkipReason)
+	}
+
+	// Fallback: the unified intent can miss a named person two ways — its pre-fetch
+	// member roster is capped at 500 (sorted by UID), and the shortcut may skip
+	// intent entirely (e.g. simple_channel_constraint when memberMap is empty so the
+	// member-name guard can't fire). Either way targetUIDs ends up empty and the
+	// summary would over-widen to ALL messages. So re-resolve against the actual
+	// post-fetch senders (nameMap, untruncated) whenever we have no target and the
+	// topic is not purely generic (pure_generic_topic by definition names no one).
+	if len(targetUIDs) == 0 && intentResult.SkipReason != "pure_generic_topic" && task.Title != "" {
+		if fallback := pipeline.ResolveTopicTarget(ctx, task.Title, nameMap, userID, toolCallFn); len(fallback) > 0 {
+			targetUIDs = fallback
+			log.Printf("[personal-worker] target resolved via post-fetch fallback: %v (creator=%s)", targetUIDs, userID)
+		}
+	}
+
+	// Record target person stats
+	tctx.Update(func(c *timing.TaskContext) {
+		c.TargetPersonCount = len(targetUIDs)
+	})
 
 	// Apply context window filter (signature changed: userID → targetUIDs)
 	filterStart := time.Now()
@@ -536,6 +586,9 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		filtered := pipeline.FilterWithContext(messages, targetUIDs, p.cfg.ContextWindow)
 		log.Printf("[personal-worker] FilterWithContext took %dms (%d → %d messages, targets=%v)",
 			time.Since(filterStart).Milliseconds(), len(messages), len(filtered), targetUIDs)
+		tctx.Update(func(c *timing.TaskContext) {
+			c.FilteredCount = len(filtered)
+		})
 		userMessages, earlyMsg = decidePersonalMessages(targetUIDs, userID, messages, filtered)
 		if earlyMsg != "" {
 			// True first-person query and the creator has no messages in the selected
@@ -556,6 +609,11 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	if len(userMessages) == 0 {
 		return noRelevantContentMessage, nil, 0, 0, p.llm.ModelVersion(), nil
 	}
+
+	// Record final message count
+	tctx.Update(func(c *timing.TaskContext) {
+		c.MessagesFinal = len(userMessages)
+	})
 
 	for i := range userMessages {
 		if name, ok := nameMap[userMessages[i].SenderUID]; ok {
@@ -583,14 +641,50 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		targetMsgCount = len(userMessages)
 	}
 
+	// Create tokenizer for token counting
+	tokCfg := tokenizer.Config{
+		CharsPerTokenCJK:   p.cfg.ResolveCharsPerTokenCJK(),
+		CharsPerTokenASCII: p.cfg.CharsPerTokenASCII,
+		KimiAPIKey:         p.cfg.KimiAPIKey,
+		HTTPTimeout:        p.cfg.TokenizerHTTPTimeout,
+	}
+	tok := tokenizer.New(p.cfg.LLMModel, tokCfg)
+
+	// System prompt overhead (same as used in chunking)
+	const systemPromptTokens = 3000
+
+	// Calculate total tokens for all messages
+	var allContent strings.Builder
+	for _, m := range userMessages {
+		allContent.WriteString(m.Content)
+		allContent.WriteString("\n")
+	}
+	// Account for per-message formatting overhead: "[idx][time] sender: " prefix
+	// Typical overhead: ~15 tokens per message (RFC3339 time + brackets + sender name)
+	const perMessageFormattingOverhead = 15
+	estimatedTotalTokens := tok.Count(allContent.String()) + len(userMessages)*perMessageFormattingOverhead
+
+	// Check if we can skip Map-Reduce
+	// Use the minimum of skipThreshold and mapMaxTokens, then subtract system prompt overhead
+	// to ensure we don't exceed the per-model context budget
+	skipThreshold := p.cfg.ResolveSkipMapReduceThreshold()
+	mapMaxTokens := p.cfg.ResolveMapMaxTokens()
+	if mapMaxTokens > 0 && mapMaxTokens < skipThreshold {
+		skipThreshold = mapMaxTokens
+	}
+	effectiveSkipThreshold := skipThreshold - systemPromptTokens
+	skipMapReduce := tok.IsExact() && estimatedTotalTokens <= effectiveSkipThreshold
+	if skipMapReduce {
+		log.Printf("[personal-worker] skip Map-Reduce: totalTokens=%d <= threshold=%d (exact=%v)",
+			estimatedTotalTokens, effectiveSkipThreshold, tok.IsExact())
+	}
+
 	// Token-aware chunking — resolve budget via explicit config / per-model default / global fallback
 	maxTokens := p.cfg.ResolveMapMaxTokens()
 	if maxTokens < 10000 {
 		log.Printf("[config] resolved MapMaxTokens=%d too small, using default 100000", maxTokens)
 		maxTokens = 100000
 	}
-	const systemPromptTokens = 3000
-	const maxMsgsPerChunk = 800
 	effectiveMax := maxTokens - systemPromptTokens
 
 	var chunks [][]pipeline.Message
@@ -598,11 +692,11 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	currentTokens := 0
 
 	for _, m := range userMessages {
-		msgTokens := estimateTokens(m.Content, p.cfg.ResolveCharsPerTokenCJK(), p.cfg.CharsPerTokenASCII)
+		msgTokens := tok.Estimate(m.Content)
 		if msgTokens > effectiveMax {
 			log.Printf("[chunking] WARNING: single message exceeds token budget: %d > %d", msgTokens, effectiveMax)
 		}
-		if len(currentChunk) > 0 && (currentTokens+msgTokens > effectiveMax || len(currentChunk) >= maxMsgsPerChunk) {
+		if len(currentChunk) > 0 && currentTokens+msgTokens > effectiveMax {
 			chunks = append(chunks, currentChunk)
 			currentChunk = nil
 			currentTokens = 0
@@ -621,6 +715,12 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	}
 	log.Printf("[personal-worker] Chunking: %d messages → %d chunks (maxTokens=%d)",
 		len(userMessages), len(chunks), effectiveMax)
+
+	// Record Map-Reduce stats
+	tctx.Update(func(c *timing.TaskContext) {
+		c.ChunkCount = len(chunks)
+		c.UsedMapReduce = len(chunks) > 1 && !skipMapReduce
+	})
 
 	startTime := task.TimeRangeStart.Format("2006-01-02 15:04")
 	endTime := task.TimeRangeEnd.Format("2006-01-02 15:04")
@@ -641,116 +741,146 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		userName = userID
 	}
 
-	// Map phase（并发）
-	type chunkResult struct {
-		summary string
-		tokens  int
-		failed  bool
-		fatal   bool
-	}
-
-	concurrency := p.cfg.WorkerMapConcurrency
-	if concurrency <= 0 {
-		concurrency = 1
-	}
-
-	results := make([]chunkResult, len(chunks))
-	mapSem := make(chan struct{}, concurrency)
-	var mapWg sync.WaitGroup
-
-	mapStart := time.Now()
-	for i, chunk := range chunks {
-		mapWg.Add(1)
-		go func(idx int, c []pipeline.Message) {
-			defer mapWg.Done()
-
-			select {
-			case mapSem <- struct{}{}:
-			case <-ctx.Done():
-				results[idx] = chunkResult{failed: true}
-				return
-			}
-			defer func() { <-mapSem }()
-
-			var formatted []string
-			for _, m := range c {
-				formatted = append(formatted, fmt.Sprintf("[%d][%s] %s: %s",
-					m.CitationIndex, m.SendTime, m.SenderName,
-					escapeCitationMarkers(m.Content)))
-			}
-
-			callStart := time.Now()
-			summary, tokens, err := p.llm.CallMap(ctx,
-				joinStrings(formatted), sourceName, idx, len(c),
-				startTime, endTime, task.Title, userName,
-			)
-			timing.RecordLLMSince(taskNo, fmt.Sprintf("Map: 分块总结 chunk#%d", idx), callStart, tokens)
-			if err != nil {
-				log.Printf("[personal-worker] Map chunk %d failed: %v", idx, err)
-				isFatal := strings.Contains(err.Error(), "reasoning budget exhausted")
-				results[idx] = chunkResult{failed: true, fatal: isFatal}
-			} else {
-				results[idx] = chunkResult{summary: summary, tokens: tokens}
-			}
-		}(i, chunk)
-	}
-	mapWg.Wait()
-	timing.Observe(taskNo, "llm_map_summary", mapStart)
-	log.Printf("[personal-worker] Map phase took %dms (%d chunks, concurrency=%d)",
-		time.Since(mapStart).Milliseconds(), len(chunks), concurrency)
-
-	if ctx.Err() != nil {
-		return "", nil, 0, 0, "", fmt.Errorf("map phase cancelled: %w", ctx.Err())
-	}
-
-	var fatalChunks []int
-	for i, r := range results {
-		if r.fatal {
-			fatalChunks = append(fatalChunks, i)
-		}
-	}
-	if len(fatalChunks) > 0 {
-		return "", nil, 0, 0, "", fmt.Errorf(
-			"Map phase aborted: reasoning budget exhausted on chunk(s) %v", fatalChunks)
-	}
-
-	var chunkSummaries []string
-	var totalTokens int
-	for _, r := range results {
-		if !r.failed && !strings.Contains(r.summary, service.MapFailedMarker) {
-			chunkSummaries = append(chunkSummaries, r.summary)
-			totalTokens += r.tokens
-		}
-	}
-	if len(chunkSummaries) == 0 && len(results) > 0 {
-		return "", nil, 0, 0, "", fmt.Errorf("all %d chunk(s) failed during Map phase (LLM unreachable)", len(results))
-	}
-
-	// Reduce phase
-	reduceStart := time.Now()
 	var finalContent string
-	var reduceTokens int
+	var totalTokens int
 
-	if len(chunkSummaries) == 1 {
-		// Single chunk fast path: skip Reduce, use Map result directly
-		finalContent = chunkSummaries[0]
-		reduceTokens = 0
-		log.Printf("[pipeline] single chunk — skipping Reduce")
-	} else {
-		// Multiple chunks: execute Reduce to merge
-		var err error
-		reduceCallStart := time.Now()
-		finalContent, reduceTokens, err = p.llm.CallReduce(ctx,
-			chunkSummaries, sourceName, startTime, endTime, targetMsgCount, task.Title,
-		)
-		timing.RecordLLMSince(taskNo, "Reduce: 合并分块总结", reduceCallStart, reduceTokens)
-		if err != nil {
-			return "", nil, 0, 0, "", fmt.Errorf("reduce: %w", err)
+	if skipMapReduce {
+		// Skip Map-Reduce: call Map once with all messages (single chunk)
+		var formatted []string
+		for _, m := range userMessages {
+			formatted = append(formatted, fmt.Sprintf("[%d][%s] %s: %s",
+				m.CitationIndex, m.SendTime, m.SenderName,
+				escapeCitationMarkers(m.Content)))
 		}
+
+		mapStart := time.Now()
+		mapCallStart := time.Now()
+		var err error
+		finalContent, totalTokens, err = p.llm.CallMap(ctx,
+			joinStrings(formatted), sourceName, 0, len(userMessages),
+			startTime, endTime, task.Title, userName,
+		)
+		timing.RecordLLMSince(taskNo, "Map: 单次总结(跳过Map-Reduce)", mapCallStart, totalTokens)
+		timing.Observe(taskNo, "llm_map_summary", mapStart)
+		if err != nil {
+			return "", nil, 0, 0, "", fmt.Errorf("map (skip map-reduce): %w", err)
+		}
+		// Check for failed marker - CallMap returns marker string with nil error after retries exhausted
+		if strings.Contains(finalContent, service.MapFailedMarker) || finalContent == "" {
+			return "", nil, 0, 0, "", fmt.Errorf("map (skip map-reduce): LLM call failed")
+		}
+		log.Printf("[personal-worker] Skip Map-Reduce: single Map call took %dms (tokens=%d)",
+			time.Since(mapStart).Milliseconds(), totalTokens)
+	} else {
+		// Normal Map-Reduce flow
+		type chunkResult struct {
+			summary string
+			tokens  int
+			failed  bool
+			fatal   bool
+		}
+
+		concurrency := p.cfg.WorkerMapConcurrency
+		if concurrency <= 0 {
+			concurrency = 1
+		}
+
+		results := make([]chunkResult, len(chunks))
+		mapSem := make(chan struct{}, concurrency)
+		var mapWg sync.WaitGroup
+
+		mapStart := time.Now()
+		for i, chunk := range chunks {
+			mapWg.Add(1)
+			go func(idx int, c []pipeline.Message) {
+				defer mapWg.Done()
+
+				select {
+				case mapSem <- struct{}{}:
+				case <-ctx.Done():
+					results[idx] = chunkResult{failed: true}
+					return
+				}
+				defer func() { <-mapSem }()
+
+				var formatted []string
+				for _, m := range c {
+					formatted = append(formatted, fmt.Sprintf("[%d][%s] %s: %s",
+						m.CitationIndex, m.SendTime, m.SenderName,
+						escapeCitationMarkers(m.Content)))
+				}
+
+				callStart := time.Now()
+				summary, tokens, err := p.llm.CallMap(ctx,
+					joinStrings(formatted), sourceName, idx, len(c),
+					startTime, endTime, task.Title, userName,
+				)
+				timing.RecordLLMSince(taskNo, fmt.Sprintf("Map: 分块总结 chunk#%d", idx), callStart, tokens)
+				if err != nil {
+					log.Printf("[personal-worker] Map chunk %d failed: %v", idx, err)
+					isFatal := strings.Contains(err.Error(), "reasoning budget exhausted")
+					results[idx] = chunkResult{failed: true, fatal: isFatal}
+				} else {
+					results[idx] = chunkResult{summary: summary, tokens: tokens}
+				}
+			}(i, chunk)
+		}
+		mapWg.Wait()
+		timing.Observe(taskNo, "llm_map_summary", mapStart)
+		log.Printf("[personal-worker] Map phase took %dms (%d chunks, concurrency=%d)",
+			time.Since(mapStart).Milliseconds(), len(chunks), concurrency)
+
+		if ctx.Err() != nil {
+			return "", nil, 0, 0, "", fmt.Errorf("map phase cancelled: %w", ctx.Err())
+		}
+
+		var fatalChunks []int
+		for i, r := range results {
+			if r.fatal {
+				fatalChunks = append(fatalChunks, i)
+			}
+		}
+		if len(fatalChunks) > 0 {
+			return "", nil, 0, 0, "", fmt.Errorf(
+				"Map phase aborted: reasoning budget exhausted on chunk(s) %v", fatalChunks)
+		}
+
+		var chunkSummaries []string
+		for _, r := range results {
+			if !r.failed && !strings.Contains(r.summary, service.MapFailedMarker) {
+				chunkSummaries = append(chunkSummaries, r.summary)
+				totalTokens += r.tokens
+			}
+		}
+		if len(chunkSummaries) == 0 && len(results) > 0 {
+			return "", nil, 0, 0, "", fmt.Errorf("all %d chunk(s) failed during Map phase (LLM unreachable)", len(results))
+		}
+
+		// Reduce phase
+		reduceStart := time.Now()
+		var reduceTokens int
+
+		if len(chunkSummaries) == 1 {
+			// Single chunk fast path: skip Reduce, use Map result directly
+			finalContent = chunkSummaries[0]
+			reduceTokens = 0
+			log.Printf("[pipeline] single chunk — skipping Reduce")
+		} else {
+			// Multiple chunks: execute Reduce to merge
+			var err error
+			reduceCallStart := time.Now()
+			finalContent, reduceTokens, err = p.llm.CallReduce(ctx,
+				chunkSummaries, sourceName, startTime, endTime, targetMsgCount, task.Title,
+			)
+			timing.RecordLLMSince(taskNo, "Reduce: 合并分块总结", reduceCallStart, reduceTokens)
+			if err != nil {
+				return "", nil, 0, 0, "", fmt.Errorf("reduce: %w", err)
+			}
+		}
+		totalTokens += reduceTokens
+		timing.Observe(taskNo, "llm_reduce_summary", reduceStart)
+		log.Printf("[personal-worker] Reduce phase took %dms", time.Since(reduceStart).Milliseconds())
 	}
-	totalTokens += reduceTokens
-	timing.Observe(taskNo, "llm_reduce_summary", reduceStart)
-	log.Printf("[personal-worker] Reduce phase took %dms", time.Since(reduceStart).Milliseconds())
 
 	// Build citations from final content
 	citationStart := time.Now()
@@ -765,27 +895,6 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		time.Since(totalStart).Milliseconds())
 
 	return finalContent, citations, targetMsgCount, totalTokens, p.llm.ModelVersion(), nil
-}
-
-func estimateTokens(content string, charsPerTokenCJK, charsPerTokenASCII int) int {
-	const overheadPerMsg = 50
-	// Defensive: avoid divide-by-zero or pathological values
-	if charsPerTokenCJK <= 0 {
-		charsPerTokenCJK = 1
-	}
-	if charsPerTokenASCII <= 0 {
-		charsPerTokenASCII = 4
-	}
-	cjkCount := 0
-	asciiCount := 0
-	for _, r := range content {
-		if r > 0x7F {
-			cjkCount++
-		} else {
-			asciiCount++
-		}
-	}
-	return cjkCount/charsPerTokenCJK + asciiCount/charsPerTokenASCII + overheadPerMsg
 }
 
 func sanitizeErrorForUser(errMsg string) string {

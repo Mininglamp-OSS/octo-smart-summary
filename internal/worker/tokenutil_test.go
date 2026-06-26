@@ -1,40 +1,8 @@
 package worker
 
 import (
-	"strings"
 	"testing"
 )
-
-func TestEstimateTokens(t *testing.T) {
-	tests := []struct {
-		name               string
-		content            string
-		charsPerTokenCJK   int
-		charsPerTokenASCII int
-		wantAtLeast        int
-	}{
-		{"empty string", "", 1, 4, 50},
-		{"pure ascii short", "hello world", 1, 4, 50 + 2},
-		{"pure cjk", "你好世界", 1, 4, 50 + 4},
-		{"mixed cjk and ascii", "hello 你好", 1, 4, 50 + 1 + 2},
-		{"defensive zero cjk ratio", "你好", 0, 4, 50 + 2},
-		{"defensive zero ascii ratio", "abcd", 1, 0, 50 + 1},
-		{"defensive negative cjk ratio", "你好", -1, 4, 50 + 2},
-		{"long cjk", strings.Repeat("字", 1000), 1, 4, 50 + 1000},
-		{"cjk ratio 2 pure cjk", "你好世界", 2, 4, 50 + 2},
-		{"cjk ratio 2 mixed", "hello 你好世界", 2, 4, 50 + 1 + 2},
-		{"cjk ratio 2 long cjk", strings.Repeat("字", 1000), 2, 4, 50 + 500},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := estimateTokens(tt.content, tt.charsPerTokenCJK, tt.charsPerTokenASCII)
-			if got < tt.wantAtLeast {
-				t.Errorf("estimateTokens(%q, %d, %d) = %d, want >= %d",
-					tt.content, tt.charsPerTokenCJK, tt.charsPerTokenASCII, got, tt.wantAtLeast)
-			}
-		})
-	}
-}
 
 func TestSanitizeErrorForUser(t *testing.T) {
 	tests := []struct {

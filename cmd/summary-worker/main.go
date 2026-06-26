@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/ws"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/db"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timing"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/worker"
@@ -18,6 +19,17 @@ import (
 
 func main() {
 	cfg := config.Load()
+
+	// Apply config to pipeline package-level variables
+	if cfg.MaxSafetyLimit > 0 {
+		pipeline.MaxSafetyLimit = cfg.MaxSafetyLimit
+	}
+	if cfg.DefaultTimeRangeDays > 0 {
+		pipeline.DefaultTimeRangeDays = cfg.DefaultTimeRangeDays
+	}
+	// EnableIntentShortcut defaults to true, so we always apply it
+	pipeline.EnableIntentShortcut = cfg.EnableIntentShortcut
+
 	// Optional override of the per-stage timing log path; defaults to
 	// timing.DefaultLogPath (/var/log/smart-summary/timing.log).
 	if p := os.Getenv("TIMING_LOG_PATH"); p != "" {

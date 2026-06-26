@@ -202,6 +202,11 @@ func FlushReport(taskNo string, totalMs int64, extraStages []StageMs) {
 	delete(acct, taskNo)
 	acctMu.Unlock()
 
+	// Get TaskContext snapshot for safe reading, then clear
+	ctxPtr := GetContext(taskNo)
+	ctx := ctxPtr.Snapshot()
+	defer ClearContext(taskNo)
+
 	var llmTotalMs int64
 	var llmTotalTokens int
 	for _, c := range calls {
@@ -212,6 +217,34 @@ func FlushReport(taskNo string, totalMs int64, extraStages []StageMs) {
 	var b strings.Builder
 	ts := timezone.Now().Format(time.RFC3339)
 	fmt.Fprintf(&b, "==== 智能总结汇总报告 task_no=%s time=%s ====\n", taskNo, ts)
+
+	// Intent recognition section
+	if ctx.IntentSkipped {
+		fmt.Fprintf(&b, "意图识别: 短路=是 原因=%s\n", ctx.IntentSkipReason)
+	} else {
+		fmt.Fprintf(&b, "意图识别: 短路=否 LLM调用=%d次\n", ctx.IntentLLMCalls)
+	}
+
+	// Message retrieval section
+	if ctx.ChannelCount > 0 || ctx.MessagesRetrieved > 0 {
+		fmt.Fprintf(&b, "消息获取: 频道=%d 召回=%d条 最终=%d条\n",
+			ctx.ChannelCount, ctx.MessagesRetrieved, ctx.MessagesFinal)
+	}
+
+	// Post-processing section
+	if ctx.TargetPersonCount > 0 || ctx.FilteredCount > 0 {
+		fmt.Fprintf(&b, "后处理: 目标人物=%d人 过滤后=%d条\n",
+			ctx.TargetPersonCount, ctx.FilteredCount)
+	}
+
+	// Summary generation section
+	if ctx.UsedMapReduce {
+		fmt.Fprintf(&b, "总结生成: Map-Reduce=是 分块=%d\n", ctx.ChunkCount)
+	} else if ctx.MessagesFinal > 0 {
+		fmt.Fprintf(&b, "总结生成: Map-Reduce=否 (单次调用)\n")
+	}
+
+	// LLM calls detail
 	fmt.Fprintf(&b, "LLM 调用次数: %d  | LLM 累计耗时: %dms  | LLM 累计 tokens: %d\n", len(calls), llmTotalMs, llmTotalTokens)
 	if len(calls) == 0 {
 		b.WriteString("  (本次没有产生 LLM 调用)\n")
@@ -245,3 +278,114 @@ type StageMs struct {
 	Name string
 	Ms   int64
 }
+
+// ---------------------------------------------------------------------------
+// TaskContext: unified task context for enhanced reporting.
+//
+// Captures metrics across all stages for a single summary task, enabling
+// richer reports that include message counts, filtering stats, and intent
+// recognition decisions alongside timing data.
+// ---------------------------------------------------------------------------
+
+// TaskContext holds per-task metrics collected during pipeline execution.
+// All field access must go through Update() or Snapshot() to avoid data races
+// when multiple goroutines work on the same task (e.g. multi-person summaries).
+type TaskContext struct {
+	mu     sync.Mutex // guards all fields below
+	TaskNo string
+
+	// Intent recognition
+	IntentSkipped    bool   // true if short-circuited (no LLM)
+	IntentSkipReason string // e.g. "pure_generic_topic", "simple_channel_constraint"
+	IntentLLMCalls   int    // number of LLM calls for intent (0 if skipped)
+
+	// Message retrieval
+	ChannelCount      int // number of channels in scope
+	MessagesRetrieved int // messages fetched before filtering
+	MessagesFinal     int // messages after post-processing
+
+	// Post-processing
+	TargetPersonCount int // number of target persons
+	FilteredCount     int // messages after FilterWithContext
+
+	// Summary generation
+	UsedMapReduce bool // true if Map-Reduce was used
+	ChunkCount    int  // number of chunks in Map phase
+	TotalTokens   int  // total tokens across all LLM calls
+}
+
+// Update acquires the context lock and calls fn with the context pointer,
+// allowing safe concurrent writes to TaskContext fields.
+func (c *TaskContext) Update(fn func(*TaskContext)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	fn(c)
+}
+
+// Snapshot returns a copy of all fields for safe reading. Use this when
+// multiple fields need to be read together consistently.
+func (c *TaskContext) Snapshot() TaskContext {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return TaskContext{
+		TaskNo:            c.TaskNo,
+		IntentSkipped:     c.IntentSkipped,
+		IntentSkipReason:  c.IntentSkipReason,
+		IntentLLMCalls:    c.IntentLLMCalls,
+		ChannelCount:      c.ChannelCount,
+		MessagesRetrieved: c.MessagesRetrieved,
+		MessagesFinal:     c.MessagesFinal,
+		TargetPersonCount: c.TargetPersonCount,
+		FilteredCount:     c.FilteredCount,
+		UsedMapReduce:     c.UsedMapReduce,
+		ChunkCount:        c.ChunkCount,
+		TotalTokens:       c.TotalTokens,
+	}
+}
+
+var (
+	ctxMu   sync.Mutex
+	taskCtx = map[string]*TaskContext{}
+)
+
+// GetContext returns the TaskContext for taskNo, creating it if needed.
+// Thread-safe for concurrent access.
+func GetContext(taskNo string) *TaskContext {
+	if taskNo == "" {
+		return &TaskContext{} // return dummy to avoid nil checks
+	}
+	ctxMu.Lock()
+	defer ctxMu.Unlock()
+	if ctx, ok := taskCtx[taskNo]; ok {
+		return ctx
+	}
+	ctx := &TaskContext{TaskNo: taskNo}
+	taskCtx[taskNo] = ctx
+	return ctx
+}
+
+// ClearContext removes the TaskContext for taskNo (call after FlushReport).
+func ClearContext(taskNo string) {
+	if taskNo == "" {
+		return
+	}
+	ctxMu.Lock()
+	delete(taskCtx, taskNo)
+	ctxMu.Unlock()
+}
+
+// RecordSkip records that a stage was skipped (short-circuited).
+func RecordSkip(taskNo, stage, reason string) {
+	if taskNo == "" {
+		return
+	}
+	ctx := GetContext(taskNo)
+	ctx.Update(func(c *TaskContext) {
+		if stage == "intent_recognition" {
+			c.IntentSkipped = true
+			c.IntentSkipReason = reason
+		}
+	})
+	log.Printf("[timing] task=%s skipped %s (%s)", taskNo, stage, reason)
+}
+

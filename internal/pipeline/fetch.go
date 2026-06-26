@@ -13,6 +13,22 @@ import (
 	"gorm.io/gorm"
 )
 
+// Package-level configurable limits (set by config.Load at startup).
+// These replace the old hardcoded constants.
+var (
+	// MaxSafetyLimit is the maximum messages per channel before safety truncation.
+	// Default: 100000. Set via config.Config.MaxSafetyLimit.
+	MaxSafetyLimit = 100000
+
+	// DefaultTimeRangeDays is the default/max time range in days.
+	// Default: 31. Set via config.Config.DefaultTimeRangeDays.
+	DefaultTimeRangeDays = 31
+
+	// EnableIntentShortcut controls whether to enable short-circuit detection.
+	// Default: true. Set via config.Config.EnableIntentShortcut.
+	EnableIntentShortcut = true
+)
+
 // ChannelInfo holds discovered channel metadata.
 type ChannelInfo struct {
 	ChannelID   string `json:"channel_id"`
@@ -345,7 +361,8 @@ func FetchMessagesFromChannel(ctx context.Context, channelID string, channelType
 		return nil, fmt.Errorf("invalid table name: %s", table)
 	}
 
-	const maxSafetyLimit = 100000
+	// Use package-level configurable limit
+	maxSafetyLimit := MaxSafetyLimit
 
 	effectiveMax := maxPerChannel
 	if effectiveMax <= 0 {
@@ -601,28 +618,36 @@ func FilterMessagesByRelevance(messages []Message, topic string, participantUIDs
 
 // ResolveAndFetchMessagesForPersonal runs the pipeline with participant-aware
 // filtering: Layer 1.5 (channel intersection) and Layer 4.5 (mutual activity).
-func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, participantUIDs []string, participantNames []string, specifiedSources []map[string]interface{}, topic string, timeStart, timeEnd time.Time, imDB *gorm.DB, toolCallFn LLMToolCallFn, llmFn LLMCallFn, tableCount int, maxPerChannel int, fetchConcurrency int, channelScopeOpts *ChannelScopeOptions) ([]Message, error) {
-	if timeEnd.Sub(timeStart) > 31*24*time.Hour {
-		return nil, fmt.Errorf("时间范围不能超过 31 天")
+// 
+// Intent recognition is consolidated into a single LLM call that extracts:
+// - Time range (Layer 0)
+// - Channel scope (Layer 1.7) 
+// - Target persons (for post-fetch filtering)
+//
+// Returns messages, intent result (for target person filtering), and error.
+func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, participantUIDs []string, participantNames []string, specifiedSources []map[string]interface{}, topic string, timeStart, timeEnd time.Time, imDB *gorm.DB, toolCallFn LLMToolCallFn, llmFn LLMCallFn, tableCount int, maxPerChannel int, fetchConcurrency int, channelScopeOpts *ChannelScopeOptions) ([]Message, *IntentResult, error) {
+	maxDays := DefaultTimeRangeDays
+	if timeEnd.Sub(timeStart) > time.Duration(maxDays)*24*time.Hour {
+		return nil, nil, fmt.Errorf("时间范围不能超过 %d 天", maxDays)
 	}
 
 	pipelineStart := time.Now()
+	originalStart, originalEnd := timeStart, timeEnd
 
-	// Layer 0: Pre-Retrieval Narrow
-	timeStart, timeEnd = PreRetrievalNarrow(ctx, topic, timeStart, timeEnd, toolCallFn)
+	// Convert specifiedSources to string slice for shortcut detection
+	var sourceIDs []string
+	for _, src := range specifiedSources {
+		if id, ok := src["source_id"].(string); ok && id != "" {
+			sourceIDs = append(sourceIDs, id)
+		}
+	}
 
-	startTS := timeStart.Unix()
-	endTS := timeEnd.Unix()
-
-	// Layer 1: channel discovery
+	// Layer 1: channel discovery (needed before intent recognition for memberMap)
 	l1Start := time.Now()
-	// Scope archived-thread discovery to explicitly-selected thread sources so
-	// an archived thread the user picked survives, while auto/background
-	// summaries (no explicit sources) keep status=1 and never leak archived.
 	selectedThreads := selectedThreadChannelIDs(specifiedSources)
 	userChannels, err := GetUserChannels(ctx, creatorUID, imDB, selectedThreads...)
 	if err != nil {
-		return nil, fmt.Errorf("channel discovery: %w", err)
+		return nil, nil, fmt.Errorf("channel discovery: %w", err)
 	}
 	log.Printf("[pipeline-personal] Layer 1 (channel discovery) took %dms (%d channels)",
 		time.Since(l1Start).Milliseconds(), len(userChannels))
@@ -631,24 +656,63 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 	l15Start := time.Now()
 	userChannels, err = IntersectParticipantChannels(ctx, userChannels, participantUIDs, imDB, selectedThreads...)
 	if err != nil {
-		return nil, fmt.Errorf("intersect participant channels: %w", err)
+		return nil, nil, fmt.Errorf("intersect participant channels: %w", err)
 	}
 	log.Printf("[pipeline-personal] Layer 1.5 (participant intersect) took %dms (%d channels)",
 		time.Since(l15Start).Milliseconds(), len(userChannels))
 
-	// Layer 1.7: channel scope narrowing via LLM (only when no explicit sources)
-	if channelScopeOpts != nil && channelScopeOpts.Enabled && len(specifiedSources) == 0 && toolCallFn != nil {
+	// Build memberMap for intent recognition (before LLM call)
+	// When explicit sources are specified, build memberMap only from those sources
+	// to avoid resolving target persons from unrelated channels
+	channelsForMemberMap := userChannels
+	if len(specifiedSources) > 0 {
+		channelsForMemberMap = ApplySourceConstraints(userChannels, specifiedSources, creatorUID)
+		log.Printf("[pipeline-personal] Building memberMap from %d specified source(s)", len(channelsForMemberMap))
+	}
+	memberMap, memberMapErr := BuildCandidateMemberMap(ctx, channelsForMemberMap, imDB)
+	if memberMapErr != nil {
+		log.Printf("[pipeline-personal] WARN: BuildCandidateMemberMap failed: %v (proceeding with empty memberMap)", memberMapErr)
+	}
+
+	// === UNIFIED INTENT RECOGNITION (1 LLM call for time + channel + person) ===
+	intentStart := time.Now()
+	intentResult, intentErr := RecognizeIntentWithShortcut(
+		ctx, topic, sourceIDs, originalStart, originalEnd,
+		userChannels, memberMap, creatorUID,
+		EnableIntentShortcut, toolCallFn,
+	)
+	if intentErr != nil {
+		log.Printf("[pipeline-personal] Intent recognition error: %v", intentErr)
+	}
+	// Guard against nil intentResult (should not happen but defensive)
+	if intentResult == nil {
+		intentResult = &IntentResult{Skipped: true, SkipReason: "error"}
+	}
+	log.Printf("[pipeline-personal] Intent recognition took %dms (skipped=%v)",
+		time.Since(intentStart).Milliseconds(), intentResult.Skipped)
+
+	// Apply time range from intent
+	if intentResult.TimeRange.Narrowed {
+		timeStart = intentResult.TimeRange.Start
+		timeEnd = intentResult.TimeRange.End
+		log.Printf("[pipeline-personal] Time narrowed to [%s ~ %s]",
+			timeStart.Format("01-02 15:04"), timeEnd.Format("01-02 15:04"))
+	}
+
+	// Apply channel scope (Layer 1.7) via the full DNF resolver.
+	// The unified intent's flat ChannelScope cannot represent ownership filters
+	// or multi-rule OR (DNF) cases, so when a channel constraint is present we
+	// delegate to ResolveChannelScope, which preserves ownership and OR rules.
+	channelScopeEnabled := channelScopeOpts != nil && channelScopeOpts.Enabled
+	if channelScopeEnabled && !intentResult.Skipped && intentResult.ChannelScope.HasConstraint && len(specifiedSources) == 0 {
 		l17Start := time.Now()
-		memberMap, mErr := BuildCandidateMemberMap(ctx, userChannels, imDB)
-		if mErr != nil {
-			log.Printf("[pipeline-personal] BuildCandidateMemberMap error: %v, skipping channel scope", mErr)
-		} else if len(memberMap) > 0 {
-			userChannels = ResolveChannelScope(ctx, topic, userChannels, creatorUID,
-				memberMap, imDB, toolCallFn)
-		}
+		userChannels = ResolveChannelScope(ctx, topic, userChannels, creatorUID, memberMap, imDB, toolCallFn)
 		log.Printf("[pipeline-personal] Layer 1.7 (channel scope) took %dms (%d channels)",
 			time.Since(l17Start).Milliseconds(), len(userChannels))
 	}
+
+	startTS := timeStart.Unix()
+	endTS := timeEnd.Unix()
 
 	// Layer 2: source constraints
 	l2Start := time.Now()
@@ -736,5 +800,5 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 	log.Printf("[pipeline-personal] Total pipeline took %dms (%d messages final)",
 		time.Since(pipelineStart).Milliseconds(), len(allMessages))
 
-	return allMessages, nil
+	return allMessages, intentResult, nil
 }

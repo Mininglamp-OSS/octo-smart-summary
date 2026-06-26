@@ -26,3 +26,7 @@ summary-worker
 
 # Stray local build binaries (dot-prefixed)
 .bin_*
+
+# Tokenizer model files (download at runtime or build time)
+internal/tokenizer/models/
+*.model

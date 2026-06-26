@@ -91,6 +91,18 @@ type Config struct {
 	// FEATURE_TEAM_SCHEDULE=false to restore the legacy single-person-only behavior
 	// (API rejects multi-person schedules with 40015, worker disables them).
 	FeatureTeamSchedule bool
+
+	// Intent recognition shortcut (skip LLM for simple topics)
+	EnableIntentShortcut bool
+
+	// Hardcoded limits (now configurable)
+	MaxSafetyLimit       int // Max messages per channel before safety truncation, default 100000
+	DefaultTimeRangeDays int // Default time range in days when not specified, default 31
+
+	// Token calculation config
+	SkipMapReduceThreshold int    // Skip Map-Reduce threshold (tokens), env SKIP_MAP_REDUCE_THRESHOLD
+	KimiAPIKey             string // Kimi API key for exact token counting, env KIMI_API_KEY
+	TokenizerHTTPTimeout   int    // HTTP timeout for tokenizer API calls, env TOKENIZER_HTTP_TIMEOUT
 }
 
 func Load() *Config {
@@ -142,6 +154,15 @@ func Load() *Config {
 		ToolCallTimeout: envInt("TOOL_CALL_TIMEOUT", 30),
 
 		FeatureTeamSchedule: envBool("FEATURE_TEAM_SCHEDULE", true),
+
+		EnableIntentShortcut: envBool("ENABLE_INTENT_SHORTCUT", true),
+
+		MaxSafetyLimit:       envInt("MAX_SAFETY_LIMIT", 100000),
+		DefaultTimeRangeDays: envInt("DEFAULT_TIME_RANGE_DAYS", 31),
+
+		SkipMapReduceThreshold: envInt("SKIP_MAP_REDUCE_THRESHOLD", 0),
+		KimiAPIKey:             envStr("KIMI_API_KEY", ""),
+		TokenizerHTTPTimeout:   envInt("TOKENIZER_HTTP_TIMEOUT", 10),
 	}
 }
 
@@ -185,38 +206,33 @@ func envBool(key string, def bool) bool {
 	return b
 }
 
-// modelMaxTokensDefaults maps LLM model names to their recommended Map-phase token budget.
-var modelMaxTokensDefaults = map[string]int{
-	"claude-sonnet-4-6": 150000,
-	"claude-opus-4-6":   150000,
-	"claude-haiku-4-5":  150000,
-	"qwen3.6-max":       400000,
-	"qwen3.6-plus":      400000,
-	"qwen3.6-flash":     400000,
-	"deepseek-v4-flash": 400000,
-	"deepseek-v4-pro":   400000,
-	"kimi-k2":           150000,
-	"kimi_k2":           150000,
+// modelMapThresholds is an ordered list of model patterns for Map-phase token budget.
+// Thresholds are tuned per-model based on production testing to balance summary quality
+// and LLM call efficiency:
+// - Claude: tiered by model capacity (Opus > Sonnet > Haiku)
+// - Qwen/DeepSeek: optimized for large context with safety margin
+// - Kimi: conservative due to 265K context limit
+// More specific patterns must come before less specific ones.
+var modelMapThresholds = []modelThreshold{
+	// Claude models - specific versions first
+	{"claude-sonnet-4-6", 250000},
+	{"claude-opus-4-6", 350000},
+	{"claude-haiku-4-5", 200000},
+	// Qwen models
+	{"qwen3.6-max", 300000},  
+	{"qwen3.6-plus", 300000},  
+	{"qwen3.6-flash", 300000}, 
+	// DeepSeek models
+	{"deepseek-v4-flash", 300000}, 
+	{"deepseek-v4-pro", 300000},   
+	// Kimi models
+	{"kimi-k2", 150000},
+	{"kimi_k2", 150000},
+	// GLM models (智谱)
+	{"glm-5.2", 300000},
 }
 
 const defaultMapMaxTokens = 100000
-
-// ResolveMapMaxTokens returns the Map-phase token budget using three-tier fallback:
-// 1. Explicit MapMaxTokens config (> 0)
-// 2. Per-model default from modelMaxTokensDefaults
-// 3. Global default (defaultMapMaxTokens)
-func (c *Config) ResolveMapMaxTokens() int {
-	if c.MapMaxTokens > 0 {
-		return c.MapMaxTokens
-	}
-	model := strings.ToLower(c.LLMModel)
-	for key, v := range modelMaxTokensDefaults {
-		if strings.Contains(model, key) {
-			return v
-		}
-	}
-	return defaultMapMaxTokens
-}
 
 // ResolveCharsPerTokenCJK returns the CJK chars-per-token ratio.
 // For qwen/deepseek/kimi models, defaults to 2 if not explicitly configured.
@@ -230,4 +246,68 @@ func (c *Config) ResolveCharsPerTokenCJK() int {
 		return 2
 	}
 	return c.CharsPerTokenCJK
+}
+
+// ResolveMapMaxTokens returns the Map-phase token budget using three-tier fallback:
+// 1. Explicit MapMaxTokens config (> 0)
+// 2. Per-model default from modelMapThresholds (ordered, first match wins)
+// 3. Global default (defaultMapMaxTokens)
+func (c *Config) ResolveMapMaxTokens() int {
+	if c.MapMaxTokens > 0 {
+		return c.MapMaxTokens
+	}
+	model := strings.ToLower(c.LLMModel)
+	for _, mt := range modelMapThresholds {
+		if strings.Contains(model, mt.pattern) {
+			return mt.threshold
+		}
+	}
+	return defaultMapMaxTokens
+}
+
+// modelThreshold is a model name pattern and its associated token threshold.
+type modelThreshold struct {
+	pattern   string
+	threshold int
+}
+
+// modelSkipThresholds is an ordered list of model patterns for skip-Map-Reduce threshold.
+// More specific patterns must come before less specific ones (e.g., "gpt-4o" before "gpt-4").
+var modelSkipThresholds = []modelThreshold{
+	// Qwen models
+	{"qwen3.6-max", 500000},
+	{"qwen3.6-plus", 500000},
+	{"qwen3.6-flash", 500000},
+	// DeepSeek models
+	{"deepseek-v4-flash", 500000},
+	{"deepseek-v4-pro", 500000},
+	// Claude models
+	{"claude-sonnet", 500000},
+	{"claude-opus", 500000},
+	{"claude-haiku", 500000},
+	// OpenAI models - more specific first
+	{"gpt-4o", 500000},
+	{"gpt-4", 500000},
+	// Kimi models
+	{"kimi-k2", 200000}, // Kimi 上下文 265K，留余量
+	{"kimi_k2", 200000},
+}
+
+const defaultSkipMapReduceThreshold = 500000
+
+// ResolveSkipMapReduceThreshold returns the skip-Map-Reduce token threshold using three-tier fallback:
+// 1. Explicit SkipMapReduceThreshold config (> 0)
+// 2. Per-model default from modelSkipThresholds (ordered, first match wins)
+// 3. Global default (defaultSkipMapReduceThreshold)
+func (c *Config) ResolveSkipMapReduceThreshold() int {
+	if c.SkipMapReduceThreshold > 0 {
+		return c.SkipMapReduceThreshold
+	}
+	model := strings.ToLower(c.LLMModel)
+	for _, mt := range modelSkipThresholds {
+		if strings.Contains(model, mt.pattern) {
+			return mt.threshold
+		}
+	}
+	return defaultSkipMapReduceThreshold
 }
