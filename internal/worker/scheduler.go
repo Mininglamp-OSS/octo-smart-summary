@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/notify"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/robfig/cron/v3"
@@ -21,12 +22,12 @@ var schedulerHTTPClient = &http.Client{Timeout: 5 * time.Second}
 // StartScheduler starts the 4 cron scan jobs (every 60s).
 // featureTeamSchedule, when true, lets multi-person schedules through the claim path
 // instead of disabling them (FEATURE_TEAM_SCHEDULE).
-func StartScheduler(db *gorm.DB, imDB *gorm.DB, maxRetry int, workerTriggerURL string, maxWindowDays int, featureTeamSchedule bool) *cron.Cron {
+func StartScheduler(db *gorm.DB, imDB *gorm.DB, maxRetry int, workerTriggerURL string, maxWindowDays int, featureTeamSchedule bool, notifier *notify.Notifier) *cron.Cron {
 	c := cron.New()
 
 	c.AddFunc("@every 60s", func() { scanPendingSchedules(db, imDB, maxWindowDays, featureTeamSchedule) })
 	c.AddFunc("@every 60s", func() { scanConfirmTimeouts(db) })
-	c.AddFunc("@every 60s", func() { scanStuckTasks(db, maxRetry) })
+	c.AddFunc("@every 60s", func() { scanStuckTasks(db, maxRetry, notifier) })
 	c.AddFunc("@every 60s", func() { scanStuckPersonalTasks(db, workerTriggerURL) })
 
 	c.Start()
@@ -339,7 +340,9 @@ func scanConfirmTimeouts(db *gorm.DB) {
 
 // scanStuckTasks resets tasks stuck in processing past their deadline.
 // Increments retry_count; if max retries exceeded, marks as Failed.
-func scanStuckTasks(db *gorm.DB, maxRetry int) {
+// notifier (optional) is fired once per task that this sweep transitions to
+// Failed, AFTER the terminal-status write has committed.
+func scanStuckTasks(db *gorm.DB, maxRetry int, notifier *notify.Notifier) {
 	now := timezone.Now()
 
 	// Reset tasks that can still retry (also handle NULL deadline for legacy data)
@@ -355,6 +358,16 @@ func scanStuckTasks(db *gorm.DB, maxRetry int) {
 		log.Printf("[scheduler] reset %d stuck tasks (retry incremented)", result.RowsAffected)
 	}
 
+	// Snapshot the IDs about to be failed so we can notify them precisely after
+	// the terminal write commits (the bulk UPDATE below cannot return the rows).
+	var toFail []int64
+	if notifier != nil {
+		db.Model(&model.SummaryTask{}).
+			Where("status = ? AND (processing_deadline IS NULL OR processing_deadline < ?) AND retry_count >= ?",
+				model.StatusProcessing, now, maxRetry-1).
+			Pluck("id", &toFail)
+	}
+
 	// Fail tasks that exceeded max retries (also handle NULL deadline)
 	failResult := db.Model(&model.SummaryTask{}).
 		Where("status = ? AND (processing_deadline IS NULL OR processing_deadline < ?) AND retry_count >= ?",
@@ -367,6 +380,26 @@ func scanStuckTasks(db *gorm.DB, maxRetry int) {
 		})
 	if failResult.RowsAffected > 0 {
 		log.Printf("[scheduler] failed %d stuck tasks (max retries exceeded)", failResult.RowsAffected)
+	}
+
+	// Notify the now-Failed tasks. Reload each so the notification reflects the
+	// committed terminal row; only fire for rows that are actually Failed (guards
+	// against a concurrent cancel/complete between snapshot and write).
+	if notifier != nil {
+		for _, id := range toFail {
+			var task model.SummaryTask
+			if err := db.First(&task, id).Error; err != nil {
+				continue
+			}
+			if task.Status != model.StatusFailed {
+				continue
+			}
+			errMsg := ""
+			if task.ErrorMessage != nil {
+				errMsg = *task.ErrorMessage
+			}
+			notifier.OnTaskTerminal(task, model.StatusFailed, errMsg)
+		}
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/notify"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
@@ -44,6 +45,10 @@ type Processor struct {
 	// get dispatched) is observable without running the LLM personal pipeline.
 	// Production leaves it nil and the real pool/processPersonalSummary is used.
 	dispatchPersonalFn func(taskID, participantRefID int64)
+	// notifier delivers the terminal-state (Completed/Failed) IM-bot notification
+	// after a task's status is durably committed. nil = disabled (OnTaskTerminal
+	// is a no-op), so it is safe to call unconditionally.
+	notifier *notify.Notifier
 }
 
 // NewProcessor creates a new task processor.
@@ -104,6 +109,32 @@ func validateOctoSearchURL(raw string) error {
 		}
 	}
 	return nil
+}
+
+// SetNotifier wires the terminal-state IM-bot notifier. Optional: when unset,
+// notifyTaskTerminal is a no-op.
+func (p *Processor) SetNotifier(n *notify.Notifier) { p.notifier = n }
+
+// notifyTaskTerminal fires the terminal-state notification for a task that just
+// reached a terminal status. It reloads the committed task row so the
+// notification reflects the durable state (title, creator, origin channel,
+// trigger type, error_message). Best-effort: any failure is swallowed inside the
+// notifier and never affects the worker's completion path. Call this ONLY after
+// the terminal-status DB write has succeeded.
+func (p *Processor) notifyTaskTerminal(taskID int64, status int) {
+	if p.notifier == nil {
+		return
+	}
+	var task model.SummaryTask
+	if err := p.db.First(&task, taskID).Error; err != nil {
+		log.Printf("[processor] notifyTaskTerminal: reload task %d failed: %v", taskID, err)
+		return
+	}
+	errMsg := ""
+	if task.ErrorMessage != nil {
+		errMsg = *task.ErrorMessage
+	}
+	p.notifier.OnTaskTerminal(task, status, errMsg)
 }
 
 // TriggerCh returns the channel for worker trigger requests.
@@ -250,6 +281,9 @@ func (p *Processor) processTask(task model.SummaryTask) {
 			Status:  newStatus,
 			Message: errMsg,
 		})
+		if newStatus == model.StatusFailed {
+			p.notifyTaskTerminal(task.ID, model.StatusFailed)
+		}
 		return
 	}
 
@@ -284,6 +318,9 @@ func (p *Processor) processTask(task model.SummaryTask) {
 			Status:  newStatus,
 			Message: errMsg,
 		})
+		if newStatus == model.StatusFailed {
+			p.notifyTaskTerminal(task.ID, model.StatusFailed)
+		}
 		return
 	}
 
@@ -323,6 +360,9 @@ func (p *Processor) processTask(task model.SummaryTask) {
 				Status:  newStatus,
 				Message: errMsg,
 			})
+			if newStatus == model.StatusFailed {
+				p.notifyTaskTerminal(task.ID, model.StatusFailed)
+			}
 			return
 		}
 		participantCount = 1

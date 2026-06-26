@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/ws"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/db"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/notify"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timing"
@@ -90,12 +91,33 @@ func main() {
 	// Start worker pool
 	pool := worker.NewWorkerPool(cfg.WorkerMaxConcurrent)
 
+	// Build the terminal-state IM-bot notifier (OCT-4). Disabled unless
+	// SUMMARY_NOTIFY_ENABLED=true; a nil deliverer / disabled config makes
+	// OnTaskTerminal a no-op, so it is always safe to wire.
+	var notifier *notify.Notifier
+	if cfg.NotifyEnabled {
+		if cfg.OctoAPIURL == "" || cfg.SummaryBotToken == "" {
+			log.Printf("[worker] SUMMARY_NOTIFY_ENABLED=true but OCTO_API_URL / SUMMARY_BOT_TOKEN missing; notifications disabled")
+		} else {
+			deliverer := notify.NewHTTPDeliverer(cfg.OctoAPIURL, cfg.SummaryBotToken)
+			notifier = notify.New(summaryDB, deliverer, notify.Config{
+				Enabled:     true,
+				WebBaseURL:  cfg.SummaryWebBaseURL,
+				MaxAttempts: cfg.MaxNotifyAttempts,
+				QuietStart:  cfg.NotifyQuietStart,
+				QuietEnd:    cfg.NotifyQuietEnd,
+			})
+			log.Printf("[worker] terminal-state notifications ENABLED")
+		}
+	}
+
 	// Start processor (polling loop)
 	proc := worker.NewProcessor(summaryDB, imDB, pool, llm, cfg)
+	proc.SetNotifier(notifier)
 	go proc.Run()
 
 	// Start scheduler (cron jobs)
-	cronSched := worker.StartScheduler(summaryDB, imDB, cfg.WorkerMaxRetry, cfg.WorkerTriggerURL, cfg.ScheduleMaxWindowDays, cfg.FeatureTeamSchedule)
+	cronSched := worker.StartScheduler(summaryDB, imDB, cfg.WorkerMaxRetry, cfg.WorkerTriggerURL, cfg.ScheduleMaxWindowDays, cfg.FeatureTeamSchedule, notifier)
 
 	// Start internal HTTP server for worker-trigger
 	hub := ws.NewHub(summaryDB)
