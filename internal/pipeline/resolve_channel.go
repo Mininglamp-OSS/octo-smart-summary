@@ -113,6 +113,7 @@ const resolveChannelScopeSystemPrompt = `你是一个频道范围解析器。根
   - 精确匹配：主题明确指定频道名，选取对应 ID
   - 模糊匹配：主题含关键词（如"dev相关"），选取所有名称中包含该关键词的频道
   - 只能从候选频道列表中选取 ID，不得编造
+  - 不得强行匹配：如果主题中的关键词与任何候选频道名称都不相关，不要选取"最接近"的频道 ID；应改为设置 has_constraint=false
 - channel_type：数组形式，仅当主题明确限定频道类型时设置
   - "私聊"、"DM" → ["dm"]
   - "群"、"群组"、"群聊" → ["group"]
@@ -127,6 +128,7 @@ const resolveChannelScopeSystemPrompt = `你是一个频道范围解析器。根
 - 当主题包含多个独立约束条件需要并集时，拆分为多条 rules
   - 例："总结下我的全部私聊，以及我和Alice所在群聊" → 两条规则
 - 如果主题不包含任何频道范围约束（如"项目进度"、"最近在聊什么"），has_constraint 为 false，rules 为空数组
+- 如果主题提到了特定关键词（频道名、人名、项目名等），但候选频道列表和成员列表中没有任何一项与该关键词匹配，则 has_constraint 为 false，rules 为空数组。不得选取"最接近"的频道或成员强行匹配。
 
 示例：
 - "我和Alice聊了什么"
@@ -141,6 +143,8 @@ const resolveChannelScopeSystemPrompt = `你是一个频道范围解析器。根
   → has_constraint=true, rules=[{channel_ids:[所有含dev的频道ID], channel_type:["group"]}]
 - "最近大家在讨论什么"
   → has_constraint=false, rules=[]
+- "octo的项目进展"（但候选频道中没有名称包含"octo"的频道）
+  → has_constraint=false, rules=[]（不要强行选取不相关的频道）
 - "我建的群在聊什么"
   → has_constraint=true, rules=[{ownership:["creator"]}]
 - "我参与但不管理的群"
@@ -187,6 +191,16 @@ func ResolveChannelScope(
 	if len(result) == 0 {
 		log.Printf("[pipeline] ResolveChannelScope: all rules resulted in 0 channels, fallback to all %d candidates",
 			len(candidates))
+		return candidates
+	}
+
+	// Guard against LLM force-fitting: when narrowing drastically reduces the
+	// candidate set (≥3 candidates → 1 result), verify that at least one
+	// selected channel name shares keyword overlap with the topic. If none do,
+	// the LLM likely picked a valid-but-irrelevant channel — fall back to all.
+	if len(candidates) >= 3 && len(result) == 1 && !topicOverlapsChannel(topic, result[0].ChannelName) {
+		log.Printf("[pipeline] ResolveChannelScope: narrowed to %q but topic %q has no keyword overlap, fallback to all %d candidates (force-fit guard)",
+			result[0].ChannelName, topic, len(candidates))
 		return candidates
 	}
 
@@ -280,6 +294,42 @@ func filterByChannelIDs(current []ChannelInfo, selectedIDs []string, allCandidat
 		}
 	}
 	return result
+}
+
+// topicOverlapsChannel checks whether any multi-character token in the topic
+// appears in the channel name. Used as a deterministic guard against LLM
+// force-fitting an irrelevant channel when the topic keyword matches nothing.
+func topicOverlapsChannel(topic, channelName string) bool {
+	// Extract multi-character ASCII runs (≥2 chars) as meaningful tokens.
+	// Single CJK characters are too ambiguous for reliable overlap detection.
+	var tokens []string
+	start := -1
+	for i := 0; i <= len(topic); i++ {
+		if i < len(topic) && ((topic[i] >= 'a' && topic[i] <= 'z') ||
+			(topic[i] >= 'A' && topic[i] <= 'Z') ||
+			(topic[i] >= '0' && topic[i] <= '9')) {
+			if start < 0 {
+				start = i
+			}
+		} else {
+			if start >= 0 {
+				if i-start >= 2 {
+					tokens = append(tokens, strings.ToLower(topic[start:i]))
+				}
+				start = -1
+			}
+		}
+	}
+	if len(tokens) == 0 {
+		return true // no extractable tokens → can't judge, assume match
+	}
+	lowerName := strings.ToLower(channelName)
+	for _, t := range tokens {
+		if strings.Contains(lowerName, t) {
+			return true
+		}
+	}
+	return false
 }
 
 func filterByOwnership(ctx context.Context, candidates []ChannelInfo, creatorUID string, ownership []string, imDB *gorm.DB) []ChannelInfo {

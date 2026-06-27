@@ -328,6 +328,94 @@ func TestResolveChannelScope_GlobalFallback(t *testing.T) {
 	}
 }
 
+// TestResolveChannelScope_ForceFitGuard reproduces issue #79: the LLM returns
+// has_constraint=true with a single channel_id that is a valid candidate but
+// has no keyword overlap with the topic (e.g. topic "octo" → channel "hello-v2").
+// The deterministic guard should detect this and fall back to all candidates.
+func TestResolveChannelScope_ForceFitGuard(t *testing.T) {
+	candidates := []ChannelInfo{
+		{ChannelID: "ch1", ChannelType: 2, ChannelName: "hello-v2"},
+		{ChannelID: "ch2", ChannelType: 2, ChannelName: "random-chat"},
+		{ChannelID: "ch3", ChannelType: 2, ChannelName: "water-cooler"},
+		{ChannelID: "ch4", ChannelType: 2, ChannelName: "announcements"},
+		{ChannelID: "ch5", ChannelType: 2, ChannelName: "general"},
+	}
+	memberMap := map[string]string{"uid_a": "Alice"}
+
+	// Simulate LLM force-fitting: topic mentions "octo" but no channel matches.
+	// LLM picks "hello-v2" as the "nearest" channel.
+	mockFn := mockChannelScopeToolCallFn(ChannelScopeResult{
+		HasConstraint: true,
+		Rules:         []ChannelScopeRule{{ChannelIDs: []string{"ch1"}}},
+		Reasoning:     "no channel named octo, picking hello-v2 as nearest",
+	})
+
+	result := ResolveChannelScope(context.Background(), "octo的项目进展", candidates, "creator", memberMap, nil, mockFn)
+	gotIDs := extractIDs(result)
+	wantIDs := extractIDs(candidates) // should fall back to all candidates
+	if !sliceEqual(gotIDs, wantIDs) {
+		t.Errorf("force-fit guard: got %v, want %v (should fallback to all candidates)", gotIDs, wantIDs)
+	}
+}
+
+// TestResolveChannelScope_ForceFitGuard_LegitimateNarrow ensures the guard
+// does NOT trigger when the topic keyword legitimately matches a channel name.
+func TestResolveChannelScope_ForceFitGuard_LegitimateNarrow(t *testing.T) {
+	candidates := []ChannelInfo{
+		{ChannelID: "ch1", ChannelType: 2, ChannelName: "octo-dev"},
+		{ChannelID: "ch2", ChannelType: 2, ChannelName: "random-chat"},
+		{ChannelID: "ch3", ChannelType: 2, ChannelName: "water-cooler"},
+		{ChannelID: "ch4", ChannelType: 2, ChannelName: "announcements"},
+	}
+	memberMap := map[string]string{"uid_a": "Alice"}
+
+	// Topic mentions "octo" and "octo-dev" is a real match.
+	mockFn := mockChannelScopeToolCallFn(ChannelScopeResult{
+		HasConstraint: true,
+		Rules:         []ChannelScopeRule{{ChannelIDs: []string{"ch1"}}},
+		Reasoning:     "octo matches octo-dev",
+	})
+
+	result := ResolveChannelScope(context.Background(), "octo的项目进展", candidates, "creator", memberMap, nil, mockFn)
+	gotIDs := extractIDs(result)
+	wantIDs := []string{"ch1"} // should NOT fall back; legitimate match
+	if !sliceEqual(gotIDs, wantIDs) {
+		t.Errorf("legitimate narrow: got %v, want %v", gotIDs, wantIDs)
+	}
+}
+
+// TestTopicOverlapsChannel tests the keyword overlap helper directly.
+func TestTopicOverlapsChannel(t *testing.T) {
+	tests := []struct {
+		topic       string
+		channelName string
+		want        bool
+	}{
+		// Force-fit: no overlap
+		{"octo的项目进展", "hello-v2", false},
+		{"octo项目进展", "random-chat", false},
+		// Legitimate match: ASCII keyword present in name
+		{"octo项目进展", "octo-dev", true},
+		{"octo项目进展", "my-octo-group", true},
+		// Multiple tokens, at least one matches
+		{"octo项目进展", "octo讨论组", true}, // "octo" matches
+		// "octo" not in name, only CJK tokens remain → no overlap
+		{"octo项目进展", "进展讨论组", false},
+		// All-Chinese topic: no extractable tokens → assume match (conservative)
+		{"项目进展总结", "random", true},
+		// Single-char ASCII tokens ignored, CJK tokens ignored → no extractable → conservative match
+		{"a的b项目", "hello", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.topic+"→"+tt.channelName, func(t *testing.T) {
+			got := topicOverlapsChannel(tt.topic, tt.channelName)
+			if got != tt.want {
+				t.Errorf("topicOverlapsChannel(%q, %q) = %v, want %v", tt.topic, tt.channelName, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestResolveChannelScope_LLMError_Fallback(t *testing.T) {
 	candidates := []ChannelInfo{
 		{ChannelID: "g1", ChannelType: 2},
