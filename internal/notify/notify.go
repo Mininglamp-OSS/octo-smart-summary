@@ -27,6 +27,7 @@ import (
 	"log"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
@@ -236,10 +237,7 @@ func (n *Notifier) markSent(taskID int64, kind string) {
 
 func (n *Notifier) markFailed(taskID int64, kind string, cause error) {
 	now := n.now()
-	le := sanitize(cause.Error())
-	if len(le) > 480 {
-		le = le[:480]
-	}
+	le := truncateForLastError(sanitize(cause.Error()))
 	if err := n.db.Model(&model.SummaryNotification{}).
 		Where("task_id = ? AND notify_kind = ?", taskID, kind).
 		Updates(map[string]any{
@@ -344,6 +342,179 @@ func atoiBounded(s string, lo, hi int) (int, error) {
 		return 0, errors.New("out of range")
 	}
 	return n, nil
+}
+
+// SweepInterval is the recommended cron cadence for Notifier.Sweep. Exposed
+// so callers (cmd/summary-worker) don't have to pick a magic interval.
+const SweepInterval = 60 * time.Second
+
+// PendingLease is how long a 'pending' row may sit without progress before
+// Sweep reclaims it. The worker's synchronous delivery path uses a 15s HTTP
+// timeout (see deliver), so anything over ~1 min must mean the worker crashed
+// between claim and markSent/markFailed, OR markFailed itself failed (e.g.
+// the byte-truncation utf8 wedge that truncateForLastError now prevents — kept
+// as belt-and-suspenders for any other write error).
+const PendingLease = 5 * time.Minute
+
+// sweepBatchSize caps how many candidate rows Sweep handles per tick so a
+// degraded octo-server cannot pile up a single sweep beyond the cron cadence.
+const sweepBatchSize = 50
+
+// Sweep is the background recovery pass invoked by the scheduler cron. It
+// looks for two classes of rows that the synchronous worker path cannot
+// recover on its own:
+//
+//   - status='failed' AND attempt_count<MaxAttempts: a transient delivery
+//     blip dropped the message; retry budget remains but no fresh
+//     OnTaskTerminal hook will fire on its own (terminal callbacks are
+//     one-shot per task transition). Without this sweep, MaxAttempts is
+//     effectively 1 for the common path.
+//   - status='pending' AND updated_at<now-PendingLease: a worker crashed (or
+//     a write failed) between claim and the markSent/markFailed write.
+//     Without this sweep the row would sit at 'pending' forever and the
+//     dedup claim would keep skipping the (task, kind) pair.
+//
+// Both branches use the existing atomic CAS (claimRetry / claimPending) so a
+// concurrent OnTaskTerminal cannot double-send: only the runner whose UPDATE
+// flips the row to pending (RowsAffected==1) proceeds.
+//
+// Sweep is best-effort: any per-row error is logged and the loop continues.
+// It is safe to call when the notifier is disabled (returns immediately).
+func (n *Notifier) Sweep(ctx context.Context) {
+	if n == nil || !n.cfg.Enabled || n.deliverer == nil || n.db == nil {
+		return
+	}
+	n.sweepRetryFailed(ctx)
+	n.sweepStalePending(ctx)
+}
+
+// sweepRetryFailed re-attempts delivery for rows stuck at status='failed'
+// with retry budget remaining.
+func (n *Notifier) sweepRetryFailed(ctx context.Context) {
+	var rows []model.SummaryNotification
+	if err := n.db.
+		Where("status = ? AND attempt_count < ?", model.NotifyStatusFailed, n.cfg.MaxAttempts).
+		Order("updated_at ASC").
+		Limit(sweepBatchSize).
+		Find(&rows).Error; err != nil {
+		log.Printf("[notify] sweep: query failed rows: %v", err)
+		return
+	}
+	for _, row := range rows {
+		if ctx.Err() != nil {
+			return
+		}
+		won, err := n.claimRetry(row.TaskID, row.NotifyKind)
+		if err != nil {
+			log.Printf("[notify] sweep: task=%d kind=%s claimRetry: %v", row.TaskID, row.NotifyKind, err)
+			continue
+		}
+		if !won {
+			continue // another runner won, or budget exhausted concurrently
+		}
+		n.redeliver(row.TaskID, row.NotifyKind)
+	}
+}
+
+// sweepStalePending reclaims rows stuck at status='pending' past the lease
+// (worker died or a write step failed between claim and markSent/markFailed).
+func (n *Notifier) sweepStalePending(ctx context.Context) {
+	cutoff := n.now().Add(-PendingLease)
+	var rows []model.SummaryNotification
+	if err := n.db.
+		Where("status = ? AND updated_at < ? AND attempt_count < ?",
+			model.NotifyStatusPending, cutoff, n.cfg.MaxAttempts).
+		Order("updated_at ASC").
+		Limit(sweepBatchSize).
+		Find(&rows).Error; err != nil {
+		log.Printf("[notify] sweep: query pending rows: %v", err)
+		return
+	}
+	for _, row := range rows {
+		if ctx.Err() != nil {
+			return
+		}
+		won, err := n.claimStalePending(row.TaskID, row.NotifyKind, cutoff)
+		if err != nil {
+			log.Printf("[notify] sweep: task=%d kind=%s claimStalePending: %v", row.TaskID, row.NotifyKind, err)
+			continue
+		}
+		if !won {
+			continue
+		}
+		log.Printf("[notify] sweep: reclaimed stale pending row task=%d kind=%s", row.TaskID, row.NotifyKind)
+		n.redeliver(row.TaskID, row.NotifyKind)
+	}
+}
+
+// claimStalePending atomically refreshes a stale 'pending' row's updated_at
+// so exactly one sweeper wins the right to redeliver it. Guarded on
+// status='pending' AND updated_at<cutoff so concurrent sweepers race and only
+// the row flipped by RowsAffected==1 proceeds.
+func (n *Notifier) claimStalePending(taskID int64, kind string, cutoff time.Time) (bool, error) {
+	now := n.now()
+	res := n.db.Model(&model.SummaryNotification{}).
+		Where("task_id = ? AND notify_kind = ? AND status = ? AND updated_at < ?",
+			taskID, kind, model.NotifyStatusPending, cutoff).
+		Update("updated_at", now)
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
+}
+
+// redeliver performs one delivery attempt for a row whose retry slot we just
+// won (claimRetry or claimStalePending). It reloads the SummaryTask so the
+// message reflects the durable terminal-state row, then mirrors the
+// build+deliver+persist sequence from OnTaskTerminal. Any failure persists
+// via markFailed and is left for the next sweep tick or until budget runs out.
+func (n *Notifier) redeliver(taskID int64, kind string) {
+	var task model.SummaryTask
+	if err := n.db.First(&task, taskID).Error; err != nil {
+		// Task row gone (extremely unusual: rows are never deleted in the
+		// happy path). Treat as a permanent delivery failure so attempt_count
+		// advances and the row eventually leaves the retry set.
+		n.markFailed(taskID, kind, fmt.Errorf("reload task %d: %w", taskID, err))
+		return
+	}
+	target, ok := resolveTarget(task)
+	if !ok {
+		n.markFailed(taskID, kind, errors.New("no deliverable target on reload"))
+		return
+	}
+	errMsg := ""
+	if task.ErrorMessage != nil {
+		errMsg = *task.ErrorMessage
+	}
+	text := n.buildText(task, kind, errMsg)
+	if deliverErr := n.deliver(target, text); deliverErr != nil {
+		n.markFailed(taskID, kind, deliverErr)
+		log.Printf("[notify] sweep: task=%d kind=%s delivery failed: %v", taskID, kind, sanitize(deliverErr.Error()))
+		return
+	}
+	n.markSent(taskID, kind)
+	log.Printf("[notify] sweep: task=%d kind=%s delivered via retry", taskID, kind)
+}
+
+// truncateForLastError caps an error string for the VARCHAR(500) last_error
+// column. It enforces both a byte cap (≤480 bytes, leaving utf8mb4 headroom)
+// AND a rune boundary so a multi-byte codepoint is never sliced through the
+// middle — MySQL strict mode rejects invalid UTF-8 with Error 1366, which
+// would leave the notification row stuck in 'pending' (no sweep / no retry).
+func truncateForLastError(s string) string {
+	const maxBytes = 480
+	if len(s) <= maxBytes {
+		return s
+	}
+	s = s[:maxBytes]
+	// Back off until the tail is a valid UTF-8 sequence. utf8.ValidString runs
+	// over the whole string, but the only way a prefix becomes invalid is a
+	// truncated trailing rune (at most 3 bytes for utf8mb4-safe runes), so this
+	// loop terminates in ≤3 iterations.
+	for len(s) > 0 && !utf8.ValidString(s) {
+		s = s[:len(s)-1]
+	}
+	return s
 }
 
 // sanitize strips any accidental Bearer token / Authorization material from an
