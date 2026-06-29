@@ -94,7 +94,7 @@ func main() {
 				MaxAttempts: cfg.MaxNotifyAttempts,
 				QuietStart:  cfg.NotifyQuietStart,
 				QuietEnd:    cfg.NotifyQuietEnd,
-			})
+			}).WithErrorSanitizer(worker.SanitizeErrorForUser)
 			log.Printf("[worker] terminal-state notifications ENABLED")
 		}
 	}

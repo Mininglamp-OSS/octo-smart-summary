@@ -47,10 +47,11 @@ type Config struct {
 
 // Notifier wires the dedup state machine (summary DB) to the bot Deliverer.
 type Notifier struct {
-	db        *gorm.DB
-	deliverer Deliverer
-	cfg       Config
-	now       func() time.Time // injectable clock for tests
+	db              *gorm.DB
+	deliverer       Deliverer
+	cfg             Config
+	now             func() time.Time // injectable clock for tests
+	errorSanitizer  func(string) string // single render-point sanitizer for failure reasons (see WithErrorSanitizer)
 }
 
 // New builds a Notifier. A nil deliverer or Enabled=false makes OnTaskTerminal a
@@ -65,6 +66,25 @@ func New(db *gorm.DB, deliverer Deliverer, cfg Config) *Notifier {
 		cfg:       cfg,
 		now:       timezone.Now,
 	}
+}
+
+// WithErrorSanitizer wires a single-render-point sanitizer for failure-reason
+// strings. It MUST be set in production: buildText runs every failure reason
+// (whether arriving via the synchronous OnTaskTerminal path OR the
+// sweep/redeliver path that reloads task.ErrorMessage raw from DB) through this
+// sanitizer before composing the user DM. The canonical implementation lives in
+// internal/worker.SanitizeErrorForUser (whitelist-maps LLM/timeout/chunk errors
+// to safe Chinese strings, everything else → "AI 处理失败，请稍后重试").
+//
+// If left nil, buildText falls back to a hardcoded safe string for any
+// non-empty failure reason — never leaks raw err.Error() to the user DM.
+// See PR#113 Jerry-Xin/OctoBoooot R3 blocker: sanitizing only at the worker
+// call sites left the sweep redeliver path renderring raw DSN/IP/stack.
+func (n *Notifier) WithErrorSanitizer(fn func(string) string) *Notifier {
+	if n != nil {
+		n.errorSanitizer = fn
+	}
+	return n
 }
 
 // OnTaskTerminal is the single entry point the worker calls right AFTER a task
@@ -274,8 +294,19 @@ func (n *Notifier) buildText(task model.SummaryTask, kind, errMsg string) string
 		} else {
 			b.WriteString("你的总结生成失败。")
 		}
+		// Single render-point sanitization: every failure reason — whether arriving
+		// via the synchronous worker path (OnTaskTerminal) or the sweep/redeliver
+		// path that reloads task.ErrorMessage raw from DB — is scrubbed here before
+		// it can reach the user DM. See WithErrorSanitizer / PR#113 R3.
 		if reason := strings.TrimSpace(errMsg); reason != "" {
-			fmt.Fprintf(&b, "\n失败原因：%s", reason)
+			safe := reason
+			if n.errorSanitizer != nil {
+				safe = n.errorSanitizer(reason)
+			} else {
+				// Defensive: never leak raw internals if no sanitizer wired.
+				safe = "AI 处理失败，请稍后重试"
+			}
+			fmt.Fprintf(&b, "\n失败原因：%s", safe)
 		}
 		return b.String()
 	default:

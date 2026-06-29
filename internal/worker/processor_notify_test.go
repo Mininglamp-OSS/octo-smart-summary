@@ -78,8 +78,8 @@ func TestNotifyTaskTerminal_SanitizesRawErrorBeforeDM(t *testing.T) {
 		{
 			name:    "empty-error-message",
 			rawErr:  "",
-			wantOut: "AI 处理失败，请稍后重试",
-			mustNot: []string{},
+			wantOut: "", // empty errMsg → no "失败原因" line rendered (PR#113 R3 single-point sanitize)
+			mustNot: []string{"失败原因"},
 		},
 	}
 
@@ -108,7 +108,13 @@ func TestNotifyTaskTerminal_SanitizesRawErrorBeforeDM(t *testing.T) {
 			}
 
 			fake := &fakeNotifyDeliverer{}
-			n := notify.New(db, fake, notify.Config{Enabled: true, MaxAttempts: 3})
+			// Production wiring: cmd/summary-worker/main.go injects
+			// worker.SanitizeErrorForUser via WithErrorSanitizer so the single
+			// render-point sanitizer in notify.buildText covers both the
+			// synchronous and the sweep/redeliver paths. Mirror that wiring
+			// here so the test exercises the same behavior as production.
+			n := notify.New(db, fake, notify.Config{Enabled: true, MaxAttempts: 3}).
+				WithErrorSanitizer(SanitizeErrorForUser)
 
 			p := &Processor{db: db}
 			p.SetNotifier(n)

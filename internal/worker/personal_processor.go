@@ -794,6 +794,18 @@ func estimateTokens(content string, charsPerTokenCJK, charsPerTokenASCII int) in
 	return cjkCount/charsPerTokenCJK + asciiCount/charsPerTokenASCII + overheadPerMsg
 }
 
+// SanitizeErrorForUser is the canonical whitelist that maps a raw internal
+// error string to a user-safe Chinese string suitable for an IM DM.
+//
+// Exported so the notify package can wire it as the single render-point
+// sanitizer in Notifier.buildText (covers both the synchronous worker path
+// AND the sweep/redeliver path that reads task.ErrorMessage raw from the DB).
+// See PR#113 Jerry-Xin/OctoBoooot R3: sanitizing only at the worker call
+// sites left the sweep path leaking DSN/IP/stack to the user DM on retry.
+func SanitizeErrorForUser(errMsg string) string {
+	return sanitizeErrorForUser(errMsg)
+}
+
 func sanitizeErrorForUser(errMsg string) string {
 	switch {
 	case strings.Contains(errMsg, "LLM API error"):

@@ -78,6 +78,11 @@ func newTestNotifier(db *gorm.DB, d Deliverer, cfg Config) *Notifier {
 	n := New(db, d, cfg)
 	// Fixed clock at 10:00 Asia/Shanghai (outside the default quiet window).
 	n.now = func() time.Time { return time.Date(2026, 6, 26, 10, 0, 0, 0, timezone.Location()) }
+	// Default test sanitizer is identity so existing tests can assert on the
+	// exact errMsg they pass in (e.g. "LLM timeout"). Production wires
+	// worker.SanitizeErrorForUser via WithErrorSanitizer; the dedicated R3
+	// regression tests below opt into that mapping explicitly.
+	n.errorSanitizer = func(s string) string { return s }
 	return n
 }
 
@@ -580,5 +585,119 @@ func TestSweep_DisabledIsNoop(t *testing.T) {
 	n.Sweep(context.Background()) // must not panic / not query
 	if len(d.sendCalls) != 0 {
 		t.Fatalf("disabled notifier sweep must be no-op")
+	}
+}
+
+// --- R3 (PR#113 Jerry-Xin/OctoBoooot) — sweep redeliver MUST sanitize ---
+//
+// Regression test for the blocker reported on head fede1ab5: the sweep path
+// reloaded task.ErrorMessage raw from DB and rendered it into the user DM,
+// bypassing the worker-side SanitizeErrorForUser scrub applied only at
+// OnTaskTerminal call sites. We now sanitize at a single render point in
+// buildText, and the production wiring (cmd/summary-worker/main.go) injects
+// worker.SanitizeErrorForUser via WithErrorSanitizer. This test asserts that
+// the sanitizer is actually invoked on the sweep redeliver path — i.e. raw
+// internal substrings never reach the deliverer.
+func TestSweep_RedeliverSanitizesRawError(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	d := &fakeDeliverer{sendErrOnce: errors.New("transient blip")}
+	n := newTestNotifier(db, d, Config{Enabled: true, MaxAttempts: 3})
+
+	// Wire a strict sanitizer mimicking worker.SanitizeErrorForUser: anything
+	// containing raw markers maps to a fixed safe string. We can't import the
+	// worker package here (import cycle), so we cover the contract: the render
+	// point invokes the injected sanitizer, raw markers never reach the DM.
+	rawMarkers := []string{"dial tcp", "10.2.3.4", "postgres://", "goroutine", "secretpw"}
+	sanitizerCalls := 0
+	n.errorSanitizer = func(s string) string {
+		sanitizerCalls++
+		for _, m := range rawMarkers {
+			if strings.Contains(s, m) {
+				return "AI 处理失败，请稍后重试"
+			}
+		}
+		return s
+	}
+
+	// Raw err in the shape the reviewer flagged: DSN + IP + credential + stack head.
+	rawErr := "dial tcp 10.2.3.4:5432: connect: connection refused (dsn=postgres://user:secretpw@10.2.3.4:5432/db) goroutine 1 [running]"
+	task := baseTask(901, model.TriggerManual)
+	task.ErrorMessage = &rawErr
+	if err := db.AutoMigrate(&model.SummaryTask{}); err != nil {
+		t.Fatalf("automigrate task: %v", err)
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("save task: %v", err)
+	}
+
+	// First call: synchronous path. Even on the immediate hop the new
+	// single-render-point sanitize runs, so the synchronous send (which fails
+	// once via sendErrOnce) must not leak the raw err either.
+	n.OnTaskTerminal(task, model.StatusFailed, rawErr)
+
+	var row model.SummaryNotification
+	if err := db.Where("task_id = ?", 901).First(&row).Error; err != nil {
+		t.Fatalf("row not found: %v", err)
+	}
+	if row.Status != model.NotifyStatusFailed {
+		t.Fatalf("precondition: expected failed after first send, got %s", row.Status)
+	}
+
+	// Sweep — this is the path that historically read task.ErrorMessage raw
+	// and rendered it unsanitized into the DM.
+	n.Sweep(context.Background())
+
+	if len(d.sendCalls) != 2 {
+		t.Fatalf("expected 2 send calls (1 initial fail + 1 sweep retry), got %d", len(d.sendCalls))
+	}
+	if sanitizerCalls < 2 {
+		t.Fatalf("sanitizer must be invoked on BOTH the synchronous AND the redeliver render; got calls=%d", sanitizerCalls)
+	}
+	for i, call := range d.sendCalls {
+		text, _ := call.Payload["text"].(string)
+		for _, m := range rawMarkers {
+			if strings.Contains(text, m) {
+				t.Fatalf("send #%d leaked raw marker %q into DM text:\n%s", i, m, text)
+			}
+		}
+		if !strings.Contains(text, "AI 处理失败，请稍后重试") {
+			t.Fatalf("send #%d missing safe failure reason; got:\n%s", i, text)
+		}
+	}
+
+	// Final state: sweep succeeded → sent.
+	db.Where("task_id = ?", 901).First(&row)
+	if row.Status != model.NotifyStatusSent {
+		t.Fatalf("after sweep retry expected sent, got %s (attempts=%d)", row.Status, row.AttemptCount)
+	}
+}
+
+// TestBuildText_NilSanitizerFallsBackToSafeString asserts the defensive
+// fallback: if Notifier is constructed without WithErrorSanitizer (production
+// misconfig), buildText still refuses to render raw err.Error() to the user
+// DM. This guards against future call sites accidentally forgetting the wiring.
+func TestBuildText_NilSanitizerFallsBackToSafeString(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	d := &fakeDeliverer{}
+	// Bypass newTestNotifier so we get a Notifier with nil errorSanitizer.
+	n := New(db, d, Config{Enabled: true})
+	n.now = func() time.Time { return time.Date(2026, 6, 26, 10, 0, 0, 0, timezone.Location()) }
+
+	rawErr := "dial tcp 10.2.3.4: connect refused dsn=postgres://u:secretpw@h/db"
+	task := baseTask(902, model.TriggerManual)
+
+	n.OnTaskTerminal(task, model.StatusFailed, rawErr)
+
+	if len(d.sendCalls) != 1 {
+		t.Fatalf("expected 1 send, got %d", len(d.sendCalls))
+	}
+	text, _ := d.sendCalls[0].Payload["text"].(string)
+	for _, m := range []string{"dial tcp", "10.2.3.4", "postgres://", "secretpw"} {
+		if strings.Contains(text, m) {
+			t.Fatalf("nil sanitizer must not leak raw marker %q to DM; text=%q", m, text)
+		}
+	}
+	if !strings.Contains(text, "AI 处理失败，请稍后重试") {
+		t.Fatalf("nil sanitizer fallback must render the safe default; text=%q", text)
 	}
 }
