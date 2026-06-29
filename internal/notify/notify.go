@@ -101,10 +101,23 @@ func (n *Notifier) OnTaskTerminal(task model.SummaryTask, status int, errMsg str
 		return
 	}
 	if !claimed {
-		// Either another run owns it, or it is already sent / exhausted.
+		// First-delivery is serialized by the unique INSERT, but the retry
+		// decision must ALSO be atomic: two runners firing in the same tick
+		// (markPersonalFailed notify + scanStuckTasks reload-and-notify on the
+		// same task) would otherwise both read the same failed row, both see
+		// budget remaining, and both deliver, sending duplicate failure DMs.
+		// claimRetry does an atomic CAS UPDATE; only the runner that flips the
+		// row to pending (RowsAffected==1) proceeds, the loser skips.
 		if row != nil && row.Status == model.NotifyStatusFailed && row.AttemptCount < n.cfg.MaxAttempts {
-			// A previous attempt failed but still has retry budget: retry on this row.
-			log.Printf("[notify] task=%d kind=%s: retrying failed row (attempt %d/%d)", task.ID, kind, row.AttemptCount, n.cfg.MaxAttempts)
+			won, e := n.claimRetry(task.ID, kind)
+			if e != nil {
+				log.Printf("[notify] task=%d kind=%s: claimRetry failed: %v", task.ID, kind, e)
+				return
+			}
+			if !won {
+				return
+			}
+			log.Printf("[notify] task=%d kind=%s: retrying failed row (won retry slot)", task.ID, kind)
 		} else {
 			return
 		}
@@ -162,6 +175,26 @@ func (n *Notifier) claim(taskID int64, kind string) (bool, *model.SummaryNotific
 		return false, &existing, nil
 	}
 	return false, nil, err
+}
+
+// claimRetry atomically reclaims a failed (task, kind) row for one more
+// delivery attempt. It flips status failed->pending in a single conditional
+// UPDATE guarded on status=failed AND attempt_count<MaxAttempts, so concurrent
+// runners race on the row and exactly one gets RowsAffected==1. Returns
+// won=true only for that single winner; losers skip to avoid duplicate sends.
+func (n *Notifier) claimRetry(taskID int64, kind string) (bool, error) {
+	now := n.now()
+	res := n.db.Model(&model.SummaryNotification{}).
+		Where("task_id = ? AND notify_kind = ? AND status = ? AND attempt_count < ?",
+			taskID, kind, model.NotifyStatusFailed, n.cfg.MaxAttempts).
+		Updates(map[string]any{
+			"status":     model.NotifyStatusPending,
+			"updated_at": now,
+		})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
 }
 
 func (n *Notifier) deliver(target deliveryTarget, text string) error {
