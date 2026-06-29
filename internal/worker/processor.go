@@ -73,6 +73,16 @@ func (p *Processor) SetNotifier(n *notify.Notifier) { p.notifier = n }
 // trigger type, error_message). Best-effort: any failure is swallowed inside the
 // notifier and never affects the worker's completion path. Call this ONLY after
 // the terminal-status DB write has succeeded.
+//
+// The reloaded task.error_message is the RAW internal error string (may carry
+// DSN credentials, IPs, goroutine stack heads). It is intentionally persisted
+// raw in the DB so ops can root-cause from logs, but it MUST NOT reach a user
+// DM. We run it through sanitizeErrorForUser here — the same sanitizer the
+// personal failure path (markPersonalFailed) already uses — so the failure
+// reason rendered into the IM payload is the user-safe whitelist mapping.
+// Single-point intercept: every task-level failure that flows through
+// notifyTaskTerminal is sanitized exactly once, and new fail-write sites do
+// not have to re-add sanitize.
 func (p *Processor) notifyTaskTerminal(taskID int64, status int) {
 	if p.notifier == nil {
 		return
@@ -86,7 +96,7 @@ func (p *Processor) notifyTaskTerminal(taskID int64, status int) {
 	if task.ErrorMessage != nil {
 		errMsg = *task.ErrorMessage
 	}
-	p.notifier.OnTaskTerminal(task, status, errMsg)
+	p.notifier.OnTaskTerminal(task, status, sanitizeErrorForUser(errMsg))
 }
 
 // TriggerCh returns the channel for worker trigger requests.
