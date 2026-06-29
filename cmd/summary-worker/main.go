@@ -152,7 +152,7 @@ func main() {
 				MaxAttempts: cfg.MaxNotifyAttempts,
 				QuietStart:  cfg.NotifyQuietStart,
 				QuietEnd:    cfg.NotifyQuietEnd,
-			})
+			}).WithErrorSanitizer(worker.SanitizeErrorForUser)
 			log.Printf("[worker] terminal-state notifications ENABLED (bot token resolved lazily on first delivery; survives server-started-after-worker race)")
 		}
 	}

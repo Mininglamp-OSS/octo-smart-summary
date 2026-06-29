@@ -125,12 +125,16 @@ func (p *Processor) SetNotifier(n *notify.Notifier) { p.notifier = n }
 // The reloaded task.error_message is the RAW internal error string (may carry
 // DSN credentials, IPs, goroutine stack heads). It is intentionally persisted
 // raw in the DB so ops can root-cause from logs, but it MUST NOT reach a user
-// DM. We run it through sanitizeErrorForUser here — the same sanitizer the
-// personal failure path (markPersonalFailed) already uses — so the failure
-// reason rendered into the IM payload is the user-safe whitelist mapping.
-// Single-point intercept: every task-level failure that flows through
-// notifyTaskTerminal is sanitized exactly once, and new fail-write sites do
-// not have to re-add sanitize.
+// DM.
+//
+// Sanitization happens at a SINGLE render point inside notify.buildText (wired
+// via notify.WithErrorSanitizer(SanitizeErrorForUser) at construction in
+// cmd/summary-worker/main.go). That single intercept covers BOTH the
+// synchronous path here AND the asynchronous sweep/redeliver path
+// (notify.go: redeliver reloads task.ErrorMessage raw from DB). Pre-PR#113 R3,
+// sanitize was applied here only and the sweep path leaked raw errors to the
+// user DM — see Jerry-Xin/OctoBoooot R3 review. We deliberately pass the raw
+// errMsg through and let buildText scrub it once at the render boundary.
 func (p *Processor) notifyTaskTerminal(taskID int64, status int) {
 	if p.notifier == nil {
 		return
@@ -144,7 +148,7 @@ func (p *Processor) notifyTaskTerminal(taskID int64, status int) {
 	if task.ErrorMessage != nil {
 		errMsg = *task.ErrorMessage
 	}
-	p.notifier.OnTaskTerminal(task, status, sanitizeErrorForUser(errMsg))
+	p.notifier.OnTaskTerminal(task, status, errMsg)
 }
 
 // TriggerCh returns the channel for worker trigger requests.
