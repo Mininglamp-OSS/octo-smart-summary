@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
@@ -345,5 +346,239 @@ func TestPayloadHasOBOReserved(t *testing.T) {
 	}
 	if payloadHasOBOReserved(map[string]any{"text": "hello"}) {
 		t.Errorf("clean payload flagged as OBO")
+	}
+}
+
+// --- B2 (PR#113 review P1-2) ---
+
+func TestMarkFailed_TruncatesAtRuneBoundary_NoUTF8Wedge(t *testing.T) {
+	// Reviewer P1-2: byte-wise truncation of a CJK error string could sever a
+	// multi-byte rune; under MySQL strict mode the resulting invalid UTF-8
+	// rejects the UPDATE and the row stays at 'pending' forever.
+	// truncateForLastError must produce a valid UTF-8 string and the row must
+	// reach 'failed'.
+	db := setupNotifyTestDB(t)
+	// Long CJK error message: 300 三-byte runes = 900 bytes, well past the
+	// 480-byte cap so the byte cut would almost certainly land mid-rune.
+	longCJK := strings.Repeat("中", 300)
+	d := &fakeDeliverer{failSend: errors.New("octo-server boom: " + longCJK)}
+	n := newTestNotifier(db, d, Config{Enabled: true, MaxAttempts: 3})
+
+	n.OnTaskTerminal(baseTask(101, model.TriggerManual), model.StatusFailed, "x")
+
+	var row model.SummaryNotification
+	if err := db.Where("task_id = ?", 101).First(&row).Error; err != nil {
+		t.Fatalf("row not found: %v", err)
+	}
+	if row.Status != model.NotifyStatusFailed {
+		t.Fatalf("expected status=failed (markFailed must not wedge at pending), got %s", row.Status)
+	}
+	if row.LastError == nil {
+		t.Fatalf("expected last_error to be set")
+	}
+	le := *row.LastError
+	if !utf8.ValidString(le) {
+		t.Fatalf("last_error must be valid UTF-8 after truncation, got bytes=%q", []byte(le))
+	}
+	if len(le) > 480 {
+		t.Fatalf("last_error must be ≤480 bytes for VARCHAR(500) utf8mb4 headroom, got %d", len(le))
+	}
+	// Must still carry the original prefix so operators can diagnose.
+	// The deliver layer wraps with "sendMessage: "; the prefix must still
+	// contain the original error head so operators can diagnose.
+	if !strings.Contains(le, "octo-server boom:") {
+		t.Fatalf("expected truncated message to keep diagnostic prefix, got %q", le)
+	}
+}
+
+func TestTruncateForLastError_ShortInputUnchanged(t *testing.T) {
+	in := "short ascii error"
+	if got := truncateForLastError(in); got != in {
+		t.Fatalf("short input must pass through, got %q", got)
+	}
+	cjk := "失败：LLM 超时"
+	if got := truncateForLastError(cjk); got != cjk {
+		t.Fatalf("short CJK input must pass through, got %q", got)
+	}
+}
+
+func TestTruncateForLastError_NeverSplitsRune(t *testing.T) {
+	// Build a string whose byte length crosses the 480 cap exactly inside a
+	// multi-byte rune so a naive [:480] slice would produce invalid UTF-8.
+	// 中 is 3 bytes; placing 160 of them gives 480 bytes (boundary-aligned),
+	// then a 4-byte rune (𠮷, U+20BB7) starting at byte 480 ensures the cut
+	// would land mid-rune for any cap inside that rune. We assert validity for
+	// a sweep of caps around the boundary by repeatedly building inputs that
+	// straddle.
+	inputs := []string{
+		strings.Repeat("中", 160) + "𠮷" + strings.Repeat("a", 100),
+		strings.Repeat("a", 479) + "𠮷xx",
+		strings.Repeat("a", 478) + "中" + strings.Repeat("b", 100),
+		strings.Repeat("a", 477) + "中" + strings.Repeat("b", 100),
+	}
+	for i, in := range inputs {
+		out := truncateForLastError(in)
+		if !utf8.ValidString(out) {
+			t.Errorf("case %d: output not valid UTF-8: %q", i, out)
+		}
+		if len(out) > 480 {
+			t.Errorf("case %d: output too long: %d bytes", i, len(out))
+		}
+	}
+}
+
+// --- B1 (PR#113 review P1-1) — background sweep ---
+
+func TestSweep_RetriesFailedRowWithBudget(t *testing.T) {
+	// Simulates the common case: first OnTaskTerminal sees a transient HTTP
+	// failure and leaves the row at status='failed', attempt_count=1. No
+	// further OnTaskTerminal will fire (terminal callbacks are one-shot per
+	// task transition). Sweep must redeliver and reach status='sent'.
+	db := setupNotifyTestDB(t)
+	d := &fakeDeliverer{sendErrOnce: errors.New("transient blip")}
+	n := newTestNotifier(db, d, Config{Enabled: true, MaxAttempts: 3})
+
+	task := baseTask(201, model.TriggerManual)
+	n.OnTaskTerminal(task, model.StatusFailed, "x")
+	var row model.SummaryNotification
+	if err := db.Where("task_id = ?", 201).First(&row).Error; err != nil {
+		t.Fatalf("row not found: %v", err)
+	}
+	if row.Status != model.NotifyStatusFailed {
+		t.Fatalf("precondition: expected failed after first attempt, got %s", row.Status)
+	}
+
+	// Persist the original task so redeliver can reload it.
+	if err := db.AutoMigrate(&model.SummaryTask{}); err != nil {
+		t.Fatalf("automigrate task: %v", err)
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("save task: %v", err)
+	}
+
+	n.Sweep(context.Background())
+
+	db.Where("task_id = ?", 201).First(&row)
+	if row.Status != model.NotifyStatusSent {
+		t.Fatalf("sweep must redeliver and mark sent, got status=%s attempts=%d", row.Status, row.AttemptCount)
+	}
+	if len(d.sendCalls) != 2 {
+		t.Fatalf("expected 2 send calls (1 initial fail + 1 sweep retry), got %d", len(d.sendCalls))
+	}
+}
+
+func TestSweep_DoesNotRetryWhenBudgetExhausted(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	d := &fakeDeliverer{failSend: errors.New("always down")}
+	n := newTestNotifier(db, d, Config{Enabled: true, MaxAttempts: 2})
+
+	task := baseTask(202, model.TriggerManual)
+	if err := db.AutoMigrate(&model.SummaryTask{}); err != nil {
+		t.Fatalf("automigrate task: %v", err)
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("save task: %v", err)
+	}
+
+	n.OnTaskTerminal(task, model.StatusFailed, "x") // attempt 1
+	n.Sweep(context.Background())                   // attempt 2 -> exhausted
+	sendsBefore := len(d.sendCalls)
+	n.Sweep(context.Background()) // must not retry
+
+	if len(d.sendCalls) != sendsBefore {
+		t.Fatalf("expected no further sends; before=%d after=%d", sendsBefore, len(d.sendCalls))
+	}
+	var row model.SummaryNotification
+	db.Where("task_id = ?", 202).First(&row)
+	if row.AttemptCount != 2 {
+		t.Fatalf("attempt_count must cap at MaxAttempts=2, got %d", row.AttemptCount)
+	}
+}
+
+func TestSweep_ReclaimsStalePendingRow(t *testing.T) {
+	// Simulates a worker crash between claim() and markSent/markFailed: the
+	// row is left at status='pending' and would normally be skipped by every
+	// future OnTaskTerminal (dedup) forever. Sweep must reclaim it past the
+	// lease and redeliver.
+	db := setupNotifyTestDB(t)
+	d := &fakeDeliverer{}
+	n := newTestNotifier(db, d, Config{Enabled: true, MaxAttempts: 3})
+
+	task := baseTask(203, model.TriggerManual)
+	if err := db.AutoMigrate(&model.SummaryTask{}); err != nil {
+		t.Fatalf("automigrate task: %v", err)
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("save task: %v", err)
+	}
+
+	// Inject a stale pending row directly: updated_at well past the lease.
+	stale := n.now().Add(-2 * PendingLease)
+	if err := db.Create(&model.SummaryNotification{
+		TaskID:     203,
+		NotifyKind: model.NotifyKindCompleted,
+		Status:     model.NotifyStatusPending,
+		CreatedAt:  stale,
+		UpdatedAt:  stale,
+	}).Error; err != nil {
+		t.Fatalf("seed stale pending: %v", err)
+	}
+
+	n.Sweep(context.Background())
+
+	var row model.SummaryNotification
+	db.Where("task_id = ?", 203).First(&row)
+	if row.Status != model.NotifyStatusSent {
+		t.Fatalf("sweep must redeliver stale pending row, got status=%s", row.Status)
+	}
+	if len(d.sendCalls) != 1 {
+		t.Fatalf("expected exactly 1 send on reclaim, got %d", len(d.sendCalls))
+	}
+}
+
+func TestSweep_DoesNotReclaimFreshPendingRow(t *testing.T) {
+	// A fresh pending row (worker still trying) must not be stolen by Sweep.
+	db := setupNotifyTestDB(t)
+	d := &fakeDeliverer{}
+	n := newTestNotifier(db, d, Config{Enabled: true, MaxAttempts: 3})
+
+	task := baseTask(204, model.TriggerManual)
+	if err := db.AutoMigrate(&model.SummaryTask{}); err != nil {
+		t.Fatalf("automigrate task: %v", err)
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("save task: %v", err)
+	}
+
+	fresh := n.now() // just claimed
+	if err := db.Create(&model.SummaryNotification{
+		TaskID:     204,
+		NotifyKind: model.NotifyKindCompleted,
+		Status:     model.NotifyStatusPending,
+		CreatedAt:  fresh,
+		UpdatedAt:  fresh,
+	}).Error; err != nil {
+		t.Fatalf("seed fresh pending: %v", err)
+	}
+
+	n.Sweep(context.Background())
+
+	if len(d.sendCalls) != 0 {
+		t.Fatalf("fresh pending row must not be reclaimed, got %d sends", len(d.sendCalls))
+	}
+	var row model.SummaryNotification
+	db.Where("task_id = ?", 204).First(&row)
+	if row.Status != model.NotifyStatusPending {
+		t.Fatalf("expected status=pending preserved, got %s", row.Status)
+	}
+}
+
+func TestSweep_DisabledIsNoop(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	d := &fakeDeliverer{}
+	n := New(db, d, Config{Enabled: false})
+	n.Sweep(context.Background()) // must not panic / not query
+	if len(d.sendCalls) != 0 {
+		t.Fatalf("disabled notifier sweep must be no-op")
 	}
 }
