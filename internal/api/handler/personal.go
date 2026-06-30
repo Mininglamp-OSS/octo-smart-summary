@@ -696,18 +696,27 @@ func (h *PersonalHandler) PersonalDraft(c *gin.Context) {
 	//
 	//   (a) row physically gone (Leave/RemoveMember)         -> 404/40008
 	//   (b) row exists AND submitted_at != NULL (race lost)  -> 409/40016
-	//   (c) row exists AND submitted_at IS NULL AND the new
-	//       content/citations_json equal what's already on disk
-	//                                                        -> idempotent 200 ok
+	//   (c) row exists AND submitted_at IS NULL AND none of the three columns
+	//       this UPDATE writes (content, citations_json, updated_at) actually
+	//       change                                           -> idempotent 200 ok
 	//
-	// (c) is reachable in normal UI without any concurrency: this codebase opens
-	// its MySQL DSN without `clientFoundRows=true` (see internal/db/db.go:11-18),
-	// so the driver reports CHANGED rows, not MATCHED rows. Two tabs both
-	// editing A -> B will both POST identical bodies; the second tab's UPDATE
-	// finds nothing to change and returns RowsAffected=0. Treating that as 409
-	// surfaces a misleading "草稿已被提交" toast that closes the editor, even
-	// though the task is still pending and nobody submitted. Per GPT OCT-29
-	// review (REJECT), the probe must also read content + citations_json and
+	// Important nuance about (c): the UPDATE below uses a map-based .Updates(),
+	// and PersonalResult.UpdatedAt carries GORM's schema.AutoUpdateTime tag
+	// (see internal/model/personal_result.go) -- so GORM silently appends
+	// `updated_at = <now>` to every map-based UPDATE. That means (c) is only
+	// reachable when MySQL sees the new updated_at as byte-equal to the old
+	// one, which in practice requires `datetime` (second precision) plus a
+	// same-second repeat save against MySQL without `clientFoundRows=true`
+	// (see internal/db/db.go:11-18). On sqlite (unit tests) and on MySQL with
+	// `datetime(3)` (millisecond precision) the appended updated_at always
+	// differs, so the driver reports RowsAffected=1 and the (c) probe branch
+	// is not entered. The fix is still correct and harmless for those
+	// environments -- it just means the no-op branch is exercised in the
+	// real "two tabs identical body, same-second" MySQL case rather than in
+	// every duplicate-body save. Treating any RowsAffected=0 as 409 would
+	// still surface a misleading "草稿已被提交" toast that closes the editor
+	// while the task is still pending and nobody submitted, so per GPT OCT-29
+	// review (REJECT) the probe must also read content + citations_json and
 	// only escalate to 409 when the row genuinely diverges.
 	//
 	// Wrapping in a Transaction is mildly redundant for a single UPDATE +
@@ -741,14 +750,21 @@ func (h *PersonalHandler) PersonalDraft(c *gin.Context) {
 				return errDraftAlreadySubmitted
 			}
 			// (c) row exists, not submitted, and the conditional UPDATE
-			// matched but changed nothing: bytes on disk already equal what
-			// the caller asked us to write. Treat as idempotent success and
+			// matched but changed nothing. Treat as idempotent success and
 			// fall through to the outer `return nil`. We do NOT re-verify
 			// probe.Content == req.Content / probe.CitationsJSON ==
-			// citationsJSON: with submitted_at IS NULL and the UPDATE's WHERE
-			// satisfied, byte-equality is the only way MySQL can return
-			// RowsAffected=0 without clientFoundRows=true -- a genuine
-			// divergence would have produced RowsAffected=1.
+			// citationsJSON: with submitted_at IS NULL and the UPDATE's
+			// WHERE satisfied, the only way MySQL can report RowsAffected=0
+			// here is when content, citations_json AND updated_at are all
+			// byte-equal to what's already on disk -- the map-based
+			// .Updates() above appends updated_at via GORM's
+			// schema.AutoUpdateTime (see internal/model/personal_result.go),
+			// so a genuine divergence in any of the three would have
+			// produced RowsAffected=1. In practice that pins (c) to MySQL
+			// `datetime` (second precision) + same-second duplicate save
+			// without clientFoundRows=true; sqlite and MySQL `datetime(3)`
+			// always produce a different updated_at and never enter this
+			// branch.
 			return nil
 		}
 		return nil

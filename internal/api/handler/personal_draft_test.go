@@ -413,11 +413,23 @@ func TestPersonalDraft_MissingSpaceHeader_StrictMiddleware(t *testing.T) {
 // T16 (OCT-31, B-FIX from GPT OCT-29): unsubmitted draft re-saved with
 // content/citations identical to what's already on disk must return 200,
 // NOT 409. Root cause: this codebase opens MySQL without `clientFoundRows=true`
-// (see internal/db/db.go:11-18), so the driver reports CHANGED rows, not
-// MATCHED rows; a no-op UPDATE returns RowsAffected=0 and the original
-// implementation misclassified that as "race lost to Submit". sqlite's UPDATE
-// reports changed rows the same way, so this test reproduces the production
-// case directly. Trigger count must stay 0 (drafts are silent).
+// (see internal/db/db.go:11-18), so on MySQL a no-op UPDATE returns
+// RowsAffected=0 and the original implementation misclassified that as
+// "race lost to Submit". Trigger count must stay 0 (drafts are silent).
+//
+// Coverage scope on sqlite: this unit test does NOT actually exercise the
+// (c) probe branch in personal.go. The handler's map-based .Updates() lets
+// GORM auto-append `updated_at = <now>` (schema.AutoUpdateTime on
+// PersonalResult.UpdatedAt), so on sqlite the second save's updated_at
+// differs from the first by at least one tick and the driver returns
+// RowsAffected=1; the request falls through the outer `return nil` and
+// the user sees 200. That's the user-visible behaviour T16 is asserting --
+// idempotent saves stay 200 and don't introduce a regression. The SQL-level
+// (c) branch is only reachable on MySQL `datetime` (second precision) with
+// a same-second duplicate save (MySQL `datetime(3)` also gets RowsAffected=1
+// because the appended ms-precision updated_at differs); covering that
+// requires a real MySQL fixture and is left to integration regression R1,
+// not simulated at the unit layer.
 func TestPersonalDraft_IdempotentNoopSave_T16(t *testing.T) {
 	db := setupMembersTestDB(t)
 	taskID, _ := seedDraftableTask(t, db)
