@@ -99,7 +99,11 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
       - name: Test
-        run: go test -race -shuffle=on -count=1 -timeout 5m ./...
+        # CGO_ENABLED=0: disable CGO to avoid linking libtokenizers.a.
+        # HF tokenizers fall back to estimate mode. Tests with //go:build cgo
+        # (sqlite-dependent: db, pipeline, worker, api/handler) are skipped.
+        # Full coverage with -race runs in the separate test-race job.
+        run: CGO_ENABLED=0 go test -shuffle=on -count=1 -timeout 5m ./...
 
   vet:
     needs: [changes]
@@ -115,7 +119,27 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
       - name: Vet
-        run: go vet ./...
+        run: CGO_ENABLED=0 go vet ./...
+
+  test-race:
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
+    name: Test (race, cgo)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Install libtokenizers
+        run: |
+          curl -fsSL https://github.com/daulet/tokenizers/releases/download/v1.27.0/libtokenizers.linux-amd64.tar.gz | tar xz
+          sudo mv libtokenizers.a /usr/local/lib/
+      - name: Test with race detector
+        run: CGO_ENABLED=1 CGO_LDFLAGS="-L/usr/local/lib" go test -race -shuffle=on -count=1 -timeout 10m ./...
 
   lint:
     needs: [changes]

@@ -648,7 +648,7 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 	}
 
 	fetchStart := time.Now()
-	messages, err = pipeline.ResolveAndFetchMessagesForPersonal(
+	messages, _, err = pipeline.ResolveAndFetchMessagesForPersonal(
 		ctx, task.CreatorID, participantUIDs, participantNames, specifiedSources, task.Title,
 		task.TimeRangeStart, task.TimeRangeEnd,
 		p.imDB, toolCallFn, llmFn, p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency,

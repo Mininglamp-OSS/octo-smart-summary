@@ -16,6 +16,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/gin-gonic/gin"
@@ -241,17 +242,18 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 	summaryMode := model.ModeByPerson
 
 	// Resolve time range
+	maxDays := pipeline.DefaultTimeRangeDays
 	var timeStart, timeEnd time.Time
 	if req.TimeRange != nil {
 		timeStart = req.TimeRange.Start
 		timeEnd = req.TimeRange.End
 	} else {
 		timeEnd = timezone.Now()
-		timeStart = timeEnd.Add(-31 * 24 * time.Hour)
+		timeStart = timeEnd.Add(-time.Duration(maxDays) * 24 * time.Hour)
 	}
 
-	if timeEnd.Sub(timeStart) > 31*24*time.Hour {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40002, Message: "时间范围不能超过31天"})
+	if timeEnd.Sub(timeStart) > time.Duration(maxDays)*24*time.Hour {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40002, Message: fmt.Sprintf("时间范围不能超过%d天", maxDays)})
 		return
 	}
 

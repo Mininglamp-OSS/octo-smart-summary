@@ -1,16 +1,47 @@
 FROM golang:1.25-alpine AS builder
 
+# Install build dependencies for CGO
+RUN apk add --no-cache gcc musl-dev curl
+
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o /bin/summary-worker ./cmd/summary-worker
+
+# Download prebuilt libtokenizers.a (musl version for Alpine)
+# Detect architecture and download appropriate version
+SHELL ["/bin/ash", "-o", "pipefail", "-c"]
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "x86_64" ]; then \
+        LIBTOK_ARCH="amd64"; \
+    elif [ "$ARCH" = "aarch64" ]; then \
+        LIBTOK_ARCH="arm64"; \
+    else \
+        echo "Unsupported architecture: $ARCH" && exit 1; \
+    fi && \
+    curl -fsSL "https://github.com/daulet/tokenizers/releases/download/v1.27.0/libtokenizers.linux-musl-${LIBTOK_ARCH}.tar.gz" | tar xz && \
+    mv libtokenizers.a /usr/local/lib/
+
+# Build with CGO enabled for exact tokenizer (Qwen/DeepSeek)
+ENV CGO_ENABLED=1
+ENV CGO_LDFLAGS="-L/usr/local/lib"
+RUN go build -o /bin/summary-worker ./cmd/summary-worker
+
+# Download tokenizer models for exact token counting
+FROM alpine:3.19 AS tokenizer-models
+RUN apk add --no-cache curl bash
+WORKDIR /models
+COPY scripts/download_tokenizer_models.sh /scripts/
+ENV TOKENIZER_MODELS_DIR=/models
+RUN /scripts/download_tokenizer_models.sh
 
 FROM alpine:3.19
 ENV TZ=Asia/Shanghai
-RUN apk add --no-cache ca-certificates tzdata \
+RUN apk add --no-cache ca-certificates tzdata libstdc++ libgcc \
     && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     && echo $TZ > /etc/timezone
 COPY --from=builder /bin/summary-worker /bin/summary-worker
+COPY --from=tokenizer-models /models /app/tokenizer-models
+ENV TOKENIZER_MODELS_DIR=/app/tokenizer-models
 EXPOSE 8082
 ENTRYPOINT ["/bin/summary-worker"]
