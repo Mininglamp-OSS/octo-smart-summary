@@ -690,11 +690,25 @@ func (h *PersonalHandler) PersonalDraft(c *gin.Context) {
 	// the draft -- which would leave team summary forever stale (draft does not
 	// trigger meta_summary).
 	//
-	// RowsAffected == 0 has two possible causes; a single follow-up SELECT
+	// RowsAffected == 0 has THREE possible causes; a single follow-up SELECT
 	// inside the same transaction disambiguates them so the HTTP layer can
-	// return distinct codes (front-end behaviours diverge: 404 = row truly gone
-	// after Leave; 409 = row exists but is now submitted, must reload + retry
-	// via /personal-edit).
+	// return distinct codes (front-end behaviours diverge):
+	//
+	//   (a) row physically gone (Leave/RemoveMember)         -> 404/40008
+	//   (b) row exists AND submitted_at != NULL (race lost)  -> 409/40016
+	//   (c) row exists AND submitted_at IS NULL AND the new
+	//       content/citations_json equal what's already on disk
+	//                                                        -> idempotent 200 ok
+	//
+	// (c) is reachable in normal UI without any concurrency: this codebase opens
+	// its MySQL DSN without `clientFoundRows=true` (see internal/db/db.go:11-18),
+	// so the driver reports CHANGED rows, not MATCHED rows. Two tabs both
+	// editing A -> B will both POST identical bodies; the second tab's UPDATE
+	// finds nothing to change and returns RowsAffected=0. Treating that as 409
+	// surfaces a misleading "草稿已被提交" toast that closes the editor, even
+	// though the task is still pending and nobody submitted. Per GPT OCT-29
+	// review (REJECT), the probe must also read content + citations_json and
+	// only escalate to 409 when the row genuinely diverges.
 	//
 	// Wrapping in a Transaction is mildly redundant for a single UPDATE +
 	// SELECT, but kept for shape-parity with PersonalEdit and to give a future
@@ -710,19 +724,32 @@ func (h *PersonalHandler) PersonalDraft(c *gin.Context) {
 			return res.Error
 		}
 		if res.RowsAffected == 0 {
-			// Disambiguate (a) row physically deleted (Leave/RemoveMember) from
-			// (b) row exists but submitted_at was just written by a racing
-			// Submit. The probe is read-only and stays inside the tx.
+			// Disambiguate the three causes above. The probe is read-only and
+			// stays inside the tx; we read submitted_at + content +
+			// citations_json so cause (c) is detectable without a second round
+			// trip.
 			var probe model.PersonalResult
-			if err := tx.Select("id", "submitted_at").
+			if err := tx.Select("id", "submitted_at", "content", "citations_json").
 				Where("id = ?", pr.ID).First(&probe).Error; err != nil {
 				if errors.Is(err, gorm.ErrRecordNotFound) {
 					return errPersonalResultGone
 				}
 				return err
 			}
-			// Row still exists => guard must have caught submitted_at != NULL.
-			return errDraftAlreadySubmitted
+			if probe.SubmittedAt != nil {
+				// (b) race lost to Submit -- this is the real 409.
+				return errDraftAlreadySubmitted
+			}
+			// (c) row exists, not submitted, and the conditional UPDATE
+			// matched but changed nothing: bytes on disk already equal what
+			// the caller asked us to write. Treat as idempotent success and
+			// fall through to the outer `return nil`. We do NOT re-verify
+			// probe.Content == req.Content / probe.CitationsJSON ==
+			// citationsJSON: with submitted_at IS NULL and the UPDATE's WHERE
+			// satisfied, byte-equality is the only way MySQL can return
+			// RowsAffected=0 without clientFoundRows=true -- a genuine
+			// divergence would have produced RowsAffected=1.
+			return nil
 		}
 		return nil
 	}); err != nil {
