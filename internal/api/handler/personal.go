@@ -77,11 +77,16 @@ func (h *PersonalHandler) parseTaskID(c *gin.Context) (int64, bool) {
 // requireTaskInSpace enforces P1 cross-space isolation: the task must exist and
 // belong to the caller's space (middleware.GetSpaceID). On a missing task OR a
 // space mismatch it writes 40008/404 ("任务不存在") -- identical to a missing task so
-// task existence is never leaked across spaces -- and returns false. An empty
-// X-Space-Id is rejected fail-closed below before any query, sealing the
+// task existence is never leaked across spaces -- and returns (nil, false). An
+// empty X-Space-Id is rejected fail-closed below before any query, sealing the
 // cross-space path for the (task_id,user_id)-only personal endpoints (Accept /
 // Decline / Submit / GetPersonal). Mirrors authorizeTaskAccess / GetMembers.
-func (h *PersonalHandler) requireTaskInSpace(c *gin.Context, taskID int64) bool {
+//
+// The loaded task is returned on success so callers that need to inspect
+// task-level fields (e.g. PersonalDraft's BY_PERSON mode gate) can do so
+// without issuing a second SELECT. Callers that do not care about the task
+// discard it via `_, taskOK := ...`.
+func (h *PersonalHandler) requireTaskInSpace(c *gin.Context, taskID int64) (*model.SummaryTask, bool) {
 	spaceID := middleware.GetSpaceID(c)
 	// fail-closed hard gate: an empty X-Space-Id must NEVER reach the query.
 	// SummaryTask.SpaceID is `not null default ''`, so tasks with space_id='' may
@@ -89,14 +94,14 @@ func (h *PersonalHandler) requireTaskInSpace(c *gin.Context, taskID int64) bool 
 	// (fail-open). Short-circuit to 40008/404 here, independent of data invariant.
 	if spaceID == "" {
 		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
-		return false
+		return nil, false
 	}
 	var task model.SummaryTask
 	if err := h.db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).First(&task).Error; err != nil {
 		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
-		return false
+		return nil, false
 	}
-	return true
+	return &task, true
 }
 
 // Accept handles POST /api/v1/summaries/:id/accept
@@ -111,7 +116,8 @@ func (h *PersonalHandler) Accept(c *gin.Context) {
 	// space before any (task_id,user_id) participant lookup; a space mismatch is
 	// reported as 40008/404 like a missing task, so existence is not leaked and a
 	// cross-space accept cannot mutate another space's participant.
-	if !h.requireTaskInSpace(c, taskID) {
+	_, taskOK := h.requireTaskInSpace(c, taskID)
+	if !taskOK {
 		return
 	}
 
@@ -284,7 +290,8 @@ func (h *PersonalHandler) Decline(c *gin.Context) {
 	}
 
 	// P1 (cross-space isolation): task must exist in the caller's space first.
-	if !h.requireTaskInSpace(c, taskID) {
+	_, taskOK := h.requireTaskInSpace(c, taskID)
+	if !taskOK {
 		return
 	}
 
@@ -342,7 +349,8 @@ func (h *PersonalHandler) GetPersonal(c *gin.Context) {
 	// task (no existence leak). This runs BEFORE the "no pr -> default" fallback so
 	// a cross-space caller can never coax a default-shaped 200 out of another
 	// space's task; the missing-pr default behaviour for in-space callers is unchanged.
-	if !h.requireTaskInSpace(c, taskID) {
+	_, taskOK := h.requireTaskInSpace(c, taskID)
+	if !taskOK {
 		return
 	}
 
@@ -385,7 +393,8 @@ func (h *PersonalHandler) Submit(c *gin.Context) {
 	}
 
 	// P1 (cross-space isolation): task must exist in the caller's space first.
-	if !h.requireTaskInSpace(c, taskID) {
+	_, taskOK := h.requireTaskInSpace(c, taskID)
+	if !taskOK {
 		return
 	}
 
@@ -501,7 +510,8 @@ func (h *PersonalHandler) PersonalEdit(c *gin.Context) {
 	// genuine in-space non-participant gets the same 40008 "你不是该任务的参与者"
 	// semantics as Accept (no differentiated leak). This also gives BE-1's revive a
 	// consistent task-existence guarantee.
-	if !h.requireTaskInSpace(c, taskID) {
+	_, taskOK := h.requireTaskInSpace(c, taskID)
+	if !taskOK {
 		return
 	}
 
@@ -640,7 +650,20 @@ func (h *PersonalHandler) PersonalDraft(c *gin.Context) {
 	// for write methods (incl. PUT) a missing X-Space-Id is rejected at the
 	// middleware with 400/40001 and this handler never runs; requireTaskInSpace
 	// is the defence-in-depth.
-	if !h.requireTaskInSpace(c, taskID) {
+	task, taskOK := h.requireTaskInSpace(c, taskID)
+	if !taskOK {
+		return
+	}
+	// BY_PERSON gate: PersonalDraft is only meaningful for BY_PERSON tasks.
+	// The worker pickup (personal_processor.go) does not filter by summary_mode
+	// and would happily materialise a PersonalResult on any mode; if the upstream
+	// gates that hard-code ModeByPerson (task.go:242 / schedule.go:535) ever
+	// regress, unchecked drafts would land on the wrong task type. This handler
+	// tier is the defence-in-depth. Sibling early-returns of the same shape live
+	// at task.go:133 (callerPlainCitationsVisible) and personal.go:1393
+	// (reviveCompletedForRecompute).
+	if task.SummaryMode != model.ModeByPerson {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "该任务不支持个人草稿"})
 		return
 	}
 
@@ -715,9 +738,9 @@ func (h *PersonalHandler) PersonalDraft(c *gin.Context) {
 	// real "two tabs identical body, same-second" MySQL case rather than in
 	// every duplicate-body save. Treating any RowsAffected=0 as 409 would
 	// still surface a misleading "草稿已被提交" toast that closes the editor
-	// while the task is still pending and nobody submitted, so per GPT OCT-29
-	// review (REJECT) the probe must also read content + citations_json and
-	// only escalate to 409 when the row genuinely diverges.
+	// while the task is still pending and nobody submitted, so the probe
+	// must also read content + citations_json and only escalate to 409 when
+	// the row genuinely diverges.
 	//
 	// Wrapping in a Transaction is mildly redundant for a single UPDATE +
 	// SELECT, but kept for shape-parity with PersonalEdit and to give a future

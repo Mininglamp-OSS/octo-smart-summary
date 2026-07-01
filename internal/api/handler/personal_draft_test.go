@@ -217,7 +217,13 @@ func TestPersonalDraft_AlreadySubmittedFastPath_409(t *testing.T) {
 // a "before update" callback that runs once and sets submitted_at in the
 // same row, then the conditional UPDATE finds RowsAffected=0, and the probe
 // SELECT inside the tx sees submitted_at != nil -> errDraftAlreadySubmitted.
-func TestPersonalDraft_RaceSubmitWinsDuringUpdate_DBGuard_409(t *testing.T) {
+// runRaceSubmitWinsDuringUpdate exercises the DB-guard race: a Submit lands
+// between PersonalDraft's fast-path read and its conditional UPDATE, the
+// UPDATE matches 0 rows, and the in-tx probe SELECT escalates to 409/40016.
+// Shared by T9b and T12b so the OCT-26 v2 matrix keeps both case ids
+// without `t.Run` plumbing or test-calls-test wiring.
+func runRaceSubmitWinsDuringUpdate(t *testing.T) {
+	t.Helper()
 	db := setupMembersTestDB(t)
 	taskID, xPRID := seedDraftableTask(t, db)
 	tc := newTriggerCapture(t)
@@ -286,6 +292,10 @@ func TestPersonalDraft_RaceSubmitWinsDuringUpdate_DBGuard_409(t *testing.T) {
 	if tc.waitFor("meta_summary", taskID) {
 		t.Errorf("DB-guard 409 must not trigger meta_summary")
 	}
+}
+
+func TestPersonalDraft_RaceSubmitWinsDuringUpdate_DBGuard_409(t *testing.T) {
+	runRaceSubmitWinsDuringUpdate(t)
 }
 
 // T12a: row physically deleted (Leave/RemoveMember race). Fast-path passes,
@@ -358,8 +368,7 @@ func TestPersonalDraft_RaceLeaveDeletesRow_404(t *testing.T) {
 // B1) is visible in test names. Reuses T9b's injector; assertions overlap on
 // purpose -- duplication is cheap, missing the regression isn't.
 func TestPersonalDraft_RaceSubmitWins_T12b(t *testing.T) {
-	// Same scenario as T9b, kept under T12b naming for v2 matrix traceability.
-	TestPersonalDraft_RaceSubmitWinsDuringUpdate_DBGuard_409(t)
+	runRaceSubmitWinsDuringUpdate(t)
 }
 
 // Sanity: the request takes a non-trivial amount of time -- catches accidental
@@ -410,7 +419,7 @@ func TestPersonalDraft_MissingSpaceHeader_StrictMiddleware(t *testing.T) {
 	assertBizCode(t, w, 40001)
 }
 
-// T16 (OCT-31, B-FIX from GPT OCT-29): unsubmitted draft re-saved with
+// T16 (OCT-31): unsubmitted draft re-saved with
 // content/citations identical to what's already on disk must return 200,
 // NOT 409. Root cause: this codebase opens MySQL without `clientFoundRows=true`
 // (see internal/db/db.go:11-18), so on MySQL a no-op UPDATE returns
@@ -525,5 +534,53 @@ func TestPersonalDraft_DivergentContentNormalPath_T17(t *testing.T) {
 	}
 	if tc.waitFor("meta_summary", taskID) {
 		t.Errorf("draft path must not trigger meta_summary")
+	}
+}
+
+// T18 (OCT-43, Critical from PR #125 review): PersonalDraft must reject
+// any task whose SummaryMode != ModeByPerson with 400/40005. Today the
+// production code-path is gated upstream (task.go / schedule.go hard-code
+// ModeByPerson, and BY_GROUP tasks fail-closed at the PersonalResult
+// lookup), but the handler itself never checked the mode -- a regression
+// in those upstream gates would let drafts land on the wrong task type.
+// Note the worker pickup (personal_processor.go) does NOT filter by mode
+// and would happily materialise a PersonalResult on any mode, so the
+// handler is the load-bearing defence-in-depth. This test pins the
+// handler-level invariant.
+func TestPersonalDraft_RejectsNonByPersonMode_T18(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID, _ := seedDraftableTask(t, db)
+	// Flip the seeded task to a non-ByPerson mode (any int != ModeByPerson;
+	// summary_mode=1 is the conceptual BY_GROUP sibling per model.go).
+	if err := db.Model(&model.SummaryTask{}).
+		Where("id = ?", taskID).
+		Update("summary_mode", 1 /* BY_GROUP */).Error; err != nil {
+		t.Fatalf("flip summary_mode: %v", err)
+	}
+
+	tc := newTriggerCapture(t)
+	h := NewPersonalHandler(db, tc.url(), nil)
+	r := setupPersonalDraftRouter(h)
+
+	body := map[string]interface{}{"content": "draft on non-ByPerson task [1]"}
+	w := doJSONRequest(r, "PUT",
+		fmt.Sprintf("/api/v1/summaries/%d/personal-draft", taskID),
+		"member_x", body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for non-ByPerson task, got %d: %s", w.Code, w.Body.String())
+	}
+	assertBizCode(t, w, 40005)
+
+	// Content MUST stay at the seeded original -- the handler must reject
+	// before ever issuing the UPDATE (gate is earlier than the DB write).
+	var prX model.PersonalResult
+	db.Where("task_id = ? AND user_id = ?", taskID, "member_x").First(&prX)
+	if prX.Content != "member_x original [1][2]" {
+		t.Errorf("BY_PERSON gate must reject before write; got content %q", prX.Content)
+	}
+	// And no meta_summary trigger must have been dispatched (gate is earlier
+	// than the trigger).
+	if tc.waitFor("meta_summary", taskID) {
+		t.Errorf("BY_PERSON gate must not trigger meta_summary")
 	}
 }
