@@ -133,6 +133,19 @@ func TestPersonalDraft_OwnSuccessSilent(t *testing.T) {
 	if tc.waitFor("meta_summary", taskID) {
 		t.Errorf("draft must NOT trigger meta_summary; capture saw one")
 	}
+
+	// v2 §4.2 assertion tightening (OCT-50 stage 7A): the draft window is
+	// SEMANTICALLY "pre-publish" — summary_result must NOT exist when this
+	// path succeeds. Locks the test against future fixture regressions that
+	// might silently seed a summary_result and turn the T1 happy-path into a
+	// silently-forked draft (the exact bug OCT-50 exists to prevent).
+	var sumCount int64
+	if err := db.Model(&model.SummaryResult{}).Where("task_id = ?", taskID).Count(&sumCount).Error; err != nil {
+		t.Fatalf("count summary_result: %v", err)
+	}
+	if sumCount != 0 {
+		t.Errorf("pre-publish draft window: summary_result must be empty, got %d rows", sumCount)
+	}
 }
 
 // T14: trigger count remains 0 across many sequential draft saves. Defends the

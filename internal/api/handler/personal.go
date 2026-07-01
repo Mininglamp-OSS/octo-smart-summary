@@ -53,6 +53,62 @@ var errPersonalResultGone = errors.New("personal result gone")
 // docstring + tests.
 var errDraftAlreadySubmitted = errors.New("personal draft already submitted")
 
+// errDraftPublished is a sentinel returned from the PersonalDraft transaction
+// when the gate-in-tx SELECT confirms `summary_result` already exists AND
+// `task.status == Completed` -- i.e. the team summary has been published
+// while the PersonalDraft caller was in flight. The outer handler maps it to
+// 409/40016 ("该总结已发布，请改走编辑接口"). This is the authoritative
+// counterpart to the fast-path published check; it closes the residual TOCTOU
+// window where the pre-tx count read observed 0 rows but
+// `saveLatestResultAndCompleteTask` (scheduled_replace_helpers.go:364-419)
+// commits between the fast-path and the tx start.
+//
+// 40016 is intentionally shared with errDraftAlreadySubmitted -- both are
+// "draft window is closed" (submitted OR published), and the front-end fallback
+// (reload -> switch to /personal-edit) is identical.
+//
+// sqlite `:memory:` FOR UPDATE caveat: our handler-level unit tests run against
+// sqlite `:memory:`, which silently ignores `FOR UPDATE` (see
+// members_auth_test.go:1837-1845). Wall-clock lock timing therefore cannot be
+// reproduced at the handler test tier; T24 covers this branch as a
+// decision-layer verification (seed a summary_result + flip task.status inside
+// a tx-scoped GORM callback so the gate-in-tx SELECT sees it) rather than as a
+// true race. Real lock-ordering evidence lives in production MySQL / an
+// integration-test seam, which is out of scope for the "personal.go-only"
+// change.
+var errDraftPublished = errors.New("personal draft published")
+
+// errDraftRegenerating is a sentinel returned from the PersonalDraft
+// transaction under two paths, both of which map to 409/40009 ("内容已被重新
+// 生成，请刷新后重试", matching edit.go:87/187 verbatim):
+//
+//	(1) gate-in-tx SELECT confirms `summary_result` already exists AND
+//	    `task.status == Processing` -- i.e. the task was revived post-publish
+//	    (Leave / RemoveMember / AddMembers-Accept in personal.go:1411 /
+//	    :210-261) but `summary_result` was NOT deleted (revive keeps it). The
+//	    row on disk is stale relative to the new roster, and drafts landing
+//	    here would silently fork `personal_result` from `summary_result`.
+//	(2) The RowsAffected==0 probe branch (see probe-(d) below) discovers
+//	    `worker_status != Completed`. The ONLY natural production trigger for
+//	    this branch is a Regenerate transaction (task.go:927-966) that
+//	    committed after the draft's fast-path read and before its intra-tx
+//	    UPDATE: Regenerate sets `personal_result.worker_status = Pending`,
+//	    deletes `summary_result`, and resets `task.status = Pending` +
+//	    participant state. The gate-in-tx already closes the primary
+//	    worker-race (saveLatestResult interleaving); probe-(d) is the
+//	    residual defence for the Regenerate seam. revive
+//	    (personal.go:1411-1428, and its Accept inline sibling
+//	    personal.go:210-261) does NOT touch worker_status, so this branch is
+//	    unreachable via the revive path -- callers reading the code should
+//	    not confuse the two.
+//
+// 40009 is intentionally shared with schedule.go ("该定时已绑定其它总结") and
+// edit.go ("内容已被重新生成"): the code is an endpoint-local
+// retryable-conflict signal; the front-end MUST dispatch on (endpoint, code,
+// message), not on code alone. See §3 of the v2 plan for the front-end
+// contract.
+var errDraftRegenerating = errors.New("personal draft regenerating")
+
 // PersonalHandler handles P2 by-person endpoints.
 type PersonalHandler struct {
 	db               *gorm.DB
@@ -691,11 +747,52 @@ func (h *PersonalHandler) PersonalDraft(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "个人总结未完成，无法编辑草稿"})
 		return
 	}
-	// Fast-path: already submitted. The authoritative guard is the conditional
-	// UPDATE inside the transaction; this early-out spares a write in the common
-	// case (front-end already hides the draft entry once submitted_at is set).
+	// Fast-path 1: already submitted. Positioned before the published-check so
+	// the "user tapped save after tapping submit" case pays zero extra DB
+	// round-trips. The authoritative guard is the conditional UPDATE inside the
+	// transaction; this early-out spares a write in the common case (front-end
+	// already hides the draft entry once submitted_at is set).
 	if pr.SubmittedAt != nil {
 		c.JSON(http.StatusConflict, apiResponse{Code: 40016, Message: "草稿已被提交，请刷新后改走编辑接口"})
+		return
+	}
+	// Fast-path 2 (v2, OCT-50): summary_result existence probe. If the team
+	// summary has ever been published for this task, `summary_result` has at
+	// least one row (worker's `saveLatestResultAndCompleteTask` is the sole
+	// writer, scheduled_replace_helpers.go:402). We reject drafts against a
+	// task whose team summary is already published (task.status=Completed →
+	// 40016) or under post-publish revive (task.status=Processing +
+	// summary_result kept → 40009), routing users to /personal-edit / retry
+	// respectively.
+	//
+	// This is an OPTIMISATION only. The authoritative gate is inside the tx
+	// (§2.4 gate-in-tx below); count==0 here can be stale by the time the tx
+	// starts (worker's saveLatest may commit between the two reads). The
+	// intra-tx re-check under `lockTask FOR UPDATE` closes that residual TOCTOU.
+	// See errDraftPublished / errDraftRegenerating docstrings above for the
+	// sqlite `:memory:` caveat that constrains our unit-test coverage of this
+	// path.
+	//
+	// LIMIT 1 + First + errors.Is(gorm.ErrRecordNotFound) is preferred over
+	// COUNT(*) so the existence probe short-circuits on the first row via the
+	// `idx_task_id` index (migrations/sql/20260101-00-baseline.sql:85) and never
+	// scans the table.
+	var publishedProbe model.SummaryResult
+	if err := h.db.Select("id").Where("task_id = ?", taskID).Limit(1).First(&publishedProbe).Error; err == nil {
+		if task.Status == model.StatusProcessing {
+			c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "内容已被重新生成，请刷新后重试"})
+			return
+		}
+		if task.Status == model.StatusCompleted {
+			c.JSON(http.StatusConflict, apiResponse{Code: 40016, Message: "该总结已发布，请改走编辑接口"})
+			return
+		}
+		// Any other task.status (Pending / Failed) with summary_result present
+		// is not a shape the writers can reach today; fall through and let the
+		// gate-in-tx / UPDATE + probe adjudicate authoritatively.
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		log.Printf("[personal] draft published-check error task=%d user=%s: %v", taskID, userID, err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
 		return
 	}
 
@@ -746,8 +843,73 @@ func (h *PersonalHandler) PersonalDraft(c *gin.Context) {
 	// SELECT, but kept for shape-parity with PersonalEdit and to give a future
 	// audit-log write a ready insertion point.
 	if err := h.db.Transaction(func(tx *gorm.DB) error {
+		// v2 §2.4 gate-in-tx: acquire the task-row lock BEFORE any read/write on
+		// summary_result / personal_result. This mirrors worker
+		// saveLatestResultAndCompleteTask (scheduled_replace_helpers.go:370-374),
+		// which also takes `SELECT FOR UPDATE` on the task row before writing
+		// summary_result + markTaskCompleted. Both sides use the SAME first lock
+		// on the SAME row → lock order is identical, no cross-lock deadlock is
+		// possible. The lock is a single-row primary-key acquire (O(1)) and is
+		// held for at most 3 tiny reads + 1 UPDATE; PersonalDraft is a low-QPS
+		// user-typed endpoint so the added contention is negligible.
+		//
+		// Residual window (honest disclosure, from v2.1 Patch 2): the gate-in-tx
+		// closes the window from `saveLatestResultAndCompleteTask` tx start
+		// onwards. There is still a ~100ms residual between
+		// `personal_processor.go:156` (the standalone `worker_status=Completed`
+		// write) and `:201` (the saveLatest tx start) where a draft that beats
+		// worker to `lockTask` will see `task.status=Processing` + no
+		// summary_result yet → gate-in-tx passes, UPDATE lands, then worker
+		// publishes summary_result from the DRAFT-mutated personal_result → fork,
+		// same shape as the original OCT-21 bug but with a 100ms window instead
+		// of a permanent one. Closing this fully requires worker-side
+		// atomicisation of :156 and :201 into a single tx (or moving :156 under
+		// the saveLatest lock), which is a worker change and is out of scope for
+		// this issue. Leader has agreed to open a follow-up for it.
+		//
+		// sqlite `:memory:` caveat: FOR UPDATE is silently ignored on sqlite
+		// (see members_auth_test.go:1837-1845), so wall-clock lock timing is
+		// NOT the property under test at the handler-test tier. The intra-tx
+		// SELECT-then-UPDATE decision logic itself IS exercised by T24 via a
+		// same-tx GORM callback that seeds summary_result + flips task.status
+		// between fast-path and gate-in-tx.
+		var lockTask model.SummaryTask
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id", "status").First(&lockTask, taskID).Error; err != nil {
+			return err
+		}
+
+		// Intra-tx re-check of summary_result existence. Under `lockTask FOR
+		// UPDATE` this is authoritative: any worker writer racing this draft
+		// must either have committed before we grabbed the lock (in which case
+		// we observe the row and reject) or is blocked behind us until we
+		// commit/rollback (in which case draft writes and worker follows
+		// afterwards -- but in that case worker's roster re-check will decide
+		// against the freshly-mutated personal_result on the roster it snapshot
+		// against, not against a stale one).
+		var txSummaryProbe model.SummaryResult
+		if err := tx.Select("id").Where("task_id = ?", taskID).Limit(1).First(&txSummaryProbe).Error; err == nil {
+			if lockTask.Status == model.StatusProcessing {
+				return errDraftRegenerating
+			}
+			return errDraftPublished
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+
+		// UPDATE conditional on worker_status = Completed (v2 §1.2): the extra
+		// clause makes probe-(d) reachable. The ONLY natural production trigger
+		// for worker_status flipping away from Completed while
+		// submitted_at IS NULL is the Regenerate tx (task.go:927-966), which
+		// also deletes summary_result and resets task.status → Pending. If
+		// Regenerate commits between the fast-path count and here, this UPDATE
+		// misses (RowsAffected=0), the probe below reads worker_status, and we
+		// return errDraftRegenerating → 40009. See errDraftRegenerating
+		// docstring for the full seam analysis (this branch is unreachable via
+		// revive: revive does not touch worker_status).
 		res := tx.Model(&model.PersonalResult{}).
-			Where("id = ? AND submitted_at IS NULL", pr.ID).
+			Where("id = ? AND submitted_at IS NULL AND worker_status = ?",
+				pr.ID, model.PersonalStatusCompleted).
 			Updates(map[string]interface{}{
 				"content":        req.Content,
 				"citations_json": citationsJSON,
@@ -756,12 +918,12 @@ func (h *PersonalHandler) PersonalDraft(c *gin.Context) {
 			return res.Error
 		}
 		if res.RowsAffected == 0 {
-			// Disambiguate the three causes above. The probe is read-only and
-			// stays inside the tx; we read submitted_at + content +
-			// citations_json so cause (c) is detectable without a second round
-			// trip.
+			// Disambiguate FOUR causes now (v2 §1.2 adds (d)). The probe is
+			// read-only and stays inside the tx; we read submitted_at +
+			// worker_status + content + citations_json so causes (b), (c), (d)
+			// are all detectable without a second round trip.
 			var probe model.PersonalResult
-			if err := tx.Select("id", "submitted_at", "content", "citations_json").
+			if err := tx.Select("id", "submitted_at", "worker_status", "content", "citations_json").
 				Where("id = ?", pr.ID).First(&probe).Error; err != nil {
 				if errors.Is(err, gorm.ErrRecordNotFound) {
 					return errPersonalResultGone
@@ -772,22 +934,31 @@ func (h *PersonalHandler) PersonalDraft(c *gin.Context) {
 				// (b) race lost to Submit -- this is the real 409.
 				return errDraftAlreadySubmitted
 			}
-			// (c) row exists, not submitted, and the conditional UPDATE
-			// matched but changed nothing. Treat as idempotent success and
-			// fall through to the outer `return nil`. We do NOT re-verify
-			// probe.Content == req.Content / probe.CitationsJSON ==
-			// citationsJSON: with submitted_at IS NULL and the UPDATE's
-			// WHERE satisfied, the only way MySQL can report RowsAffected=0
-			// here is when content, citations_json AND updated_at are all
-			// byte-equal to what's already on disk -- the map-based
-			// .Updates() above appends updated_at via GORM's
-			// schema.AutoUpdateTime (see internal/model/personal_result.go),
-			// so a genuine divergence in any of the three would have
-			// produced RowsAffected=1. In practice that pins (c) to MySQL
-			// `datetime` (second precision) + same-second duplicate save
-			// without clientFoundRows=true; sqlite and MySQL `datetime(3)`
-			// always produce a different updated_at and never enter this
-			// branch.
+			if probe.WorkerStatus != model.PersonalStatusCompleted {
+				// (d) Regenerate tx committed worker_status: Completed→Pending
+				// (and summary_result was deleted, task.status→Pending) between
+				// our fast-path count read and this UPDATE. The row on disk is
+				// stale relative to the new run; retry after refresh. See
+				// errDraftRegenerating docstring for why this branch is
+				// unreachable via revive.
+				return errDraftRegenerating
+			}
+			// (c) row exists, not submitted, worker_status is still Completed,
+			// and the conditional UPDATE matched but changed nothing. Treat as
+			// idempotent success and fall through to the outer `return nil`.
+			// We do NOT re-verify probe.Content == req.Content /
+			// probe.CitationsJSON == citationsJSON: with submitted_at IS NULL,
+			// worker_status = Completed and the UPDATE's WHERE otherwise
+			// satisfied, the only way MySQL can report RowsAffected=0 here is
+			// when content, citations_json AND updated_at are all byte-equal
+			// to what's already on disk -- the map-based .Updates() above
+			// appends updated_at via GORM's schema.AutoUpdateTime (see
+			// internal/model/personal_result.go), so a genuine divergence in
+			// any of the three would have produced RowsAffected=1. In practice
+			// that pins (c) to MySQL `datetime` (second precision) +
+			// same-second duplicate save without clientFoundRows=true; sqlite
+			// and MySQL `datetime(3)` always produce a different updated_at
+			// and never enter this branch.
 			return nil
 		}
 		return nil
@@ -798,6 +969,14 @@ func (h *PersonalHandler) PersonalDraft(c *gin.Context) {
 		}
 		if errors.Is(err, errDraftAlreadySubmitted) {
 			c.JSON(http.StatusConflict, apiResponse{Code: 40016, Message: "草稿已被提交，请刷新后改走编辑接口"})
+			return
+		}
+		if errors.Is(err, errDraftPublished) {
+			c.JSON(http.StatusConflict, apiResponse{Code: 40016, Message: "该总结已发布，请改走编辑接口"})
+			return
+		}
+		if errors.Is(err, errDraftRegenerating) {
+			c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "内容已被重新生成，请刷新后重试"})
 			return
 		}
 		log.Printf("[personal] personal-draft update error task=%d user=%s: %v", taskID, userID, err)
