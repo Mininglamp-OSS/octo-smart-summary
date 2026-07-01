@@ -54,6 +54,22 @@ package handler
 //     integration seam, out of scope for this issue's "personal.go only"
 //     change. T24's docstring inside the test body repeats this note so it
 //     stays with the code that carries the caveat.
+//
+//   T25 – Fast-path stale-task.Status race (OCT-62 gpt blocker landing).
+//         The handler read `task.Status` once via `requireTaskInSpace` at
+//         :709; concurrent `reviveCompletedForRecompute` (Leave/RemoveMember)
+//         flips task.status Completed→Processing while KEEPING summary_result
+//         intact. Under the pre-OCT-62 fast-path (which dispatched by the
+//         stale `task.Status`) this would return 40016 ("published") when the
+//         correct answer is 40009 ("revive in progress"). T25 pins the OCT-62
+//         fix: fast-path is EXISTENCE-only, so the tx-scoped gate-in-tx reads
+//         the FRESH lockTask.Status=Processing and dispatches 40009.
+//         Injection rides the SAME in-tx `Before("gorm:query")` seam as T24,
+//         but hooks the `summary_task` lockTask SELECT (the SECOND
+//         summary_task query of the handler) and flips task.status to
+//         Processing right before that SELECT runs, so the SELECT reads back
+//         Processing. Reverse direction (early Processing → later Completed →
+//         must return 40016) is covered by the reverse mode below.
 
 import (
 	"fmt"
@@ -401,6 +417,182 @@ func TestPersonalDraft_GateInTx_TxScopedPublishedCheck_BlocksAfterFastPath_40016
 	var prX model.PersonalResult
 	db.Where("id = ?", xPRID).First(&prX)
 	if prX.Content == "draft racing publish [1]" {
+		t.Errorf("gate-in-tx 40016 must NOT persist draft content, got %q", prX.Content)
+	}
+	if tc.waitFor("meta_summary", taskID) {
+		t.Errorf("gate-in-tx 40016 must not trigger meta_summary")
+	}
+}
+// T25 — Fast-path stale-task.Status race (OCT-62 gpt blocker).
+//
+// Fixture: seedDraftableTask leaves task.status=Completed; then
+// seedPublishedSummary seeds a summary_result row (still task.status=Completed
+// -- i.e. the "already published" shape). Under the pre-OCT-62 fast-path this
+// would take the 40016 branch by looking at the (about-to-be-stale) task.Status
+// captured by requireTaskInSpace at :709.
+//
+// Race injection: a Before("gorm:query") callback on `summary_task` fires on
+// the SECOND summary_task query (the tx-scoped `lockTask` SELECT at :878;
+// call #1 is the outer `requireTaskInSpace` at :155, which happens BEFORE the
+// tx opens and captures the stale Completed). When the callback fires it
+// UPDATEs task.status → Processing via the same tx (mirroring T24's
+// same-tx-write pattern), so the in-flight `First(&lockTask, taskID)` reads
+// back the fresh Processing status. The gate-in-tx then observes
+// summary_result HIT + lockTask.Status=Processing → errDraftRegenerating →
+// 40009 (the CORRECT dispatch for the concurrent-revive shape).
+//
+// Reverse assertion (buggy pre-OCT-62 code): if the fast-path were restored to
+// its "dispatch by task.Status" version, this test would fail with 40016 —
+// because :709 captured Completed, and the fast-path would return without
+// ever reaching the gate-in-tx where the fresh status lives. This is the
+// exact scenario gpt's code review flagged (OCT-61 blocker).
+//
+// sqlite :memory: caveats (same as T24):
+//   - FOR UPDATE is silently ignored, so this test does not exercise real
+//     lock-order — it verifies the DECISION LAYER (gate-in-tx dispatches by
+//     fresh lockTask.Status, not by stale outer task.Status).
+//   - Sibling sessions do not share the DB, so the injected UPDATE must ride
+//     the SAME tx via `tx.Session(&gorm.Session{NewDB: true}).Exec`.
+func TestPersonalDraft_FastPath_TaskStatusFlipped_ByRevive_40009_T25(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID, xPRID := seedDraftableTask(t, db)
+	// Seed the "already published" shape: summary_result row present,
+	// task.status still Completed. The fast-path (post-OCT-62) probes
+	// summary_result, HITS, but does NOT dispatch — it falls through into the
+	// tx. Inside the tx, the lockTask SELECT is where we flip status.
+	seedPublishedSummary(t, db, taskID, model.StatusCompleted)
+
+	tc := newTriggerCapture(t)
+	h := NewPersonalHandler(db, tc.url(), nil)
+	r := setupPersonalDraftRouter(h)
+
+	// Interposition seam. Handler emits TWO summary_task queries:
+	//   1. requireTaskInSpace() at personal.go:155 — OUTSIDE the tx, reads the
+	//      pre-race Completed. This capture is what makes the pre-OCT-62
+	//      fast-path stale.
+	//   2. `SELECT ... FOR UPDATE` on summary_task inside the tx at :878
+	//      (lockTask). This is the AUTHORITATIVE read the gate-in-tx branches
+	//      on. We interpose here, flip task.status → Processing in-tx BEFORE
+	//      GORM runs the queued SELECT, so the SELECT reads back Processing.
+	cbName := "test:oct62_stale_task_status_race"
+	summaryTaskQueries := 0
+	fired := false
+	err := db.Callback().Query().Before("gorm:query").Register(cbName, func(tx *gorm.DB) {
+		if tx.Statement == nil || tx.Statement.Table != "summary_task" {
+			return
+		}
+		summaryTaskQueries++
+		// Skip the outer requireTaskInSpace (call #1). Fire on the tx-scoped
+		// lockTask SELECT (call #2), which is the SELECT the gate-in-tx
+		// dispatches on.
+		if summaryTaskQueries < 2 || fired {
+			return
+		}
+		fired = true
+		// Flip task.status Completed → Processing in the SAME tx. Under sqlite
+		// :memory: sibling sessions cannot see each other, so the write must
+		// go through the current tx via `NewDB: true` (mirroring T24).
+		if err := tx.Session(&gorm.Session{NewDB: true}).Exec(
+			"UPDATE summary_task SET status = ? WHERE id = ?",
+			model.StatusProcessing, taskID).Error; err != nil {
+			t.Errorf("stale-status race injector failed to flip task.status: %v", err)
+			return
+		}
+	})
+	if err != nil {
+		t.Fatalf("registering stale-status callback: %v", err)
+	}
+	defer func() {
+		_ = db.Callback().Query().Remove(cbName)
+	}()
+
+	body := map[string]interface{}{"content": "draft racing revive [1]"}
+	w := doJSONRequest(r, "PUT",
+		fmt.Sprintf("/api/v1/summaries/%d/personal-draft", taskID),
+		"member_x", body)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 from gate-in-tx (fresh Processing), got %d: %s", w.Code, w.Body.String())
+	}
+	// The KEY assertion: 40009, NOT 40016. Under the pre-OCT-62 fast-path
+	// (dispatch by stale task.Status=Completed) this would be 40016 — that is
+	// the bug gpt flagged.
+	assertBizCode(t, w, 40009)
+	if !fired {
+		t.Errorf("stale-status race injector never fired -- lockTask SELECT branch was not exercised")
+	}
+
+	// Draft content MUST NOT have landed: gate-in-tx rolled back on
+	// errDraftRegenerating BEFORE the UPDATE.
+	var prX model.PersonalResult
+	db.Where("id = ?", xPRID).First(&prX)
+	if prX.Content == "draft racing revive [1]" {
+		t.Errorf("gate-in-tx 40009 must NOT persist draft content, got %q", prX.Content)
+	}
+	if tc.waitFor("meta_summary", taskID) {
+		t.Errorf("gate-in-tx 40009 must not trigger meta_summary")
+	}
+}
+
+// T25b — Reverse direction of T25. Early read is Processing (revive already
+// in flight when requireTaskInSpace ran); revive then completes and publishes
+// (task.status flips Processing → Completed) between the outer read and the
+// tx-scoped lockTask. Correct dispatch is 40016 (published), not 40009. Under
+// pre-OCT-62 fast-path this would incorrectly return 40009. This pins the
+// reverse case gpt described in OCT-61.
+func TestPersonalDraft_FastPath_TaskStatusFlipped_ByPublish_40016_T25b(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID, xPRID := seedDraftableTask(t, db)
+	// Seed the pre-race shape: summary_result present, task.status = Processing
+	// (revive in flight). The outer requireTaskInSpace captures Processing;
+	// then in-tx callback flips to Completed so the fresh lockTask reads
+	// Completed and gate-in-tx dispatches 40016.
+	seedPublishedSummary(t, db, taskID, model.StatusProcessing)
+
+	tc := newTriggerCapture(t)
+	h := NewPersonalHandler(db, tc.url(), nil)
+	r := setupPersonalDraftRouter(h)
+
+	cbName := "test:oct62_stale_task_status_race_reverse"
+	summaryTaskQueries := 0
+	fired := false
+	err := db.Callback().Query().Before("gorm:query").Register(cbName, func(tx *gorm.DB) {
+		if tx.Statement == nil || tx.Statement.Table != "summary_task" {
+			return
+		}
+		summaryTaskQueries++
+		if summaryTaskQueries < 2 || fired {
+			return
+		}
+		fired = true
+		if err := tx.Session(&gorm.Session{NewDB: true}).Exec(
+			"UPDATE summary_task SET status = ? WHERE id = ?",
+			model.StatusCompleted, taskID).Error; err != nil {
+			t.Errorf("reverse race injector failed to flip task.status: %v", err)
+			return
+		}
+	})
+	if err != nil {
+		t.Fatalf("registering reverse callback: %v", err)
+	}
+	defer func() {
+		_ = db.Callback().Query().Remove(cbName)
+	}()
+
+	body := map[string]interface{}{"content": "draft racing publish (reverse) [1]"}
+	w := doJSONRequest(r, "PUT",
+		fmt.Sprintf("/api/v1/summaries/%d/personal-draft", taskID),
+		"member_x", body)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 from gate-in-tx (fresh Completed), got %d: %s", w.Code, w.Body.String())
+	}
+	assertBizCode(t, w, 40016)
+	if !fired {
+		t.Errorf("reverse race injector never fired")
+	}
+
+	var prX model.PersonalResult
+	db.Where("id = ?", xPRID).First(&prX)
+	if prX.Content == "draft racing publish (reverse) [1]" {
 		t.Errorf("gate-in-tx 40016 must NOT persist draft content, got %q", prX.Content)
 	}
 	if tc.waitFor("meta_summary", taskID) {

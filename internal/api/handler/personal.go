@@ -756,19 +756,31 @@ func (h *PersonalHandler) PersonalDraft(c *gin.Context) {
 		c.JSON(http.StatusConflict, apiResponse{Code: 40016, Message: "草稿已被提交，请刷新后改走编辑接口"})
 		return
 	}
-	// Fast-path 2 (v2, OCT-50): summary_result existence probe. If the team
-	// summary has ever been published for this task, `summary_result` has at
-	// least one row (worker's `saveLatestResultAndCompleteTask` is the sole
-	// writer, scheduled_replace_helpers.go:402). We reject drafts against a
-	// task whose team summary is already published (task.status=Completed →
-	// 40016) or under post-publish revive (task.status=Processing +
-	// summary_result kept → 40009), routing users to /personal-edit / retry
-	// respectively.
+	// Fast-path 2 (v2, OCT-50; refined stage 8A per OCT-62 gpt blocker):
+	// summary_result existence probe. If the team summary has ever been
+	// published for this task, `summary_result` has at least one row (worker's
+	// `saveLatestResultAndCompleteTask` is the sole writer,
+	// scheduled_replace_helpers.go:402).
 	//
-	// This is an OPTIMISATION only. The authoritative gate is inside the tx
-	// (§2.4 gate-in-tx below); count==0 here can be stale by the time the tx
-	// starts (worker's saveLatest may commit between the two reads). The
-	// intra-tx re-check under `lockTask FOR UPDATE` closes that residual TOCTOU.
+	// **This is an EXISTENCE-only optimisation.** Code dispatch (40009 vs
+	// 40016) is delegated ENTIRELY to the gate-in-tx below, because
+	// `task.Status` read at :709 by `requireTaskInSpace` can be stale by the
+	// time we reach here: concurrent `reviveCompletedForRecompute`
+	// (personal.go:1590-1606, Leave / RemoveMember paths) flips
+	// task.status Completed ↔ Processing while keeping summary_result intact,
+	// which used to make this fast-path dispatch the wrong code (40016 when
+	// the answer is 40009, and vice versa). Re-reading task.Status here would
+	// still be TOCTOU — the read-vs-tx-start window can flip again. The
+	// authoritative dispatch therefore lives in the gate-in-tx, which reads
+	// `lockTask.Status` under `FOR UPDATE` and cannot be raced.
+	//
+	// When the probe HITS we fall through into the tx: gate-in-tx will
+	// (nearly always) hit the same summary_result row under lockTask and
+	// dispatch the correct code — so the "reject" cost is one extra
+	// `BEGIN` + `SELECT lockTask FOR UPDATE` + `SELECT summary_result LIMIT 1`
+	// + `ROLLBACK`, which is negligible on a low-QPS user-typed endpoint.
+	// When the probe MISSES (gorm.ErrRecordNotFound), we still short-circuit
+	// on the common happy path where no team summary has ever been published.
 	// See errDraftPublished / errDraftRegenerating docstrings above for the
 	// sqlite `:memory:` caveat that constrains our unit-test coverage of this
 	// path.
@@ -778,23 +790,13 @@ func (h *PersonalHandler) PersonalDraft(c *gin.Context) {
 	// `idx_task_id` index (migrations/sql/20260101-00-baseline.sql:85) and never
 	// scans the table.
 	var publishedProbe model.SummaryResult
-	if err := h.db.Select("id").Where("task_id = ?", taskID).Limit(1).First(&publishedProbe).Error; err == nil {
-		if task.Status == model.StatusProcessing {
-			c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "内容已被重新生成，请刷新后重试"})
-			return
-		}
-		if task.Status == model.StatusCompleted {
-			c.JSON(http.StatusConflict, apiResponse{Code: 40016, Message: "该总结已发布，请改走编辑接口"})
-			return
-		}
-		// Any other task.status (Pending / Failed) with summary_result present
-		// is not a shape the writers can reach today; fall through and let the
-		// gate-in-tx / UPDATE + probe adjudicate authoritatively.
-	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+	if err := h.db.Select("id").Where("task_id = ?", taskID).Limit(1).First(&publishedProbe).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		log.Printf("[personal] draft published-check error task=%d user=%s: %v", taskID, userID, err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
 		return
 	}
+	// gorm.ErrRecordNotFound and "row exists" both fall through into the tx.
+	// The tx-scoped gate is authoritative for the dispatch decision.
 
 	citations := pr.GetCitations()
 	cleanedCitations := service.CleanUnreferencedCitations(req.Content, citations)
