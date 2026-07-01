@@ -21,7 +21,7 @@ func (f *fakeNotifyDeliverer) EnsureFriend(_ context.Context, _, _ string) error
 	return nil
 }
 
-func (f *fakeNotifyDeliverer) SendMessage(_ context.Context, msg notify.SendMessageRequest) error {
+func (f *fakeNotifyDeliverer) SendMessage(_ context.Context, _ string, msg notify.SendMessageRequest) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.sendCalls = append(f.sendCalls, msg)
@@ -108,7 +108,7 @@ func TestNotifyTaskTerminal_SanitizesRawErrorBeforeDM(t *testing.T) {
 			}
 
 			fake := &fakeNotifyDeliverer{}
-			n := notify.New(db, fake, notify.Config{Enabled: true, MaxAttempts: 3})
+			n := notify.New(db, nil, fake, notify.Config{Enabled: true, MaxAttempts: 3})
 
 			p := &Processor{db: db}
 			p.SetNotifier(n)
@@ -117,7 +117,9 @@ func TestNotifyTaskTerminal_SanitizesRawErrorBeforeDM(t *testing.T) {
 			if len(fake.sendCalls) != 1 {
 				t.Fatalf("expected exactly 1 SendMessage call, got %d", len(fake.sendCalls))
 			}
-			text, _ := fake.sendCalls[0].Payload["text"].(string)
+			// octo-server recognizes a plain-text bot message by "content" (type=1),
+			// not "text"; assert against the server-recognized payload key.
+			text, _ := fake.sendCalls[0].Payload["content"].(string)
 			// The failure-reason line is "失败原因：<sanitized>" — assert the
 			// sanitized whitelist mapping is what landed in the IM payload.
 			if !strings.Contains(text, tc.wantOut) {

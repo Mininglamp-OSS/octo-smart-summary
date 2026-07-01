@@ -48,19 +48,23 @@ type Config struct {
 // Notifier wires the dedup state machine (summary DB) to the bot Deliverer.
 type Notifier struct {
 	db        *gorm.DB
+	imDB      *gorm.DB // shared IM DB, read-only; used to resolve space names. May be nil.
 	deliverer Deliverer
 	cfg       Config
 	now       func() time.Time // injectable clock for tests
 }
 
 // New builds a Notifier. A nil deliverer or Enabled=false makes OnTaskTerminal a
-// no-op, so callers can wire it unconditionally.
-func New(db *gorm.DB, deliverer Deliverer, cfg Config) *Notifier {
+// no-op, so callers can wire it unconditionally. imDB is the shared IM DB used
+// (read-only) to resolve the space name for notification text; it may be nil, in
+// which case the text gracefully degrades to the space-less wording.
+func New(db *gorm.DB, imDB *gorm.DB, deliverer Deliverer, cfg Config) *Notifier {
 	if cfg.MaxAttempts < 1 {
 		cfg.MaxAttempts = 3
 	}
 	return &Notifier{
 		db:        db,
+		imDB:      imDB,
 		deliverer: deliverer,
 		cfg:       cfg,
 		now:       timezone.Now,
@@ -202,6 +206,18 @@ func (n *Notifier) deliver(target deliveryTarget, text string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
+	// Light guard against the silent-success trap: for a system-bot DM, if the
+	// recipient is NOT an active member of this Space, octo-server strips space_id
+	// but still returns 200 — the message is then dropped and the user silently
+	// gets nothing while we would mark it "sent". Detect provable non-membership
+	// here and fail the delivery explicitly instead. (nil imDB / query error =>
+	// allowed; server still enforces.)
+	if target.TargetUID != "" && target.SpaceID != "" &&
+		!n.recipientIsActiveMember(0, target.SpaceID, target.TargetUID) {
+		return fmt.Errorf("recipient %s is not an active member of space %s; "+
+			"server would strip space_id and drop the notification", target.TargetUID, target.SpaceID)
+	}
+
 	// DM 可达前置：先 ensureFriend（幂等，带 space_id 供 server 拼 s{spaceID}_{uid}
 	// 白名单 channel），再 sendMessage.
 	if target.TargetUID != "" {
@@ -209,15 +225,68 @@ func (n *Notifier) deliver(target deliveryTarget, text string) error {
 			return fmt.Errorf("ensureFriend: %w", err)
 		}
 	}
+	// octo-server identifies a plain-text bot message by its ContentType enum
+	// (type=1=Text) carrying the body in "content"; a bare {"text":...} payload is
+	// not recognized and renders as an empty/unopenable message. Send the
+	// server-recognized shape instead.
+	//
+	// summary is registered as a system bot, so its messages must carry space_id:
+	// octo-server's filterPersonMessagesBySpace drops a system-bot message whose
+	// payload has an empty space_id (it would otherwise be unopenable in the UI).
+	// Include space_id only when known, to hit the "exact match keep" branch and
+	// avoid regressing the empty-SpaceID case.
+	payload := map[string]any{"type": 1, "content": text}
+	if target.SpaceID != "" {
+		payload["space_id"] = target.SpaceID
+	}
 	msg := SendMessageRequest{
 		ChannelID:   target.ChannelID,
 		ChannelType: target.ChannelType,
-		Payload:     map[string]any{"text": text},
+		Payload:     payload,
 	}
-	if err := n.deliverer.SendMessage(ctx, msg); err != nil {
+	if err := n.deliverer.SendMessage(ctx, target.SpaceID, msg); err != nil {
 		return fmt.Errorf("sendMessage: %w", err)
 	}
 	return nil
+}
+
+// recipientIsActiveMember reports whether uid is an active member (status=1) of
+// an active Space (status=1), mirroring octo-server's space.CheckMembership.
+//
+// Why this matters: for a system-bot DM, octo-server only adopts the X-Space-ID
+// header (and thus injects the authoritative payload.space_id) when the
+// RECIPIENT is an active member of that Space. If they are not, the server
+// STRIPS space_id yet still returns 200 — the message is then dropped by
+// filterPersonMessagesBySpace and the user silently never sees it, while the
+// worker would otherwise record it as "sent". Pre-checking here turns that
+// silent loss into an explicit delivery failure (retried/visible), instead of a
+// false success.
+//
+// Conservative failure mode: on a nil imDB or a query error we return true
+// (do NOT block delivery) — the server-side CheckMembership still guards
+// correctness; this pre-check only exists to avoid the silent-success trap when
+// we can cheaply prove non-membership.
+func (n *Notifier) recipientIsActiveMember(taskID uint, spaceID, uid string) bool {
+	if n == nil || n.imDB == nil {
+		return true // cannot check → don't block; server still enforces.
+	}
+	spaceID = strings.TrimSpace(spaceID)
+	uid = strings.TrimSpace(uid)
+	if spaceID == "" || uid == "" {
+		return true // nothing to check against; leave existing behavior.
+	}
+	var count int
+	err := n.imDB.Raw(
+		"SELECT COUNT(*) FROM space_member sm "+
+			"INNER JOIN space s ON s.space_id = sm.space_id AND s.status = 1 "+
+			"WHERE sm.uid = ? AND sm.space_id = ? AND sm.status = 1",
+		uid, spaceID,
+	).Scan(&count).Error
+	if err != nil {
+		log.Printf("[notify] task=%d: recipientIsActiveMember(space=%s,uid=%s) query failed: %v; allowing delivery", taskID, spaceID, uid, err)
+		return true // fail-open: don't turn a transient DB error into a drop.
+	}
+	return count > 0
 }
 
 func (n *Notifier) markSent(taskID int64, kind string) {
@@ -255,12 +324,18 @@ func (n *Notifier) markFailed(taskID int64, kind string, cause error) {
 // error message.
 func (n *Notifier) buildText(task model.SummaryTask, kind, errMsg string) string {
 	title := strings.TrimSpace(task.Title)
+	space := n.resolveSpaceName(task)
 	switch kind {
 	case model.NotifyKindCompleted:
 		var b strings.Builder
-		if title != "" {
+		switch {
+		case space != "" && title != "":
+			fmt.Fprintf(&b, "你在空间「%s」的总结「%s」已生成完成。", space, title)
+		case space != "":
+			fmt.Fprintf(&b, "你在空间「%s」的总结已生成完成。", space)
+		case title != "":
 			fmt.Fprintf(&b, "你的总结「%s」已生成完成。", title)
-		} else {
+		default:
 			b.WriteString("你的总结已生成完成。")
 		}
 		if link := n.resultLink(task); link != "" {
@@ -269,9 +344,14 @@ func (n *Notifier) buildText(task model.SummaryTask, kind, errMsg string) string
 		return b.String()
 	case model.NotifyKindFailed:
 		var b strings.Builder
-		if title != "" {
+		switch {
+		case space != "" && title != "":
+			fmt.Fprintf(&b, "你在空间「%s」的总结「%s」生成失败。", space, title)
+		case space != "":
+			fmt.Fprintf(&b, "你在空间「%s」的总结生成失败。", space)
+		case title != "":
 			fmt.Fprintf(&b, "你的总结「%s」生成失败。", title)
-		} else {
+		default:
 			b.WriteString("你的总结生成失败。")
 		}
 		if reason := strings.TrimSpace(errMsg); reason != "" {
@@ -281,6 +361,27 @@ func (n *Notifier) buildText(task model.SummaryTask, kind, errMsg string) string
 	default:
 		return ""
 	}
+}
+
+// resolveSpaceName looks up the human-readable space name for the task's
+// SpaceID from the shared IM DB (read-only). It is best-effort and degrades
+// gracefully: a nil imDB, empty SpaceID, query error, or no row all yield ""
+// so buildText falls back to the space-less wording. It never panics and never
+// blocks delivery — any error is swallowed (logged only).
+func (n *Notifier) resolveSpaceName(task model.SummaryTask) string {
+	if n == nil || n.imDB == nil {
+		return ""
+	}
+	spaceID := strings.TrimSpace(task.SpaceID)
+	if spaceID == "" {
+		return ""
+	}
+	var name string
+	if err := n.imDB.Raw("SELECT name FROM space WHERE space_id = ? LIMIT 1", spaceID).Scan(&name).Error; err != nil {
+		log.Printf("[notify] task=%d: resolveSpaceName(space_id=%s) failed: %v", task.ID, spaceID, err)
+		return ""
+	}
+	return strings.TrimSpace(name)
 }
 
 // resultLink builds the result URL from the configured base. Empty base → no link.

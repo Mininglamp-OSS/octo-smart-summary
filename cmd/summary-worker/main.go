@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -16,7 +17,40 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timing"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/worker"
+	"gorm.io/gorm"
 )
+
+// summaryNotificationRobotID 是「总结助手」系统 bot 的固定 UID，与 octo-server 的
+// pkg/space.SummaryNotificationBotUID 一致（单一真源在 server 侧）。summary 与 server
+// 共享同一 MySQL `im` 库，这里硬编码该常量字符串用于从 robot 表查 bot_token。
+const summaryNotificationRobotID = "summary_notification"
+
+// resolveSummaryBotToken 解析通知 bot 的 bot_token（OCT-5 / 方案 D：共享 DB）。
+//
+// 优先级：
+//  1. 若 env SUMMARY_BOT_TOKEN（envToken）非空则直接用之（向后兼容旧部署）；
+//  2. 为空才从共享 IM 库查 robot 表。server 首启动时会自动生成强随机 token 写入
+//     该表（见 octo-server modules/robot/api.go ensureSummaryBotToken）。
+//
+// 启动顺序竞态修复：本函数现在作为 HTTPDeliverer 的 lazy tokenFn 使用，在每次投递前
+// 被调用（带非空值缓存），不再在启动时用其返回值决定 disable。拿到空（未生成 /
+// 表无行）返回 error，让本次投递失败走既有 best-effort，下次再查；不 panic。
+//
+// imDB 为 nil 防护：imDB==nil 时直接返回空 + error，不解引空指针 panic。
+func resolveSummaryBotToken(envToken string, imDB *gorm.DB) (string, error) {
+	if envToken != "" {
+		return envToken, nil
+	}
+	if imDB == nil {
+		return "", fmt.Errorf("resolveSummaryBotToken: imDB is nil and env SUMMARY_BOT_TOKEN empty")
+	}
+	var token string
+	// 参照 main.go SetUserNameResolver 里的 imDB.Raw(...).Scan(...) 用法。
+	if err := imDB.Raw("SELECT bot_token FROM robot WHERE robot_id = ? LIMIT 1", summaryNotificationRobotID).Scan(&token).Error; err != nil {
+		return "", fmt.Errorf("resolveSummaryBotToken: query robot.bot_token: %w", err)
+	}
+	return token, nil
+}
 
 func main() {
 	cfg := config.Load()
@@ -96,18 +130,30 @@ func main() {
 	// OnTaskTerminal a no-op, so it is always safe to wire.
 	var notifier *notify.Notifier
 	if cfg.NotifyEnabled {
-		if cfg.OctoAPIURL == "" || cfg.SummaryBotToken == "" {
-			log.Printf("[worker] SUMMARY_NOTIFY_ENABLED=true but OCTO_API_URL / SUMMARY_BOT_TOKEN missing; notifications disabled")
+		// OCT-5 / 方案 D（共享 DB）+ 启动顺序竞态修复：bot_token 不再靠 env 写死/注入，
+		// 也不再在启动时一次性固化。server 首启动时自动生成强随机 token 写入共享 IM 库的
+		// robot 表；summary 这边优先用 env SUMMARY_BOT_TOKEN（向后兼容），为空才从 IM 库查。
+		//
+		// 关键：OCTO_API_URL 非空时总是装配 notifier，不再因启动时 token 空而 disable。
+		// token 改为 HTTPDeliverer 首次投递时 lazy 解析 + 缓存；若 worker 先于 server 起，
+		// 启动时拿不到 token 也不再永久禁用，server 后写了 token 后后续投递自动恢复。
+		if cfg.OctoAPIURL == "" {
+			log.Printf("[worker] SUMMARY_NOTIFY_ENABLED=true but OCTO_API_URL missing; notifications disabled")
 		} else {
-			deliverer := notify.NewHTTPDeliverer(cfg.OctoAPIURL, cfg.SummaryBotToken)
-			notifier = notify.New(summaryDB, deliverer, notify.Config{
+			tokenFn := func() (string, error) {
+				return resolveSummaryBotToken(cfg.SummaryBotToken, imDB)
+			}
+			deliverer := notify.NewHTTPDelivererWithTokenFunc(cfg.OctoAPIURL, tokenFn)
+			// imDB（共享 IM 库）注入用于在通知文本中解析空间名（只读查 space 表）；
+			// imDB 为 nil / 查不到时 buildText 优雅降级回不带空间名的旧文案。
+			notifier = notify.New(summaryDB, imDB, deliverer, notify.Config{
 				Enabled:     true,
 				WebBaseURL:  cfg.SummaryWebBaseURL,
 				MaxAttempts: cfg.MaxNotifyAttempts,
 				QuietStart:  cfg.NotifyQuietStart,
 				QuietEnd:    cfg.NotifyQuietEnd,
 			})
-			log.Printf("[worker] terminal-state notifications ENABLED")
+			log.Printf("[worker] terminal-state notifications ENABLED (bot token resolved lazily on first delivery; survives server-started-after-worker race)")
 		}
 	}
 

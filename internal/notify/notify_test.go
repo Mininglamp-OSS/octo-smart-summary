@@ -3,8 +3,11 @@ package notify
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -38,6 +41,7 @@ type fakeDeliverer struct {
 	mu          sync.Mutex
 	ensureCalls []ensureCall
 	sendCalls   []SendMessageRequest
+	sendSpaceID []string // spaceID passed to each SendMessage (parallel to sendCalls)
 	failEnsure  error
 	failSend    error
 	sendErrOnce error // returned once then cleared (for retry tests)
@@ -50,10 +54,11 @@ func (f *fakeDeliverer) EnsureFriend(ctx context.Context, spaceID, uid string) e
 	return f.failEnsure
 }
 
-func (f *fakeDeliverer) SendMessage(ctx context.Context, msg SendMessageRequest) error {
+func (f *fakeDeliverer) SendMessage(ctx context.Context, spaceID string, msg SendMessageRequest) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.sendCalls = append(f.sendCalls, msg)
+	f.sendSpaceID = append(f.sendSpaceID, spaceID)
 	if f.sendErrOnce != nil {
 		e := f.sendErrOnce
 		f.sendErrOnce = nil
@@ -75,7 +80,7 @@ func baseTask(id int64, trigger int) model.SummaryTask {
 }
 
 func newTestNotifier(db *gorm.DB, d Deliverer, cfg Config) *Notifier {
-	n := New(db, d, cfg)
+	n := New(db, nil, d, cfg)
 	// Fixed clock at 10:00 Asia/Shanghai (outside the default quiet window).
 	n.now = func() time.Time { return time.Date(2026, 6, 26, 10, 0, 0, 0, timezone.Location()) }
 	return n
@@ -98,9 +103,17 @@ func TestOnTaskTerminal_CompletedDelivers(t *testing.T) {
 	if msg.ChannelType != WireChannelDM || msg.ChannelID != "user-1" {
 		t.Fatalf("expected DM to user-1, got type=%d id=%s", msg.ChannelType, msg.ChannelID)
 	}
-	text, _ := msg.Payload["text"].(string)
+	text, _ := msg.Payload["content"].(string)
 	if !strings.Contains(text, "今日群聊") || !strings.Contains(text, "https://app.example.com/summary/TST-1") {
 		t.Fatalf("completed text missing title/link: %q", text)
+	}
+	// octo-server recognizes a plain-text bot message by ContentType type=1 (Text)
+	// carrying "content"; a bare {"text":...} renders empty. Assert the wire shape.
+	if tp, _ := msg.Payload["type"].(int); tp != 1 {
+		t.Fatalf("expected payload type=1 (Text), got %v", msg.Payload["type"])
+	}
+	if _, ok := msg.Payload["text"]; ok {
+		t.Fatalf("payload must not carry legacy 'text' key, got %v", msg.Payload)
 	}
 	// OBO reserved fields must not be present.
 	if payloadHasOBOReserved(msg.Payload) {
@@ -124,7 +137,7 @@ func TestOnTaskTerminal_FailedCarriesReason(t *testing.T) {
 	if len(d.sendCalls) != 1 {
 		t.Fatalf("expected 1 send, got %d", len(d.sendCalls))
 	}
-	text, _ := d.sendCalls[0].Payload["text"].(string)
+	text, _ := d.sendCalls[0].Payload["content"].(string)
 	if !strings.Contains(text, "失败") || !strings.Contains(text, "LLM timeout") {
 		t.Fatalf("failed text missing reason: %q", text)
 	}
@@ -252,7 +265,7 @@ func TestOnTaskTerminal_RetryBudgetExhausted(t *testing.T) {
 func TestQuietWindow_SuppressesScheduledNotManual(t *testing.T) {
 	db := setupNotifyTestDB(t)
 	d := &fakeDeliverer{}
-	n := New(db, d, Config{Enabled: true, QuietStart: "22:00", QuietEnd: "07:00"})
+	n := New(db, nil, d, Config{Enabled: true, QuietStart: "22:00", QuietEnd: "07:00"})
 	// Clock at 23:30 Asia/Shanghai (inside the overnight quiet window).
 	n.now = func() time.Time { return time.Date(2026, 6, 26, 23, 30, 0, 0, timezone.Location()) }
 
@@ -576,9 +589,576 @@ func TestSweep_DoesNotReclaimFreshPendingRow(t *testing.T) {
 func TestSweep_DisabledIsNoop(t *testing.T) {
 	db := setupNotifyTestDB(t)
 	d := &fakeDeliverer{}
-	n := New(db, d, Config{Enabled: false})
+	n := New(db, nil, d, Config{Enabled: false})
 	n.Sweep(context.Background()) // must not panic / not query
 	if len(d.sendCalls) != 0 {
 		t.Fatalf("disabled notifier sweep must be no-op")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// HTTPDeliverer lazy-token tests (启动顺序竞态修复 / OCT-5)
+//
+// 这些测试验证：bot token 在投递时 lazy 解析（而非启动时固化），空值不缓存使得
+// server 晚起后能最终恢复，非空值缓存命中后不再调用 tokenFn，且 lazy 解析到的
+// token 确实出现在 Authorization 头里。
+// ---------------------------------------------------------------------------
+
+// TestHTTPDeliverer_LazyToken_EmptyThenNonEmpty_NotCachedRecovers 模拟 worker 先起、
+// server 晚写 token：tokenFn 首次返回空（投递失败），第二次返回非空（投递成功）。
+// 验证 deliverer 不缓存空值，第二次能拿到 token —— 即启动顺序竞态被修复，无需重启。
+func TestHTTPDeliverer_LazyToken_EmptyThenNonEmpty_NotCachedRecovers(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	var calls int32
+	tokenFn := func() (string, error) {
+		n := atomic.AddInt32(&calls, 1)
+		if n == 1 {
+			return "", nil // server 尚未写库
+		}
+		return "late-token", nil // server 已写库
+	}
+
+	d := NewHTTPDelivererWithTokenFunc(srv.URL, tokenFn)
+
+	// 首次投递：token 为空 → 应失败（best-effort 失败处理会吞掉），不 panic。
+	err := d.SendMessage(context.Background(), "", SendMessageRequest{ChannelID: "u1", ChannelType: WireChannelDM})
+	if err == nil {
+		t.Fatalf("expected first delivery to fail because token is empty")
+	}
+
+	// 第二次投递：token 已可用 → 应成功，且不缓存上一次的空值。
+	if err := d.SendMessage(context.Background(), "", SendMessageRequest{ChannelID: "u1", ChannelType: WireChannelDM}); err != nil {
+		t.Fatalf("expected second delivery to succeed after token became available, got: %v", err)
+	}
+	if gotAuth != "Bearer late-token" {
+		t.Fatalf("expected Authorization to carry lazily-resolved token, got %q", gotAuth)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("expected tokenFn called twice (empty not cached), got %d", got)
+	}
+}
+
+// TestHTTPDeliverer_LazyToken_AlwaysEmpty_FailsNoPanic 验证 tokenFn 持续返回空时，
+// post 返回错误而非 panic；上层 best-effort 失败处理负责吞掉。
+func TestHTTPDeliverer_LazyToken_AlwaysEmpty_FailsNoPanic(t *testing.T) {
+	tokenFn := func() (string, error) { return "", nil }
+	d := NewHTTPDelivererWithTokenFunc("http://127.0.0.1:0", tokenFn)
+
+	err := d.SendMessage(context.Background(), "", SendMessageRequest{ChannelID: "u1", ChannelType: WireChannelDM})
+	if err == nil {
+		t.Fatalf("expected error when token stays empty")
+	}
+	// 再调一次仍应失败（空值不缓存、不永久禁用）。
+	if err := d.EnsureFriend(context.Background(), "s1", "u1"); err == nil {
+		t.Fatalf("expected error on EnsureFriend when token stays empty")
+	}
+}
+
+// TestHTTPDeliverer_LazyToken_TokenFnError_Propagates 验证 tokenFn 返回 error 时
+// 投递失败、错误传播，不缓存、不 panic（模拟 imDB 查询出错）。
+func TestHTTPDeliverer_LazyToken_TokenFnError_Propagates(t *testing.T) {
+	tokenFn := func() (string, error) { return "", errors.New("db down") }
+	d := NewHTTPDelivererWithTokenFunc("http://127.0.0.1:0", tokenFn)
+
+	err := d.SendMessage(context.Background(), "", SendMessageRequest{ChannelID: "u1", ChannelType: WireChannelDM})
+	if err == nil {
+		t.Fatalf("expected error when tokenFn errors")
+	}
+}
+
+// TestHTTPDeliverer_LazyToken_NonEmptyCached_TokenFnNotReinvoked 验证缓存命中：
+// tokenFn 返回非空后被缓存，后续投递不再调用 tokenFn（用计数器断言）。
+func TestHTTPDeliverer_LazyToken_NonEmptyCached_TokenFnNotReinvoked(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	var calls int32
+	tokenFn := func() (string, error) {
+		atomic.AddInt32(&calls, 1)
+		return "cached-token", nil
+	}
+	d := NewHTTPDelivererWithTokenFunc(srv.URL, tokenFn)
+
+	for i := 0; i < 5; i++ {
+		if err := d.SendMessage(context.Background(), "", SendMessageRequest{ChannelID: "u1", ChannelType: WireChannelDM}); err != nil {
+			t.Fatalf("delivery %d failed: %v", i, err)
+		}
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("expected tokenFn invoked once (cached afterwards), got %d", got)
+	}
+}
+
+// TestHTTPDeliverer_BackwardCompat_FixedToken 验证旧构造 NewHTTPDeliverer 仍可用，
+// 固定 token 出现在 Authorization 头里（向后兼容）。
+func TestHTTPDeliverer_BackwardCompat_FixedToken(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	d := NewHTTPDeliverer(srv.URL, "fixed-secret")
+	if err := d.SendMessage(context.Background(), "", SendMessageRequest{ChannelID: "u1", ChannelType: WireChannelDM}); err != nil {
+		t.Fatalf("backward-compat delivery failed: %v", err)
+	}
+	if gotAuth != "Bearer fixed-secret" {
+		t.Fatalf("expected fixed token in Authorization, got %q", gotAuth)
+	}
+}
+
+// TestHTTPDeliverer_SendMessage_AttachesXSpaceIDHeader asserts the X-Space-ID
+// header carries the spaceID on the wire. octo-server STRIPS client
+// payload.space_id for a system-bot DM and only trusts the value resolved from
+// the X-Space-ID header (adopted when the recipient is an active member of that
+// space). Without this header the notification is filtered out as a system-bot
+// message with no space_id. Empty spaceID must NOT send the header.
+func TestHTTPDeliverer_SendMessage_AttachesXSpaceIDHeader(t *testing.T) {
+	var gotHeader string
+	var present bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("X-Space-ID")
+		_, present = r.Header["X-Space-Id"] // canonical MIME key for X-Space-ID
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	d := NewHTTPDeliverer(srv.URL, "tok")
+
+	// non-empty spaceID → header present with that value.
+	if err := d.SendMessage(context.Background(), "space-9", SendMessageRequest{ChannelID: "u1", ChannelType: WireChannelDM}); err != nil {
+		t.Fatalf("send failed: %v", err)
+	}
+	if !present || gotHeader != "space-9" {
+		t.Fatalf("expected X-Space-ID=space-9, present=%v got=%q", present, gotHeader)
+	}
+
+	// empty spaceID → header absent (avoid sending a meaningless/forgeable hint).
+	gotHeader, present = "", false
+	if err := d.SendMessage(context.Background(), "", SendMessageRequest{ChannelID: "u1", ChannelType: WireChannelDM}); err != nil {
+		t.Fatalf("send failed: %v", err)
+	}
+	if present {
+		t.Fatalf("expected no X-Space-ID header when spaceID empty, got %q", gotHeader)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PR#113 notify — payload wire shape + 「空间名 + 总结名称」文本
+// ---------------------------------------------------------------------------
+
+// setupIMTestDB builds an in-memory IM DB with just the `space` table that
+// resolveSpaceName reads (read-only raw SELECT). Schema is NOT owned by this
+// service — created here only to back the unit test.
+func setupIMTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open im db: %v", err)
+	}
+	if err := db.Exec("CREATE TABLE space (space_id TEXT PRIMARY KEY, name TEXT)").Error; err != nil {
+		t.Fatalf("create space table: %v", err)
+	}
+	return db
+}
+
+// TestBuildText_CompletedIncludesSpaceAndTitle 注入可控 imDB 让 resolveSpaceName
+// 返回已知空间名，断言成功文本同时含「空间「<名>」」与「总结「<Title>」」。
+func TestBuildText_CompletedIncludesSpaceAndTitle(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	imDB := setupIMTestDB(t)
+	if err := imDB.Exec("INSERT INTO space (space_id, name) VALUES (?, ?)", "space-9", "研发一组").Error; err != nil {
+		t.Fatalf("seed space: %v", err)
+	}
+	d := &fakeDeliverer{}
+	n := New(db, imDB, d, Config{Enabled: true, WebBaseURL: "https://app.example.com"})
+	n.now = func() time.Time { return time.Date(2026, 6, 26, 10, 0, 0, 0, timezone.Location()) }
+
+	n.OnTaskTerminal(baseTask(301, model.TriggerManual), model.StatusCompleted, "")
+
+	if len(d.sendCalls) != 1 {
+		t.Fatalf("expected 1 send, got %d", len(d.sendCalls))
+	}
+	text, _ := d.sendCalls[0].Payload["content"].(string)
+	if !strings.Contains(text, "空间「研发一组」") {
+		t.Fatalf("completed text missing space name: %q", text)
+	}
+	if !strings.Contains(text, "总结「今日群聊」") {
+		t.Fatalf("completed text missing title: %q", text)
+	}
+	if !strings.Contains(text, "https://app.example.com/summary/TST-1") {
+		t.Fatalf("completed text missing link: %q", text)
+	}
+}
+
+// TestBuildText_FailedIncludesSpaceAndReason 断言失败文本含空间名 + 失败原因。
+func TestBuildText_FailedIncludesSpaceAndReason(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	imDB := setupIMTestDB(t)
+	if err := imDB.Exec("INSERT INTO space (space_id, name) VALUES (?, ?)", "space-9", "研发一组").Error; err != nil {
+		t.Fatalf("seed space: %v", err)
+	}
+	d := &fakeDeliverer{}
+	n := New(db, imDB, d, Config{Enabled: true})
+	n.now = func() time.Time { return time.Date(2026, 6, 26, 10, 0, 0, 0, timezone.Location()) }
+
+	n.OnTaskTerminal(baseTask(302, model.TriggerManual), model.StatusFailed, "LLM timeout")
+
+	text, _ := d.sendCalls[0].Payload["content"].(string)
+	if !strings.Contains(text, "空间「研发一组」") {
+		t.Fatalf("failed text missing space name: %q", text)
+	}
+	if !strings.Contains(text, "总结「今日群聊」") || !strings.Contains(text, "失败") {
+		t.Fatalf("failed text missing title/失败: %q", text)
+	}
+	if !strings.Contains(text, "LLM timeout") {
+		t.Fatalf("failed text missing reason: %q", text)
+	}
+}
+
+// TestBuildText_DegradesWhenIMDBNil 降级路径：imDB 为 nil 时退回不带空间名的旧文案。
+func TestBuildText_DegradesWhenIMDBNil(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	d := &fakeDeliverer{}
+	n := New(db, nil, d, Config{Enabled: true, WebBaseURL: "https://app.example.com"})
+	n.now = func() time.Time { return time.Date(2026, 6, 26, 10, 0, 0, 0, timezone.Location()) }
+
+	n.OnTaskTerminal(baseTask(303, model.TriggerManual), model.StatusCompleted, "")
+
+	text, _ := d.sendCalls[0].Payload["content"].(string)
+	if strings.Contains(text, "空间「") {
+		t.Fatalf("nil imDB must degrade to space-less wording, got %q", text)
+	}
+	if text != "你的总结「今日群聊」已生成完成。\n查看结果：https://app.example.com/summary/TST-1" {
+		t.Fatalf("degraded text mismatch: %q", text)
+	}
+}
+
+// TestBuildText_DegradesWhenSpaceNotFound 降级路径：imDB 在但查不到该 space_id，
+// 同样退回旧文案，且绝不阻断投递。
+func TestBuildText_DegradesWhenSpaceNotFound(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	imDB := setupIMTestDB(t) // table exists but no matching row
+	d := &fakeDeliverer{}
+	n := New(db, imDB, d, Config{Enabled: true})
+	n.now = func() time.Time { return time.Date(2026, 6, 26, 10, 0, 0, 0, timezone.Location()) }
+
+	n.OnTaskTerminal(baseTask(304, model.TriggerManual), model.StatusCompleted, "")
+
+	if len(d.sendCalls) != 1 {
+		t.Fatalf("delivery must not be blocked by missing space, got %d sends", len(d.sendCalls))
+	}
+	text, _ := d.sendCalls[0].Payload["content"].(string)
+	if strings.Contains(text, "空间「") {
+		t.Fatalf("missing space row must degrade to space-less wording, got %q", text)
+	}
+	if !strings.Contains(text, "你的总结「今日群聊」已生成完成。") {
+		t.Fatalf("degraded text mismatch: %q", text)
+	}
+}
+
+// TestResolveSpaceName_NilReceiverAndNilDB 直接覆盖 resolveSpaceName 的 nil 防护。
+func TestResolveSpaceName_NilReceiverAndNilDB(t *testing.T) {
+	var nilN *Notifier
+	if got := nilN.resolveSpaceName(baseTask(1, model.TriggerManual)); got != "" {
+		t.Fatalf("nil receiver must return empty, got %q", got)
+	}
+	n := New(setupNotifyTestDB(t), nil, &fakeDeliverer{}, Config{Enabled: true})
+	if got := n.resolveSpaceName(baseTask(1, model.TriggerManual)); got != "" {
+		t.Fatalf("nil imDB must return empty, got %q", got)
+	}
+	// Empty SpaceID short-circuits even with a live imDB.
+	n2 := New(setupNotifyTestDB(t), setupIMTestDB(t), &fakeDeliverer{}, Config{Enabled: true})
+	task := baseTask(1, model.TriggerManual)
+	task.SpaceID = ""
+	if got := n2.resolveSpaceName(task); got != "" {
+		t.Fatalf("empty space_id must return empty, got %q", got)
+	}
+}
+
+// --- space_id in payload (system-bot space filter fix) ---
+
+// TestDeliver_PayloadCarriesSpaceID_WhenKnown asserts the delivered payload
+// includes space_id when the target SpaceID is non-empty. Summary runs as a
+// system bot; octo-server's filterPersonMessagesBySpace drops a system-bot
+// message whose payload has an empty space_id, so it must be carried through.
+// fail-before: deliver previously built the payload without space_id, so this
+// key assertion would have failed.
+func TestDeliver_PayloadCarriesSpaceID_WhenKnown(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	d := &fakeDeliverer{}
+	n := newTestNotifier(db, d, Config{Enabled: true, WebBaseURL: "https://app.example.com"})
+
+	// baseTask carries SpaceID="space-9".
+	n.OnTaskTerminal(baseTask(1, model.TriggerManual), model.StatusCompleted, "")
+
+	if len(d.sendCalls) != 1 {
+		t.Fatalf("expected 1 send, got %d", len(d.sendCalls))
+	}
+	got, ok := d.sendCalls[0].Payload["space_id"]
+	if !ok {
+		t.Fatalf("payload must carry space_id when target.SpaceID is set, got %v", d.sendCalls[0].Payload)
+	}
+	if got != "space-9" {
+		t.Fatalf("expected space_id=space-9, got %v", got)
+	}
+}
+
+// TestDeliver_PayloadOmitsSpaceID_WhenEmpty asserts the payload does NOT
+// include a space_id key when the target SpaceID is empty, avoiding a
+// regression on the empty-SpaceID path.
+func TestDeliver_PayloadOmitsSpaceID_WhenEmpty(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	d := &fakeDeliverer{}
+	n := newTestNotifier(db, d, Config{Enabled: true, WebBaseURL: "https://app.example.com"})
+
+	task := baseTask(1, model.TriggerManual)
+	task.SpaceID = ""
+	n.OnTaskTerminal(task, model.StatusCompleted, "")
+
+	if len(d.sendCalls) != 1 {
+		t.Fatalf("expected 1 send, got %d", len(d.sendCalls))
+	}
+	if _, ok := d.sendCalls[0].Payload["space_id"]; ok {
+		t.Fatalf("payload must not carry space_id when target.SpaceID is empty, got %v", d.sendCalls[0].Payload)
+	}
+}
+
+// --- X-Space-ID header (system-bot DM fail-closed space resolution fix) ---
+//
+// 真根因：summary 是系统 bot，octo-server 对系统 bot 的 DM fail-closed：client 在
+// payload 里传的 space_id 一律被 strip，server 只认自己解析的权威 space_id。解析
+// 路径上 worker 唯一可控的输入是 HTTP 请求头 X-Space-ID —— 当接收人是该 space 活跃
+// 成员（CheckMembership=true）时 server 采纳该头并注入权威 payload.space_id。因此
+// worker 发 sendMessage / ensureFriend 必须带 X-Space-ID 头，光改 payload 无效。
+
+// TestDeliver_PassesSpaceIDToSendMessage 断言 deliver()（OnTaskTerminal 路径）把
+// target.SpaceID 透传给 Deliverer.SendMessage 的 spaceID 参数 —— 这是 X-Space-ID
+// 头值的来源。fail-before：旧 SendMessage 签名没有 spaceID 参数，无从透传。
+func TestDeliver_PassesSpaceIDToSendMessage(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	d := &fakeDeliverer{}
+	n := newTestNotifier(db, d, Config{Enabled: true})
+
+	// baseTask carries SpaceID="space-9".
+	n.OnTaskTerminal(baseTask(1, model.TriggerManual), model.StatusCompleted, "")
+
+	if len(d.sendSpaceID) != 1 {
+		t.Fatalf("expected 1 send, got %d", len(d.sendSpaceID))
+	}
+	if d.sendSpaceID[0] != "space-9" {
+		t.Fatalf("expected spaceID=space-9 passed to SendMessage, got %q", d.sendSpaceID[0])
+	}
+}
+
+// TestRedeliver_PassesSpaceIDToSendMessage 确认 redeliver（sweep 重投递）路径同样
+// 经过 deliver→SendMessage，因此也带上权威 spaceID。
+func TestRedeliver_PassesSpaceIDToSendMessage(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	d := &fakeDeliverer{sendErrOnce: errors.New("transient blip")}
+	n := newTestNotifier(db, d, Config{Enabled: true, MaxAttempts: 3})
+
+	task := baseTask(401, model.TriggerManual)
+	n.OnTaskTerminal(task, model.StatusFailed, "x") // first attempt fails, row -> failed
+
+	if err := db.AutoMigrate(&model.SummaryTask{}); err != nil {
+		t.Fatalf("automigrate task: %v", err)
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("save task: %v", err)
+	}
+
+	n.Sweep(context.Background()) // redeliver path
+
+	if len(d.sendSpaceID) != 2 {
+		t.Fatalf("expected 2 sends (initial + sweep redeliver), got %d", len(d.sendSpaceID))
+	}
+	for i, sid := range d.sendSpaceID {
+		if sid != "space-9" {
+			t.Fatalf("send #%d: expected spaceID=space-9 (redeliver must carry it too), got %q", i, sid)
+		}
+	}
+}
+
+// TestHTTPDeliverer_SendMessage_SetsXSpaceIDHeader 用 httptest 起 server 捕获请求头，
+// 断言 SpaceID 非空时 sendMessage 请求带 X-Space-ID 头且值正确。这是真根因修复的
+// 核心断言：server 会 strip payload.space_id，只认这个头。
+func TestHTTPDeliverer_SendMessage_SetsXSpaceIDHeader(t *testing.T) {
+	var gotSpace string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSpace = r.Header.Get("X-Space-ID")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	d := NewHTTPDeliverer(srv.URL, "tok")
+	if err := d.SendMessage(context.Background(), "space-9",
+		SendMessageRequest{ChannelID: "u1", ChannelType: WireChannelDM}); err != nil {
+		t.Fatalf("send failed: %v", err)
+	}
+	if gotSpace != "space-9" {
+		t.Fatalf("expected X-Space-ID=space-9, got %q", gotSpace)
+	}
+}
+
+// TestHTTPDeliverer_SendMessage_OmitsXSpaceIDHeader_WhenEmpty 断言 SpaceID 为空时
+// 不带 X-Space-ID 头（保持向后兼容，不引入空头）。
+func TestHTTPDeliverer_SendMessage_OmitsXSpaceIDHeader_WhenEmpty(t *testing.T) {
+	var present bool
+	var gotSpace string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, present = r.Header["X-Space-Id"] // canonical MIME key for X-Space-ID
+		gotSpace = r.Header.Get("X-Space-ID")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	d := NewHTTPDeliverer(srv.URL, "tok")
+	if err := d.SendMessage(context.Background(), "",
+		SendMessageRequest{ChannelID: "u1", ChannelType: WireChannelDM}); err != nil {
+		t.Fatalf("send failed: %v", err)
+	}
+	if present || gotSpace != "" {
+		t.Fatalf("expected NO X-Space-ID header when spaceID empty, got present=%v value=%q", present, gotSpace)
+	}
+}
+
+// TestHTTPDeliverer_SendMessage_TrimsXSpaceIDHeader 断言头值不带前后空格（即便调用
+// 方传入带空格的 spaceID，spaceHeader 也会 TrimSpace，避免引入脏值）。
+func TestHTTPDeliverer_SendMessage_TrimsXSpaceIDHeader(t *testing.T) {
+	var gotSpace string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSpace = r.Header.Get("X-Space-ID")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	d := NewHTTPDeliverer(srv.URL, "tok")
+	if err := d.SendMessage(context.Background(), "  space-9  ",
+		SendMessageRequest{ChannelID: "u1", ChannelType: WireChannelDM}); err != nil {
+		t.Fatalf("send failed: %v", err)
+	}
+	if gotSpace != "space-9" {
+		t.Fatalf("expected trimmed X-Space-ID=space-9, got %q", gotSpace)
+	}
+}
+
+// TestHTTPDeliverer_EnsureFriend_SetsXSpaceIDHeader 断言 ensureFriend 也带 X-Space-ID
+// 头（同一权威 space 解析路径），SpaceID 为空时不带。
+func TestHTTPDeliverer_EnsureFriend_SetsXSpaceIDHeader(t *testing.T) {
+	var gotSpace string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSpace = r.Header.Get("X-Space-ID")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	d := NewHTTPDeliverer(srv.URL, "tok")
+	if err := d.EnsureFriend(context.Background(), "space-9", "u1"); err != nil {
+		t.Fatalf("ensureFriend failed: %v", err)
+	}
+	if gotSpace != "space-9" {
+		t.Fatalf("expected X-Space-ID=space-9 on ensureFriend, got %q", gotSpace)
+	}
+
+	gotSpace = ""
+	if err := d.EnsureFriend(context.Background(), "", "u1"); err != nil {
+		t.Fatalf("ensureFriend (empty space) failed: %v", err)
+	}
+	if gotSpace != "" {
+		t.Fatalf("expected NO X-Space-ID header when spaceID empty, got %q", gotSpace)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 轻量防护：接收人非该 space 活跃成员时，deliver 应显式失败，而非静默「已发送」
+// （octo-server 对系统 bot DM 在接收人非成员时会 strip space_id 但仍返 200，
+// 导致消息被丢弃、用户看不到；worker 侧预检把静默丢失转成显式失败。）
+// ---------------------------------------------------------------------------
+
+// setupIMTestDBWithMembers 建带 space + space_member 两表的内存 IM 库，用于成员校验。
+func setupIMTestDBWithMembers(t *testing.T) *gorm.DB {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open im db: %v", err)
+	}
+	if err := db.Exec("CREATE TABLE space (space_id TEXT PRIMARY KEY, name TEXT, status INTEGER)").Error; err != nil {
+		t.Fatalf("create space table: %v", err)
+	}
+	if err := db.Exec("CREATE TABLE space_member (space_id TEXT, uid TEXT, status INTEGER)").Error; err != nil {
+		t.Fatalf("create space_member table: %v", err)
+	}
+	return db
+}
+
+// TestDeliver_ActiveMember_Delivers 接收人是活跃成员 → 正常投递。
+func TestDeliver_ActiveMember_Delivers(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	imDB := setupIMTestDBWithMembers(t)
+	imDB.Exec("INSERT INTO space (space_id, name, status) VALUES (?,?,1)", "space-9", "研发一组")
+	imDB.Exec("INSERT INTO space_member (space_id, uid, status) VALUES (?,?,1)", "space-9", "user-1")
+	d := &fakeDeliverer{}
+	n := New(db, imDB, d, Config{Enabled: true})
+	n.now = func() time.Time { return time.Date(2026, 6, 26, 10, 0, 0, 0, timezone.Location()) }
+
+	n.OnTaskTerminal(baseTask(501, model.TriggerManual), model.StatusCompleted, "")
+
+	if len(d.sendCalls) != 1 {
+		t.Fatalf("active member: expected 1 send, got %d", len(d.sendCalls))
+	}
+	var row model.SummaryNotification
+	if err := db.Where("task_id=?", 501).First(&row).Error; err != nil {
+		t.Fatalf("load notification: %v", err)
+	}
+	if row.Status != "sent" {
+		t.Fatalf("active member: expected status=sent, got %q", row.Status)
+	}
+}
+
+// TestDeliver_NonMember_FailsNotSilentSent 接收人非活跃成员 → 不发送，记录 failed（非 sent）。
+func TestDeliver_NonMember_FailsNotSilentSent(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	imDB := setupIMTestDBWithMembers(t)
+	imDB.Exec("INSERT INTO space (space_id, name, status) VALUES (?,?,1)", "space-9", "研发一组")
+	// user-1 有一行但 status=2（被降权/退出）→ 非活跃成员。
+	imDB.Exec("INSERT INTO space_member (space_id, uid, status) VALUES (?,?,2)", "space-9", "user-1")
+	d := &fakeDeliverer{}
+	n := New(db, imDB, d, Config{Enabled: true})
+	n.now = func() time.Time { return time.Date(2026, 6, 26, 10, 0, 0, 0, timezone.Location()) }
+
+	n.OnTaskTerminal(baseTask(502, model.TriggerManual), model.StatusCompleted, "")
+
+	if len(d.sendCalls) != 0 {
+		t.Fatalf("non-member: expected 0 send (blocked), got %d", len(d.sendCalls))
+	}
+	var row model.SummaryNotification
+	if err := db.Where("task_id=?", 502).First(&row).Error; err != nil {
+		t.Fatalf("load notification: %v", err)
+	}
+	if row.Status == "sent" {
+		t.Fatalf("non-member: notification wrongly marked sent (silent-success trap not closed)")
+	}
+}
+
+// TestDeliver_NilIMDB_AllowsDelivery imDB 为 nil → 无法校验 → 放行（不阻断，server 兜底）。
+func TestDeliver_NilIMDB_AllowsDelivery(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	d := &fakeDeliverer{}
+	n := New(db, nil, d, Config{Enabled: true})
+	n.now = func() time.Time { return time.Date(2026, 6, 26, 10, 0, 0, 0, timezone.Location()) }
+
+	n.OnTaskTerminal(baseTask(503, model.TriggerManual), model.StatusCompleted, "")
+
+	if len(d.sendCalls) != 1 {
+		t.Fatalf("nil imDB: expected 1 send (fail-open), got %d", len(d.sendCalls))
 	}
 }

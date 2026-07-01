@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -34,7 +35,19 @@ type Deliverer interface {
 	// ensureFriend whitelist side — sendMessage.channel_id stays a bare uid.
 	EnsureFriend(ctx context.Context, spaceID, targetUID string) error
 	// SendMessage posts a bot message to the resolved channel.
-	SendMessage(ctx context.Context, msg SendMessageRequest) error
+	//
+	// spaceID (SummaryTask.SpaceID) is required so octo-server can inject the
+	// authoritative payload.space_id for a system-bot DM. octo-server
+	// fail-closes on system-bot DMs: it STRIPS any client-supplied
+	// payload.space_id and instead trusts only the value it resolves itself.
+	// The single worker-controllable input on that resolution path is the
+	// HTTP request header `X-Space-ID`: for a system-bot DM, when
+	// CheckMembership(spaceID, recipientUID)=true (the recipient is an active
+	// member of the space — the case here), octo-server adopts the header and
+	// uses it to inject the authoritative payload.space_id. Without the header
+	// the message is filtered out / unopenable. The header is only attached
+	// when spaceID is non-empty (empty → no header, preserving compatibility).
+	SendMessage(ctx context.Context, spaceID string, msg SendMessageRequest) error
 }
 
 // SendMessageRequest is the body of POST {OCTO_API_URL}/v1/bot/sendMessage.
@@ -66,20 +79,76 @@ func payloadHasOBOReserved(payload map[string]any) bool {
 }
 
 // HTTPDeliverer is the production Deliverer talking to octo-server's bot API.
+//
+// 启动顺序竞态修复（OCT-5 / 方案 D）：token 不再在构造时固化。容器编排不保证
+// summary-worker 与 octo-server 的启动先后；若 worker 先起、server 尚未
+// ensureSummaryBotToken 写库，启动时查库会拿到空 token。旧实现会就此把 notifier
+// 永久 disable，即便 server 之后写了 token 也不恢复，必须人工重启 worker。
+//
+// 现在 HTTPDeliverer 持有一个 tokenFn（token provider），在每次投递前 lazy 解析
+// token，并把「首次拿到的非空 token」缓存住（见 cachedToken）。空值不缓存，下次
+// 再查，因此 server 晚起后写了 token，worker 能在后续投递中自动恢复，无需重启。
 type HTTPDeliverer struct {
 	baseURL string
-	token   string
+	tokenFn func() (string, error)
 	client  *http.Client
+
+	// token 缓存：只缓存「非空成功值」。一旦缓存命中即不再调用 tokenFn。
+	cacheMu     sync.RWMutex
+	cachedToken string
 }
 
-// NewHTTPDeliverer builds a Deliverer. token is the SUMMARY_BOT_TOKEN secret —
-// it is stored only in memory and only ever placed in the Authorization header.
+// NewHTTPDeliverer builds a Deliverer from a fixed token. token is the
+// SUMMARY_BOT_TOKEN secret — it is stored only in memory and only ever placed in
+// the Authorization header.
+//
+// 向后兼容：保留旧签名。内部包成一个返回固定 token 的 tokenFn。固定 token 为空时
+// 仍会在投递时报错（best-effort 失败处理吞掉），不再 panic、不会永久禁用。
 func NewHTTPDeliverer(baseURL, token string) *HTTPDeliverer {
+	return NewHTTPDelivererWithTokenFunc(baseURL, func() (string, error) {
+		return token, nil
+	})
+}
+
+// NewHTTPDelivererWithTokenFunc builds a Deliverer that lazily resolves the bot
+// token via tokenFn on each post (with non-empty-value caching). This is the
+// path that survives the startup-order race: assemble the notifier even when the
+// token is not yet available, and let it resolve once octo-server has written it
+// into the shared IM DB.
+func NewHTTPDelivererWithTokenFunc(baseURL string, tokenFn func() (string, error)) *HTTPDeliverer {
 	return &HTTPDeliverer{
 		baseURL: strings.TrimRight(baseURL, "/"),
-		token:   token,
+		tokenFn: tokenFn,
 		client:  &http.Client{Timeout: 10 * time.Second},
 	}
+}
+
+// resolveToken returns the bot token, preferring the cached non-empty value and
+// otherwise invoking tokenFn. A non-empty success is cached; empty values and
+// errors are NOT cached so a late-starting server can still be picked up later.
+func (d *HTTPDeliverer) resolveToken() (string, error) {
+	d.cacheMu.RLock()
+	cached := d.cachedToken
+	d.cacheMu.RUnlock()
+	if cached != "" {
+		return cached, nil
+	}
+
+	if d.tokenFn == nil {
+		return "", fmt.Errorf("no bot token provider configured")
+	}
+	token, err := d.tokenFn()
+	if err != nil {
+		return "", err
+	}
+	if token == "" {
+		return "", fmt.Errorf("bot token unavailable (empty); not yet provisioned by octo-server")
+	}
+
+	d.cacheMu.Lock()
+	d.cachedToken = token
+	d.cacheMu.Unlock()
+	return token, nil
 }
 
 func (d *HTTPDeliverer) EnsureFriend(ctx context.Context, spaceID, targetUID string) error {
@@ -87,18 +156,37 @@ func (d *HTTPDeliverer) EnsureFriend(ctx context.Context, spaceID, targetUID str
 		"target_uid": targetUID,
 		"space_id":   spaceID,
 	}
-	return d.post(ctx, "/v1/bot/ensureFriend", body)
+	// octo-server resolves the authoritative space from the X-Space-ID header
+	// for a system bot; attach it (only when known) so ensureFriend builds the
+	// space-scoped whitelist against the same authoritative space as the send.
+	return d.post(ctx, "/v1/bot/ensureFriend", body, spaceHeader(spaceID))
 }
 
-func (d *HTTPDeliverer) SendMessage(ctx context.Context, msg SendMessageRequest) error {
+func (d *HTTPDeliverer) SendMessage(ctx context.Context, spaceID string, msg SendMessageRequest) error {
 	if payloadHasOBOReserved(msg.Payload) {
 		// Defensive: never let an OBO reserved field leak into a bot message.
 		return fmt.Errorf("sendMessage payload contains forbidden OBO reserved field")
 	}
-	return d.post(ctx, "/v1/bot/sendMessage", msg)
+	// octo-server STRIPS client payload.space_id for a system-bot DM and trusts
+	// only the value it resolves from the X-Space-ID header (adopted when the
+	// recipient is an active member of that space). Attach the header — without
+	// it the message is filtered out. Only when spaceID is non-empty.
+	return d.post(ctx, "/v1/bot/sendMessage", msg, spaceHeader(spaceID))
 }
 
-func (d *HTTPDeliverer) post(ctx context.Context, path string, body any) error {
+// spaceHeader returns the X-Space-ID header map for a non-empty (trimmed)
+// spaceID, or nil when empty so post attaches no header (compat with the
+// empty-SpaceID path). octo-server TrimSpace's the value, but we also avoid
+// introducing any surrounding whitespace ourselves.
+func spaceHeader(spaceID string) map[string]string {
+	spaceID = strings.TrimSpace(spaceID)
+	if spaceID == "" {
+		return nil
+	}
+	return map[string]string{"X-Space-ID": spaceID}
+}
+
+func (d *HTTPDeliverer) post(ctx context.Context, path string, body any, headers map[string]string) error {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("marshal %s body: %w", path, err)
@@ -107,8 +195,19 @@ func (d *HTTPDeliverer) post(ctx context.Context, path string, body any) error {
 	if err != nil {
 		return fmt.Errorf("build %s request: %w", path, err)
 	}
+	token, err := d.resolveToken()
+	if err != nil {
+		// Lazy resolve failed (token not yet provisioned by octo-server). Fail
+		// this delivery so the existing best-effort failure handling kicks in;
+		// do NOT panic and do NOT permanently disable the notifier — a later
+		// post will retry resolution and recover once the server writes it.
+		return fmt.Errorf("%s: resolve bot token: %w", path, err)
+	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+d.token)
+	req.Header.Set("Authorization", "Bearer "+token)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := d.client.Do(req)
 	if err != nil {
