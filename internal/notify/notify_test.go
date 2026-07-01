@@ -1,8 +1,11 @@
+//go:build cgo
+
 package notify
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1350,5 +1353,166 @@ func TestBuildText_NilSanitizerFallsBackToSafeString(t *testing.T) {
 	}
 	if !strings.Contains(text, "AI 处理失败，请稍后重试") {
 		t.Fatalf("nil sanitizer fallback must render the safe default; text=%q", text)
+	}
+}
+
+// --- Blocker 3 regression: token-not-yet-provisioned MUST NOT consume retry budget ---
+//
+// See upstream PR#126 review (yujiawei / OctoBoooot / Jerry-Xin一致意见):
+// resolveToken 在 octo-server 尚未把 bot token 写库前返回错误，若被 markFailed
+// 当普通失败记账，MaxAttempts 内预算耗尽 → 通知永久丢失。修复：错误改为
+// ErrTokenNotYetProvisioned sentinel，deliver/redeliver 用 errors.Is 分流到
+// markDeferred（保 pending、不递增 attempt_count、回拨 updated_at 让下轮 Sweep
+// 立即接过），下面这组测试锁死该行为。
+
+// deferredDeliverer: EnsureFriend 前 failCount 次返回 sentinel-wrapped 错误，
+// 之后返回 nil；SendMessage 记录调用次数并成功。用于模拟 token 未 provisioned
+// 的启动窗口以及之后 octo-server 回填后的恢复过程。
+type deferredDeliverer struct {
+	mu           sync.Mutex
+	failCount    int // 还需失败几次
+	ensureCalls  int
+	sendCalls    int
+}
+
+func (d *deferredDeliverer) EnsureFriend(ctx context.Context, spaceID, uid string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.ensureCalls++
+	if d.failCount > 0 {
+		d.failCount--
+		// 模仿真实 client.go post() 的双层 wrap：外层 "path: resolve bot token: <sentinel>"
+		return fmt.Errorf("/v1/bot/ensureFriend: resolve bot token: %w", ErrTokenNotYetProvisioned)
+	}
+	return nil
+}
+
+func (d *deferredDeliverer) SendMessage(ctx context.Context, spaceID string, msg SendMessageRequest) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.sendCalls++
+	return nil
+}
+
+// TestOnTaskTerminal_TokenNotYetProvisioned_DoesNotConsumeBudget 覆盖主回归链路：
+// 前 5 次 EnsureFriend 返回 sentinel，第 6 次成功。断言全程 attempt_count 未增、
+// status 恒为 pending，直到 token 就绪才真正 SendMessage 一次并 status=sent。
+func TestOnTaskTerminal_TokenNotYetProvisioned_DoesNotConsumeBudget(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	if err := db.AutoMigrate(&model.SummaryTask{}); err != nil {
+		t.Fatalf("automigrate task: %v", err)
+	}
+	// 5 次同步/sweep 都要落到 sentinel 上，第 6 次 Sweep 才真正投递成功。
+	d := &deferredDeliverer{failCount: 5}
+	n := newTestNotifier(db, d, Config{Enabled: true, MaxAttempts: 3})
+
+	task := baseTask(701, model.TriggerManual)
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("save task: %v", err)
+	}
+
+	// 同步路径：一次 OnTaskTerminal 应命中 sentinel → markDeferred（pending, attempt=0）
+	n.OnTaskTerminal(task, model.StatusCompleted, "")
+
+	var row model.SummaryNotification
+	if err := db.Where("task_id = ?", 701).First(&row).Error; err != nil {
+		t.Fatalf("row not found: %v", err)
+	}
+	if row.Status != model.NotifyStatusPending {
+		t.Fatalf("after sentinel-fail OnTaskTerminal, expected status=pending got %s", row.Status)
+	}
+	if row.AttemptCount != 0 {
+		t.Fatalf("sentinel must not increment attempt_count, got %d", row.AttemptCount)
+	}
+	// updated_at 应已被回拨到 PendingLease 之外，下一轮 Sweep 能立即接管
+	if !row.UpdatedAt.Before(n.now().Add(-PendingLease)) {
+		t.Fatalf("markDeferred must backdate updated_at past PendingLease; got %v (now=%v, lease=%v)",
+			row.UpdatedAt, n.now(), PendingLease)
+	}
+	if row.LastError == nil || *row.LastError == "" {
+		t.Fatalf("markDeferred should set last_error for operator visibility")
+	}
+
+	// 连续 4 次 Sweep（仍在 5 次失败窗口内），应始终 pending、attempt=0、
+	// SendMessage 一次都没被调（EnsureFriend 阶段就短路了）。
+	for i := 0; i < 4; i++ {
+		n.Sweep(context.Background())
+		db.Where("task_id = ?", 701).First(&row)
+		if row.Status != model.NotifyStatusPending {
+			t.Fatalf("sweep #%d: expected pending, got %s", i+1, row.Status)
+		}
+		if row.AttemptCount != 0 {
+			t.Fatalf("sweep #%d must not burn budget, got attempt=%d", i+1, row.AttemptCount)
+		}
+	}
+	if d.sendCalls != 0 {
+		t.Fatalf("SendMessage must not have been reached while token was unavailable, got %d calls", d.sendCalls)
+	}
+
+	// 第 5 次 Sweep：deferredDeliverer 的失败次数刚好用完（同步路径消耗 1 + 4 次 sweep = 5 次），
+	// EnsureFriend 首次成功 → SendMessage 一次 → markSent。
+	n.Sweep(context.Background())
+	db.Where("task_id = ?", 701).First(&row)
+	if row.Status != model.NotifyStatusSent {
+		t.Fatalf("after token becomes available, expected status=sent, got %s (attempt=%d)",
+			row.Status, row.AttemptCount)
+	}
+	if d.sendCalls != 1 {
+		t.Fatalf("SendMessage must have been called exactly once (only when token was ready), got %d", d.sendCalls)
+	}
+}
+
+// TestOnTaskTerminal_TokenNotYetProvisioned_KeepsPendingIndefinitely 是长时间无
+// token 场景：无论多少次 Sweep，只要 sentinel 一直出现，就永远不消耗预算、
+// 永远不落 failed。防止将来有人给 markDeferred 加莫名其妙的上限。
+func TestOnTaskTerminal_TokenNotYetProvisioned_KeepsPendingIndefinitely(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	if err := db.AutoMigrate(&model.SummaryTask{}); err != nil {
+		t.Fatalf("automigrate task: %v", err)
+	}
+	d := &deferredDeliverer{failCount: 1000} // 事实上无限
+	n := newTestNotifier(db, d, Config{Enabled: true, MaxAttempts: 3})
+
+	task := baseTask(702, model.TriggerManual)
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("save task: %v", err)
+	}
+	n.OnTaskTerminal(task, model.StatusCompleted, "")
+	for i := 0; i < 20; i++ {
+		n.Sweep(context.Background())
+	}
+
+	var row model.SummaryNotification
+	db.Where("task_id = ?", 702).First(&row)
+	if row.Status != model.NotifyStatusPending {
+		t.Fatalf("expected pending throughout, got %s", row.Status)
+	}
+	if row.AttemptCount != 0 {
+		t.Fatalf("attempt_count must remain 0 no matter how many sweeps, got %d", row.AttemptCount)
+	}
+	if d.sendCalls != 0 {
+		t.Fatalf("SendMessage must never fire while token remains unavailable, got %d", d.sendCalls)
+	}
+}
+
+// TestOnTaskTerminal_NonSentinelErrorStillConsumesBudget 是反向回归：
+// 普通 delivery 失败（HTTP 5xx / ensureFriend 语义失败 / 其他 tokenFn 错误）
+// 必须继续走 markFailed 计数，绝对不能被 sentinel 分流误伤。
+func TestOnTaskTerminal_NonSentinelErrorStillConsumesBudget(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	d := &fakeDeliverer{failSend: errors.New("HTTP 500 boom")}
+	n := newTestNotifier(db, d, Config{Enabled: true, MaxAttempts: 3})
+
+	n.OnTaskTerminal(baseTask(703, model.TriggerManual), model.StatusCompleted, "")
+
+	var row model.SummaryNotification
+	if err := db.Where("task_id = ?", 703).First(&row).Error; err != nil {
+		t.Fatalf("row not found: %v", err)
+	}
+	if row.Status != model.NotifyStatusFailed {
+		t.Fatalf("non-sentinel error must land at status=failed, got %s", row.Status)
+	}
+	if row.AttemptCount != 1 {
+		t.Fatalf("non-sentinel error must increment attempt_count, got %d", row.AttemptCount)
 	}
 }

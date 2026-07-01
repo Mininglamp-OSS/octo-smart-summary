@@ -149,12 +149,18 @@ func (n *Notifier) OnTaskTerminal(task model.SummaryTask, status int, errMsg str
 
 	// 2) Build + deliver.
 	text := n.buildText(task, kind, errMsg)
-	deliverErr := n.deliver(target, text)
+	deliverErr := n.deliver(task.ID, target, text)
 
 	// 3) Persist outcome.
 	if deliverErr == nil {
 		n.markSent(task.ID, kind)
 		log.Printf("[notify] task=%d kind=%s delivered to channel_type=%d", task.ID, kind, target.ChannelType)
+		return
+	}
+	// Startup-race: token 尚未 provisioned。Keep pending 且不消耗 attempt 预算，让下轮 Sweep 立即重试。
+	if errors.Is(deliverErr, ErrTokenNotYetProvisioned) {
+		n.markDeferred(task.ID, kind, deliverErr)
+		log.Printf("[notify] task=%d kind=%s deferred (token not yet provisioned)", task.ID, kind)
 		return
 	}
 	n.markFailed(task.ID, kind, deliverErr)
@@ -221,7 +227,7 @@ func (n *Notifier) claimRetry(taskID int64, kind string) (bool, error) {
 	return res.RowsAffected == 1, nil
 }
 
-func (n *Notifier) deliver(target deliveryTarget, text string) error {
+func (n *Notifier) deliver(taskID int64, target deliveryTarget, text string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -232,7 +238,7 @@ func (n *Notifier) deliver(target deliveryTarget, text string) error {
 	// here and fail the delivery explicitly instead. (nil imDB / query error =>
 	// allowed; server still enforces.)
 	if target.TargetUID != "" && target.SpaceID != "" &&
-		!n.recipientIsActiveMember(0, target.SpaceID, target.TargetUID) {
+		!n.recipientIsActiveMember(uint(taskID), target.SpaceID, target.TargetUID) {
 		return fmt.Errorf("recipient %s is not an active member of space %s; "+
 			"server would strip space_id and drop the notification", target.TargetUID, target.SpaceID)
 	}
@@ -335,6 +341,36 @@ func (n *Notifier) markFailed(taskID int64, kind string, cause error) {
 			"last_error":    le,
 		}).Error; err != nil {
 		log.Printf("[notify] task=%d kind=%s: markFailed failed: %v", taskID, kind, err)
+	}
+}
+
+// markDeferred handles the narrow "infra not yet ready" case (bot token not
+// provisioned by octo-server). Row stays 'pending', attempt_count is NOT
+// incremented, and updated_at is BACKDATED past PendingLease so the very next
+// sweepStalePending tick reclaims it — no budget burned, no ~5min lease wait.
+// last_error records the reason for operator visibility.
+//
+// Concurrency: same single-row UPDATE contract as markFailed/markSent, so a
+// racing sweepStalePending can still CAS-refresh updated_at without corruption.
+//
+// Note: because Sweep runs sweepRetryFailed BEFORE sweepStalePending in the
+// same tick, if a retry hits the sentinel and defers here, the very same tick
+// will pick the row up again via the stale-pending branch. That extra retry
+// inside one tick is intentional — the whole point is not to wait — and
+// correctness is preserved by the existing atomic CAS in claimStalePending.
+func (n *Notifier) markDeferred(taskID int64, kind string, cause error) {
+	le := truncateForLastError(sanitize(cause.Error()))
+	// Backdate past PendingLease so next Sweep tick's sweepStalePending picks
+	// it up immediately instead of waiting the full ~5min lease.
+	stale := n.now().Add(-PendingLease - time.Second)
+	if err := n.db.Model(&model.SummaryNotification{}).
+		Where("task_id = ? AND notify_kind = ?", taskID, kind).
+		Updates(map[string]any{
+			"status":     model.NotifyStatusPending,
+			"updated_at": stale,
+			"last_error": le,
+		}).Error; err != nil {
+		log.Printf("[notify] task=%d kind=%s: markDeferred failed: %v", taskID, kind, err)
 	}
 }
 
@@ -687,7 +723,14 @@ func (n *Notifier) redeliver(taskID int64, kind string) {
 		errMsg = *task.ErrorMessage
 	}
 	text := n.buildText(task, kind, errMsg)
-	if deliverErr := n.deliver(target, text); deliverErr != nil {
+	if deliverErr := n.deliver(taskID, target, text); deliverErr != nil {
+		// Startup-race in the sweep path: same treatment as OnTaskTerminal —
+		// keep pending, don't burn budget, let the next tick pick it up.
+		if errors.Is(deliverErr, ErrTokenNotYetProvisioned) {
+			n.markDeferred(taskID, kind, deliverErr)
+			log.Printf("[notify] sweep: task=%d kind=%s deferred (token not yet provisioned)", taskID, kind)
+			return
+		}
 		n.markFailed(taskID, kind, deliverErr)
 		log.Printf("[notify] sweep: task=%d kind=%s delivery failed: %v", taskID, kind, sanitize(deliverErr.Error()))
 		return

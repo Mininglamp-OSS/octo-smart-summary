@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,14 @@ import (
 	"sync"
 	"time"
 )
+
+// ErrTokenNotYetProvisioned marks the narrow startup-race case where the bot
+// token row is not yet written by octo-server. Callers use errors.Is on the
+// wrapped chain to divert delivery into a no-budget-consumed retry path
+// (see Notifier.markDeferred) instead of counting it as a normal HTTP failure.
+// Any other tokenFn error (real DB failure, etc.) is deliberately NOT this
+// sentinel and follows the standard failure/attempt_count accounting.
+var ErrTokenNotYetProvisioned = errors.New("bot token not yet provisioned")
 
 // Channel type values on the IM-bot wire protocol (sendMessage.channel_type).
 // These are the octo-server bot API values, NOT model.OriginChannel* — see
@@ -142,7 +151,9 @@ func (d *HTTPDeliverer) resolveToken() (string, error) {
 		return "", err
 	}
 	if token == "" {
-		return "", fmt.Errorf("bot token unavailable (empty); not yet provisioned by octo-server")
+		// Sentinel-wrapped so upstream can errors.Is this specific startup-race
+		// case and retry without consuming attempt budget (markDeferred).
+		return "", fmt.Errorf("bot token unavailable (empty); not yet provisioned by octo-server: %w", ErrTokenNotYetProvisioned)
 	}
 
 	d.cacheMu.Lock()
