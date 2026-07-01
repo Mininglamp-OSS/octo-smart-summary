@@ -39,7 +39,6 @@ import (
 // decoupled and trivially testable.
 type Config struct {
 	Enabled     bool
-	WebBaseURL  string
 	MaxAttempts int
 	QuietStart  string // "HH:MM" or ""
 	QuietEnd    string // "HH:MM" or ""
@@ -358,8 +357,25 @@ func (n *Notifier) buildText(task model.SummaryTask, kind, errMsg string) string
 		default:
 			b.WriteString("你的总结已生成完成。")
 		}
-		if link := n.resultLink(task); link != "" {
-			fmt.Fprintf(&b, "\n查看结果：%s", link)
+		// 追加有用的元信息（全部 best-effort，查不到/为零的行直接跳过，绝不阻断通知）：
+		// - 时间范围：本次总结覆盖的聊天区间；
+		// - 参与成员：多人任务的成员数（单人任务无意义，省略）；
+		// - 消息数量：本次总结处理的消息条数；
+		// - 生成时间：结果产出的本地时间。
+		// 之前这里追加的是「查看结果：<link>」外链，但该链接与前端真实入口
+		// （WKApp 内部路由 /summary/detail?taskId=）三重错位、根本打不开，已移除。
+		if tr := formatTimeRange(task); tr != "" {
+			fmt.Fprintf(&b, "\n时间范围：%s", tr)
+		}
+		meta := n.resultMeta(task)
+		if cnt := n.participantCount(task); cnt > 0 {
+			fmt.Fprintf(&b, "\n参与成员：%d 人", cnt)
+		}
+		if meta.msgCount > 0 {
+			fmt.Fprintf(&b, "\n消息数量：%d 条", meta.msgCount)
+		}
+		if !meta.generatedAt.IsZero() {
+			fmt.Fprintf(&b, "\n生成时间：%s", timezone.In(meta.generatedAt).Format("2006-01-02 15:04"))
 		}
 		return b.String()
 	case model.NotifyKindFailed:
@@ -416,12 +432,64 @@ func (n *Notifier) resolveSpaceName(task model.SummaryTask) string {
 }
 
 // resultLink builds the result URL from the configured base. Empty base → no link.
-func (n *Notifier) resultLink(task model.SummaryTask) string {
-	base := strings.TrimRight(strings.TrimSpace(n.cfg.WebBaseURL), "/")
-	if base == "" || task.TaskNo == "" {
+// notifyResultMeta carries the best-effort metadata pulled from summary_result
+// for a completed task's notification text. Zero values mean "unknown / omit".
+type notifyResultMeta struct {
+	generatedAt time.Time
+	msgCount    int
+}
+
+// resultMeta best-effort loads the completed task's summary_result row for the
+// generation time + processed message count shown in the success notification.
+// It degrades gracefully: nil db, query error, or no row all yield the zero
+// value so buildText simply omits those lines. Never panics, never blocks.
+func (n *Notifier) resultMeta(task model.SummaryTask) notifyResultMeta {
+	if n == nil || n.db == nil {
+		return notifyResultMeta{}
+	}
+	var row struct {
+		GeneratedAt   time.Time
+		TotalMsgCount int
+	}
+	// Latest version wins if a result was regenerated. Read-only single row.
+	if err := n.db.Raw(
+		"SELECT generated_at, total_msg_count FROM summary_result WHERE task_id = ? ORDER BY version DESC, id DESC LIMIT 1",
+		task.ID,
+	).Scan(&row).Error; err != nil {
+		log.Printf("[notify] task=%d: resultMeta query failed: %v", task.ID, err)
+		return notifyResultMeta{}
+	}
+	return notifyResultMeta{generatedAt: row.GeneratedAt, msgCount: row.TotalMsgCount}
+}
+
+// participantCount best-effort counts the participants of a by-person task for
+// the "参与成员：N 人" line. Returns 0 (line omitted) for single-person tasks,
+// nil db, or a query error. Read-only; never panics, never blocks.
+func (n *Notifier) participantCount(task model.SummaryTask) int {
+	if n == nil || n.db == nil {
+		return 0
+	}
+	var cnt int64
+	if err := n.db.Raw(
+		"SELECT COUNT(*) FROM summary_participant WHERE task_id = ?",
+		task.ID,
+	).Scan(&cnt).Error; err != nil {
+		log.Printf("[notify] task=%d: participantCount query failed: %v", task.ID, err)
+		return 0
+	}
+	return int(cnt)
+}
+
+// formatTimeRange renders the chat window a summary covers as
+// "YYYY-MM-DD HH:MM ~ YYYY-MM-DD HH:MM" in the local timezone. Returns "" when
+// either bound is zero so buildText omits the line.
+func formatTimeRange(task model.SummaryTask) string {
+	if task.TimeRangeStart.IsZero() || task.TimeRangeEnd.IsZero() {
 		return ""
 	}
-	return base + "/summary/" + task.TaskNo
+	start := timezone.In(task.TimeRangeStart).Format("2006-01-02 15:04")
+	end := timezone.In(task.TimeRangeEnd).Format("2006-01-02 15:04")
+	return start + " ~ " + end
 }
 
 // inQuietWindow reports whether t (Asia/Shanghai) falls inside the configured

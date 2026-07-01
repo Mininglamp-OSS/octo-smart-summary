@@ -148,7 +148,6 @@ func main() {
 			// imDB 为 nil / 查不到时 buildText 优雅降级回不带空间名的旧文案。
 			notifier = notify.New(summaryDB, imDB, deliverer, notify.Config{
 				Enabled:     true,
-				WebBaseURL:  cfg.SummaryWebBaseURL,
 				MaxAttempts: cfg.MaxNotifyAttempts,
 				QuietStart:  cfg.NotifyQuietStart,
 				QuietEnd:    cfg.NotifyQuietEnd,

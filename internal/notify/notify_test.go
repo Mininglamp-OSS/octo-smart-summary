@@ -94,7 +94,7 @@ func newTestNotifier(db *gorm.DB, d Deliverer, cfg Config) *Notifier {
 func TestOnTaskTerminal_CompletedDelivers(t *testing.T) {
 	db := setupNotifyTestDB(t)
 	d := &fakeDeliverer{}
-	n := newTestNotifier(db, d, Config{Enabled: true, WebBaseURL: "https://app.example.com"})
+	n := newTestNotifier(db, d, Config{Enabled: true})
 
 	n.OnTaskTerminal(baseTask(1, model.TriggerManual), model.StatusCompleted, "")
 
@@ -109,8 +109,13 @@ func TestOnTaskTerminal_CompletedDelivers(t *testing.T) {
 		t.Fatalf("expected DM to user-1, got type=%d id=%s", msg.ChannelType, msg.ChannelID)
 	}
 	text, _ := msg.Payload["content"].(string)
-	if !strings.Contains(text, "今日群聊") || !strings.Contains(text, "https://app.example.com/summary/TST-1") {
-		t.Fatalf("completed text missing title/link: %q", text)
+	if !strings.Contains(text, "今日群聊") {
+		t.Fatalf("completed text missing title: %q", text)
+	}
+	// The unreachable WKApp-internal result link was removed (see notify.go
+	// buildText); success notifications must NOT carry a browser URL anymore.
+	if strings.Contains(text, "http://") || strings.Contains(text, "https://") || strings.Contains(text, "查看结果") {
+		t.Fatalf("completed text must not carry a result link anymore: %q", text)
 	}
 	// octo-server recognizes a plain-text bot message by ContentType type=1 (Text)
 	// carrying "content"; a bare {"text":...} renders empty. Assert the wire shape.
@@ -784,7 +789,7 @@ func TestBuildText_CompletedIncludesSpaceAndTitle(t *testing.T) {
 		t.Fatalf("seed space: %v", err)
 	}
 	d := &fakeDeliverer{}
-	n := New(db, imDB, d, Config{Enabled: true, WebBaseURL: "https://app.example.com"})
+	n := New(db, imDB, d, Config{Enabled: true})
 	n.now = func() time.Time { return time.Date(2026, 6, 26, 10, 0, 0, 0, timezone.Location()) }
 
 	n.OnTaskTerminal(baseTask(301, model.TriggerManual), model.StatusCompleted, "")
@@ -799,12 +804,75 @@ func TestBuildText_CompletedIncludesSpaceAndTitle(t *testing.T) {
 	if !strings.Contains(text, "总结「今日群聊」") {
 		t.Fatalf("completed text missing title: %q", text)
 	}
-	if !strings.Contains(text, "https://app.example.com/summary/TST-1") {
-		t.Fatalf("completed text missing link: %q", text)
+	if strings.Contains(text, "http://") || strings.Contains(text, "https://") || strings.Contains(text, "查看结果") {
+		t.Fatalf("completed text must not carry a result link anymore: %q", text)
 	}
 }
 
-// TestBuildText_FailedIncludesSpaceAndReason 断言失败文本含空间名 + 失败原因。
+// TestBuildText_CompletedIncludesRichMeta 验证成功通知追加的完整元信息：
+// 时间范围 + 参与成员数 + 消息数量 + 生成时间（替代已删除的不可达链接）。
+// 都是 best-effort，此处 seed 齐数据确认都渲染出来。
+func TestBuildText_CompletedIncludesRichMeta(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	// Seed the read-only source tables buildText best-effort queries.
+	if err := db.Exec("CREATE TABLE summary_result (id INTEGER PRIMARY KEY, task_id INTEGER, total_msg_count INTEGER, version INTEGER, generated_at DATETIME)").Error; err != nil {
+		t.Fatalf("create summary_result: %v", err)
+	}
+	if err := db.Exec("CREATE TABLE summary_participant (id INTEGER PRIMARY KEY, task_id INTEGER)").Error; err != nil {
+		t.Fatalf("create summary_participant: %v", err)
+	}
+	gen := time.Date(2026, 6, 26, 9, 30, 0, 0, timezone.Location())
+	db.Exec("INSERT INTO summary_result (task_id, total_msg_count, version, generated_at) VALUES (?,?,?,?)", 601, 128, 1, gen)
+	db.Exec("INSERT INTO summary_participant (task_id) VALUES (?),(?),(?)", 601, 601, 601)
+
+	d := &fakeDeliverer{}
+	n := New(db, nil, d, Config{Enabled: true})
+	n.now = func() time.Time { return time.Date(2026, 6, 26, 10, 0, 0, 0, timezone.Location()) }
+
+	task := baseTask(601, model.TriggerManual)
+	task.TimeRangeStart = time.Date(2026, 6, 25, 0, 0, 0, 0, timezone.Location())
+	task.TimeRangeEnd = time.Date(2026, 6, 25, 23, 59, 0, 0, timezone.Location())
+
+	n.OnTaskTerminal(task, model.StatusCompleted, "")
+
+	if len(d.sendCalls) != 1 {
+		t.Fatalf("expected 1 send, got %d", len(d.sendCalls))
+	}
+	text, _ := d.sendCalls[0].Payload["content"].(string)
+	for _, want := range []string{
+		"已生成完成",
+		"时间范围：2026-06-25 00:00 ~ 2026-06-25 23:59",
+		"参与成员：3 人",
+		"消息数量：128 条",
+		"生成时间：2026-06-26 09:30",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("completed text missing %q; full text:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "http://") || strings.Contains(text, "https://") {
+		t.Fatalf("completed text must not carry a link: %q", text)
+	}
+}
+
+// TestParticipantCount_SinglePersonOmitted 单人任务（无 participant 行）不渲染
+// 「参与成员」行；meta 表不存在时也优雅降级不崩。
+func TestParticipantCount_SinglePersonOmitted(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	d := &fakeDeliverer{}
+	n := New(db, nil, d, Config{Enabled: true})
+	n.now = func() time.Time { return time.Date(2026, 6, 26, 10, 0, 0, 0, timezone.Location()) }
+
+	n.OnTaskTerminal(baseTask(602, model.TriggerManual), model.StatusCompleted, "")
+
+	if len(d.sendCalls) != 1 {
+		t.Fatalf("expected 1 send (best-effort must not block), got %d", len(d.sendCalls))
+	}
+	text, _ := d.sendCalls[0].Payload["content"].(string)
+	if strings.Contains(text, "参与成员") {
+		t.Fatalf("single-person task must omit member line; got %q", text)
+	}
+}
 func TestBuildText_FailedIncludesSpaceAndReason(t *testing.T) {
 	db := setupNotifyTestDB(t)
 	imDB := setupIMTestDB(t)
@@ -836,7 +904,7 @@ func TestBuildText_FailedIncludesSpaceAndReason(t *testing.T) {
 func TestBuildText_DegradesWhenIMDBNil(t *testing.T) {
 	db := setupNotifyTestDB(t)
 	d := &fakeDeliverer{}
-	n := New(db, nil, d, Config{Enabled: true, WebBaseURL: "https://app.example.com"})
+	n := New(db, nil, d, Config{Enabled: true})
 	n.now = func() time.Time { return time.Date(2026, 6, 26, 10, 0, 0, 0, timezone.Location()) }
 
 	n.OnTaskTerminal(baseTask(303, model.TriggerManual), model.StatusCompleted, "")
@@ -845,7 +913,7 @@ func TestBuildText_DegradesWhenIMDBNil(t *testing.T) {
 	if strings.Contains(text, "空间「") {
 		t.Fatalf("nil imDB must degrade to space-less wording, got %q", text)
 	}
-	if text != "你的总结「今日群聊」已生成完成。\n查看结果：https://app.example.com/summary/TST-1" {
+	if text != "你的总结「今日群聊」已生成完成。" {
 		t.Fatalf("degraded text mismatch: %q", text)
 	}
 }
@@ -903,7 +971,7 @@ func TestResolveSpaceName_NilReceiverAndNilDB(t *testing.T) {
 func TestDeliver_PayloadCarriesSpaceID_WhenKnown(t *testing.T) {
 	db := setupNotifyTestDB(t)
 	d := &fakeDeliverer{}
-	n := newTestNotifier(db, d, Config{Enabled: true, WebBaseURL: "https://app.example.com"})
+	n := newTestNotifier(db, d, Config{Enabled: true})
 
 	// baseTask carries SpaceID="space-9".
 	n.OnTaskTerminal(baseTask(1, model.TriggerManual), model.StatusCompleted, "")
@@ -926,7 +994,7 @@ func TestDeliver_PayloadCarriesSpaceID_WhenKnown(t *testing.T) {
 func TestDeliver_PayloadOmitsSpaceID_WhenEmpty(t *testing.T) {
 	db := setupNotifyTestDB(t)
 	d := &fakeDeliverer{}
-	n := newTestNotifier(db, d, Config{Enabled: true, WebBaseURL: "https://app.example.com"})
+	n := newTestNotifier(db, d, Config{Enabled: true})
 
 	task := baseTask(1, model.TriggerManual)
 	task.SpaceID = ""

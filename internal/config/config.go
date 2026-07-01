@@ -119,10 +119,6 @@ type Config struct {
 	// against octo-server. SECRET: read from env only, never printed/logged and
 	// never written to summary_notification.last_error.
 	SummaryBotToken string
-	// SummaryWebBaseURL is the base URL used to build the result link in a
-	// success notification (e.g. https://host/summary/<task_no>). When empty the
-	// success notification omits the link.
-	SummaryWebBaseURL string
 	// MaxNotifyAttempts caps same-row retries for a single (task_id, notify_kind)
 	// notification before it is left in status='failed'. Default 3.
 	MaxNotifyAttempts int
@@ -200,7 +196,6 @@ func Load() *Config {
 
 		NotifyEnabled:     envBool("SUMMARY_NOTIFY_ENABLED", false),
 		SummaryBotToken:   envStr("SUMMARY_BOT_TOKEN", ""),
-		SummaryWebBaseURL: envStr("SUMMARY_WEB_BASE_URL", ""),
 		MaxNotifyAttempts: envInt("MAX_NOTIFY_ATTEMPTS", 3),
 		NotifyQuietStart:  envStr("SUMMARY_NOTIFY_QUIET_START", ""),
 		NotifyQuietEnd:    envStr("SUMMARY_NOTIFY_QUIET_END", ""),
