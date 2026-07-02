@@ -14,11 +14,15 @@ func TestLoad_WorkflowConfigs(t *testing.T) {
 		t.Setenv("SKIP_MAP_REDUCE_THRESHOLD", "")
 		t.Setenv("TOKENIZER_HTTP_TIMEOUT", "")
 		t.Setenv("MESSAGE_FETCH_BACKEND", "")
+		t.Setenv("OCTO_SEARCH_POLL_INTERVAL_SECONDS", "")
 
 		cfg := Load()
 
 		if cfg.MessageFetchBackend != "batch" {
 			t.Errorf("MessageFetchBackend = %q, want batch", cfg.MessageFetchBackend)
+		}
+		if cfg.OctoSearchPollSec != 1 {
+			t.Errorf("OctoSearchPollSec = %d, want 1", cfg.OctoSearchPollSec)
 		}
 		if cfg.EnableIntentShortcut != true {
 			t.Errorf("EnableIntentShortcut = %v, want true", cfg.EnableIntentShortcut)
@@ -45,11 +49,15 @@ func TestLoad_WorkflowConfigs(t *testing.T) {
 		t.Setenv("SKIP_MAP_REDUCE_THRESHOLD", "150000")
 		t.Setenv("TOKENIZER_HTTP_TIMEOUT", "20")
 		t.Setenv("MESSAGE_FETCH_BACKEND", "mysql")
+		t.Setenv("OCTO_SEARCH_POLL_INTERVAL_SECONDS", "2")
 
 		cfg := Load()
 
 		if cfg.MessageFetchBackend != "mysql" {
 			t.Errorf("MessageFetchBackend = %q, want mysql", cfg.MessageFetchBackend)
+		}
+		if cfg.OctoSearchPollSec != 2 {
+			t.Errorf("OctoSearchPollSec = %d, want 2", cfg.OctoSearchPollSec)
 		}
 		if cfg.EnableIntentShortcut != false {
 			t.Errorf("EnableIntentShortcut = %v, want false", cfg.EnableIntentShortcut)

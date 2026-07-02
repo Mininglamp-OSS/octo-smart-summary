@@ -173,7 +173,7 @@ func TestFetchViaBatch_HappyPathMappingAndBackfill(t *testing.T) {
 		},
 	}
 	candidates := []ChannelInfo{{ChannelID: "g1", ChannelType: 2, ChannelName: "群一"}}
-	msgs, err := fetchViaBatch(context.Background(), fc, candidates, "self", 0, 100000, 4)
+	msgs, err := fetchViaBatch(context.Background(), fc, candidates, "self", 0, 100000, 4, time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -209,7 +209,7 @@ func TestRunOneBatch_RejectsUnexpectedRowChannel(t *testing.T) {
 	}
 	_, err := runOneBatch(context.Background(), fc, []string{"g1"}, 0, 100, map[string]ChannelInfo{
 		"g1": {ChannelID: "g1", ChannelType: 2},
-	})
+	}, time.Second)
 	if err == nil {
 		t.Fatal("unexpected row channel must fail the batch")
 	}
@@ -231,7 +231,7 @@ func TestRunOneBatch_RejectsUnexpectedPartChannel(t *testing.T) {
 	}
 	_, err := runOneBatch(context.Background(), fc, []string{"g1"}, 0, 100, map[string]ChannelInfo{
 		"g1": {ChannelID: "g1", ChannelType: 2},
-	})
+	}, time.Second)
 	if err == nil {
 		t.Fatal("unexpected part channel must fail the batch")
 	}
@@ -250,7 +250,7 @@ func TestRunOneBatch_RejectsPositiveCountWithoutParts(t *testing.T) {
 	}
 	_, err := runOneBatch(context.Background(), fc, []string{"g1"}, 0, 100, map[string]ChannelInfo{
 		"g1": {ChannelID: "g1", ChannelType: 2},
-	})
+	}, time.Second)
 	if err == nil {
 		t.Fatal("positive actual_count without parts must fail the batch")
 	}
@@ -263,7 +263,7 @@ func TestFetchViaBatch_FatalErrorAborts(t *testing.T) {
 		parseFn:  func([]service.Part) ([]service.BatchMessageRow, error) { return nil, nil },
 	}
 	candidates := []ChannelInfo{{ChannelID: "g1", ChannelType: 2}}
-	_, err := fetchViaBatch(context.Background(), fc, candidates, "self", 0, 100000, 4)
+	_, err := fetchViaBatch(context.Background(), fc, candidates, "self", 0, 100000, 4, time.Second)
 	if !errors.Is(err, service.ErrUnauthorized) {
 		t.Fatalf("401 must abort whole fetch, got err=%v", err)
 	}
@@ -288,7 +288,7 @@ func TestFetchViaBatch_IsolatableSkipsBadBatchKeepsRest(t *testing.T) {
 	for i := range candidates {
 		candidates[i] = ChannelInfo{ChannelID: fmt.Sprintf("g%02d", i), ChannelType: 2}
 	}
-	msgs, err := fetchViaBatch(context.Background(), fc, candidates, "self", 0, 100000, 4)
+	msgs, err := fetchViaBatch(context.Background(), fc, candidates, "self", 0, 100000, 4, time.Second)
 	if err != nil {
 		t.Fatalf("isolatable failure must NOT abort, got err=%v", err)
 	}
@@ -316,7 +316,7 @@ func TestFetchViaBatch_413SplitsByChannel(t *testing.T) {
 		{ChannelID: "c1", ChannelType: 2},
 		{ChannelID: "c2", ChannelType: 2},
 	}
-	msgs, err := fetchViaBatch(context.Background(), fc, candidates, "self", 0, 100000, 4)
+	msgs, err := fetchViaBatch(context.Background(), fc, candidates, "self", 0, 100000, 4, time.Second)
 	if err != nil {
 		t.Fatalf("413 should split, not fail: %v", err)
 	}
@@ -334,7 +334,7 @@ func TestFetchViaBatch_EmptyCandidates(t *testing.T) {
 		pollFn:  func(string) (*service.BatchStatus, error) { return nil, nil },
 		parseFn: func([]service.Part) ([]service.BatchMessageRow, error) { return nil, nil },
 	}
-	msgs, err := fetchViaBatch(context.Background(), fc, nil, "self", 0, 100000, 4)
+	msgs, err := fetchViaBatch(context.Background(), fc, nil, "self", 0, 100000, 4, time.Second)
 	if err != nil || msgs != nil {
 		t.Fatalf("empty candidates → (nil,nil), got msgs=%v err=%v", msgs, err)
 	}
@@ -349,7 +349,7 @@ func TestFetchViaBatch_PollErrorTriggersDelete(t *testing.T) {
 	}
 	candidates := []ChannelInfo{{ChannelID: "g1", ChannelType: 2}}
 	// Plain errors are isolatable, but the submitted task must still be deleted.
-	_, err := fetchViaBatch(context.Background(), fc, candidates, "self", 0, 100000, 4)
+	_, err := fetchViaBatch(context.Background(), fc, candidates, "self", 0, 100000, 4, time.Second)
 	if err != nil {
 		t.Fatalf("plain poll error should be isolatable (nil err), got %v", err)
 	}
@@ -380,7 +380,7 @@ func TestFetchViaBatch_413SplitKeepsSuccessfulSiblingOnIsolatableFailure(t *test
 		{ChannelID: "c1", ChannelType: 2},
 		{ChannelID: "c2", ChannelType: 2},
 	}
-	msgs, err := fetchViaBatch(context.Background(), fc, candidates, "self", 0, 100000, 4)
+	msgs, err := fetchViaBatch(context.Background(), fc, candidates, "self", 0, 100000, 4, time.Second)
 	if err != nil {
 		t.Fatalf("isolatable sibling failure must NOT fail the whole batch: %v", err)
 	}
@@ -400,7 +400,7 @@ func TestFetchViaBatch_UnknownClientErrorAborts(t *testing.T) {
 		parseFn: func([]service.Part) ([]service.BatchMessageRow, error) { return nil, nil },
 	}
 	candidates := []ChannelInfo{{ChannelID: "g1", ChannelType: 2}}
-	_, err := fetchViaBatch(context.Background(), fc, candidates, "self", 0, 100000, 4)
+	_, err := fetchViaBatch(context.Background(), fc, candidates, "self", 0, 100000, 4, time.Second)
 	if !errors.Is(err, service.ErrFatalClient) {
 		t.Fatalf("unknown 4xx must abort whole fetch, got err=%v", err)
 	}
@@ -420,7 +420,7 @@ func TestFetchViaBatch_ContextDeadlinePropagates(t *testing.T) {
 	candidates := []ChannelInfo{{ChannelID: "g1", ChannelType: 2}}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
-	_, err := fetchViaBatch(ctx, fc, candidates, "self", 0, 100000, 4)
+	_, err := fetchViaBatch(ctx, fc, candidates, "self", 0, 100000, 4, time.Second)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("ctx deadline must propagate (not be swallowed as isolatable), got err=%v", err)
 	}

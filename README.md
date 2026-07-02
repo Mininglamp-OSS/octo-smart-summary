@@ -53,6 +53,7 @@ export LLM_API_KEY=sk-your-key-here
 export MESSAGE_FETCH_BACKEND=batch
 export OCTO_SEARCH_URL=http://octo-search-batch:8080
 export OCTO_SEARCH_TOKEN=your-s2s-token
+export OCTO_SEARCH_POLL_INTERVAL_SECONDS=1
 export SUMMARY_LISTEN_ADDR=:8090
 
 ./cmd serve
