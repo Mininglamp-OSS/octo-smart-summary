@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 )
 
 const MapFailedMarker = "总结失败"
@@ -398,7 +399,7 @@ func buildMapSystemPrompt(userName, topic string) string {
 	sb.WriteString(fmt.Sprintf("- 当前用户：%s\n", userName))
 	sb.WriteString(fmt.Sprintf("- 总结主题：%s\n", topic))
 
-	now := time.Now()
+	now := timezone.Now()
 	weekdays := [...]string{"日", "一", "二", "三", "四", "五", "六"}
 	sb.WriteString(fmt.Sprintf("- 当前日期：%s（星期%s）\n",
 		now.Format("2006-01-02"), weekdays[now.Weekday()]))
@@ -443,7 +444,7 @@ func buildReduceSystemPrompt(topic string) string {
 	sb.WriteString(`你是一个专业的工作内容整理助手。请将以下多个分片总结合并为一份完整的总结报告。
 
 `)
-	now := time.Now()
+	now := timezone.Now()
 	weekdays := [...]string{"日", "一", "二", "三", "四", "五", "六"}
 	sb.WriteString(fmt.Sprintf("当前日期：%s（星期%s）\n\n",
 		now.Format("2006-01-02"), weekdays[now.Weekday()]))
