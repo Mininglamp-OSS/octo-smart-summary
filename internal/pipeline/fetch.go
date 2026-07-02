@@ -416,7 +416,7 @@ func FetchMessagesFromChannel(ctx context.Context, channelID string, channelType
 	return messages, nil
 }
 
-func fetchMessagesByBackend(ctx context.Context, backend string, octoClient octoSearchClient, candidates []ChannelInfo, creatorUID string, startTS, endTS int64, imDB *gorm.DB, tableCount int, maxPerChannel int, fetchConcurrency int) ([]Message, error) {
+func fetchMessagesByBackend(ctx context.Context, backend string, octoClient octoSearchClient, candidates []ChannelInfo, creatorUID string, startTS, endTS int64, imDB *gorm.DB, tableCount int, maxPerChannel int, fetchConcurrency int, octoSearchPollSec int) ([]Message, error) {
 	selected := strings.ToLower(strings.TrimSpace(backend))
 	if selected == "" {
 		selected = "batch"
@@ -426,7 +426,7 @@ func fetchMessagesByBackend(ctx context.Context, backend string, octoClient octo
 		if octoClient == nil {
 			return nil, fmt.Errorf("octo-search client is not configured")
 		}
-		return fetchViaBatch(ctx, octoClient, candidates, creatorUID, startTS, endTS, fetchConcurrency)
+		return fetchViaBatch(ctx, octoClient, candidates, creatorUID, startTS, endTS, fetchConcurrency, time.Duration(octoSearchPollSec)*time.Second)
 	case "mysql":
 		return fetchViaMySQL(ctx, candidates, creatorUID, startTS, endTS, imDB, tableCount, maxPerChannel, fetchConcurrency)
 	default:
@@ -701,7 +701,7 @@ func FilterMessagesByRelevance(messages []Message, topic string, participantUIDs
 // - Target persons (for post-fetch filtering)
 //
 // Returns messages, intent result (for target person filtering), and error.
-func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, participantUIDs []string, participantNames []string, specifiedSources []map[string]interface{}, topic string, timeStart, timeEnd time.Time, imDB *gorm.DB, octoClient octoSearchClient, messageFetchBackend string, toolCallFn LLMToolCallFn, llmFn LLMCallFn, tableCount int, maxPerChannel int, fetchConcurrency int, channelScopeOpts *ChannelScopeOptions) ([]Message, *IntentResult, error) {
+func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, participantUIDs []string, participantNames []string, specifiedSources []map[string]interface{}, topic string, timeStart, timeEnd time.Time, imDB *gorm.DB, octoClient octoSearchClient, messageFetchBackend string, toolCallFn LLMToolCallFn, llmFn LLMCallFn, tableCount int, maxPerChannel int, fetchConcurrency int, octoSearchPollSec int, channelScopeOpts *ChannelScopeOptions) ([]Message, *IntentResult, error) {
 	maxDays := DefaultTimeRangeDays
 	if timeEnd.Sub(timeStart) > time.Duration(maxDays)*24*time.Hour {
 		return nil, nil, fmt.Errorf("时间范围不能超过 %d 天", maxDays)
@@ -798,7 +798,7 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 
 	// Layer 4: fetch message content from the configured backend.
 	fetchStart := time.Now()
-	allMessages, err := fetchMessagesByBackend(ctx, messageFetchBackend, octoClient, candidates, creatorUID, startTS, endTS, imDB, tableCount, maxPerChannel, fetchConcurrency)
+	allMessages, err := fetchMessagesByBackend(ctx, messageFetchBackend, octoClient, candidates, creatorUID, startTS, endTS, imDB, tableCount, maxPerChannel, fetchConcurrency, octoSearchPollSec)
 	if err != nil {
 		return nil, nil, fmt.Errorf("fetch messages via %s: %w", messageFetchBackend, err)
 	}

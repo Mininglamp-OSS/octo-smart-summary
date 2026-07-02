@@ -11,6 +11,7 @@ All configuration is done via environment variables.
 | `MESSAGE_FETCH_BACKEND` | Message content backend: `batch` or `mysql` | No | `batch` |
 | `OCTO_SEARCH_URL` | octo-search-batch base URL for message export (without `/v1`) | Yes when `MESSAGE_FETCH_BACKEND=batch` | — |
 | `OCTO_SEARCH_TOKEN` | S2S bearer token for octo-search-batch | Yes when `MESSAGE_FETCH_BACKEND=batch` | — |
+| `OCTO_SEARCH_POLL_INTERVAL_SECONDS` | Poll interval for octo-search-batch task status | No | `1` |
 | `OCTO_API_URL` | Authentication API base URL | Yes (API) | — |
 | `LLM_API_URL` | LLM gateway base URL (OpenAI-compatible) | Yes (Worker) | — |
 | `LLM_API_KEY` | API key for the LLM gateway | Yes (Worker) | — |

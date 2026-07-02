@@ -503,7 +503,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		ctx, userID, nil, nil, specifiedSources, task.Title,
 		task.TimeRangeStart, task.TimeRangeEnd,
 		p.imDB, p.octoClient, p.cfg.MessageFetchBackend, toolCallFn, llmFn,
-		p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency,
+		p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency, p.cfg.OctoSearchPollSec,
 		channelScopeOpts,
 	)
 	timing.Observe(taskNo, "fetch_messages", fetchStart)

@@ -83,6 +83,7 @@ type Config struct {
 	MessageFetchBackend string
 	OctoSearchURL       string
 	OctoSearchToken     string
+	OctoSearchPollSec   int
 
 	// Channel scope narrowing
 	ChannelScopeEnabled bool
@@ -157,6 +158,7 @@ func Load() *Config {
 		MessageFetchBackend: strings.ToLower(strings.TrimSpace(envStr("MESSAGE_FETCH_BACKEND", "batch"))),
 		OctoSearchURL:       envStr("OCTO_SEARCH_URL", ""),
 		OctoSearchToken:     envStr("OCTO_SEARCH_TOKEN", ""),
+		OctoSearchPollSec:   envInt("OCTO_SEARCH_POLL_INTERVAL_SECONDS", 1),
 
 		ChannelScopeEnabled: envBool("CHANNEL_SCOPE_ENABLED", true),
 

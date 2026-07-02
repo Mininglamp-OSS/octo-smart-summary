@@ -24,7 +24,6 @@ import (
 const octoSearchBatchSize = 30
 
 const (
-	octoSearchPollInterval = 5 * time.Second  // API-recommended polling interval.
 	octoSearchTotalBudget  = 20 * time.Minute // Total client-side budget; upstream ctx has no deadline.
 	octoSearchDefaultConc  = 10               // Default concurrency, matching existing fetchConcurrency.
 	octoSearchMinWindowSec = int64(6 * 3600)  // Minimum single-channel split window before skipping.
@@ -112,7 +111,7 @@ type octoSearchClient interface {
 // fetchConcurrency preserves the existing configurable concurrency behavior.
 // This function creates the total timeout because the upstream context has no
 // deadline.
-func fetchViaBatch(ctx context.Context, client octoSearchClient, candidates []ChannelInfo, creatorUID string, startTS, endTS int64, fetchConcurrency int) ([]Message, error) {
+func fetchViaBatch(ctx context.Context, client octoSearchClient, candidates []ChannelInfo, creatorUID string, startTS, endTS int64, fetchConcurrency int, pollInterval time.Duration) ([]Message, error) {
 	if len(candidates) == 0 {
 		return nil, nil // Do not submit an empty channel list.
 	}
@@ -124,6 +123,9 @@ func fetchViaBatch(ctx context.Context, client octoSearchClient, candidates []Ch
 
 	if fetchConcurrency <= 0 {
 		fetchConcurrency = octoSearchDefaultConc
+	}
+	if pollInterval <= 0 {
+		pollInterval = time.Second
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, octoSearchTotalBudget)
@@ -154,7 +156,7 @@ func fetchViaBatch(ctx context.Context, client octoSearchClient, candidates []Ch
 			}
 			defer func() { <-sem }()
 
-			msgs, err := runBatchWithSplit(ctx, client, chs, startTS, endTS, infoByID)
+			msgs, err := runBatchWithSplit(ctx, client, chs, startTS, endTS, infoByID, pollInterval)
 			if err != nil {
 				if isFatalBatchErr(err) {
 					// Aborting errors stop the whole fetch.
@@ -213,8 +215,8 @@ func isFatalBatchErr(err error) bool {
 // runBatchWithSplit submits one batch. On 413 it first bisects by channel; when
 // a single channel is still too large, it switches to time-window splitting.
 // Other errors are returned for the caller to classify.
-func runBatchWithSplit(ctx context.Context, client octoSearchClient, chs []string, startTS, endTS int64, infoByID map[string]ChannelInfo) ([]Message, error) {
-	msgs, err := runOneBatch(ctx, client, chs, startTS, endTS, infoByID)
+func runBatchWithSplit(ctx context.Context, client octoSearchClient, chs []string, startTS, endTS int64, infoByID map[string]ChannelInfo, pollInterval time.Duration) ([]Message, error) {
+	msgs, err := runOneBatch(ctx, client, chs, startTS, endTS, infoByID, pollInterval)
 	if err == nil {
 		return msgs, nil
 	}
@@ -227,7 +229,7 @@ func runBatchWithSplit(ctx context.Context, client octoSearchClient, chs []strin
 	if splittable {
 		var out []Message
 		for _, p := range parts {
-			sub, subErr := runBatchWithSplit(ctx, client, p, startTS, endTS, infoByID)
+			sub, subErr := runBatchWithSplit(ctx, client, p, startTS, endTS, infoByID, pollInterval)
 			if subErr != nil {
 				if isFatalBatchErr(subErr) {
 					return nil, subErr
@@ -242,13 +244,13 @@ func runBatchWithSplit(ctx context.Context, client octoSearchClient, chs []strin
 	}
 
 	// A single channel is still too large; shrink the time window.
-	return runWithTimeWindowSplit(ctx, client, chs, startTS, endTS, infoByID)
+	return runWithTimeWindowSplit(ctx, client, chs, startTS, endTS, infoByID, pollInterval)
 }
 
 // runWithTimeWindowSplit bisects the time window for a single channel after
 // 413. If the minimum window is still too large, the channel is skipped instead
 // of retrying forever.
-func runWithTimeWindowSplit(ctx context.Context, client octoSearchClient, chs []string, startTS, endTS int64, infoByID map[string]ChannelInfo) ([]Message, error) {
+func runWithTimeWindowSplit(ctx context.Context, client octoSearchClient, chs []string, startTS, endTS int64, infoByID map[string]ChannelInfo, pollInterval time.Duration) ([]Message, error) {
 	if endTS-startTS <= octoSearchMinWindowSec {
 		log.Printf("[pipeline-personal] octo-search: channel %v still 413 at min window (%ds), skipping", chs, endTS-startTS)
 		return nil, nil
@@ -258,7 +260,7 @@ func runWithTimeWindowSplit(ctx context.Context, client octoSearchClient, chs []
 	// Recurse on both halves; aborting errors stop the fetch, isolatable errors skip only
 	// that half.
 	for _, w := range [2][2]int64{{startTS, mid}, {mid + 1, endTS}} {
-		sub, err := runBatchWithSplit(ctx, client, chs, w[0], w[1], infoByID)
+		sub, err := runBatchWithSplit(ctx, client, chs, w[0], w[1], infoByID, pollInterval)
 		if err != nil {
 			if isFatalBatchErr(err) {
 				return nil, err
@@ -273,7 +275,7 @@ func runWithTimeWindowSplit(ctx context.Context, client octoSearchClient, chs []
 
 // runOneBatch submits one batch, polls to a terminal status, downloads rows,
 // then maps rows back to pipeline messages.
-func runOneBatch(ctx context.Context, client octoSearchClient, chs []string, startTS, endTS int64, infoByID map[string]ChannelInfo) ([]Message, error) {
+func runOneBatch(ctx context.Context, client octoSearchClient, chs []string, startTS, endTS int64, infoByID map[string]ChannelInfo, pollInterval time.Duration) ([]Message, error) {
 	batchStart := time.Now()
 	taskID, err := client.Submit(ctx, chs, startTS, endTS)
 	if err != nil {
@@ -281,7 +283,7 @@ func runOneBatch(ctx context.Context, client octoSearchClient, chs []string, sta
 	}
 	submitElapsed := time.Since(batchStart)
 
-	status, err := pollUntilTerminal(ctx, client, taskID)
+	status, err := pollUntilTerminal(ctx, client, taskID, pollInterval)
 	if err != nil {
 		return nil, err
 	}
@@ -340,10 +342,13 @@ func validateBatchStatusParts(status *service.BatchStatus, chs []string) error {
 	return nil
 }
 
-// pollUntilTerminal polls at a fixed interval until a terminal status. On
+// pollUntilTerminal polls at the configured interval until a terminal status. On
 // cancellation or poll error it attempts best-effort Delete.
-func pollUntilTerminal(ctx context.Context, client octoSearchClient, taskID string) (*service.BatchStatus, error) {
-	ticker := time.NewTicker(octoSearchPollInterval)
+func pollUntilTerminal(ctx context.Context, client octoSearchClient, taskID string, pollInterval time.Duration) (*service.BatchStatus, error) {
+	if pollInterval <= 0 {
+		pollInterval = time.Second
+	}
+	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	for {
 		status, err := client.Poll(ctx, taskID)
