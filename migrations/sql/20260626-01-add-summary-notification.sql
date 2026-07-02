@@ -11,7 +11,8 @@ CREATE TABLE IF NOT EXISTS `summary_notification` (
     `updated_at`    DATETIME     NOT NULL,
     `sent_at`       DATETIME         NULL,
     PRIMARY KEY (`id`),
-    UNIQUE KEY `uk_task_kind_uid` (`task_id`, `notify_kind`, `recipient_uid`)
+    UNIQUE KEY `uk_task_kind_uid` (`task_id`, `notify_kind`, `recipient_uid`),
+    KEY `idx_sweep` (`status`, `updated_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- +migrate Down
