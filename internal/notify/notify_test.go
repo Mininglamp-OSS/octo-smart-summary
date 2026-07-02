@@ -1548,9 +1548,21 @@ func setupByPersonDB(t *testing.T) *gorm.DB {
 func seedParticipants(t *testing.T, db *gorm.DB, taskID int64, uids ...string) {
 	t.Helper()
 	for _, uid := range uids {
-		if err := db.Create(&model.SummaryParticipant{TaskID: taskID, UserID: uid}).Error; err != nil {
+		// Seed as an active (submitted) status so these fan-out/dedup/idempotency
+		// tests express "real participants who should receive the DM"; the default
+		// zero value is ParticipantPending, which resolveTargets now excludes.
+		if err := db.Create(&model.SummaryParticipant{TaskID: taskID, UserID: uid, Status: model.ParticipantSubmitted}).Error; err != nil {
 			t.Fatalf("seed participant %s: %v", uid, err)
 		}
+	}
+}
+
+// seedParticipantStatus seeds one participant row with an explicit status,
+// so tests can exercise resolveTargets' pending/declined exclusion filter.
+func seedParticipantStatus(t *testing.T, db *gorm.DB, taskID int64, uid string, status int) {
+	t.Helper()
+	if err := db.Create(&model.SummaryParticipant{TaskID: taskID, UserID: uid, Status: status}).Error; err != nil {
+		t.Fatalf("seed participant %s (status=%d): %v", uid, status, err)
 	}
 }
 
@@ -1811,5 +1823,48 @@ func TestOnTaskTerminal_ByPerson_ParticipantQueryOK_StillFansOut(t *testing.T) {
 		if got[uid] != 1 {
 			t.Fatalf("uid %s must receive exactly 1 DM, got %d (%v)", uid, got[uid], got)
 		}
+	}
+}
+
+// (g) by-person 状态过滤：resolveTargets 只 fan-out 真正参与的人。
+// pending(0)/declined(2) 成员绝不进扇出（不该收「总结完成」通知），
+// accepted(1)/submitted(5) 成员 + 发起者 CreatorID 必须在 targets 里。
+// 与生成阶段 (personal_processor.go) 排除 pending/declined 的口径对齐。
+// fail-before: 未加 status 过滤时全部 participant 都会被塞进 targets，
+// pending/declined 的断言会红；加过滤后变绿。
+func TestResolveTargets_ByPerson_ExcludesPendingAndDeclined(t *testing.T) {
+	db := setupByPersonDB(t)
+	n := newTestNotifier(db, &fakeDeliverer{}, Config{Enabled: true})
+
+	task := byPersonTask(1010) // creator=user-1, ModeByPerson
+	seedParticipantStatus(t, db, 1010, "p-pending", model.ParticipantPending)     // 0 -> excluded
+	seedParticipantStatus(t, db, 1010, "p-declined", model.ParticipantDeclined)   // 2 -> excluded
+	seedParticipantStatus(t, db, 1010, "p-accepted", model.ParticipantAccepted)   // 1 -> included
+	seedParticipantStatus(t, db, 1010, "p-submitted", model.ParticipantSubmitted) // 5 -> included
+
+	targets, err := n.resolveTargets(task)
+	if err != nil {
+		t.Fatalf("resolveTargets returned err: %v", err)
+	}
+
+	got := make(map[string]int)
+	for _, tgt := range targets {
+		got[tgt.TargetUID]++
+	}
+
+	// declined/pending must NOT be fanned out.
+	for _, uid := range []string{"p-pending", "p-declined"} {
+		if got[uid] != 0 {
+			t.Fatalf("uid %s (pending/declined) must be excluded from targets, got %d (all=%v)", uid, got[uid], got)
+		}
+	}
+	// accepted/submitted + creator must be present exactly once.
+	for _, uid := range []string{"p-accepted", "p-submitted", "user-1"} {
+		if got[uid] != 1 {
+			t.Fatalf("uid %s must appear exactly once in targets, got %d (all=%v)", uid, got[uid], got)
+		}
+	}
+	if len(targets) != 3 {
+		t.Fatalf("expected 3 targets (accepted + submitted + creator), got %d (%v)", len(targets), got)
 	}
 }

@@ -20,8 +20,9 @@ type deliveryTarget struct {
 // It returns a list so a by-person task can fan out one DM per recipient; an
 // empty list means "no deliverable target" (caller skips).
 //
-// by-person (SummaryMode==ModeByPerson): union of every summary_participant's
-// UserID with the task creator, deduped. Each uid becomes an independent creator
+// by-person (SummaryMode==ModeByPerson): union of active participants'
+// (excluding pending/declined, aligned with生成阶段) UserID with the task
+// creator, deduped. Each uid becomes an independent creator
 // DM target so the notify state machine dedups/retries each recipient on its own
 // (task, kind, uid) row.
 //
@@ -59,8 +60,12 @@ func (n *Notifier) resolveTargets(task model.SummaryTask) ([]deliveryTarget, err
 			targets = append(targets, mk(uid))
 		}
 		if n != nil && n.db != nil {
+			// Only fan out to真正参与的人：排除 pending/declined，与生成阶段
+			// (personal_processor.go) 对齐，避免未接受/已拒绝成员误收完成通知。
 			var parts []model.SummaryParticipant
-			if err := n.db.Where("task_id = ?", task.ID).Find(&parts).Error; err != nil {
+			if err := n.db.Where("task_id = ? AND status NOT IN ?",
+				task.ID, []int{model.ParticipantPending, model.ParticipantDeclined}).
+				Find(&parts).Error; err != nil {
 				return nil, err
 			}
 			for _, p := range parts {
