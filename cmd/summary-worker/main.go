@@ -11,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/ws"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/db"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/notify"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timing"
@@ -90,12 +91,40 @@ func main() {
 	// Start worker pool
 	pool := worker.NewWorkerPool(cfg.WorkerMaxConcurrent)
 
+	// Build the terminal-state notifier (方向 B: reliable delivery + full fan-out).
+	// Disabled unless SUMMARY_NOTIFY_ENABLED=true; a nil deliverer / disabled
+	// config makes OnTaskTerminal a no-op, so it is always safe to wire.
+	var notifier *notify.Notifier
+	if cfg.NotifyEnabled {
+		if cfg.OctoAPIURL == "" {
+			log.Printf("[worker] SUMMARY_NOTIFY_ENABLED=true but OCTO_API_URL missing; notifications disabled")
+		} else {
+			// SUMMARY_NOTIFY_TOKEN authenticates /v1/internal/notify. Prod misconfig
+			// must fail fast; dev only warns.
+			if cfg.NotifyInternalToken == "" {
+				if cfg.AppEnv == "prod" {
+					log.Fatalf("[worker] SUMMARY_NOTIFY_ENABLED=true but SUMMARY_NOTIFY_TOKEN missing (APP_ENV=prod)")
+				}
+				log.Printf("[worker] WARNING: SUMMARY_NOTIFY_ENABLED=true but SUMMARY_NOTIFY_TOKEN missing (APP_ENV=%s); /v1/internal/notify will 401", cfg.AppEnv)
+			}
+			deliverer := notify.NewInternalNotifyDeliverer(cfg.OctoAPIURL, cfg.NotifyInternalToken, cfg.SummaryWebBaseURL)
+			// imDB (shared IM DB, read-only) resolves space names in the text and the
+			// active-membership pre-check; nil-safe degradation inside notify.
+			notifier = notify.New(summaryDB, imDB, deliverer, notify.Config{
+				Enabled:     true,
+				MaxAttempts: cfg.MaxNotifyAttempts,
+			}).WithErrorSanitizer(worker.SanitizeErrorForUser)
+			log.Printf("[worker] terminal-state notifications ENABLED (internal-notify transport)")
+		}
+	}
+
 	// Start processor (polling loop)
 	proc := worker.NewProcessor(summaryDB, imDB, pool, llm, cfg)
+	proc.SetNotifier(notifier)
 	go proc.Run()
 
 	// Start scheduler (cron jobs)
-	cronSched := worker.StartScheduler(summaryDB, imDB, cfg.WorkerMaxRetry, cfg.WorkerTriggerURL, cfg.ScheduleMaxWindowDays, cfg.FeatureTeamSchedule)
+	cronSched := worker.StartScheduler(summaryDB, imDB, cfg.WorkerMaxRetry, cfg.WorkerTriggerURL, cfg.ScheduleMaxWindowDays, cfg.FeatureTeamSchedule, notifier)
 
 	// Start internal HTTP server for worker-trigger
 	hub := ws.NewHub(summaryDB)
