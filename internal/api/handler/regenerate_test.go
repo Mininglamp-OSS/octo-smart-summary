@@ -32,6 +32,7 @@ func setupRegenerateDB(t *testing.T) *gorm.DB {
 		&model.PersonalResult{},
 		&model.SummaryResult{},
 		&model.SummaryChunk{},
+		&model.SummaryNotification{},
 	)
 	return db
 }
@@ -101,6 +102,16 @@ func seedCompletedTask(t *testing.T, db *gorm.DB) (taskID int64, participantID i
 		ChunkIndex:   0,
 		ChunkSummary: "old chunk",
 		TokenUsed:    50,
+	})
+
+	// Prior terminal-state notification rows: a 'sent' completed row that would
+	// otherwise survive Regenerate and silently suppress the re-run's delivery.
+	db.Create(&model.SummaryNotification{
+		TaskID:       task.ID,
+		NotifyKind:   model.NotifyKindCompleted,
+		RecipientUID: "creator1",
+		Status:       model.NotifyStatusSent,
+		SentAt:       &now,
 	})
 
 	return task.ID, participant.ID, pr.ID
@@ -193,6 +204,13 @@ func TestRegenerate_ResetsAllAssociatedData(t *testing.T) {
 	db.Model(&model.SummaryChunk{}).Where("task_id = ?", taskID).Count(&chunkCount)
 	if chunkCount != 0 {
 		t.Errorf("summary_chunk count: want 0, got %d", chunkCount)
+	}
+
+	// Verify SummaryNotification cleared (re-arms delivery for the re-run).
+	var notifCount int64
+	db.Model(&model.SummaryNotification{}).Where("task_id = ?", taskID).Count(&notifCount)
+	if notifCount != 0 {
+		t.Errorf("summary_notification count: want 0, got %d", notifCount)
 	}
 }
 

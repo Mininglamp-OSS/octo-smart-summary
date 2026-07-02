@@ -971,6 +971,11 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 		}).Error; err != nil {
 			return err
 		}
+		// Regenerate must re-arm notification delivery: clear all prior rows so
+		// OnTaskTerminal re-claims fresh instead of hitting sent/failed dedup rows.
+		if err := tx.Where("task_id = ?", taskID).Delete(&model.SummaryNotification{}).Error; err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {
