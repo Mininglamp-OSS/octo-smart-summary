@@ -19,14 +19,17 @@ const (
 // SummaryNotification is the dedup / idempotency state machine row for a single
 // terminal-state notification. It lives in the summary DB (never the IM DB).
 //
-// The UNIQUE(task_id, notify_kind) key is the preemptive-insert lock: the first
-// writer INSERTs status='pending' and wins; a duplicate-key error means another
-// run already owns this (task, kind) so the current run skips. A row is NEVER
+// The UNIQUE(task_id, notify_kind, recipient_uid) key is the per-recipient
+// preemptive-insert lock: the first writer INSERTs status='pending' for a given
+// (task, kind, uid) and wins; a duplicate-key error means that recipient is
+// already owned so the current run skips it. by-person tasks fan out to one row
+// per recipient, so each person is deduped/retried independently. A row is NEVER
 // DELETEd — failed deliveries stay as status='failed' with last_error for audit.
 type SummaryNotification struct {
 	ID           int64      `gorm:"primaryKey;autoIncrement" json:"id"`
-	TaskID       int64      `gorm:"column:task_id;not null;uniqueIndex:uk_task_kind,priority:1" json:"task_id"`
-	NotifyKind   string     `gorm:"column:notify_kind;type:varchar(16);not null;uniqueIndex:uk_task_kind,priority:2" json:"notify_kind"`
+	TaskID       int64      `gorm:"column:task_id;not null;uniqueIndex:uk_task_kind_uid,priority:1" json:"task_id"`
+	NotifyKind   string     `gorm:"column:notify_kind;type:varchar(16);not null;uniqueIndex:uk_task_kind_uid,priority:2" json:"notify_kind"`
+	RecipientUID string     `gorm:"column:recipient_uid;type:varchar(64);not null;default:'';uniqueIndex:uk_task_kind_uid,priority:3" json:"recipient_uid"`
 	Status       string     `gorm:"column:status;type:varchar(16);not null;default:'pending'" json:"status"`
 	AttemptCount int        `gorm:"column:attempt_count;not null;default:0" json:"attempt_count"`
 	LastError    *string    `gorm:"column:last_error;type:varchar(500)" json:"last_error"`

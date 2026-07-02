@@ -313,12 +313,13 @@ func TestQuietWindow_OutsideWindowDelivers(t *testing.T) {
 }
 
 func TestResolveTarget_DMFallbackForAllOrigins(t *testing.T) {
+	n := newTestNotifier(setupNotifyTestDB(t), &fakeDeliverer{}, Config{Enabled: true})
 	origins := []int{model.OriginChannelGlobal, model.OriginChannelDM, model.OriginChannelGroup, model.OriginChannelThread}
 	for _, o := range origins {
 		task := baseTask(1, model.TriggerManual)
 		task.OriginChannelType = o
 		task.OriginChannelID = "origin-chan"
-		tgt, ok := resolveTarget(task)
+		tgt, ok := n.creatorTarget(task)
 		if !ok {
 			t.Fatalf("origin %d: expected resolvable target", o)
 		}
@@ -329,10 +330,15 @@ func TestResolveTarget_DMFallbackForAllOrigins(t *testing.T) {
 }
 
 func TestResolveTarget_EmptyCreatorUnresolvable(t *testing.T) {
+	n := newTestNotifier(setupNotifyTestDB(t), &fakeDeliverer{}, Config{Enabled: true})
 	task := baseTask(1, model.TriggerManual)
 	task.CreatorID = ""
-	if _, ok := resolveTarget(task); ok {
+	if _, ok := n.creatorTarget(task); ok {
 		t.Fatalf("empty creator must be unresolvable")
+	}
+	// resolveTargets for a non-by-person task with empty creator yields no target.
+	if tgts, err := n.resolveTargets(task); err != nil || len(tgts) != 0 {
+		t.Fatalf("empty creator non-by-person must yield no targets/no err, got %d err=%v", len(tgts), err)
 	}
 }
 
@@ -541,11 +547,12 @@ func TestSweep_ReclaimsStalePendingRow(t *testing.T) {
 	// Inject a stale pending row directly: updated_at well past the lease.
 	stale := n.now().Add(-2 * PendingLease)
 	if err := db.Create(&model.SummaryNotification{
-		TaskID:     203,
-		NotifyKind: model.NotifyKindCompleted,
-		Status:     model.NotifyStatusPending,
-		CreatedAt:  stale,
-		UpdatedAt:  stale,
+		TaskID:       203,
+		NotifyKind:   model.NotifyKindCompleted,
+		RecipientUID: "user-1",
+		Status:       model.NotifyStatusPending,
+		CreatedAt:    stale,
+		UpdatedAt:    stale,
 	}).Error; err != nil {
 		t.Fatalf("seed stale pending: %v", err)
 	}
@@ -578,11 +585,12 @@ func TestSweep_DoesNotReclaimFreshPendingRow(t *testing.T) {
 
 	fresh := n.now() // just claimed
 	if err := db.Create(&model.SummaryNotification{
-		TaskID:     204,
-		NotifyKind: model.NotifyKindCompleted,
-		Status:     model.NotifyStatusPending,
-		CreatedAt:  fresh,
-		UpdatedAt:  fresh,
+		TaskID:       204,
+		NotifyKind:   model.NotifyKindCompleted,
+		RecipientUID: "user-1",
+		Status:       model.NotifyStatusPending,
+		CreatedAt:    fresh,
+		UpdatedAt:    fresh,
 	}).Error; err != nil {
 		t.Fatalf("seed fresh pending: %v", err)
 	}
@@ -1369,10 +1377,10 @@ func TestBuildText_NilSanitizerFallsBackToSafeString(t *testing.T) {
 // 之后返回 nil；SendMessage 记录调用次数并成功。用于模拟 token 未 provisioned
 // 的启动窗口以及之后 octo-server 回填后的恢复过程。
 type deferredDeliverer struct {
-	mu           sync.Mutex
-	failCount    int // 还需失败几次
-	ensureCalls  int
-	sendCalls    int
+	mu          sync.Mutex
+	failCount   int // 还需失败几次
+	ensureCalls int
+	sendCalls   int
 }
 
 func (d *deferredDeliverer) EnsureFriend(ctx context.Context, spaceID, uid string) error {
@@ -1514,5 +1522,294 @@ func TestOnTaskTerminal_NonSentinelErrorStillConsumesBudget(t *testing.T) {
 	}
 	if row.AttemptCount != 1 {
 		t.Fatalf("non-sentinel error must increment attempt_count, got %d", row.AttemptCount)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// by-person 多目标逐人 DM (feat/notify-delivery)
+//
+// completed：给「所有 participant ∪ 发起者 CreatorID」并集去重后逐人各发一条 DM。
+// failed：只发发起者一人（不群发，避免噪音）。
+// 非 by-person：成功/失败都只回退发起者单 DM（保持现状语义）。
+// 幂等：每个收件人独立去重（三元键 task_id+notify_kind+recipient_uid），重试只
+// 重发失败的那个人。
+// ---------------------------------------------------------------------------
+
+// setupByPersonDB 在通知库上追加 summary_participant 表，供 resolveTargets 查参与人。
+func setupByPersonDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	db := setupNotifyTestDB(t)
+	if err := db.AutoMigrate(&model.SummaryParticipant{}); err != nil {
+		t.Fatalf("automigrate participant: %v", err)
+	}
+	return db
+}
+
+func seedParticipants(t *testing.T, db *gorm.DB, taskID int64, uids ...string) {
+	t.Helper()
+	for _, uid := range uids {
+		if err := db.Create(&model.SummaryParticipant{TaskID: taskID, UserID: uid}).Error; err != nil {
+			t.Fatalf("seed participant %s: %v", uid, err)
+		}
+	}
+}
+
+func sentUIDs(d *fakeDeliverer) map[string]int {
+	got := make(map[string]int)
+	for _, c := range d.sendCalls {
+		got[c.ChannelID]++
+	}
+	return got
+}
+
+func byPersonTask(id int64) model.SummaryTask {
+	task := baseTask(id, model.TriggerManual)
+	task.SummaryMode = model.ModeByPerson
+	return task
+}
+
+// (a) by-person + 发起者不在 participant 里 → completed 每人各一条、发起者也收到、去重无重复。
+func TestOnTaskTerminal_ByPerson_CompletedFansOutToAllPlusCreator(t *testing.T) {
+	db := setupByPersonDB(t)
+	d := &fakeDeliverer{}
+	n := newTestNotifier(db, d, Config{Enabled: true})
+
+	task := byPersonTask(1001) // creator=user-1
+	seedParticipants(t, db, 1001, "p-a", "p-b")
+
+	n.OnTaskTerminal(task, model.StatusCompleted, "")
+
+	got := sentUIDs(d)
+	want := map[string]int{"p-a": 1, "p-b": 1, "user-1": 1}
+	if len(d.sendCalls) != 3 {
+		t.Fatalf("expected 3 sends (2 participants + creator), got %d (%v)", len(d.sendCalls), got)
+	}
+	for uid, c := range want {
+		if got[uid] != c {
+			t.Fatalf("expected uid %s to receive %d DM, got %d (all=%v)", uid, c, got[uid], got)
+		}
+	}
+	// One row per (task, completed, uid) — three distinct recipient_uids.
+	var cnt int64
+	db.Model(&model.SummaryNotification{}).Where("task_id = ? AND notify_kind = ?", 1001, model.NotifyKindCompleted).Count(&cnt)
+	if cnt != 3 {
+		t.Fatalf("expected 3 notification rows (one per recipient), got %d", cnt)
+	}
+}
+
+// (a-dedup) 发起者同时也是 participant → 并集去重，只发一条给发起者。
+func TestOnTaskTerminal_ByPerson_CreatorAlsoParticipant_Deduped(t *testing.T) {
+	db := setupByPersonDB(t)
+	d := &fakeDeliverer{}
+	n := newTestNotifier(db, d, Config{Enabled: true})
+
+	task := byPersonTask(1002) // creator=user-1
+	seedParticipants(t, db, 1002, "user-1", "p-x")
+
+	n.OnTaskTerminal(task, model.StatusCompleted, "")
+
+	got := sentUIDs(d)
+	if len(d.sendCalls) != 2 {
+		t.Fatalf("expected 2 sends (deduped creator+participant), got %d (%v)", len(d.sendCalls), got)
+	}
+	if got["user-1"] != 1 || got["p-x"] != 1 {
+		t.Fatalf("expected exactly one DM each to user-1 and p-x, got %v", got)
+	}
+}
+
+// (b) failed 时只有发起者收到（participant 不收）。
+func TestOnTaskTerminal_ByPerson_FailedOnlyCreator(t *testing.T) {
+	db := setupByPersonDB(t)
+	d := &fakeDeliverer{}
+	n := newTestNotifier(db, d, Config{Enabled: true})
+
+	task := byPersonTask(1003) // creator=user-1
+	seedParticipants(t, db, 1003, "p-a", "p-b")
+
+	n.OnTaskTerminal(task, model.StatusFailed, "boom")
+
+	got := sentUIDs(d)
+	if len(d.sendCalls) != 1 || got["user-1"] != 1 {
+		t.Fatalf("failed must go ONLY to creator, got %d sends (%v)", len(d.sendCalls), got)
+	}
+	// No participant row should exist for the failed kind.
+	var cnt int64
+	db.Model(&model.SummaryNotification{}).Where("task_id = ? AND notify_kind = ? AND recipient_uid <> ?", 1003, model.NotifyKindFailed, "user-1").Count(&cnt)
+	if cnt != 0 {
+		t.Fatalf("failed must not create participant rows, got %d", cnt)
+	}
+}
+
+// (c) 非 by-person → completed 和 failed 都只发发起者。
+func TestOnTaskTerminal_NonByPerson_OnlyCreatorBothKinds(t *testing.T) {
+	db := setupByPersonDB(t)
+	d := &fakeDeliverer{}
+	n := newTestNotifier(db, d, Config{Enabled: true})
+
+	// Even if participant rows exist, a non-by-person task must ignore them.
+	seedParticipants(t, db, 1004, "p-a", "p-b")
+	task := baseTask(1004, model.TriggerManual) // SummaryMode != ModeByPerson
+
+	n.OnTaskTerminal(task, model.StatusCompleted, "")
+	n.OnTaskTerminal(task, model.StatusFailed, "boom")
+
+	got := sentUIDs(d)
+	if len(d.sendCalls) != 2 || got["user-1"] != 2 {
+		t.Fatalf("non-by-person must send only to creator (completed+failed), got %d sends (%v)", len(d.sendCalls), got)
+	}
+}
+
+// (d) 三元去重键幂等：同 (task,kind,uid) 重复触发只发一次；不同 uid 各自独立。
+func TestOnTaskTerminal_ByPerson_PerRecipientIdempotent(t *testing.T) {
+	db := setupByPersonDB(t)
+	d := &fakeDeliverer{}
+	n := newTestNotifier(db, d, Config{Enabled: true})
+
+	task := byPersonTask(1005) // creator=user-1
+	seedParticipants(t, db, 1005, "p-a", "p-b")
+
+	// Fire three times: dedup must collapse to exactly one DM per recipient.
+	n.OnTaskTerminal(task, model.StatusCompleted, "")
+	n.OnTaskTerminal(task, model.StatusCompleted, "")
+	n.OnTaskTerminal(task, model.StatusCompleted, "")
+
+	got := sentUIDs(d)
+	if len(d.sendCalls) != 3 {
+		t.Fatalf("dedup: expected 3 sends total across 3 recipients, got %d (%v)", len(d.sendCalls), got)
+	}
+	for _, uid := range []string{"p-a", "p-b", "user-1"} {
+		if got[uid] != 1 {
+			t.Fatalf("dedup: uid %s must receive exactly 1 DM, got %d (%v)", uid, got[uid], got)
+		}
+	}
+	var cnt int64
+	db.Model(&model.SummaryNotification{}).Where("task_id = ?", 1005).Count(&cnt)
+	if cnt != 3 {
+		t.Fatalf("dedup: expected 3 rows (one per uid), got %d", cnt)
+	}
+}
+
+// (d-independent) 一个收件人 fail、其余成功：重试只重发失败的那个人，不重发已成功的人。
+func TestOnTaskTerminal_ByPerson_OneFailsOthersUnaffected(t *testing.T) {
+	db := setupByPersonDB(t)
+	// First send fails (sendErrOnce), subsequent succeed. The failed recipient
+	// gets status=failed with budget; a second OnTaskTerminal must retry ONLY
+	// that recipient and leave the already-sent ones alone.
+	d := &fakeDeliverer{sendErrOnce: errors.New("transient blip on first recipient")}
+	n := newTestNotifier(db, d, Config{Enabled: true, MaxAttempts: 3})
+
+	task := byPersonTask(1006) // creator=user-1
+	seedParticipants(t, db, 1006, "p-a", "p-b")
+
+	n.OnTaskTerminal(task, model.StatusCompleted, "") // one of the three fails once
+
+	var failedRows int64
+	db.Model(&model.SummaryNotification{}).Where("task_id = ? AND status = ?", 1006, model.NotifyStatusFailed).Count(&failedRows)
+	if failedRows != 1 {
+		t.Fatalf("expected exactly 1 recipient failed on first pass, got %d", failedRows)
+	}
+	var sentRows int64
+	db.Model(&model.SummaryNotification{}).Where("task_id = ? AND status = ?", 1006, model.NotifyStatusSent).Count(&sentRows)
+	if sentRows != 2 {
+		t.Fatalf("expected 2 recipients sent on first pass, got %d", sentRows)
+	}
+
+	sendsAfterFirst := len(d.sendCalls) // 3 (2 ok + 1 failed attempt)
+
+	// Second pass: only the failed recipient should be retried (one more send);
+	// the two already-sent recipients must be skipped (dedup).
+	n.OnTaskTerminal(task, model.StatusCompleted, "")
+
+	if len(d.sendCalls) != sendsAfterFirst+1 {
+		t.Fatalf("retry must resend ONLY the failed recipient (+1 send); before=%d after=%d", sendsAfterFirst, len(d.sendCalls))
+	}
+	var allSent int64
+	db.Model(&model.SummaryNotification{}).Where("task_id = ? AND status = ?", 1006, model.NotifyStatusSent).Count(&allSent)
+	if allSent != 3 {
+		t.Fatalf("after retry all 3 recipients must be sent, got %d", allSent)
+	}
+}
+
+// (e) 单人（非 by-person）fail-before/pass-after 不回归：首投失败→标 failed，
+// 预算内二次触发重试成功。等价于历史单目标语义在新签名下不变。
+func TestOnTaskTerminal_SinglePerson_FailBeforePassAfter(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	d := &fakeDeliverer{sendErrOnce: errors.New("transient blip")}
+	n := newTestNotifier(db, d, Config{Enabled: true, MaxAttempts: 3})
+
+	task := baseTask(1007, model.TriggerManual) // single-person
+	n.OnTaskTerminal(task, model.StatusCompleted, "")
+
+	var row model.SummaryNotification
+	db.Where("task_id = ? AND recipient_uid = ?", 1007, "user-1").First(&row)
+	if row.Status != model.NotifyStatusFailed || row.AttemptCount != 1 {
+		t.Fatalf("fail-before: expected failed attempt=1, got status=%s attempt=%d", row.Status, row.AttemptCount)
+	}
+
+	n.OnTaskTerminal(task, model.StatusCompleted, "") // retry succeeds
+	db.Where("task_id = ? AND recipient_uid = ?", 1007, "user-1").First(&row)
+	if row.Status != model.NotifyStatusSent {
+		t.Fatalf("pass-after: expected sent, got %s", row.Status)
+	}
+	if len(d.sendCalls) != 2 {
+		t.Fatalf("expected 2 sends (fail + retry), got %d", len(d.sendCalls))
+	}
+}
+
+// (f) by-person 参与人查询出错时：绝不降级成「只发发起者的假成功」。
+// 之前 err 被静默吞掉 → 只 add(CreatorID) → 发起者被标 sent、participant 一行不建、
+// sweep 也发现不了，participant 永久漏发。修复后 resolveTargets 返回 err，
+// OnTaskTerminal 跳过整轮：不投递、不建任何行（尤其没有 creator 的 sent 行）。
+// 用一个缺 summary_participant 表的通知库触发真实查询错误（no such table）。
+func TestOnTaskTerminal_ByPerson_ParticipantQueryError_NoPartialSuccess(t *testing.T) {
+	// setupNotifyTestDB 只建 summary_notification，故意不建 summary_participant，
+	// 让 resolveTargets 的 Find(&parts) 真正报错（而非空结果）。
+	db := setupNotifyTestDB(t)
+	d := &fakeDeliverer{}
+	n := newTestNotifier(db, d, Config{Enabled: true, MaxAttempts: 3})
+
+	task := byPersonTask(1008) // creator=user-1, ModeByPerson
+
+	n.OnTaskTerminal(task, model.StatusCompleted, "")
+
+	// fail-then-no-partial-success: 一条都不能发，尤其不能发给发起者。
+	if len(d.sendCalls) != 0 {
+		t.Fatalf("participant query error must skip delivery entirely, got %d sends (%v)", len(d.sendCalls), sentUIDs(d))
+	}
+	// 一行都不能建：既不能有 creator 的 sent 行，也不能有任何 pending/failed 行。
+	var cnt int64
+	db.Model(&model.SummaryNotification{}).Where("task_id = ?", 1008).Count(&cnt)
+	if cnt != 0 {
+		t.Fatalf("participant query error must create NO notification rows (no fake creator success), got %d", cnt)
+	}
+	var creatorSent int64
+	db.Model(&model.SummaryNotification{}).
+		Where("task_id = ? AND recipient_uid = ? AND status = ?", 1008, "user-1", model.NotifyStatusSent).
+		Count(&creatorSent)
+	if creatorSent != 0 {
+		t.Fatalf("must not produce a creator sent row on participant query error, got %d", creatorSent)
+	}
+}
+
+// (f-control) 参与人表存在且正常：新 (,, error) 签名不得回归多目标扇出。
+// 与 fail 用例对照，确认改动只在"查询出错"分支生效，正常路径依旧全绿。
+func TestOnTaskTerminal_ByPerson_ParticipantQueryOK_StillFansOut(t *testing.T) {
+	db := setupByPersonDB(t) // 建了 summary_participant 表
+	d := &fakeDeliverer{}
+	n := newTestNotifier(db, d, Config{Enabled: true, MaxAttempts: 3})
+
+	task := byPersonTask(1009) // creator=user-1
+	seedParticipants(t, db, 1009, "p-a", "p-b")
+
+	n.OnTaskTerminal(task, model.StatusCompleted, "")
+
+	got := sentUIDs(d)
+	if len(d.sendCalls) != 3 {
+		t.Fatalf("normal path must still fan out to 3 recipients, got %d (%v)", len(d.sendCalls), got)
+	}
+	for _, uid := range []string{"p-a", "p-b", "user-1"} {
+		if got[uid] != 1 {
+			t.Fatalf("uid %s must receive exactly 1 DM, got %d (%v)", uid, got[uid], got)
+		}
 	}
 }

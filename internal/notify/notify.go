@@ -112,16 +112,49 @@ func (n *Notifier) OnTaskTerminal(task model.SummaryTask, status int, errMsg str
 		return
 	}
 
-	target, ok := resolveTarget(task)
-	if !ok {
+	// completed fans out to every recipient (participants ∪ creator for a
+	// by-person task, else just the creator). failed goes ONLY to the creator to
+	// avoid broadcasting a failure to participants who never asked. Each recipient
+	// runs the claim/deliver/mark state machine on its own (task, kind, uid) row,
+	// so one recipient's failure never blocks another's.
+	var targets []deliveryTarget
+	if kind == model.NotifyKindFailed {
+		if t, ok := n.creatorTarget(task); ok {
+			targets = []deliveryTarget{t}
+		}
+	} else {
+		// A participant-lookup error must NOT degrade to a creator-only "success":
+		// that would fake-deliver to the creator, never build participant rows,
+		// and hide the miss from the sweep. Skip this run and let the next
+		// OnTaskTerminal trigger / sweep retry a full resolve.
+		resolved, err := n.resolveTargets(task)
+		if err != nil {
+			log.Printf("[notify] task=%d kind=%s: resolveTargets failed, skipping (will retry on next trigger/sweep): %v", task.ID, kind, err)
+			return
+		}
+		targets = resolved
+	}
+	if len(targets) == 0 {
 		log.Printf("[notify] task=%d kind=%s: no deliverable target (empty creator), skipping", task.ID, kind)
 		return
 	}
 
-	// 1) Preemptive unique insert — claim the right to deliver this (task, kind).
-	claimed, row, err := n.claim(task.ID, kind)
+	for _, target := range targets {
+		n.deliverToRecipient(task, kind, errMsg, target)
+	}
+}
+
+// deliverToRecipient runs the per-recipient claim/deliver/mark state machine for
+// a single (task, kind, recipient_uid). Extracted from OnTaskTerminal so the
+// by-person fan-out drives it once per recipient; each call is fully independent
+// (its own dedup row, retry budget, and failure handling).
+func (n *Notifier) deliverToRecipient(task model.SummaryTask, kind, errMsg string, target deliveryTarget) {
+	uid := target.TargetUID
+
+	// 1) Preemptive unique insert — claim the right to deliver this (task, kind, uid).
+	claimed, row, err := n.claim(task.ID, kind, uid)
 	if err != nil {
-		log.Printf("[notify] task=%d kind=%s: claim failed: %v", task.ID, kind, err)
+		log.Printf("[notify] task=%d kind=%s uid=%s: claim failed: %v", task.ID, kind, uid, err)
 		return
 	}
 	if !claimed {
@@ -133,15 +166,15 @@ func (n *Notifier) OnTaskTerminal(task model.SummaryTask, status int, errMsg str
 		// claimRetry does an atomic CAS UPDATE; only the runner that flips the
 		// row to pending (RowsAffected==1) proceeds, the loser skips.
 		if row != nil && row.Status == model.NotifyStatusFailed && row.AttemptCount < n.cfg.MaxAttempts {
-			won, e := n.claimRetry(task.ID, kind)
+			won, e := n.claimRetry(task.ID, kind, uid)
 			if e != nil {
-				log.Printf("[notify] task=%d kind=%s: claimRetry failed: %v", task.ID, kind, e)
+				log.Printf("[notify] task=%d kind=%s uid=%s: claimRetry failed: %v", task.ID, kind, uid, e)
 				return
 			}
 			if !won {
 				return
 			}
-			log.Printf("[notify] task=%d kind=%s: retrying failed row (won retry slot)", task.ID, kind)
+			log.Printf("[notify] task=%d kind=%s uid=%s: retrying failed row (won retry slot)", task.ID, kind, uid)
 		} else {
 			return
 		}
@@ -153,18 +186,18 @@ func (n *Notifier) OnTaskTerminal(task model.SummaryTask, status int, errMsg str
 
 	// 3) Persist outcome.
 	if deliverErr == nil {
-		n.markSent(task.ID, kind)
-		log.Printf("[notify] task=%d kind=%s delivered to channel_type=%d", task.ID, kind, target.ChannelType)
+		n.markSent(task.ID, kind, uid)
+		log.Printf("[notify] task=%d kind=%s uid=%s delivered to channel_type=%d", task.ID, kind, uid, target.ChannelType)
 		return
 	}
 	// Startup-race: token 尚未 provisioned。Keep pending 且不消耗 attempt 预算，让下轮 Sweep 立即重试。
 	if errors.Is(deliverErr, ErrTokenNotYetProvisioned) {
-		n.markDeferred(task.ID, kind, deliverErr)
-		log.Printf("[notify] task=%d kind=%s deferred (token not yet provisioned)", task.ID, kind)
+		n.markDeferred(task.ID, kind, uid, deliverErr)
+		log.Printf("[notify] task=%d kind=%s uid=%s deferred (token not yet provisioned)", task.ID, kind, uid)
 		return
 	}
-	n.markFailed(task.ID, kind, deliverErr)
-	log.Printf("[notify] task=%d kind=%s delivery failed: %v", task.ID, kind, sanitize(deliverErr.Error()))
+	n.markFailed(task.ID, kind, uid, deliverErr)
+	log.Printf("[notify] task=%d kind=%s uid=%s delivery failed: %v", task.ID, kind, uid, sanitize(deliverErr.Error()))
 }
 
 func kindForStatus(status int) (string, bool) {
@@ -181,25 +214,26 @@ func kindForStatus(status int) (string, bool) {
 // claim attempts the preemptive INSERT. Returns claimed=true when this run won
 // the (task, kind) slot. When the row already exists, claimed=false and the
 // existing row is returned so the caller can decide whether retry budget remains.
-func (n *Notifier) claim(taskID int64, kind string) (bool, *model.SummaryNotification, error) {
+func (n *Notifier) claim(taskID int64, kind, uid string) (bool, *model.SummaryNotification, error) {
 	now := n.now()
 	row := &model.SummaryNotification{
 		TaskID:       taskID,
 		NotifyKind:   kind,
+		RecipientUID: uid,
 		Status:       model.NotifyStatusPending,
 		AttemptCount: 0,
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
-	// Plain Create: the UNIQUE(task_id, notify_kind) constraint rejects a
-	// duplicate with an error we treat as "someone else owns it".
+	// Plain Create: the UNIQUE(task_id, notify_kind, recipient_uid) constraint
+	// rejects a duplicate with an error we treat as "this recipient is owned".
 	err := n.db.Create(row).Error
 	if err == nil {
 		return true, row, nil
 	}
 	if isDuplicateKey(err) {
 		var existing model.SummaryNotification
-		if e := n.db.Where("task_id = ? AND notify_kind = ?", taskID, kind).First(&existing).Error; e != nil {
+		if e := n.db.Where("task_id = ? AND notify_kind = ? AND recipient_uid = ?", taskID, kind, uid).First(&existing).Error; e != nil {
 			return false, nil, e
 		}
 		return false, &existing, nil
@@ -212,11 +246,11 @@ func (n *Notifier) claim(taskID int64, kind string) (bool, *model.SummaryNotific
 // UPDATE guarded on status=failed AND attempt_count<MaxAttempts, so concurrent
 // runners race on the row and exactly one gets RowsAffected==1. Returns
 // won=true only for that single winner; losers skip to avoid duplicate sends.
-func (n *Notifier) claimRetry(taskID int64, kind string) (bool, error) {
+func (n *Notifier) claimRetry(taskID int64, kind, uid string) (bool, error) {
 	now := n.now()
 	res := n.db.Model(&model.SummaryNotification{}).
-		Where("task_id = ? AND notify_kind = ? AND status = ? AND attempt_count < ?",
-			taskID, kind, model.NotifyStatusFailed, n.cfg.MaxAttempts).
+		Where("task_id = ? AND notify_kind = ? AND recipient_uid = ? AND status = ? AND attempt_count < ?",
+			taskID, kind, uid, model.NotifyStatusFailed, n.cfg.MaxAttempts).
 		Updates(map[string]any{
 			"status":     model.NotifyStatusPending,
 			"updated_at": now,
@@ -314,10 +348,10 @@ func (n *Notifier) recipientIsActiveMember(taskID uint, spaceID, uid string) boo
 	return count > 0
 }
 
-func (n *Notifier) markSent(taskID int64, kind string) {
+func (n *Notifier) markSent(taskID int64, kind, uid string) {
 	now := n.now()
 	if err := n.db.Model(&model.SummaryNotification{}).
-		Where("task_id = ? AND notify_kind = ?", taskID, kind).
+		Where("task_id = ? AND notify_kind = ? AND recipient_uid = ?", taskID, kind, uid).
 		Updates(map[string]any{
 			"status":        model.NotifyStatusSent,
 			"sent_at":       now,
@@ -325,22 +359,22 @@ func (n *Notifier) markSent(taskID int64, kind string) {
 			"attempt_count": gorm.Expr("attempt_count + 1"),
 			"last_error":    nil,
 		}).Error; err != nil {
-		log.Printf("[notify] task=%d kind=%s: markSent failed: %v", taskID, kind, err)
+		log.Printf("[notify] task=%d kind=%s uid=%s: markSent failed: %v", taskID, kind, uid, err)
 	}
 }
 
-func (n *Notifier) markFailed(taskID int64, kind string, cause error) {
+func (n *Notifier) markFailed(taskID int64, kind, uid string, cause error) {
 	now := n.now()
 	le := truncateForLastError(sanitize(cause.Error()))
 	if err := n.db.Model(&model.SummaryNotification{}).
-		Where("task_id = ? AND notify_kind = ?", taskID, kind).
+		Where("task_id = ? AND notify_kind = ? AND recipient_uid = ?", taskID, kind, uid).
 		Updates(map[string]any{
 			"status":        model.NotifyStatusFailed,
 			"updated_at":    now,
 			"attempt_count": gorm.Expr("attempt_count + 1"),
 			"last_error":    le,
 		}).Error; err != nil {
-		log.Printf("[notify] task=%d kind=%s: markFailed failed: %v", taskID, kind, err)
+		log.Printf("[notify] task=%d kind=%s uid=%s: markFailed failed: %v", taskID, kind, uid, err)
 	}
 }
 
@@ -358,19 +392,19 @@ func (n *Notifier) markFailed(taskID int64, kind string, cause error) {
 // will pick the row up again via the stale-pending branch. That extra retry
 // inside one tick is intentional — the whole point is not to wait — and
 // correctness is preserved by the existing atomic CAS in claimStalePending.
-func (n *Notifier) markDeferred(taskID int64, kind string, cause error) {
+func (n *Notifier) markDeferred(taskID int64, kind, uid string, cause error) {
 	le := truncateForLastError(sanitize(cause.Error()))
 	// Backdate past PendingLease so next Sweep tick's sweepStalePending picks
 	// it up immediately instead of waiting the full ~5min lease.
 	stale := n.now().Add(-PendingLease - time.Second)
 	if err := n.db.Model(&model.SummaryNotification{}).
-		Where("task_id = ? AND notify_kind = ?", taskID, kind).
+		Where("task_id = ? AND notify_kind = ? AND recipient_uid = ?", taskID, kind, uid).
 		Updates(map[string]any{
 			"status":     model.NotifyStatusPending,
 			"updated_at": stale,
 			"last_error": le,
 		}).Error; err != nil {
-		log.Printf("[notify] task=%d kind=%s: markDeferred failed: %v", taskID, kind, err)
+		log.Printf("[notify] task=%d kind=%s uid=%s: markDeferred failed: %v", taskID, kind, uid, err)
 	}
 }
 
@@ -640,15 +674,15 @@ func (n *Notifier) sweepRetryFailed(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		won, err := n.claimRetry(row.TaskID, row.NotifyKind)
+		won, err := n.claimRetry(row.TaskID, row.NotifyKind, row.RecipientUID)
 		if err != nil {
-			log.Printf("[notify] sweep: task=%d kind=%s claimRetry: %v", row.TaskID, row.NotifyKind, err)
+			log.Printf("[notify] sweep: task=%d kind=%s uid=%s claimRetry: %v", row.TaskID, row.NotifyKind, row.RecipientUID, err)
 			continue
 		}
 		if !won {
 			continue // another runner won, or budget exhausted concurrently
 		}
-		n.redeliver(row.TaskID, row.NotifyKind)
+		n.redeliver(row.TaskID, row.NotifyKind, row.RecipientUID)
 	}
 }
 
@@ -670,16 +704,16 @@ func (n *Notifier) sweepStalePending(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		won, err := n.claimStalePending(row.TaskID, row.NotifyKind, cutoff)
+		won, err := n.claimStalePending(row.TaskID, row.NotifyKind, row.RecipientUID, cutoff)
 		if err != nil {
-			log.Printf("[notify] sweep: task=%d kind=%s claimStalePending: %v", row.TaskID, row.NotifyKind, err)
+			log.Printf("[notify] sweep: task=%d kind=%s uid=%s claimStalePending: %v", row.TaskID, row.NotifyKind, row.RecipientUID, err)
 			continue
 		}
 		if !won {
 			continue
 		}
-		log.Printf("[notify] sweep: reclaimed stale pending row task=%d kind=%s", row.TaskID, row.NotifyKind)
-		n.redeliver(row.TaskID, row.NotifyKind)
+		log.Printf("[notify] sweep: reclaimed stale pending row task=%d kind=%s uid=%s", row.TaskID, row.NotifyKind, row.RecipientUID)
+		n.redeliver(row.TaskID, row.NotifyKind, row.RecipientUID)
 	}
 }
 
@@ -687,11 +721,11 @@ func (n *Notifier) sweepStalePending(ctx context.Context) {
 // so exactly one sweeper wins the right to redeliver it. Guarded on
 // status='pending' AND updated_at<cutoff so concurrent sweepers race and only
 // the row flipped by RowsAffected==1 proceeds.
-func (n *Notifier) claimStalePending(taskID int64, kind string, cutoff time.Time) (bool, error) {
+func (n *Notifier) claimStalePending(taskID int64, kind, uid string, cutoff time.Time) (bool, error) {
 	now := n.now()
 	res := n.db.Model(&model.SummaryNotification{}).
-		Where("task_id = ? AND notify_kind = ? AND status = ? AND updated_at < ?",
-			taskID, kind, model.NotifyStatusPending, cutoff).
+		Where("task_id = ? AND notify_kind = ? AND recipient_uid = ? AND status = ? AND updated_at < ?",
+			taskID, kind, uid, model.NotifyStatusPending, cutoff).
 		Update("updated_at", now)
 	if res.Error != nil {
 		return false, res.Error
@@ -701,21 +735,22 @@ func (n *Notifier) claimStalePending(taskID int64, kind string, cutoff time.Time
 
 // redeliver performs one delivery attempt for a row whose retry slot we just
 // won (claimRetry or claimStalePending). It reloads the SummaryTask so the
-// message reflects the durable terminal-state row, then mirrors the
+// message reflects the durable terminal-state row, then rebuilds the target for
+// THIS recipient_uid (not blindly the creator) and mirrors the
 // build+deliver+persist sequence from OnTaskTerminal. Any failure persists
 // via markFailed and is left for the next sweep tick or until budget runs out.
-func (n *Notifier) redeliver(taskID int64, kind string) {
+func (n *Notifier) redeliver(taskID int64, kind, uid string) {
 	var task model.SummaryTask
 	if err := n.db.First(&task, taskID).Error; err != nil {
 		// Task row gone (extremely unusual: rows are never deleted in the
 		// happy path). Treat as a permanent delivery failure so attempt_count
 		// advances and the row eventually leaves the retry set.
-		n.markFailed(taskID, kind, fmt.Errorf("reload task %d: %w", taskID, err))
+		n.markFailed(taskID, kind, uid, fmt.Errorf("reload task %d: %w", taskID, err))
 		return
 	}
-	target, ok := resolveTarget(task)
+	target, ok := targetForUID(task, uid)
 	if !ok {
-		n.markFailed(taskID, kind, errors.New("no deliverable target on reload"))
+		n.markFailed(taskID, kind, uid, errors.New("no deliverable target on reload"))
 		return
 	}
 	errMsg := ""
@@ -727,16 +762,16 @@ func (n *Notifier) redeliver(taskID int64, kind string) {
 		// Startup-race in the sweep path: same treatment as OnTaskTerminal —
 		// keep pending, don't burn budget, let the next tick pick it up.
 		if errors.Is(deliverErr, ErrTokenNotYetProvisioned) {
-			n.markDeferred(taskID, kind, deliverErr)
-			log.Printf("[notify] sweep: task=%d kind=%s deferred (token not yet provisioned)", taskID, kind)
+			n.markDeferred(taskID, kind, uid, deliverErr)
+			log.Printf("[notify] sweep: task=%d kind=%s uid=%s deferred (token not yet provisioned)", taskID, kind, uid)
 			return
 		}
-		n.markFailed(taskID, kind, deliverErr)
-		log.Printf("[notify] sweep: task=%d kind=%s delivery failed: %v", taskID, kind, sanitize(deliverErr.Error()))
+		n.markFailed(taskID, kind, uid, deliverErr)
+		log.Printf("[notify] sweep: task=%d kind=%s uid=%s delivery failed: %v", taskID, kind, uid, sanitize(deliverErr.Error()))
 		return
 	}
-	n.markSent(taskID, kind)
-	log.Printf("[notify] sweep: task=%d kind=%s delivered via retry", taskID, kind)
+	n.markSent(taskID, kind, uid)
+	log.Printf("[notify] sweep: task=%d kind=%s uid=%s delivered via retry", taskID, kind, uid)
 }
 
 // truncateForLastError caps an error string for the VARCHAR(500) last_error
