@@ -70,7 +70,7 @@ type Config struct {
 	CharsPerTokenCJK          int
 	CharsPerTokenASCII        int
 
-	// Worker trigger URL (API → Worker)
+	// Worker trigger URL (API -> Worker)
 	WorkerTriggerURL string
 
 	// Candidate search query limit (-1 = no limit, >0 = use as SQL LIMIT)
@@ -108,6 +108,26 @@ type Config struct {
 	SkipMapReduceThreshold int    // Skip Map-Reduce threshold (tokens), env SKIP_MAP_REDUCE_THRESHOLD
 	KimiAPIKey             string // Kimi API key for exact token counting, env KIMI_API_KEY
 	TokenizerHTTPTimeout   int    // HTTP timeout for tokenizer API calls, env TOKENIZER_HTTP_TIMEOUT
+
+	// --- OCT-4 task-terminal notification (delivery to the IM bot) ---
+
+	// NotifyEnabled is the master switch for delivering a terminal-state
+	// notification (Completed / Failed) back to the task creator via the IM bot.
+	// Default OFF so the feature can be dark-launched.
+	NotifyEnabled bool
+	// SummaryBotToken authenticates the bot sendMessage / ensureFriend calls
+	// against octo-server. SECRET: read from env only, never printed/logged and
+	// never written to summary_notification.last_error.
+	SummaryBotToken string
+	// MaxNotifyAttempts caps same-row retries for a single (task_id, notify_kind)
+	// notification before it is left in status='failed'. Default 3.
+	MaxNotifyAttempts int
+	// NotifyQuietStart / NotifyQuietEnd define an optional quiet window
+	// ("HH:MM"). When both are set the window SUPPRESSES scheduled-task
+	// notifications only (on-demand/manual tasks are never suppressed). Empty =
+	// disabled (default).
+	NotifyQuietStart string
+	NotifyQuietEnd   string
 }
 
 func Load() *Config {
@@ -162,6 +182,7 @@ func Load() *Config {
 
 		ToolCallTimeout: envInt("TOOL_CALL_TIMEOUT", 30),
 
+		// keep upstream main default (true, #112)
 		FeatureTeamSchedule: envBool("FEATURE_TEAM_SCHEDULE", true),
 
 		EnableIntentShortcut: envBool("ENABLE_INTENT_SHORTCUT", true),
@@ -172,6 +193,12 @@ func Load() *Config {
 		SkipMapReduceThreshold: envInt("SKIP_MAP_REDUCE_THRESHOLD", 0),
 		KimiAPIKey:             envStr("KIMI_API_KEY", ""),
 		TokenizerHTTPTimeout:   envInt("TOKENIZER_HTTP_TIMEOUT", 10),
+
+		NotifyEnabled:     envBool("SUMMARY_NOTIFY_ENABLED", false),
+		SummaryBotToken:   envStr("SUMMARY_BOT_TOKEN", ""),
+		MaxNotifyAttempts: envInt("MAX_NOTIFY_ATTEMPTS", 3),
+		NotifyQuietStart:  envStr("SUMMARY_NOTIFY_QUIET_START", ""),
+		NotifyQuietEnd:    envStr("SUMMARY_NOTIFY_QUIET_END", ""),
 	}
 }
 

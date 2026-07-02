@@ -213,6 +213,9 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 			Progress: 100,
 			Message:  "总结完成",
 		})
+		// Task durably reached Completed above (saveLatestResultAndCompleteTask /
+		// completeTaskWithoutNewResult succeeded). Fire the terminal notification.
+		p.notifyTaskTerminal(taskID, model.StatusCompleted)
 		log.Printf("[personal-worker] task %d single-person completed directly", taskID)
 	} else {
 		// Multi-person mode: trigger meta-summary to check if all participants completed.
@@ -439,6 +442,9 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 			Progress: 0,
 			Message:  sanitized,
 		})
+		// shouldNotify is set only when the task-level CAS to StatusFailed actually
+		// flipped the row (single-person terminal failure). Fire the notification.
+		p.notifyTaskTerminal(pr.TaskID, model.StatusFailed)
 	}
 	log.Printf("[personal-worker] task=%d marked failed (terminal), sanitizedMsg=%s", pr.TaskID, sanitized)
 }
@@ -896,6 +902,39 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		time.Since(totalStart).Milliseconds())
 
 	return finalContent, citations, targetMsgCount, totalTokens, p.llm.ModelVersion(), nil
+}
+
+func estimateTokens(content string, charsPerTokenCJK, charsPerTokenASCII int) int {
+	const overheadPerMsg = 50
+	// Defensive: avoid divide-by-zero or pathological values
+	if charsPerTokenCJK <= 0 {
+		charsPerTokenCJK = 1
+	}
+	if charsPerTokenASCII <= 0 {
+		charsPerTokenASCII = 4
+	}
+	cjkCount := 0
+	asciiCount := 0
+	for _, r := range content {
+		if r > 0x7F {
+			cjkCount++
+		} else {
+			asciiCount++
+		}
+	}
+	return cjkCount/charsPerTokenCJK + asciiCount/charsPerTokenASCII + overheadPerMsg
+}
+
+// SanitizeErrorForUser is the canonical whitelist that maps a raw internal
+// error string to a user-safe Chinese string suitable for an IM DM.
+//
+// Exported so the notify package can wire it as the single render-point
+// sanitizer in Notifier.buildText (covers both the synchronous worker path
+// AND the sweep/redeliver path that reads task.ErrorMessage raw from the DB).
+// See PR#113 Jerry-Xin/OctoBoooot R3: sanitizing only at the worker call
+// sites left the sweep path leaking DSN/IP/stack to the user DM on retry.
+func SanitizeErrorForUser(errMsg string) string {
+	return sanitizeErrorForUser(errMsg)
 }
 
 func sanitizeErrorForUser(errMsg string) string {
