@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
@@ -28,6 +30,7 @@ type Processor struct {
 	pool       *WorkerPool
 	llm        *service.LLMClient
 	cfg        *config.Config
+	octoClient *service.OctoSearchBatchClient // Chat-message content source.
 	stopCh     chan struct{}
 	triggerCh  chan model.WorkerTriggerRequest
 	meta       *MetaProcessor
@@ -45,17 +48,62 @@ type Processor struct {
 
 // NewProcessor creates a new task processor.
 func NewProcessor(db, imDB *gorm.DB, pool *WorkerPool, llm *service.LLMClient, cfg *config.Config) *Processor {
+	octoClient, err := newOctoSearchClientForBackend(cfg)
+	if err != nil {
+		log.Fatalf("[processor] %v", err)
+	}
 	p := &Processor{
-		db:        db,
-		imDB:      imDB,
-		pool:      pool,
-		llm:       llm,
-		cfg:       cfg,
-		stopCh:    make(chan struct{}),
-		triggerCh: make(chan model.WorkerTriggerRequest, 100),
+		db:         db,
+		imDB:       imDB,
+		pool:       pool,
+		llm:        llm,
+		cfg:        cfg,
+		octoClient: octoClient,
+		stopCh:     make(chan struct{}),
+		triggerCh:  make(chan model.WorkerTriggerRequest, 100),
 	}
 	p.meta = NewMetaProcessor(p)
 	return p
+}
+
+func newOctoSearchClientForBackend(cfg *config.Config) (*service.OctoSearchBatchClient, error) {
+	backend := strings.ToLower(strings.TrimSpace(cfg.MessageFetchBackend))
+	if backend == "" {
+		backend = "batch"
+	}
+	switch backend {
+	case "batch":
+		if cfg.OctoSearchURL == "" || cfg.OctoSearchToken == "" {
+			return nil, fmt.Errorf("OCTO_SEARCH_URL / OCTO_SEARCH_TOKEN are required when MESSAGE_FETCH_BACKEND=batch")
+		}
+		if err := validateOctoSearchURL(cfg.OctoSearchURL); err != nil {
+			return nil, fmt.Errorf("invalid OCTO_SEARCH_URL: %w", err)
+		}
+		return service.NewOctoSearchBatchClient(cfg.OctoSearchURL, cfg.OctoSearchToken), nil
+	case "mysql":
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("invalid MESSAGE_FETCH_BACKEND %q (want batch or mysql)", cfg.MessageFetchBackend)
+	}
+}
+
+func validateOctoSearchURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("scheme must be http or https")
+	}
+	if u.Host == "" {
+		return fmt.Errorf("host is required")
+	}
+	for _, segment := range strings.Split(strings.Trim(u.Path, "/"), "/") {
+		if segment == "v1" {
+			return fmt.Errorf("must be base URL without /v1")
+		}
+	}
+	return nil
 }
 
 // TriggerCh returns the channel for worker trigger requests.
@@ -313,9 +361,9 @@ func (p *Processor) processTask(task model.SummaryTask) {
 	} else {
 		isScheduledMultiPerson := task.TriggerType == model.TriggerScheduled
 
-		// 🔴 P0 dispatch-deadlock fix.
+		// Scheduled dispatch must not depend on the deadline-refresh CAS.
 		//
-		// ROOT CAUSE: the AUTO scheduled multi-person dispatch (Blocker-1) used to sit
+		// The AUTO scheduled multi-person dispatch used to sit
 		// BEHIND a "refresh processing_deadline" CAS (WHERE status=Processing). When that
 		// CAS returned RowsAffected==0 the code logged "status changed (likely cancelled),
 		// skipping dispatch" and RETURNED -- without dispatching anyone AND without putting
@@ -328,7 +376,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 		// scanStuckTasks revive (deadline lapse / timezone-vs-wallclock skew across
 		// processes), a second worker replica, or a stale reload struct racing the row.
 		// Treating "CAS missed" as "give up, leave it Processing" is the defect -- the
-		// dispatch logic itself is correct, it was just fatally gated.
+		// dispatch logic itself is correct; it was gated by the CAS.
 		//
 		// FIX (direction A + B): for EVERY scheduled multi-person task (AUTO *and*
 		// CONFIRM), decide+dispatch on the MAIN path up front (idempotent:
@@ -338,9 +386,9 @@ func (p *Processor) processTask(task model.SummaryTask) {
 		// AFTER dispatch and a miss never strands the task. For the MANUAL (non-scheduled)
 		// multi-person path we keep the original guarded CAS, but a miss re-reads the real
 		// status and only returns on a genuine terminal/changed state -- otherwise it
-		// falls through, and the异常 path resets to Pending instead of leaving the task pinned in Processing.
+		// falls through, and the abnormal path resets to Pending instead of leaving the task pinned in Processing.
 		//
-		// 🔴 P1 EXPERIENCE FIX (why this branch now covers CONFIRM, not just AUTO):
+		// This branch covers scheduled CONFIRM rounds as well as AUTO rounds:
 		// A scheduled CONFIRM task (confirm_policy=1/2) reaches the processor with its
 		// participants ALREADY materialized as confirmed Accepted members --
 		// buildScheduledTaskParticipantsConfirm only writes rows for members who already
@@ -349,7 +397,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 		// confirmation" left to do at processor time -- the round is already locked to its
 		// confirmed roster. Previously these CONFIRM rounds fell into the non-dispatch
 		// "participants pending confirm" branch and only got picked up ~5 min later by
-		// scanStuckPersonalTasks, so users stared at "生成中" for minutes. Driving dispatch here is SAFE because:
+		// scanStuckPersonalTasks, so users stayed on the in-progress state for minutes. Driving dispatch here is SAFE because:
 		//   1. scheduledAutoDispatchTargets is idempotent -- it selects ONLY
 		//      status==Accepted AND pr.worker_status==Pending, so in-flight/finished
 		//      personals are never re-dispatched, and unconfirmed members do not exist as
@@ -372,8 +420,8 @@ func (p *Processor) processTask(task model.SummaryTask) {
 			}
 
 			// Best-effort deadline refresh so scanStuckTasks does not revive us while the
-			// personal workers run. A miss here is NOT fatal: dispatch already happened,
-			// and re-claim is idempotent. We only need to ensure we don't闷 in Processing
+			// personal workers run. A miss here is acceptable: dispatch already happened,
+			// and re-claim is idempotent. We only need to ensure we do not stay in Processing
 			// with nothing in flight, so on a miss we re-read the real status.
 			casResult := p.db.Model(&model.SummaryTask{}).
 				Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
@@ -402,10 +450,10 @@ func (p *Processor) processTask(task model.SummaryTask) {
 			return
 		}
 
-		// Manual (non-scheduled) multi-person (CONFIRM / human-confirm, P1): Creator
+		// Manual (non-scheduled) multi-person (CONFIRM / human-confirm): Creator
 		// already triggered by the API handler; other participants remain WaitingConfirm
 		// until they accept. We must NOT blindly dispatch everyone here. Keep the guarded
-		// deadline-refresh CAS, but make a miss non-fatal and never leave the task pinned
+		// deadline-refresh CAS, but make a miss recoverable and never leave the task pinned
 		// in Processing. (Scheduled CONFIRM rounds never reach this branch -- they take
 		// the active-dispatch path above, because their roster is already confirmed.)
 		casResult := p.db.Model(&model.SummaryTask{}).
@@ -432,7 +480,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 			case model.StatusProcessing:
 				// We still own it (a benign racing deadline write). Fall through to the waiting-for-confirm path below.
 			default:
-				// Bounced to Pending/WaitingConfirm by a concurrent revive. Do NOT闷 in
+				// Bounced to Pending/WaitingConfirm by a concurrent revive. Do NOT stay in
 				// Processing: let the next claim handle it. (No dispatch here -- CONFIRM
 				// participants must still confirm.)
 				log.Printf("[processor] task %d no longer Processing (status=%d), deferring to next claim", task.ID, cur.Status)
@@ -451,17 +499,17 @@ func (p *Processor) processTask(task model.SummaryTask) {
 }
 
 // scheduleConfirmPolicyIsAuto reports whether the task's bound schedule uses the
-// AUTO confirm policy (confirm_policy==0, the存量单人 default). The confirm policy
+// AUTO confirm policy (confirm_policy==0, the legacy single-person default). The confirm policy
 // lives on summary_schedule, not summary_task, so it is read via task.ScheduleID.
 //
 // Default is FALSE (NOT auto) on every uncertain path -- safe side. Only an
 // explicitly read schedule.confirm_policy == SchedConfirmAuto returns true.
-// Rationale: returning true on uncertainty would全量 dispatch a task that may be
+// Rationale: returning true on uncertainty would dispatch all participants for a task that may be
 // CONFIRM, firing personal workers without the required human confirmation and
 // breaking the manual-confirm semantics. Failing closed (no auto-dispatch) is
 // recoverable -- the task waits / the 5-minute stuck scan can still pick up a
 // genuinely AUTO run -- whereas failing open mis-triggers CONFIRM tasks. So both
-// ScheduleID==nil and a failed lookup return false. (P0 AUTO tasks always carry a
+// ScheduleID==nil and a failed lookup return false. (AUTO tasks always carry a
 // ScheduleID, bound at claim time, so the normal AUTO path is unaffected.)
 func (p *Processor) scheduleConfirmPolicyIsAuto(task model.SummaryTask) bool {
 	if task.ScheduleID == nil {
@@ -651,7 +699,7 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 	messages, _, err = pipeline.ResolveAndFetchMessagesForPersonal(
 		ctx, task.CreatorID, participantUIDs, participantNames, specifiedSources, task.Title,
 		task.TimeRangeStart, task.TimeRangeEnd,
-		p.imDB, toolCallFn, llmFn, p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency,
+		p.imDB, p.octoClient, p.cfg.MessageFetchBackend, toolCallFn, llmFn, p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency,
 		channelScopeOpts,
 	)
 	timing.Observe(task.TaskNo, "fetch_messages", fetchStart)

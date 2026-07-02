@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"log"
 	"sort"
 	"strings"
@@ -205,7 +206,7 @@ func getPeerUID(channelID, selfUID string) string {
 }
 
 // NormalizeDMChannelID converts a logical DM channel id (peerUID or peer@self)
-// into the storage-layer format: max(uid1,uid2)@min(uid1,uid2).
+// into the WuKongIM storage format: the UID with the larger CRC32 hash comes first.
 // For non-DM channels (channelType != 1), returns input unchanged.
 func NormalizeDMChannelID(channelID string, selfUID string, channelType int) string {
 	if channelType != 1 {
@@ -219,10 +220,10 @@ func NormalizeDMChannelID(channelID string, selfUID string, channelType int) str
 		a = channelID
 		b = selfUID
 	}
-	if a < b {
-		a, b = b, a
+	if crc32.ChecksumIEEE([]byte(a)) > crc32.ChecksumIEEE([]byte(b)) {
+		return a + "@" + b
 	}
-	return a + "@" + b
+	return b + "@" + a
 }
 
 // mapFrontendSourceType maps frontend source_type to backend channelType.
@@ -413,6 +414,81 @@ func FetchMessagesFromChannel(ctx context.Context, channelID string, channelType
 	log.Printf("[pipeline-personal] FetchMessagesFromChannel %s: %d rows fetched (maxPerChannel=%d)",
 		channelID, len(messages), maxPerChannel)
 	return messages, nil
+}
+
+func fetchMessagesByBackend(ctx context.Context, backend string, octoClient octoSearchClient, candidates []ChannelInfo, creatorUID string, startTS, endTS int64, imDB *gorm.DB, tableCount int, maxPerChannel int, fetchConcurrency int) ([]Message, error) {
+	selected := strings.ToLower(strings.TrimSpace(backend))
+	if selected == "" {
+		selected = "batch"
+	}
+	switch selected {
+	case "batch":
+		if octoClient == nil {
+			return nil, fmt.Errorf("octo-search client is not configured")
+		}
+		return fetchViaBatch(ctx, octoClient, candidates, creatorUID, startTS, endTS, fetchConcurrency)
+	case "mysql":
+		return fetchViaMySQL(ctx, candidates, creatorUID, startTS, endTS, imDB, tableCount, maxPerChannel, fetchConcurrency)
+	default:
+		return nil, fmt.Errorf("unsupported message fetch backend %q", backend)
+	}
+}
+
+func fetchViaMySQL(ctx context.Context, candidates []ChannelInfo, creatorUID string, startTS, endTS int64, imDB *gorm.DB, tableCount int, maxPerChannel int, fetchConcurrency int) ([]Message, error) {
+	if imDB == nil {
+		return nil, fmt.Errorf("IM database not available")
+	}
+	normIDs, infoByID := normalizeAndIndexCandidates(candidates, creatorUID)
+	if len(normIDs) == 0 {
+		return nil, nil
+	}
+	if fetchConcurrency <= 0 {
+		fetchConcurrency = octoSearchDefaultConc
+	}
+
+	var (
+		mu  sync.Mutex
+		wg  sync.WaitGroup
+		all []Message
+		sem = make(chan struct{}, fetchConcurrency)
+	)
+	for _, id := range normIDs {
+		info := infoByID[id]
+		wg.Add(1)
+		go func(ch ChannelInfo) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+
+			msgs, err := FetchMessagesFromChannel(ctx, ch.ChannelID, ch.ChannelType, startTS, endTS, imDB, tableCount, creatorUID, maxPerChannel)
+			if err != nil {
+				log.Printf("[pipeline-personal] mysql message fetch skipped channel=%s: %v", ch.ChannelID, err)
+				return
+			}
+			for i := range msgs {
+				msgs[i].SourceName = ch.ChannelName
+				msgs[i].ChannelType = ch.ChannelType
+			}
+			mu.Lock()
+			all = append(all, msgs...)
+			mu.Unlock()
+		}(info)
+	}
+	wg.Wait()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].ChannelID != all[j].ChannelID {
+			return all[i].ChannelID < all[j].ChannelID
+		}
+		return all[i].MessageSeq < all[j].MessageSeq
+	})
+	return all, nil
 }
 
 // IntersectParticipantChannels filters channels to only those where both
@@ -618,14 +694,14 @@ func FilterMessagesByRelevance(messages []Message, topic string, participantUIDs
 
 // ResolveAndFetchMessagesForPersonal runs the pipeline with participant-aware
 // filtering: Layer 1.5 (channel intersection) and Layer 4.5 (mutual activity).
-// 
+//
 // Intent recognition is consolidated into a single LLM call that extracts:
 // - Time range (Layer 0)
-// - Channel scope (Layer 1.7) 
+// - Channel scope (Layer 1.7)
 // - Target persons (for post-fetch filtering)
 //
 // Returns messages, intent result (for target person filtering), and error.
-func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, participantUIDs []string, participantNames []string, specifiedSources []map[string]interface{}, topic string, timeStart, timeEnd time.Time, imDB *gorm.DB, toolCallFn LLMToolCallFn, llmFn LLMCallFn, tableCount int, maxPerChannel int, fetchConcurrency int, channelScopeOpts *ChannelScopeOptions) ([]Message, *IntentResult, error) {
+func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, participantUIDs []string, participantNames []string, specifiedSources []map[string]interface{}, topic string, timeStart, timeEnd time.Time, imDB *gorm.DB, octoClient octoSearchClient, messageFetchBackend string, toolCallFn LLMToolCallFn, llmFn LLMCallFn, tableCount int, maxPerChannel int, fetchConcurrency int, channelScopeOpts *ChannelScopeOptions) ([]Message, *IntentResult, error) {
 	maxDays := DefaultTimeRangeDays
 	if timeEnd.Sub(timeStart) > time.Duration(maxDays)*24*time.Hour {
 		return nil, nil, fmt.Errorf("时间范围不能超过 %d 天", maxDays)
@@ -720,62 +796,14 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 	log.Printf("[pipeline-personal] Layer 2 (source constraints) took %dms (%d → %d candidates)",
 		time.Since(l2Start).Milliseconds(), len(userChannels), len(candidates))
 
-	// Layer 4: message fetching（并发）
+	// Layer 4: fetch message content from the configured backend.
 	fetchStart := time.Now()
-	if fetchConcurrency <= 0 {
-		fetchConcurrency = 10
+	allMessages, err := fetchMessagesByBackend(ctx, messageFetchBackend, octoClient, candidates, creatorUID, startTS, endTS, imDB, tableCount, maxPerChannel, fetchConcurrency)
+	if err != nil {
+		return nil, nil, fmt.Errorf("fetch messages via %s: %w", messageFetchBackend, err)
 	}
-
-	type fetchResult struct {
-		msgs []Message
-		err  error
-		ch   ChannelInfo
-	}
-
-	resultsCh := make(chan fetchResult, len(candidates))
-	sem := make(chan struct{}, fetchConcurrency)
-	var wg sync.WaitGroup
-
-	for _, ch := range candidates {
-		wg.Add(1)
-		go func(channel ChannelInfo) {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				resultsCh <- fetchResult{nil, ctx.Err(), channel}
-				return
-			}
-			defer func() { <-sem }()
-			msgs, err := FetchMessagesFromChannel(ctx, channel.ChannelID, channel.ChannelType, startTS, endTS, imDB, tableCount, creatorUID, maxPerChannel)
-			if err == nil {
-				for i := range msgs {
-					msgs[i].SourceName = channel.ChannelName
-					msgs[i].ChannelType = channel.ChannelType
-				}
-			}
-			resultsCh <- fetchResult{msgs, err, channel}
-		}(ch)
-	}
-	wg.Wait()
-	close(resultsCh)
-
-	var allMessages []Message
-	for r := range resultsCh {
-		if r.err != nil {
-			log.Printf("[pipeline-personal] fetch from %s error: %v", r.ch.ChannelID, r.err)
-			continue
-		}
-		allMessages = append(allMessages, r.msgs...)
-	}
-	sort.Slice(allMessages, func(i, j int) bool {
-		if allMessages[i].ChannelID != allMessages[j].ChannelID {
-			return allMessages[i].ChannelID < allMessages[j].ChannelID
-		}
-		return allMessages[i].MessageSeq < allMessages[j].MessageSeq
-	})
-	log.Printf("[pipeline-personal] Layer 4: fetched %d messages from %d channels in %dms",
-		len(allMessages), len(candidates), time.Since(fetchStart).Milliseconds())
+	log.Printf("[pipeline-personal] Layer 4 (%s): fetched %d messages from %d candidates in %dms",
+		messageFetchBackend, len(allMessages), len(candidates), time.Since(fetchStart).Milliseconds())
 
 	// Layer 4.5: mutual activity filter
 	l45Start := time.Now()

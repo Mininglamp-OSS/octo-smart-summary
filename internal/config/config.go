@@ -79,6 +79,11 @@ type Config struct {
 	// Fetch concurrency for parallel channel message retrieval
 	FetchConcurrency int
 
+	// Message content fetch backend: "batch" or "mysql".
+	MessageFetchBackend string
+	OctoSearchURL       string
+	OctoSearchToken     string
+
 	// Channel scope narrowing
 	ChannelScopeEnabled bool
 
@@ -148,6 +153,10 @@ func Load() *Config {
 		CandidateQueryLimit: envInt("SUMMARY_CHAT_CANDIDATE_LIMIT", -1),
 
 		FetchConcurrency: envInt("FETCH_CONCURRENCY", 10),
+
+		MessageFetchBackend: strings.ToLower(strings.TrimSpace(envStr("MESSAGE_FETCH_BACKEND", "batch"))),
+		OctoSearchURL:       envStr("OCTO_SEARCH_URL", ""),
+		OctoSearchToken:     envStr("OCTO_SEARCH_TOKEN", ""),
 
 		ChannelScopeEnabled: envBool("CHANNEL_SCOPE_ENABLED", true),
 
@@ -219,16 +228,16 @@ var modelMapThresholds = []modelThreshold{
 	{"claude-opus-4-6", 350000},
 	{"claude-haiku-4-5", 200000},
 	// Qwen models
-	{"qwen3.6-max", 300000},  
-	{"qwen3.6-plus", 300000},  
-	{"qwen3.6-flash", 300000}, 
+	{"qwen3.6-max", 300000},
+	{"qwen3.6-plus", 300000},
+	{"qwen3.6-flash", 300000},
 	// DeepSeek models
-	{"deepseek-v4-flash", 300000}, 
-	{"deepseek-v4-pro", 300000},   
+	{"deepseek-v4-flash", 300000},
+	{"deepseek-v4-pro", 300000},
 	// Kimi models
 	{"kimi-k2", 150000},
 	{"kimi_k2", 150000},
-	// GLM models (智谱)
+	// GLM models
 	{"glm-5.2", 300000},
 }
 
@@ -289,7 +298,7 @@ var modelSkipThresholds = []modelThreshold{
 	{"gpt-4o", 500000},
 	{"gpt-4", 500000},
 	// Kimi models
-	{"kimi-k2", 200000}, // Kimi 上下文 265K，留余量
+	{"kimi-k2", 200000}, // Leave headroom for Kimi's 265K context.
 	{"kimi_k2", 200000},
 }
 

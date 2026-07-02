@@ -5,14 +5,63 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	sqlite3 "github.com/mattn/go-sqlite3"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
+
+// echoOctoClient returns one synthetic message per submitted channel and sender.
+// Archive tests use it to focus on channel discovery and filtering behavior.
+// senders defaults to ["user1"]; multi-person cases pass multiple senders for
+// the mutual-activity filter.
+func echoOctoClient(senders ...string) *fakeOctoClient {
+	if len(senders) == 0 {
+		senders = []string{"user1"}
+	}
+	var mu sync.Mutex
+	tasks := map[string][]string{}
+	seq := 0
+	return &fakeOctoClient{
+		submitFn: func(chs []string, _, _ int64) (string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			seq++
+			id := fmt.Sprintf("task-%d", seq)
+			tasks[id] = append([]string(nil), chs...)
+			return id, nil
+		},
+		pollFn: func(taskID string) (*service.BatchStatus, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			return &service.BatchStatus{
+				Status: "completed",
+				Parts:  []service.Part{{URL: taskID, ChannelIDs: tasks[taskID]}},
+			}, nil
+		},
+		parseFn: func(parts []service.Part) ([]service.BatchMessageRow, error) {
+			var rows []service.BatchMessageRow
+			var n int64
+			for _, p := range parts {
+				for _, ch := range p.ChannelIDs {
+					for _, s := range senders {
+						n++
+						rows = append(rows, service.BatchMessageRow{
+							MessageSeq: n, FromUID: s, ChannelID: ch,
+							Timestamp: time.Now().Unix(), Payload: "hello",
+						})
+					}
+				}
+			}
+			return rows, nil
+		},
+	}
+}
 
 // archiveDriverOnce registers a sqlite3 driver variant that knows the MySQL
 // collation name (utf8mb4_unicode_ci) hardcoded into the pipeline's thread
@@ -167,7 +216,7 @@ func TestResolveAndFetch_SelectedArchivedThread_ProducesMessages(t *testing.T) {
 
 	msgs, _, err := ResolveAndFetchMessagesForPersonal(
 		context.Background(), "user1", nil, nil, specifiedSources, "",
-		start, end, db, nil, nil, 1, 0, 2, nil,
+		start, end, db, echoOctoClient(), "batch", nil, nil, 1, 0, 2, nil,
 	)
 	if err != nil {
 		t.Fatalf("ResolveAndFetchMessagesForPersonal: %v", err)
@@ -182,6 +231,34 @@ func TestResolveAndFetch_SelectedArchivedThread_ProducesMessages(t *testing.T) {
 	}
 }
 
+func TestResolveAndFetch_MySQLBackend_UsesLegacyMessageFilter(t *testing.T) {
+	db := setupPipelineImDB(t)
+	ts := time.Now().Add(-time.Hour).Unix()
+	seedPipelineThreads(db, ts)
+	db.Exec(`INSERT INTO message (message_seq, from_uid, channel_id, channel_type, timestamp, payload, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		4, "user1", "grp1____thB", 5, ts, []byte(`{"type":1,"content":"deleted"}`), 1)
+
+	specifiedSources := []map[string]interface{}{
+		{"source_id": "grp1____thB", "source_type": 2},
+	}
+	start := time.Now().Add(-24 * time.Hour)
+	end := time.Now().Add(time.Hour)
+
+	msgs, _, err := ResolveAndFetchMessagesForPersonal(
+		context.Background(), "user1", nil, nil, specifiedSources, "",
+		start, end, db, nil, "mysql", nil, nil, 1, 0, 2, nil,
+	)
+	if err != nil {
+		t.Fatalf("ResolveAndFetchMessagesForPersonal: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("got %d messages, want 1", len(msgs))
+	}
+	if msgs[0].Content != "hello" {
+		t.Fatalf("content = %q, want hello", msgs[0].Content)
+	}
+}
+
 func TestResolveAndFetch_NoSources_ArchivedExcluded(t *testing.T) {
 	db := setupPipelineImDB(t)
 	ts := time.Now().Add(-time.Hour).Unix()
@@ -193,7 +270,7 @@ func TestResolveAndFetch_NoSources_ArchivedExcluded(t *testing.T) {
 	// No explicit sources -> auto discovery -> only the active thread's message.
 	msgs, _, err := ResolveAndFetchMessagesForPersonal(
 		context.Background(), "user1", nil, nil, nil, "",
-		start, end, db, nil, nil, 1, 0, 2, nil,
+		start, end, db, echoOctoClient(), "batch", nil, nil, 1, 0, 2, nil,
 	)
 	if err != nil {
 		t.Fatalf("ResolveAndFetchMessagesForPersonal: %v", err)
@@ -282,7 +359,7 @@ func seedSharedArchivedThread(db *gorm.DB, ts int64) {
 }
 
 // TestResolveAndFetch_MultiPerson_SelectedArchivedThread_Retained is the
-// regression guard for the Layer 1.5 blocker: a participant channel lookup that
+// regression guard for Layer 1.5: a participant channel lookup that
 // ignored the selected-thread scope removed the creator-side archived thread in
 // the intersect, yielding an empty summary. With the scope threaded through, the
 // shared archived thread survives and its messages are returned.
@@ -300,7 +377,7 @@ func TestResolveAndFetch_MultiPerson_SelectedArchivedThread_Retained(t *testing.
 
 	msgs, _, err := ResolveAndFetchMessagesForPersonal(
 		context.Background(), "user1", []string{"user2"}, nil, specifiedSources, "",
-		start, end, db, nil, nil, 1, 0, 2, nil,
+		start, end, db, echoOctoClient("user1", "user2"), "batch", nil, nil, 1, 0, 2, nil,
 	)
 	if err != nil {
 		t.Fatalf("ResolveAndFetchMessagesForPersonal: %v", err)
