@@ -7,7 +7,10 @@ All configuration is done via environment variables.
 | Variable | Description | Required | Default |
 |----------|-------------|----------|---------|
 | `MYSQL_DSN` | MySQL DSN for the summary database | Yes | — |
-| `IM_MYSQL_DSN` | MySQL DSN for the IM database (read-only, message tables) | Yes | — |
+| `IM_MYSQL_DSN` | MySQL DSN for the IM database (read-only channel/member metadata) | Yes | — |
+| `MESSAGE_FETCH_BACKEND` | Message content backend: `batch` or `mysql` | No | `batch` |
+| `OCTO_SEARCH_URL` | octo-search-batch base URL for message export (without `/v1`) | Yes when `MESSAGE_FETCH_BACKEND=batch` | — |
+| `OCTO_SEARCH_TOKEN` | S2S bearer token for octo-search-batch | Yes when `MESSAGE_FETCH_BACKEND=batch` | — |
 | `OCTO_API_URL` | Authentication API base URL | Yes (API) | — |
 | `LLM_API_URL` | LLM gateway base URL (OpenAI-compatible) | Yes (Worker) | — |
 | `LLM_API_KEY` | API key for the LLM gateway | Yes (Worker) | — |

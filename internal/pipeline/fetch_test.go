@@ -25,18 +25,18 @@ func TestNormalizeDMChannelID(t *testing.T) {
 			want:        "5904fca8@2c56cb",
 		},
 		{
-			name:        "already has @ reorder",
+			name:        "already has @ normalized by crc32",
 			channelID:   "a@b",
 			selfUID:     "x",
 			channelType: 1,
-			want:        "b@a",
+			want:        "a@b",
 		},
 		{
-			name:        "already correct order",
+			name:        "already has @ reordered by crc32",
 			channelID:   "b@a",
 			selfUID:     "x",
 			channelType: 1,
-			want:        "b@a",
+			want:        "a@b",
 		},
 		{
 			name:        "non-DM unchanged",

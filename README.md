@@ -50,10 +50,17 @@ go build ./cmd
 # minimal config via env
 export LLM_API_URL=https://api.example.com/v1
 export LLM_API_KEY=sk-your-key-here
+export MESSAGE_FETCH_BACKEND=batch
+export OCTO_SEARCH_URL=http://octo-search-batch:8080
+export OCTO_SEARCH_TOKEN=your-s2s-token
 export SUMMARY_LISTEN_ADDR=:8090
 
 ./cmd serve
 ```
+
+`OCTO_SEARCH_URL` is the octo-search-batch base URL; do not include the `/v1`
+suffix because the client appends the API path. Set `MESSAGE_FETCH_BACKEND=mysql`
+to use the legacy MySQL message-content path.
 
 Then, from another terminal:
 

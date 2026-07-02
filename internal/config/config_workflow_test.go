@@ -13,9 +13,13 @@ func TestLoad_WorkflowConfigs(t *testing.T) {
 		t.Setenv("DEFAULT_TIME_RANGE_DAYS", "")
 		t.Setenv("SKIP_MAP_REDUCE_THRESHOLD", "")
 		t.Setenv("TOKENIZER_HTTP_TIMEOUT", "")
+		t.Setenv("MESSAGE_FETCH_BACKEND", "")
 
 		cfg := Load()
 
+		if cfg.MessageFetchBackend != "batch" {
+			t.Errorf("MessageFetchBackend = %q, want batch", cfg.MessageFetchBackend)
+		}
 		if cfg.EnableIntentShortcut != true {
 			t.Errorf("EnableIntentShortcut = %v, want true", cfg.EnableIntentShortcut)
 		}
@@ -40,9 +44,13 @@ func TestLoad_WorkflowConfigs(t *testing.T) {
 		t.Setenv("DEFAULT_TIME_RANGE_DAYS", "14")
 		t.Setenv("SKIP_MAP_REDUCE_THRESHOLD", "150000")
 		t.Setenv("TOKENIZER_HTTP_TIMEOUT", "20")
+		t.Setenv("MESSAGE_FETCH_BACKEND", "mysql")
 
 		cfg := Load()
 
+		if cfg.MessageFetchBackend != "mysql" {
+			t.Errorf("MessageFetchBackend = %q, want mysql", cfg.MessageFetchBackend)
+		}
 		if cfg.EnableIntentShortcut != false {
 			t.Errorf("EnableIntentShortcut = %v, want false", cfg.EnableIntentShortcut)
 		}

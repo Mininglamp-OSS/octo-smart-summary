@@ -217,7 +217,7 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 	} else {
 		// Multi-person mode: trigger meta-summary to check if all participants completed.
 		//
-		// §4.4-2 system back-fill of submitted_at (Blocker-1): the meta completion gate
+		// System back-fill of submitted_at: the meta completion gate
 		// requires submitted_at IS NOT NULL, but the personal worker only sets
 		// ParticipantCompleted/WorkerStatus=Completed -- it never writes submitted_at
 		// (the only manual writer is /submit). A scheduled multi-person task driven by the
@@ -258,7 +258,7 @@ func (p *Processor) backfillScheduledSubmittedAt(taskID int64, pr *model.Persona
 			Scan(&status).Error; err != nil {
 			return err
 		}
-		// Confirmed gate (口径同 meta totalAccepted): skip Pending/Declined.
+		// Use the same accepted-participant gate as meta aggregation.
 		if status == model.ParticipantPending || status == model.ParticipantDeclined {
 			return nil
 		}
@@ -284,7 +284,8 @@ func (p *Processor) backfillScheduledSubmittedAt(taskID int64, pr *model.Persona
 func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *model.SummaryParticipant, errMsg string) {
 	sanitized := sanitizeErrorForUser(errMsg)
 
-	// 🔴 Blocker-3 fix: self-heal vs terminal failure.
+	// Retryable personal failures are returned to Pending; exhausted attempts are
+	// marked terminal for that participant.
 	//
 	// The old markPersonalFailed unconditionally set worker_status=Failed and reset the
 	// participant to Accepted. But the retry scanner (scanStuckPersonalTasks) only
@@ -294,7 +295,7 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 	// does NOT propagate task-level failure, so meta would wait forever for a submit that
 	// never comes -> task stuck until the lease times out.
 	//
-	// New behavior (P0, AUTO path):
+	// Retry behavior:
 	//   - retry_count < WorkerMaxRetry: increment retry_count and set worker_status back
 	//     to Pending (participant stays Accepted). scanStuckPersonalTasks' M3 sweep (and
 	//     the AUTO dispatch path) then naturally re-runs it -- a transient failure heals.
@@ -304,7 +305,7 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 	//       * multi-person: Decline the failed participant so it drops out of meta's
 	//         totalAccepted (status NOT IN Pending,Declined), letting the remaining
 	//         members aggregate; then kick meta to re-evaluate. This keeps the existing
-	//         meta gate intact (no confirmed_set change -- that is P1 scope).
+	//         meta gate intact.
 	maxRetry := p.cfg.WorkerMaxRetry
 	if maxRetry < 1 {
 		maxRetry = 1
@@ -501,7 +502,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	messages, intentResult, err := pipeline.ResolveAndFetchMessagesForPersonal(
 		ctx, userID, nil, nil, specifiedSources, task.Title,
 		task.TimeRangeStart, task.TimeRangeEnd,
-		p.imDB, toolCallFn, llmFn,
+		p.imDB, p.octoClient, p.cfg.MessageFetchBackend, toolCallFn, llmFn,
 		p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency,
 		channelScopeOpts,
 	)
