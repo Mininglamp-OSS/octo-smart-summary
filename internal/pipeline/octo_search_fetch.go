@@ -274,18 +274,22 @@ func runWithTimeWindowSplit(ctx context.Context, client octoSearchClient, chs []
 // runOneBatch submits one batch, polls to a terminal status, downloads rows,
 // then maps rows back to pipeline messages.
 func runOneBatch(ctx context.Context, client octoSearchClient, chs []string, startTS, endTS int64, infoByID map[string]ChannelInfo) ([]Message, error) {
+	batchStart := time.Now()
 	taskID, err := client.Submit(ctx, chs, startTS, endTS)
 	if err != nil {
 		return nil, err
 	}
+	submitElapsed := time.Since(batchStart)
 
 	status, err := pollUntilTerminal(ctx, client, taskID)
 	if err != nil {
 		return nil, err
 	}
+	statusReadyElapsed := time.Since(batchStart)
 
 	switch status.Status {
 	case "completed", "partial":
+		downloadMapStart := time.Now()
 		if status.Status == "partial" {
 			for _, w := range status.Warnings {
 				log.Printf("[pipeline-personal] octo-search partial truncation: channel=%s code=%s limit=%d seen=%d",
@@ -299,7 +303,16 @@ func runOneBatch(ctx context.Context, client octoSearchClient, chs []string, sta
 		if err != nil {
 			return nil, err
 		}
-		return rowsToMessages(rows, infoByID)
+		msgs, err := rowsToMessages(rows, infoByID)
+		if err != nil {
+			return nil, err
+		}
+		downloadMapElapsed := time.Since(downloadMapStart)
+		totalElapsed := time.Since(batchStart)
+		log.Printf("[pipeline-personal] octo-search task completed: task_id=%s status=%s channels=%d parts=%d rows=%d messages=%d submit_ms=%d status_ready_ms=%d download_map_ms=%d total_ms=%d",
+			taskID, status.Status, len(chs), len(status.Parts), len(rows), len(msgs),
+			submitElapsed.Milliseconds(), statusReadyElapsed.Milliseconds(), downloadMapElapsed.Milliseconds(), totalElapsed.Milliseconds())
+		return msgs, nil
 	case "failed":
 		return nil, fmt.Errorf("octo-search task %s failed: %s %s", taskID, status.ErrorCode, status.ErrorMsg)
 	case "cancelled":
