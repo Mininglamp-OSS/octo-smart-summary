@@ -43,7 +43,7 @@ func setupMembersTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open summary db: %v", err)
 	}
-	db.AutoMigrate(&model.SummaryTask{}, &model.SummarySource{}, &model.SummaryParticipant{}, &model.PersonalResult{}, &model.SummarySchedule{})
+	db.AutoMigrate(&model.SummaryTask{}, &model.SummarySource{}, &model.SummaryParticipant{}, &model.PersonalResult{}, &model.SummarySchedule{}, &model.SummaryResult{})
 	// Mirror the production MySQL unique constraints AutoMigrate doesn't create on
 	// sqlite, so handler ON CONFLICT upserts resolve:
 	//   uk_part(task_id,user_id)            -- AddMembers participant upsert (F2)
