@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 )
 
 // TimeNarrowResult represents the structured output from time-range extraction.
@@ -77,7 +78,7 @@ func PreRetrievalNarrow(ctx context.Context, topic string, originalStart, origin
 	}
 	topic = sanitizeTopic(topic)
 
-	now := time.Now()
+	now := timezone.Now()
 	currentDate := now.Format("2006-01-02")
 	weekdays := [...]string{"日", "一", "二", "三", "四", "五", "六"}
 	weekday := weekdays[now.Weekday()]
