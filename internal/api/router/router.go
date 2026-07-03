@@ -53,6 +53,12 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		v1.PUT("/summaries/:id/edit", editH.EditSummary)
 		// need3/need6: a participant edits their OWN personal report -> triggers team recompute.
 		v1.PUT("/summaries/:id/personal-edit", personalH.PersonalEdit)
+		// OCT-21: a participant edits their OWN personal report BEFORE submit
+		// (draft). Does NOT trigger team recompute, does NOT write edited_at,
+		// does NOT revive. Allowed only when worker_status==Completed AND
+		// submitted_at IS NULL; once submitted the caller must switch to
+		// /personal-edit (which DOES trigger recompute).
+		v1.PUT("/summaries/:id/personal-draft", personalH.PersonalDraft)
 		// need7: creator adds new members as PENDING/unconfirmed; no PersonalResult,
 		// no dispatch -- the new member must Accept to generate their summary.
 		v1.POST("/summaries/:id/members", personalH.AddMembers)
