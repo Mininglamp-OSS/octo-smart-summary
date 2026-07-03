@@ -2,6 +2,7 @@ package worker
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/notify"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/robfig/cron/v3"
@@ -21,13 +23,29 @@ var schedulerHTTPClient = &http.Client{Timeout: 5 * time.Second}
 // StartScheduler starts the 4 cron scan jobs (every 60s).
 // featureTeamSchedule, when true, lets multi-person schedules through the claim path
 // instead of disabling them (FEATURE_TEAM_SCHEDULE).
-func StartScheduler(db *gorm.DB, imDB *gorm.DB, maxRetry int, workerTriggerURL string, maxWindowDays int, featureTeamSchedule bool) *cron.Cron {
+func StartScheduler(db *gorm.DB, imDB *gorm.DB, maxRetry int, workerTriggerURL string, maxWindowDays int, featureTeamSchedule bool, notifier *notify.Notifier) *cron.Cron {
 	c := cron.New()
 
 	c.AddFunc("@every 60s", func() { scanPendingSchedules(db, imDB, maxWindowDays, featureTeamSchedule) })
 	c.AddFunc("@every 60s", func() { scanConfirmTimeouts(db) })
-	c.AddFunc("@every 60s", func() { scanStuckTasks(db, maxRetry) })
+	c.AddFunc("@every 60s", func() { scanStuckTasks(db, maxRetry, notifier) })
 	c.AddFunc("@every 60s", func() { scanStuckPersonalTasks(db, workerTriggerURL) })
+	if notifier != nil {
+		// Background sweep for the notify state machine. Re-attempts rows stuck
+		// at status='failed' with retry budget remaining (the synchronous worker
+		// path is one-shot, so without this sweep MaxNotifyAttempts collapses
+		// to 1 for the common case) and reclaims rows stuck at status='pending'
+		// past their lease (worker crash mid-delivery). Both branches use atomic
+		// CAS, so they cannot double-send with a concurrent OnTaskTerminal call.
+		c.AddFunc("@every 60s", func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 55*time.Second)
+			defer cancel()
+			notifier.Sweep(ctx)
+		})
+		c.Start()
+		log.Println("[scheduler] started with 5 scan jobs (every 60s)")
+		return c
+	}
 
 	c.Start()
 	log.Println("[scheduler] started with 4 scan jobs (every 60s)")
@@ -339,7 +357,9 @@ func scanConfirmTimeouts(db *gorm.DB) {
 
 // scanStuckTasks resets tasks stuck in processing past their deadline.
 // Increments retry_count; if max retries exceeded, marks as Failed.
-func scanStuckTasks(db *gorm.DB, maxRetry int) {
+// notifier (optional) is fired once per task that this sweep transitions to
+// Failed, AFTER the terminal-status write has committed.
+func scanStuckTasks(db *gorm.DB, maxRetry int, notifier *notify.Notifier) {
 	now := timezone.Now()
 
 	// Reset tasks that can still retry (also handle NULL deadline for legacy data)
@@ -355,18 +375,57 @@ func scanStuckTasks(db *gorm.DB, maxRetry int) {
 		log.Printf("[scheduler] reset %d stuck tasks (retry incremented)", result.RowsAffected)
 	}
 
-	// Fail tasks that exceeded max retries (also handle NULL deadline)
-	failResult := db.Model(&model.SummaryTask{}).
+	// Fail tasks that exceeded max retries. Two-step (snapshot IDs, then per-row
+	// CAS UPDATE) so we can attribute exactly which IDs *this* sweep flipped to
+	// Failed — a bulk UPDATE cannot return the rows, and a snapshot-then-bulk
+	// shape would miss any task that crossed the deadline between the snapshot
+	// and the UPDATE (review feedback P2-2: snapshot-then-update race could
+	// drop the notification for a late-crosser since on the next sweep its
+	// status is already Failed). The per-row CAS guards on the same predicates
+	// the snapshot used, so concurrent transitions are absorbed (RowsAffected==0
+	// means another worker / cancel got there first; we skip).
+	var toFail []int64
+	db.Model(&model.SummaryTask{}).
 		Where("status = ? AND (processing_deadline IS NULL OR processing_deadline < ?) AND retry_count >= ?",
 			model.StatusProcessing, now, maxRetry-1).
-		Updates(map[string]interface{}{
-			"status":              model.StatusFailed,
-			"processing_deadline": nil,
-			"retry_count":         gorm.Expr("retry_count + 1"),
-			"error_message":       "exceeded max retries",
-		})
-	if failResult.RowsAffected > 0 {
-		log.Printf("[scheduler] failed %d stuck tasks (max retries exceeded)", failResult.RowsAffected)
+		Pluck("id", &toFail)
+
+	var failedIDs []int64
+	for _, id := range toFail {
+		res := db.Model(&model.SummaryTask{}).
+			Where("id = ? AND status = ? AND (processing_deadline IS NULL OR processing_deadline < ?) AND retry_count >= ?",
+				id, model.StatusProcessing, now, maxRetry-1).
+			Updates(map[string]interface{}{
+				"status":              model.StatusFailed,
+				"processing_deadline": nil,
+				"retry_count":         gorm.Expr("retry_count + 1"),
+				"error_message":       "exceeded max retries",
+			})
+		if res.Error == nil && res.RowsAffected == 1 {
+			failedIDs = append(failedIDs, id)
+		}
+	}
+	if len(failedIDs) > 0 {
+		log.Printf("[scheduler] failed %d stuck tasks (max retries exceeded)", len(failedIDs))
+	}
+
+	// Notify exactly the tasks this sweep transitioned. Reload each so the
+	// notification reflects the committed terminal row.
+	if notifier != nil {
+		for _, id := range failedIDs {
+			var task model.SummaryTask
+			if err := db.First(&task, id).Error; err != nil {
+				continue
+			}
+			if task.Status != model.StatusFailed {
+				continue
+			}
+			errMsg := ""
+			if task.ErrorMessage != nil {
+				errMsg = *task.ErrorMessage
+			}
+			notifier.OnTaskTerminal(task, model.StatusFailed, errMsg)
+		}
 	}
 }
 

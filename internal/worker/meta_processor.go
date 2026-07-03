@@ -294,6 +294,11 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 			EventType: "META_SUMMARY_UPDATED",
 		})
 
+		// Task durably reached Completed (saveLatestResultAndCompleteTask succeeded).
+		// The notifier dedups on UNIQUE(task_id, completed), so a meta re-run that
+		// produces a new version still only sends ONE completed notification.
+		m.proc.notifyTaskTerminal(taskID, model.StatusCompleted)
+
 		log.Printf("[meta-worker] task %d meta-summary version %d created (%d participants)",
 			taskID, result.Version, len(submitted))
 

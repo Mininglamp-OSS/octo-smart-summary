@@ -70,7 +70,7 @@ type Config struct {
 	CharsPerTokenCJK          int
 	CharsPerTokenASCII        int
 
-	// Worker trigger URL (API → Worker)
+	// Worker trigger URL (API -> Worker)
 	WorkerTriggerURL string
 
 	// Candidate search query limit (-1 = no limit, >0 = use as SQL LIMIT)
@@ -109,6 +109,28 @@ type Config struct {
 	SkipMapReduceThreshold int    // Skip Map-Reduce threshold (tokens), env SKIP_MAP_REDUCE_THRESHOLD
 	KimiAPIKey             string // Kimi API key for exact token counting, env KIMI_API_KEY
 	TokenizerHTTPTimeout   int    // HTTP timeout for tokenizer API calls, env TOKENIZER_HTTP_TIMEOUT
+
+	// --- task-terminal notification (delivery via octo-server internal-notify) ---
+
+	// NotifyEnabled is the master switch for delivering a terminal-state
+	// notification (Completed / Failed) to the task's recipients. Default OFF so
+	// the feature can be dark-launched.
+	NotifyEnabled bool
+	// NotifyInternalToken authenticates POST /v1/internal/notify via the
+	// X-Internal-Token header (constant-time compared server-side). SECRET: read
+	// from env only, never printed/logged, never written to
+	// summary_notification.last_error. Prod + NotifyEnabled but empty => startup
+	// fatal (fail-fast on misconfig); dev only warns.
+	NotifyInternalToken string
+	// SummaryWebBaseURL is the base for a result link in the notification text.
+	// Empty => no link appended.
+	SummaryWebBaseURL string
+	// AppEnv is the deployment environment ("prod" | "dev"). Drives the
+	// prod-fatal / dev-warn handling of a missing NotifyInternalToken.
+	AppEnv string
+	// MaxNotifyAttempts caps same-row retries for a single (task_id, notify_kind)
+	// notification before it is left in status='failed'. Default 3.
+	MaxNotifyAttempts int
 }
 
 func Load() *Config {
@@ -164,6 +186,7 @@ func Load() *Config {
 
 		ToolCallTimeout: envInt("TOOL_CALL_TIMEOUT", 30),
 
+		// keep upstream main default (true, #112)
 		FeatureTeamSchedule: envBool("FEATURE_TEAM_SCHEDULE", true),
 
 		EnableIntentShortcut: envBool("ENABLE_INTENT_SHORTCUT", true),
@@ -174,6 +197,14 @@ func Load() *Config {
 		SkipMapReduceThreshold: envInt("SKIP_MAP_REDUCE_THRESHOLD", 0),
 		KimiAPIKey:             envStr("KIMI_API_KEY", ""),
 		TokenizerHTTPTimeout:   envInt("TOKENIZER_HTTP_TIMEOUT", 10),
+
+		NotifyEnabled:       envBool("SUMMARY_NOTIFY_ENABLED", false),
+		// Custom env name (老板拍板): distinct from matter's NOTIFY_INTERNAL_TOKEN.
+		// Header contract X-Internal-Token is unchanged; only the source env differs.
+		NotifyInternalToken: envStr("SUMMARY_NOTIFY_TOKEN", ""),
+		SummaryWebBaseURL:   envStr("SUMMARY_WEB_BASE_URL", ""),
+		AppEnv:              envStr("APP_ENV", "dev"),
+		MaxNotifyAttempts:   envInt("MAX_NOTIFY_ATTEMPTS", 3),
 	}
 }
 
