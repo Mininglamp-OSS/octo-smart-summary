@@ -54,7 +54,8 @@ func shouldSkipScheduledPlaceholderResult(triggerType int, content string) bool 
 
 func completedPersonalResultUpdates(pr model.PersonalResult, content string, citations []model.Citation, msgCount, totalTokens int, modelVer string, genAt time.Time, skipContent bool) map[string]interface{} {
 	updates := map[string]interface{}{
-		"worker_status": model.PersonalStatusCompleted,
+		"worker_status":  model.PersonalStatusCompleted,
+		"workflow_stage": model.WorkflowStageGenerateSummary,
 	}
 	if skipContent {
 		return updates
@@ -67,6 +68,17 @@ func completedPersonalResultUpdates(pr model.PersonalResult, content string, cit
 	updates["model_version"] = modelVer
 	updates["generated_at"] = genAt
 	return updates
+}
+
+func (p *Processor) updatePersonalWorkflowStage(personalResultID int64, stage string) {
+	if personalResultID == 0 || stage == "" {
+		return
+	}
+	if err := p.db.Model(&model.PersonalResult{}).
+		Where("id = ? AND worker_status = ?", personalResultID, model.PersonalStatusProcessing).
+		Update("workflow_stage", stage).Error; err != nil {
+		log.Printf("[personal-worker] update workflow stage pr=%d stage=%s: %v", personalResultID, stage, err)
+	}
 }
 
 func (p *Processor) processPersonalSummary(ctx context.Context, taskID, participantRefID int64) {
@@ -131,8 +143,54 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 		return
 	}
 
+	nonNegativeMs := func(start time.Time) int64 {
+		if start.IsZero() {
+			return 0
+		}
+		d := now.Sub(start)
+		if d < 0 {
+			return 0
+		}
+		return d.Milliseconds()
+	}
+	taskWaitMs := nonNegativeMs(task.CreatedAt)
+	prWaitMs := nonNegativeMs(pr.CreatedAt)
+	participantWaitMs := nonNegativeMs(participant.CreatedAt)
+	timing.GetContext(task.TaskNo).Update(func(c *timing.TaskContext) {
+		c.TaskCreatedToWorkerStartMs = taskWaitMs
+		c.PersonalResultCreatedToWorkerStartMs = prWaitMs
+		c.ParticipantCreatedToWorkerStartMs = participantWaitMs
+	})
+	log.Printf("[personal-worker] pre-worker wait task=%s task_created_to_start=%dms personal_result_created_to_start=%dms participant_created_to_start=%dms",
+		task.TaskNo, taskWaitMs, prWaitMs, participantWaitMs)
+
+	workerStartAt := now
+	lastWorkflowStageAt := workerStartAt
+	reportStage := func(stage string) {
+		stageAt := timezone.Now()
+		sinceWorkerStartMs := stageAt.Sub(workerStartAt).Milliseconds()
+		deltaMs := stageAt.Sub(lastWorkflowStageAt).Milliseconds()
+		if sinceWorkerStartMs < 0 {
+			sinceWorkerStartMs = 0
+		}
+		if deltaMs < 0 {
+			deltaMs = 0
+		}
+		lastWorkflowStageAt = stageAt
+		timing.GetContext(task.TaskNo).Update(func(c *timing.TaskContext) {
+			c.WorkflowStages = append(c.WorkflowStages, timing.WorkflowStageMs{
+				Stage:              stage,
+				SinceWorkerStartMs: sinceWorkerStartMs,
+				DeltaMs:            deltaMs,
+			})
+		})
+		log.Printf("[personal-worker] workflow stage task=%s pr=%d stage=%s since_worker_start=%dms delta=%dms",
+			task.TaskNo, pr.ID, stage, sinceWorkerStartMs, deltaMs)
+		p.updatePersonalWorkflowStage(pr.ID, stage)
+	}
+
 	// Execute pipeline
-	content, citations, msgCount, totalTokens, modelVer, err := p.executePersonalPipeline(ctx, task, participant.UserID)
+	content, citations, msgCount, totalTokens, modelVer, err := p.executePersonalPipeline(ctx, task, participant.UserID, reportStage)
 	if err != nil {
 		log.Printf("[personal-worker] pipeline error task=%d user=%s: %v", taskID, participant.UserID, err)
 		p.markPersonalFailed(&pr, &participant, err.Error())
@@ -345,8 +403,9 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 			// retry_count was already atomically incremented above; only the remaining
 			// columns are written here (do not re-set retry_count to an app-layer value).
 			if err := tx.Model(pr).Updates(map[string]interface{}{
-				"worker_status": model.PersonalStatusPending,
-				"error_message": &sanitized,
+				"worker_status":  model.PersonalStatusPending,
+				"workflow_stage": "",
+				"error_message":  &sanitized,
 			}).Error; err != nil {
 				return err
 			}
@@ -449,7 +508,7 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 	log.Printf("[personal-worker] task=%d marked failed (terminal), sanitizedMsg=%s", pr.TaskID, sanitized)
 }
 
-func (p *Processor) executePersonalPipeline(ctx context.Context, task model.SummaryTask, userID string) (string, []model.Citation, int, int, string, error) {
+func (p *Processor) executePersonalPipeline(ctx context.Context, task model.SummaryTask, userID string, reportStage func(string)) (string, []model.Citation, int, int, string, error) {
 	totalStart := time.Now()
 	taskNo := task.TaskNo
 	defer func() {
@@ -510,7 +569,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		task.TimeRangeStart, task.TimeRangeEnd,
 		p.imDB, p.octoClient, p.cfg.MessageFetchBackend, toolCallFn, llmFn,
 		p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency, p.cfg.OctoSearchPollSec,
-		channelScopeOpts,
+		channelScopeOpts, reportStage,
 	)
 	timing.Observe(taskNo, "fetch_messages", fetchStart)
 	if err != nil {
@@ -648,6 +707,10 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		targetMsgCount = len(userMessages)
 	}
 
+	if reportStage != nil {
+		reportStage(model.WorkflowStageAnalyzeChatContent)
+	}
+
 	// Create tokenizer for token counting
 	tokCfg := tokenizer.Config{
 		CharsPerTokenCJK:   p.cfg.ResolveCharsPerTokenCJK(),
@@ -760,6 +823,10 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 				escapeCitationMarkers(m.Content)))
 		}
 
+		if reportStage != nil {
+			reportStage(model.WorkflowStageGenerateSummary)
+		}
+
 		mapStart := time.Now()
 		mapCallStart := time.Now()
 		var err error
@@ -795,6 +862,12 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		results := make([]chunkResult, len(chunks))
 		mapSem := make(chan struct{}, concurrency)
 		var mapWg sync.WaitGroup
+
+		if len(chunks) == 1 && reportStage != nil {
+			// Single-chunk fast path: the Map call produces the final user-facing summary.
+			// Attribute its latency to generate_summary instead of analyze_chat_content.
+			reportStage(model.WorkflowStageGenerateSummary)
+		}
 
 		mapStart := time.Now()
 		for i, chunk := range chunks {
@@ -861,6 +934,10 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		}
 		if len(chunkSummaries) == 0 && len(results) > 0 {
 			return "", nil, 0, 0, "", fmt.Errorf("all %d chunk(s) failed during Map phase (LLM unreachable)", len(results))
+		}
+
+		if len(chunks) > 1 && reportStage != nil {
+			reportStage(model.WorkflowStageGenerateSummary)
 		}
 
 		// Reduce phase

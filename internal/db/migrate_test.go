@@ -160,6 +160,12 @@ SELECT 1;
 -- +migrate Down
 SELECT 1;
 `)},
+	"20260703-01-add-personal-workflow-stage.sql": &fstest.MapFile{Data: []byte(`-- +migrate Up
+ALTER TABLE summary_personal_result ADD COLUMN workflow_stage varchar(32) NOT NULL DEFAULT '';
+
+-- +migrate Down
+ALTER TABLE summary_personal_result DROP COLUMN workflow_stage;
+`)},
 }
 
 func testSource() migrate.MigrationSource {
@@ -185,8 +191,8 @@ func TestRunMigrations_NewDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runMigrationsCore: %v", err)
 	}
-	if n != 3 {
-		t.Fatalf("expected 3 migrations applied, got %d", n)
+	if n != 4 {
+		t.Fatalf("expected 4 migrations applied, got %d", n)
 	}
 
 	tables := []string{
@@ -209,6 +215,12 @@ func TestRunMigrations_NewDB(t *testing.T) {
 		if err != nil {
 			t.Errorf("index %s not found: %v", idx, err)
 		}
+	}
+
+	var workflowStageCol string
+	err = db.QueryRow("SELECT name FROM pragma_table_info('summary_personal_result') WHERE name='workflow_stage'").Scan(&workflowStageCol)
+	if err != nil {
+		t.Fatalf("workflow_stage column not found: %v", err)
 	}
 }
 
@@ -247,8 +259,8 @@ func TestRunMigrations_ExistingDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runMigrationsCore: %v", err)
 	}
-	if n != 2 {
-		t.Fatalf("expected 2 migrations applied (006+007), got %d", n)
+	if n != 3 {
+		t.Fatalf("expected 3 migrations applied (006+007+workflow_stage), got %d", n)
 	}
 }
 
@@ -273,8 +285,8 @@ func TestRunMigrations_Idempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first run: %v", err)
 	}
-	if n1 != 3 {
-		t.Fatalf("first run: expected 3, got %d", n1)
+	if n1 != 4 {
+		t.Fatalf("first run: expected 4, got %d", n1)
 	}
 
 	n2, err := runMigrationsCore(db, "sqlite3", testSource())

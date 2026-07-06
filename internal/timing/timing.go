@@ -218,6 +218,17 @@ func FlushReport(taskNo string, totalMs int64, extraStages []StageMs) {
 	ts := timezone.Now().Format(time.RFC3339)
 	fmt.Fprintf(&b, "==== 智能总结汇总报告 task_no=%s time=%s ====\n", taskNo, ts)
 
+	if ctx.TaskCreatedToWorkerStartMs > 0 || ctx.PersonalResultCreatedToWorkerStartMs > 0 || ctx.ParticipantCreatedToWorkerStartMs > 0 {
+		fmt.Fprintf(&b, "前置等待: 任务创建→worker开始=%dms 个人结果创建→worker开始=%dms 参与者创建→worker开始=%dms\n",
+			ctx.TaskCreatedToWorkerStartMs, ctx.PersonalResultCreatedToWorkerStartMs, ctx.ParticipantCreatedToWorkerStartMs)
+	}
+	if len(ctx.WorkflowStages) > 0 {
+		b.WriteString("Workflow阶段上报:\n")
+		for _, ws := range ctx.WorkflowStages {
+			fmt.Fprintf(&b, "  stage=%s  距worker开始=%dms  距上一阶段=%dms\n", ws.Stage, ws.SinceWorkerStartMs, ws.DeltaMs)
+		}
+	}
+
 	// Intent recognition section
 	if ctx.IntentSkipped {
 		fmt.Fprintf(&b, "意图识别: 短路=是 原因=%s\n", ctx.IntentSkipReason)
@@ -279,6 +290,13 @@ type StageMs struct {
 	Ms   int64
 }
 
+// WorkflowStageMs records when a user-visible workflow stage was reported.
+type WorkflowStageMs struct {
+	Stage              string
+	SinceWorkerStartMs int64
+	DeltaMs            int64
+}
+
 // ---------------------------------------------------------------------------
 // TaskContext: unified task context for enhanced reporting.
 //
@@ -293,6 +311,14 @@ type StageMs struct {
 type TaskContext struct {
 	mu     sync.Mutex // guards all fields below
 	TaskNo string
+
+	// Pre-worker waiting
+	TaskCreatedToWorkerStartMs           int64 // summary_task.created_at -> personal worker start
+	PersonalResultCreatedToWorkerStartMs int64 // summary_personal_result.created_at -> personal worker start
+	ParticipantCreatedToWorkerStartMs    int64 // summary_participant.created_at -> personal worker start
+
+	// User-visible workflow stages
+	WorkflowStages []WorkflowStageMs
 
 	// Intent recognition
 	IntentSkipped    bool   // true if short-circuited (no LLM)
@@ -327,19 +353,24 @@ func (c *TaskContext) Update(fn func(*TaskContext)) {
 func (c *TaskContext) Snapshot() TaskContext {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	workflowStages := append([]WorkflowStageMs(nil), c.WorkflowStages...)
 	return TaskContext{
-		TaskNo:            c.TaskNo,
-		IntentSkipped:     c.IntentSkipped,
-		IntentSkipReason:  c.IntentSkipReason,
-		IntentLLMCalls:    c.IntentLLMCalls,
-		ChannelCount:      c.ChannelCount,
-		MessagesRetrieved: c.MessagesRetrieved,
-		MessagesFinal:     c.MessagesFinal,
-		TargetPersonCount: c.TargetPersonCount,
-		FilteredCount:     c.FilteredCount,
-		UsedMapReduce:     c.UsedMapReduce,
-		ChunkCount:        c.ChunkCount,
-		TotalTokens:       c.TotalTokens,
+		TaskNo:                               c.TaskNo,
+		TaskCreatedToWorkerStartMs:           c.TaskCreatedToWorkerStartMs,
+		PersonalResultCreatedToWorkerStartMs: c.PersonalResultCreatedToWorkerStartMs,
+		ParticipantCreatedToWorkerStartMs:    c.ParticipantCreatedToWorkerStartMs,
+		WorkflowStages:                       workflowStages,
+		IntentSkipped:                        c.IntentSkipped,
+		IntentSkipReason:                     c.IntentSkipReason,
+		IntentLLMCalls:                       c.IntentLLMCalls,
+		ChannelCount:                         c.ChannelCount,
+		MessagesRetrieved:                    c.MessagesRetrieved,
+		MessagesFinal:                        c.MessagesFinal,
+		TargetPersonCount:                    c.TargetPersonCount,
+		FilteredCount:                        c.FilteredCount,
+		UsedMapReduce:                        c.UsedMapReduce,
+		ChunkCount:                           c.ChunkCount,
+		TotalTokens:                          c.TotalTokens,
 	}
 }
 
@@ -388,4 +419,3 @@ func RecordSkip(taskNo, stage, reason string) {
 	})
 	log.Printf("[timing] task=%s skipped %s (%s)", taskNo, stage, reason)
 }
-

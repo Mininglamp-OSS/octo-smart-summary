@@ -255,7 +255,10 @@ func (h *PersonalHandler) Accept(c *gin.Context) {
 				prCompleted = true
 			} else if pr.WorkerStatus != model.PersonalStatusPending {
 				if err := tx.Model(&model.PersonalResult{}).Where("id = ?", pr.ID).
-					Update("worker_status", model.PersonalStatusPending).Error; err != nil {
+					Updates(map[string]interface{}{
+						"worker_status":  model.PersonalStatusPending,
+						"workflow_stage": "",
+					}).Error; err != nil {
 					return err
 				}
 			}
@@ -417,22 +420,24 @@ func (h *PersonalHandler) GetPersonal(c *gin.Context) {
 	if err := h.db.Where("task_id = ? AND user_id = ?", taskID, userID).First(&pr).Error; err != nil {
 		// Not found → return default
 		ok(c, gin.H{
-			"worker_status": 0,
-			"content":       "",
-			"submitted_at":  nil,
-			"generated_at":  nil,
-			"msg_count":     0,
+			"worker_status":  0,
+			"workflow_stage": "",
+			"content":        "",
+			"submitted_at":   nil,
+			"generated_at":   nil,
+			"msg_count":      0,
 		})
 		return
 	}
 
 	result := gin.H{
-		"worker_status": pr.WorkerStatus,
-		"content":       pr.Content,
-		"citations":     pr.GetCitations(),
-		"submitted_at":  nil,
-		"generated_at":  nil,
-		"msg_count":     pr.MsgCount,
+		"worker_status":  pr.WorkerStatus,
+		"workflow_stage": pr.WorkflowStage,
+		"content":        pr.Content,
+		"citations":      pr.GetCitations(),
+		"submitted_at":   nil,
+		"generated_at":   nil,
+		"msg_count":      pr.MsgCount,
 	}
 	if pr.SubmittedAt != nil {
 		result["submitted_at"] = pr.SubmittedAt.Format(time.RFC3339)
