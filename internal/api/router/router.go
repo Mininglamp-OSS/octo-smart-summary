@@ -11,7 +11,7 @@ import (
 )
 
 // SetupPublic configures the public API router on :8080.
-func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middleware.TokenResolver, workerTriggerURL string, candidateQueryLimit int, featureTeamSchedule bool) *gin.Engine {
+func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middleware.TokenResolver, workerTriggerURL string, candidateQueryLimit int, featureTeamSchedule bool, customTemplateLimit int) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
 
@@ -37,6 +37,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 
 	// API routes
 	taskH := handler.NewTaskHandler(db, imDB, workerTriggerURL)
+	taskH.SetCustomTemplateLimit(customTemplateLimit)
 	schedH := handler.NewScheduleHandlerWithFlag(db, featureTeamSchedule)
 	personalH := handler.NewPersonalHandler(db, workerTriggerURL, hub)
 	editH := handler.NewEditHandler(db)
@@ -68,6 +69,11 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		v1.GET("/summary-member-candidates", handler.NewCandidateHandler(imDB, candidateQueryLimit).SearchCandidates)
 		v1.GET("/summary-chat-candidates", handler.NewCandidateHandler(imDB, candidateQueryLimit).SearchChatCandidates)
 		v1.GET("/summary-templates", taskH.GetTemplates)
+		v1.POST("/summary-templates/my", taskH.CreateCustomTemplate)
+		v1.PUT("/summary-templates/my/:id", taskH.UpdateCustomTemplate)
+		v1.DELETE("/summary-templates/my/:id", taskH.DeleteCustomTemplate)
+		v1.PUT("/summary-templates/:id/my", taskH.UpdateMyTemplate)
+		v1.DELETE("/summary-templates/:id/my", taskH.DeleteMyTemplate)
 
 		v1.POST("/summary-schedules", schedH.CreateSchedule)
 		v1.GET("/summary-schedules", schedH.ListSchedules)

@@ -166,6 +166,33 @@ ALTER TABLE summary_personal_result ADD COLUMN workflow_stage varchar(32) NOT NU
 -- +migrate Down
 ALTER TABLE summary_personal_result DROP COLUMN workflow_stage;
 `)},
+	"20260706-01-summary-user-template.sql": &fstest.MapFile{Data: []byte(`-- +migrate Up
+CREATE TABLE summary_user_template (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  space_id TEXT NOT NULL DEFAULT '',
+  user_id TEXT NOT NULL,
+  template_id TEXT NOT NULL,
+  label TEXT NOT NULL DEFAULT '',
+  description TEXT NOT NULL DEFAULT '',
+  is_custom INTEGER NOT NULL DEFAULT 0,
+  pattern TEXT NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  deleted_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX uk_summary_user_template ON summary_user_template (space_id, user_id, template_id);
+CREATE INDEX idx_summary_user_template_user ON summary_user_template (space_id, user_id, is_custom, deleted_at);
+
+-- +migrate Down
+DROP TABLE IF EXISTS summary_user_template;
+`)},
+	"20260707-01-summary-user-template-compat.sql": &fstest.MapFile{Data: []byte(`-- +migrate Up
+SELECT 1;
+
+-- +migrate Down
+SELECT 1;
+`)},
 }
 
 func testSource() migrate.MigrationSource {
@@ -191,14 +218,14 @@ func TestRunMigrations_NewDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runMigrationsCore: %v", err)
 	}
-	if n != 4 {
-		t.Fatalf("expected 4 migrations applied, got %d", n)
+	if n != 6 {
+		t.Fatalf("expected 6 migrations applied, got %d", n)
 	}
 
 	tables := []string{
 		"summary_chunk", "summary_event", "summary_participant",
 		"summary_personal_result", "summary_result", "summary_schedule",
-		"summary_source", "summary_task",
+		"summary_source", "summary_task", "summary_user_template",
 	}
 	for _, tbl := range tables {
 		var name string
@@ -208,7 +235,7 @@ func TestRunMigrations_NewDB(t *testing.T) {
 		}
 	}
 
-	indexes := []string{"idx_participant_task_user", "idx_event_task_id"}
+	indexes := []string{"idx_participant_task_user", "idx_event_task_id", "uk_summary_user_template", "idx_summary_user_template_user"}
 	for _, idx := range indexes {
 		var name string
 		err := db.QueryRow("SELECT name FROM sqlite_master WHERE type='index' AND name=?", idx).Scan(&name)
@@ -221,6 +248,14 @@ func TestRunMigrations_NewDB(t *testing.T) {
 	err = db.QueryRow("SELECT name FROM pragma_table_info('summary_personal_result') WHERE name='workflow_stage'").Scan(&workflowStageCol)
 	if err != nil {
 		t.Fatalf("workflow_stage column not found: %v", err)
+	}
+
+	for _, col := range []string{"label", "description", "is_custom", "sort_order", "deleted_at"} {
+		var name string
+		err = db.QueryRow("SELECT name FROM pragma_table_info('summary_user_template') WHERE name=?", col).Scan(&name)
+		if err != nil {
+			t.Fatalf("summary_user_template column %s not found: %v", col, err)
+		}
 	}
 }
 
@@ -259,8 +294,8 @@ func TestRunMigrations_ExistingDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runMigrationsCore: %v", err)
 	}
-	if n != 3 {
-		t.Fatalf("expected 3 migrations applied (006+007+workflow_stage), got %d", n)
+	if n != 5 {
+		t.Fatalf("expected 5 migrations applied (006+007+workflow_stage+user_template+template_compat), got %d", n)
 	}
 }
 
@@ -285,8 +320,8 @@ func TestRunMigrations_Idempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first run: %v", err)
 	}
-	if n1 != 4 {
-		t.Fatalf("first run: expected 4, got %d", n1)
+	if n1 != 6 {
+		t.Fatalf("first run: expected 6, got %d", n1)
 	}
 
 	n2, err := runMigrationsCore(db, "sqlite3", testSource())

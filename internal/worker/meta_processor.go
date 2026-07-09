@@ -201,7 +201,7 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 			}
 
 			reduceStart := time.Now()
-			content, tokens, err := m.proc.llm.CallReduceByPerson(ctx, participantSummaries, startTime, endTime)
+			content, tokens, err := m.proc.llm.CallReduceByPerson(ctx, participantSummaries, startTime, endTime, task.Title)
 			reportKey := "team#" + strconv.FormatInt(taskID, 10)
 			timing.RecordLLMSince(reportKey, "团队汇总: 合并各成员总结", reduceStart, tokens)
 			timing.FlushReport(reportKey, time.Since(reduceStart).Milliseconds(), nil)

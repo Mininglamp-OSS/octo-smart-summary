@@ -81,15 +81,15 @@ type ThinkingParam struct {
 }
 
 type chatRequestWithTools struct {
-	Model              string                 `json:"model"`
-	Messages           []ChatMessage          `json:"messages"`
-	Temperature        float64                `json:"temperature"`
-	MaxTokens          int                    `json:"max_tokens"`
-	Tools              []Tool                 `json:"tools"`
+	Model       string        `json:"model"`
+	Messages    []ChatMessage `json:"messages"`
+	Temperature float64       `json:"temperature"`
+	MaxTokens   int           `json:"max_tokens"`
+	Tools       []Tool        `json:"tools"`
 	// ToolChoice controls function calling behavior.
 	// For Kimi models: string "auto" (Kimi does not support forced function calling).
 	// For other models: ToolChoice struct with Type="function" and Function specification.
-	ToolChoice interface{} `json:"tool_choice"`
+	ToolChoice         interface{}            `json:"tool_choice"`
 	ChatTemplateKwargs map[string]interface{} `json:"chat_template_kwargs,omitempty"`
 	Thinking           *ThinkingParam         `json:"thinking,omitempty"`
 }
@@ -414,10 +414,10 @@ func buildMapSystemPrompt(userName, topic string) string {
 ## 输出要求
 - 紧密围绕主题，与主题无关的闲聊、表情、寒暄等直接跳过
 - 提炼关键信息：讨论了什么、达成了什么结论、有什么待办、谁负责什么
-- 【强制】输出总长度不超过 2000 token（约 1500 字），超出时优先保留关键结论和待办事项，压缩次要细节
+- 默认输出总长度不超过 2000 token（约 1500 字）；如果总结主题明确要求详细说明、完整展开或逐项说明，可在模型输出预算内适当展开，但仍需避免无关内容和原文复述
 - 如果聊天记录中没有明确结论，如实说明"尚未达成共识"，不要编造
 - 有待办事项时，用 ` + "`- [ ] 内容（负责人）`" + ` 格式列出
-- 根据实际内容自行组织结构，不需要套用固定模板
+- 如果总结主题中包含输出结构、详细程度、分点方式、待办格式等要求，必须优先遵循；如果主题没有指定结构，再根据实际内容自行组织结构
 - 保持简洁，不要复述原文，用自己的话归纳
 
 ## 引用规则（必须严格遵守）
@@ -452,11 +452,11 @@ func buildReduceSystemPrompt(topic string) string {
 	sb.WriteString(`要求：
 - 合并相同主题，去除重复
 - 保留所有待办事项和责任人
-- 输出总长度不超过 2000 token（约 1500 字），超出时合并相似要点、压缩细节
+- 默认输出总长度不超过 2000 token（约 1500 字）；如果总结主题明确要求详细说明、完整展开或逐项说明，可在模型输出预算内适当展开，但仍需合并相似要点、压缩无关细节
 - 如有冲突信息，保留最新的
 - 保留所有 [n] 引用标记，不要删除或修改
 - 合并相同要点时，合并其引用编号
-- 根据实际内容自行组织结构，不需要套用固定模板
+- 如果总结主题中包含输出结构、详细程度、分点方式、待办格式等要求，必须优先遵循；如果主题没有指定结构，再根据实际内容自行组织结构
 - 用显示名称指代人，绝对不要输出 UID 或用户 ID
 - 输出语言与输入语言保持一致
 
@@ -526,7 +526,7 @@ func (c *LLMClient) CallReduce(ctx context.Context, chunkSummaries []string, sou
 
 // CallReduceByPerson merges participant-level summaries.
 // Each participant is assigned a [Pn] tag that the LLM should reference in the output.
-func (c *LLMClient) CallReduceByPerson(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string) (string, int, error) {
+func (c *LLMClient) CallReduceByPerson(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string) (string, int, error) {
 	var parts []string
 	for i, ps := range participantSummaries {
 		parts = append(parts, fmt.Sprintf("[P%d]【%s 的工作总结】\n%s", i+1, ps.Name, ps.Summary))
@@ -541,11 +541,11 @@ func (c *LLMClient) CallReduceByPerson(ctx context.Context, participantSummaries
 - 每个要点末尾必须标注来源成员编号，格式为 [Pn]，例如 [P1]、[P2]
 - 多位成员贡献同一要点时，列出所有编号，如 [P1][P3]
 - 只引用真实存在的编号，不要捏造
-- 根据实际内容自行组织结构，不需要套用固定模板
+- 如果总结主题中包含输出结构、详细程度、分点方式、待办格式等要求，必须优先遵循；如果主题没有指定结构，再根据实际内容自行组织结构
 - 用显示名称指代人，绝对不要输出 UID 或用户 ID`
 
 	return c.Call(ctx, []ChatMessage{
 		{Role: "system", Content: system},
-		{Role: "user", Content: fmt.Sprintf("时间范围：%s ~ %s\n\n%s", startTime, endTime, text)},
+		{Role: "user", Content: fmt.Sprintf("总结主题：%s\n时间范围：%s ~ %s\n\n%s", topic, startTime, endTime, text)},
 	}, 0.1)
 }
