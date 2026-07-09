@@ -23,8 +23,9 @@ type SourceRef struct {
 }
 
 // sourceKey normalizes a SourceRef into a lookup key comparable against the
-// keys produced from GetUserChannels output. DM ids are folded through
-// NormalizeDMChannelID so peer/peer@self/self@peer all collapse to one key.
+// keys produced from the accessible-channel query output. DM ids are folded
+// through NormalizeDMChannelID so peer/peer@self/self@peer all collapse to
+// one key.
 func (s SourceRef) sourceKey(selfUID string) (channelType int, channelID string) {
 	switch s.SourceType {
 	case 1: // group -> pipeline group
@@ -38,35 +39,48 @@ func (s SourceRef) sourceKey(selfUID string) (channelType int, channelID string)
 	}
 }
 
-// ValidateUserAccessibleSources checks each entry in sources against the
-// authoritative user-accessible channel set (GetUserChannels). Returns the
-// subset that is NOT accessible; callers turn a non-empty missing list into
-// a 40017 business error.
+// ValidateUserAccessibleSources rejects entries the user cannot see. Write
+// path only: fail-closed on any error, including imDB==nil. Read paths keep
+// the permissive GetUserChannels (see reviewer thread e0640d10).
 //
-// imDB==nil is a permissive fallback (mirrors ResolveSourceNameWithType) so
-// unit-test paths that skip the IM DB stay green. sources empty -> no work,
-// nil missing.
+// Empty sources short-circuits to (nil, nil). Otherwise returns the subset
+// of sources that are NOT accessible; callers turn a non-empty missing list
+// into a 40017 business error, or on err into an HTTP 500.
 func ValidateUserAccessibleSources(ctx context.Context, uid string, imDB *gorm.DB, sources []SourceRef) ([]SourceRef, error) {
-	if imDB == nil || len(sources) == 0 {
+	if len(sources) == 0 {
 		return nil, nil
 	}
+	// Fail-closed on missing IM DB: production wires imDB=nil when the IM
+	// connection failed at startup (cmd/summary-api/main.go:61-64). A permissive
+	// fallback here would let any Update/Create bypass the access check whenever
+	// the IM DB happens to be down — the exact IDOR this whole change closes.
+	// Callers surface this as HTTP 500 (not 40017), so an outage looks like an
+	// outage rather than a false "no access" verdict.
+	if imDB == nil {
+		return nil, fmt.Errorf("access check unavailable: IM DB not connected")
+	}
 
-	// Pass explicitly-selected thread ids to GetUserChannels so an archived
-	// thread the user is legitimately editing (e.g. keeping it in a schedule)
-	// still shows up in the accessible set. Non-thread entries are ignored
-	// by the underlying query.
+	// Gather the two id sets we need to probe:
+	//   * selectedThreadIDs -> archived-thread relaxation for the thread query
+	//   * dmIDs             -> targeted DM existence check (avoids the LIMIT 200
+	//                          truncation that a broad "list all my DMs" query
+	//                          would inherit for heavy users)
 	var selectedThreadIDs []string
+	var dmIDs []string
 	for _, s := range sources {
-		if s.SourceType == 2 && s.SourceID != "" {
-			selectedThreadIDs = append(selectedThreadIDs, s.SourceID)
+		switch s.SourceType {
+		case 2:
+			if s.SourceID != "" {
+				selectedThreadIDs = append(selectedThreadIDs, s.SourceID)
+			}
+		case 3:
+			if s.SourceID != "" {
+				dmIDs = append(dmIDs, NormalizeDMChannelID(s.SourceID, uid, 1))
+			}
 		}
 	}
 
-	// Write path is fail-closed: any IM query failure short-circuits to an
-	// error (surfaced as HTTP 500 by callers) so a partial visibility set can't
-	// masquerade as "no access" and cause false 403/40017. Read paths keep the
-	// permissive GetUserChannels intact (see reviewer thread e0640d10).
-	channels, err := getUserChannelsStrict(ctx, uid, imDB, selectedThreadIDs...)
+	channels, err := getUserChannelsStrict(ctx, uid, imDB, selectedThreadIDs, dmIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -74,8 +88,7 @@ func ValidateUserAccessibleSources(ctx context.Context, uid string, imDB *gorm.D
 	// (channel_type, channel_id) set of what the user can see.
 	allowed := make(map[[2]string]struct{}, len(channels))
 	for _, ch := range channels {
-		key := [2]string{itoa2(ch.ChannelType), ch.ChannelID}
-		allowed[key] = struct{}{}
+		allowed[[2]string{itoa2(ch.ChannelType), ch.ChannelID}] = struct{}{}
 	}
 
 	var missing []SourceRef
@@ -112,21 +125,31 @@ func itoa2(n int) string {
 
 // getUserChannelsStrict is the write-path variant of GetUserChannels: any
 // group/DM/thread query failure returns an error instead of the permissive
-// log-and-continue used by read paths. Kept in this file rather than folded
-// back into GetUserChannels because the five existing read-path callers rely
-// on the fail-open degradation to tolerate transient IM outages; changing that
-// contract would ripple far outside this fix (reviewer thread e0640d10).
+// log-and-continue used by read paths. Kept private here (rather than folded
+// back into GetUserChannels) because the five existing read-path callers rely
+// on the fail-open degradation to tolerate transient IM outages; changing
+// that contract would ripple far outside this fix (reviewer thread e0640d10).
 //
-// Semantics otherwise mirror GetUserChannels verbatim (same SQL, same
-// selectedThreadIDs scoping for archived threads, same DM normalization).
-func getUserChannelsStrict(ctx context.Context, uid string, imDB *gorm.DB, selectedThreadIDs ...string) ([]ChannelInfo, error) {
+// Semantics deliberately diverge from GetUserChannels on two axes to match
+// the picker contract and avoid write-path false negatives:
+//   - Thread accessibility joins group_member (not thread_member) so any
+//     thread inside a user's group counts as accessible even if the user has
+//     never posted in it — mirroring candidates.go:188-190 (the picker the
+//     frontend actually shows). thread_member was too strict and produced
+//     false 40017 on a user's first source pick.
+//   - DM accessibility is a targeted existence check on the request's DM ids
+//     (no LIMIT), instead of listing the top-N most-recent DMs. The LIMIT
+//     200 in GetUserChannels' DM query is fine for read-path candidate
+//     surfacing but broke write-path validation for users with more than
+//     200 DMs (a legitimate DM #201+ would get judged missing).
+func getUserChannelsStrict(ctx context.Context, uid string, imDB *gorm.DB, selectedThreadIDs, dmIDs []string) ([]ChannelInfo, error) {
 	if imDB == nil {
 		return nil, fmt.Errorf("IM database not available")
 	}
 
 	var channels []ChannelInfo
 
-	// Groups
+	// Groups — pull all groups the user is an active member of.
 	type groupRow struct {
 		ChannelID   string `gorm:"column:channel_id"`
 		ChannelType int    `gorm:"column:channel_type"`
@@ -158,34 +181,40 @@ func getUserChannelsStrict(ctx context.Context, uid string, imDB *gorm.DB, selec
 		})
 	}
 
-	// DM channels — write path fails closed (contrast: GetUserChannels logs+continues).
-	type dmRow struct {
-		ChannelID string `gorm:"column:channel_id"`
-	}
-	var dms []dmRow
-	err = imDB.WithContext(ctx).Raw(`
-		SELECT channel_id
-		FROM conversation_extra
-		WHERE uid = ? AND channel_type = 1
-		GROUP BY channel_id
-		ORDER BY MAX(updated_at) DESC
-		LIMIT 200
-	`, uid).Scan(&dms).Error
-	if err != nil {
-		return nil, fmt.Errorf("query DM channels: %w", err)
-	}
-	for _, d := range dms {
-		peerUID := getPeerUID(d.ChannelID, uid)
-		normalized := NormalizeDMChannelID(d.ChannelID, uid, 1)
-		channels = append(channels, ChannelInfo{
-			ChannelID:   normalized,
-			ChannelType: 1,
-			ChannelName: fmt.Sprintf("私聊-%s", peerUID),
-			PeerUID:     peerUID,
-		})
+	// DM channels — targeted existence check on the request's DM ids, no LIMIT.
+	// See the function-doc note on why this diverges from GetUserChannels.
+	if len(dmIDs) > 0 {
+		type dmRow struct {
+			ChannelID string `gorm:"column:channel_id"`
+		}
+		var dms []dmRow
+		err = imDB.WithContext(ctx).Raw(`
+			SELECT channel_id
+			FROM conversation_extra
+			WHERE uid = ?
+			  AND channel_type = 1
+			  AND channel_id IN ?
+			GROUP BY channel_id
+		`, uid, dmIDs).Scan(&dms).Error
+		if err != nil {
+			return nil, fmt.Errorf("query DM channels: %w", err)
+		}
+		for _, d := range dms {
+			peerUID := getPeerUID(d.ChannelID, uid)
+			normalized := NormalizeDMChannelID(d.ChannelID, uid, 1)
+			channels = append(channels, ChannelInfo{
+				ChannelID:   normalized,
+				ChannelType: 1,
+				ChannelName: fmt.Sprintf("私聊-%s", peerUID),
+				PeerUID:     peerUID,
+			})
+		}
 	}
 
-	// Thread channels (channelType=5) — write path fails closed.
+	// Thread channels (channelType=5) — joined via group_member so any thread
+	// inside a group the user belongs to counts (see function-doc note aligning
+	// with picker candidates.go:188-190). Archived threads only surface when
+	// selectedThreadIDs explicitly names them (same relaxation as GetUserChannels).
 	type threadRow struct {
 		ChannelID   string `gorm:"column:channel_id"`
 		ChannelType int    `gorm:"column:channel_type"`
@@ -206,8 +235,9 @@ func getUserChannelsStrict(ctx context.Context, uid string, imDB *gorm.DB, selec
 		       COALESCE(g.space_id, '') AS space_id
 		FROM thread t
 		INNER JOIN ` + "`group`" + ` g ON g.group_no COLLATE utf8mb4_unicode_ci = t.group_no
-		INNER JOIN thread_member tm ON tm.thread_id = t.id
-		WHERE tm.uid = ?
+		INNER JOIN group_member gm ON gm.group_no COLLATE utf8mb4_unicode_ci = t.group_no
+		WHERE gm.uid = ?
+		  AND gm.is_deleted = 0
 		  AND ` + threadStatusCond + `
 		  AND g.status = 1
 		ORDER BY t.updated_at DESC

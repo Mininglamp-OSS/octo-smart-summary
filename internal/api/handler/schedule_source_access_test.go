@@ -229,9 +229,10 @@ func TestUpdateSchedule_SourceAccessDenied(t *testing.T) {
 func TestCreateSchedule_SourceAccessQueryFailure500(t *testing.T) {
 	db := newScheduleTestDB(t)
 	imDB := newAccessTestIMDB(t)
-	// Drop the DM table so the strict helper's DM query fails; group query still
-	// succeeds (source is a group), but the DM sub-query error must propagate.
-	imDB.Exec(`DROP TABLE conversation_extra`)
+	// Drop the group table so the strict helper's group query fails. Any IM
+	// query error must propagate as 500, never surface as 40017 (which would
+	// let an IM outage synthesize a false access denial).
+	imDB.Exec("DROP TABLE `group`")
 	r := newAccessTestRouter(db, imDB)
 	taskID := seedScheduleTask(t, db, "T-acc-err", "s1", "u1")
 
@@ -251,5 +252,42 @@ func TestCreateSchedule_SourceAccessQueryFailure500(t *testing.T) {
 	}
 	if resp.Code == 40017 {
 		t.Fatalf("must not surface 40017 on IM failure (would be false-positive access denial)")
+	}
+}
+
+// TestCreateSchedule_SourceAccessNilIMDB500 asserts the end-to-end fail-closed
+// contract when the handler was wired without an IM DB (production behavior
+// when IM DB connection failed at startup — cmd/summary-api/main.go:61-64).
+// Any Create with sources must be rejected as HTTP 500, never accepted.
+// Regression guard for upstream review round-1 P1 (imDB==nil production
+// fail-open).
+func TestCreateSchedule_SourceAccessNilIMDB500(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newAccessTestRouter(db, nil) // imDB=nil mirrors "IM DB unavailable" wiring
+	taskID := seedScheduleTask(t, db, "T-acc-nil", "s1", "u1")
+
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID,
+		"interval_days": 1, "run_time": "09:00",
+		"sources": []map[string]interface{}{{"source_type": 1, "source_id": "grp_any", "source_name": "?"}},
+	})
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 when imDB==nil (fail-closed), got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v; body=%s", err, w.Body.String())
+	}
+	if resp.Code == 40017 {
+		t.Fatalf("must not surface 40017 when imDB is unavailable (would be a false access denial)")
+	}
+	// Response must not leak raw DB / err.Error() to caller. Sentinel: our
+	// canonical wording is "source access check unavailable"; the leaked form
+	// used to be "source access check failed: ...".
+	if want := "source access check unavailable"; resp.Message != want {
+		t.Fatalf("response Message should be the sanitized form %q, got %q", want, resp.Message)
 	}
 }

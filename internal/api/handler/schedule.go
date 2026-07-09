@@ -586,7 +586,10 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 	// user cannot see before persisting. imDB==nil bypasses (test path).
 	if len(req.Sources) > 0 {
 		if missing, err := pipeline.ValidateUserAccessibleSources(c.Request.Context(), userID, h.imDB, sourceReqsToPipelineRefs(req.Sources)); err != nil {
-			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "source access check failed: " + err.Error()})
+			// Log the underlying cause server-side; response stays generic so we
+			// don't leak IM DB errors / SQL details to the caller.
+			log.Printf("[handler] CreateSchedule source access check: %v", err)
+			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "source access check unavailable"})
 			return
 		} else if len(missing) > 0 {
 			respondSourceAccessDenied(c, missing)
@@ -1200,7 +1203,8 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		// Source-access check: reject sources the user cannot see (unbound / no
 		// membership / deleted / archived non-thread). imDB==nil bypasses (test path).
 		if missing, err := pipeline.ValidateUserAccessibleSources(c.Request.Context(), userID, h.imDB, sourceReqsToPipelineRefs(req.Sources)); err != nil {
-			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "source access check failed: " + err.Error()})
+			log.Printf("[handler] UpdateSchedule source access check: %v", err)
+			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "source access check unavailable"})
 			return
 		} else if len(missing) > 0 {
 			respondSourceAccessDenied(c, missing)
