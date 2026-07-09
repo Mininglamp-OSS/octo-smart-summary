@@ -37,7 +37,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 
 	// API routes
 	taskH := handler.NewTaskHandler(db, imDB, workerTriggerURL)
-	schedH := handler.NewScheduleHandlerWithFlag(db, featureTeamSchedule)
+	schedH := handler.NewScheduleHandlerWithIMDB(db, imDB, featureTeamSchedule)
 	personalH := handler.NewPersonalHandler(db, workerTriggerURL, hub)
 	editH := handler.NewEditHandler(db)
 

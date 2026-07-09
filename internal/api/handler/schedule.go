@@ -11,6 +11,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/gin-gonic/gin"
@@ -21,13 +22,15 @@ import (
 
 // ScheduleHandler handles schedule endpoints.
 type ScheduleHandler struct {
-	db *gorm.DB
+	db   *gorm.DB
+	imDB *gorm.DB // IM database; used for user-access validation on write. nil = access check bypassed (test paths).
 	// featureTeamSchedule, when true, bypasses the multi-person rejection guards
 	// (FEATURE_TEAM_SCHEDULE). Default false keeps the existing 40015 behavior.
 	featureTeamSchedule bool
 }
 
 // NewScheduleHandler creates a new ScheduleHandler.
+// Retained for backwards compatibility with tests that don't need IM-DB access checks.
 func NewScheduleHandler(db *gorm.DB) *ScheduleHandler {
 	return &ScheduleHandler{db: db}
 }
@@ -35,8 +38,53 @@ func NewScheduleHandler(db *gorm.DB) *ScheduleHandler {
 // NewScheduleHandlerWithFlag creates a ScheduleHandler with the team-schedule
 // feature flag explicitly set. When featureTeamSchedule is true the multi-person
 // rejection guards are bypassed so multi-participant schedules can be created.
+// Retained for backwards compatibility with tests that don't need IM-DB access checks.
 func NewScheduleHandlerWithFlag(db *gorm.DB, featureTeamSchedule bool) *ScheduleHandler {
 	return &ScheduleHandler{db: db, featureTeamSchedule: featureTeamSchedule}
+}
+
+// NewScheduleHandlerWithIMDB is the production constructor; wires the IM DB so
+// Create/Update can run source-access validation. imDB==nil is tolerated and
+// disables the access check (see pipeline.ValidateUserAccessibleSources).
+func NewScheduleHandlerWithIMDB(db, imDB *gorm.DB, featureTeamSchedule bool) *ScheduleHandler {
+	return &ScheduleHandler{db: db, imDB: imDB, featureTeamSchedule: featureTeamSchedule}
+}
+
+// sourceReqsToPipelineRefs converts handler-private sourceReq entries into the
+// pipeline access-check shape. Kept inline so sourceReq stays package-private.
+func sourceReqsToPipelineRefs(in []sourceReq) []pipeline.SourceRef {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]pipeline.SourceRef, 0, len(in))
+	for _, s := range in {
+		out = append(out, pipeline.SourceRef{
+			SourceType: s.SourceType,
+			SourceID:   s.SourceID,
+			SourceName: s.SourceName,
+		})
+	}
+	return out
+}
+
+// respondSourceAccessDenied writes the canonical 40017 response for a
+// non-empty missing-sources list: HTTP 403, code 40017, generic message, and
+// data.missing_sources with per-entry (source_type, source_id, source_name)
+// so the frontend can pinpoint offenders without trusting client-supplied text.
+func respondSourceAccessDenied(c *gin.Context, missing []pipeline.SourceRef) {
+	items := make([]map[string]interface{}, 0, len(missing))
+	for _, m := range missing {
+		items = append(items, map[string]interface{}{
+			"source_type": m.SourceType,
+			"source_id":   m.SourceID,
+			"source_name": m.SourceName,
+		})
+	}
+	c.JSON(http.StatusForbidden, apiResponse{
+		Code:    40017,
+		Message: "存在无权访问或不存在的来源",
+		Data:    map[string]interface{}{"missing_sources": items},
+	})
 }
 
 type createScheduleReq struct {
@@ -533,6 +581,21 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		return
 	}
 	summaryMode := model.ModeByPerson
+
+	// Source-access check (same contract as UpdateSchedule): reject sources the
+	// user cannot see before persisting. imDB==nil bypasses (test path).
+	if len(req.Sources) > 0 {
+		if missing, err := pipeline.ValidateUserAccessibleSources(c.Request.Context(), userID, h.imDB, sourceReqsToPipelineRefs(req.Sources)); err != nil {
+			// Log the underlying cause server-side; response stays generic so we
+			// don't leak IM DB errors / SQL details to the caller.
+			log.Printf("[handler] CreateSchedule source access check: %v", err)
+			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "source access check unavailable"})
+			return
+		} else if len(missing) > 0 {
+			respondSourceAccessDenied(c, missing)
+			return
+		}
+	}
 
 	var sourceConfig model.JSON
 	if len(req.Sources) > 0 {
@@ -1137,6 +1200,16 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		updates["time_range_type"] = *req.TimeRangeType
 	}
 	if req.Sources != nil {
+		// Source-access check: reject sources the user cannot see (unbound / no
+		// membership / deleted / archived non-thread). imDB==nil bypasses (test path).
+		if missing, err := pipeline.ValidateUserAccessibleSources(c.Request.Context(), userID, h.imDB, sourceReqsToPipelineRefs(req.Sources)); err != nil {
+			log.Printf("[handler] UpdateSchedule source access check: %v", err)
+			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "source access check unavailable"})
+			return
+		} else if len(missing) > 0 {
+			respondSourceAccessDenied(c, missing)
+			return
+		}
 		b, _ := json.Marshal(req.Sources)
 		updates["source_config"] = model.JSON(b)
 	}
