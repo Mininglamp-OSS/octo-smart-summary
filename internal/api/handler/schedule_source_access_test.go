@@ -221,3 +221,35 @@ func TestUpdateSchedule_SourceAccessDenied(t *testing.T) {
 		t.Fatalf("source_config mutated on denied update: got=%s want=%s", reloaded.SourceConfig, prevSourceCfg)
 	}
 }
+
+// TestCreateSchedule_SourceAccessQueryFailure500 asserts that when the IM DB
+// itself errors (fail-closed strict path), the handler surfaces HTTP 500 with
+// a non-40017 code instead of leaking a false 40017. Regression guard for
+// reviewer thread e0640d10.
+func TestCreateSchedule_SourceAccessQueryFailure500(t *testing.T) {
+	db := newScheduleTestDB(t)
+	imDB := newAccessTestIMDB(t)
+	// Drop the DM table so the strict helper's DM query fails; group query still
+	// succeeds (source is a group), but the DM sub-query error must propagate.
+	imDB.Exec(`DROP TABLE conversation_extra`)
+	r := newAccessTestRouter(db, imDB)
+	taskID := seedScheduleTask(t, db, "T-acc-err", "s1", "u1")
+
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID,
+		"interval_days": 1, "run_time": "09:00",
+		"sources": []map[string]interface{}{{"source_type": 1, "source_id": "grp_ok", "source_name": "g"}},
+	})
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 on IM query failure, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v; body=%s", err, w.Body.String())
+	}
+	if resp.Code == 40017 {
+		t.Fatalf("must not surface 40017 on IM failure (would be false-positive access denial)")
+	}
+}

@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 
 	"gorm.io/gorm"
 )
@@ -61,7 +62,11 @@ func ValidateUserAccessibleSources(ctx context.Context, uid string, imDB *gorm.D
 		}
 	}
 
-	channels, err := GetUserChannels(ctx, uid, imDB, selectedThreadIDs...)
+	// Write path is fail-closed: any IM query failure short-circuits to an
+	// error (surfaced as HTTP 500 by callers) so a partial visibility set can't
+	// masquerade as "no access" and cause false 403/40017. Read paths keep the
+	// permissive GetUserChannels intact (see reviewer thread e0640d10).
+	channels, err := getUserChannelsStrict(ctx, uid, imDB, selectedThreadIDs...)
 	if err != nil {
 		return nil, err
 	}
@@ -103,4 +108,122 @@ func itoa2(n int) string {
 	default:
 		return "?"
 	}
+}
+
+// getUserChannelsStrict is the write-path variant of GetUserChannels: any
+// group/DM/thread query failure returns an error instead of the permissive
+// log-and-continue used by read paths. Kept in this file rather than folded
+// back into GetUserChannels because the five existing read-path callers rely
+// on the fail-open degradation to tolerate transient IM outages; changing that
+// contract would ripple far outside this fix (reviewer thread e0640d10).
+//
+// Semantics otherwise mirror GetUserChannels verbatim (same SQL, same
+// selectedThreadIDs scoping for archived threads, same DM normalization).
+func getUserChannelsStrict(ctx context.Context, uid string, imDB *gorm.DB, selectedThreadIDs ...string) ([]ChannelInfo, error) {
+	if imDB == nil {
+		return nil, fmt.Errorf("IM database not available")
+	}
+
+	var channels []ChannelInfo
+
+	// Groups
+	type groupRow struct {
+		ChannelID   string `gorm:"column:channel_id"`
+		ChannelType int    `gorm:"column:channel_type"`
+		ChannelName string `gorm:"column:channel_name"`
+		SpaceID     string `gorm:"column:space_id"`
+	}
+	var groups []groupRow
+	err := imDB.WithContext(ctx).Raw(`
+		SELECT g.group_no AS channel_id,
+		       2 AS channel_type,
+		       g.name AS channel_name,
+		       COALESCE(g.space_id, '') AS space_id
+		FROM `+"`group`"+` g
+		INNER JOIN group_member gm ON g.group_no = gm.group_no
+		WHERE gm.uid = ?
+		  AND gm.is_deleted = 0
+		  AND g.status = 1
+		ORDER BY g.updated_at DESC
+	`, uid).Scan(&groups).Error
+	if err != nil {
+		return nil, fmt.Errorf("query groups: %w", err)
+	}
+	for _, g := range groups {
+		channels = append(channels, ChannelInfo{
+			ChannelID:   g.ChannelID,
+			ChannelType: g.ChannelType,
+			ChannelName: g.ChannelName,
+			SpaceID:     g.SpaceID,
+		})
+	}
+
+	// DM channels — write path fails closed (contrast: GetUserChannels logs+continues).
+	type dmRow struct {
+		ChannelID string `gorm:"column:channel_id"`
+	}
+	var dms []dmRow
+	err = imDB.WithContext(ctx).Raw(`
+		SELECT channel_id
+		FROM conversation_extra
+		WHERE uid = ? AND channel_type = 1
+		GROUP BY channel_id
+		ORDER BY MAX(updated_at) DESC
+		LIMIT 200
+	`, uid).Scan(&dms).Error
+	if err != nil {
+		return nil, fmt.Errorf("query DM channels: %w", err)
+	}
+	for _, d := range dms {
+		peerUID := getPeerUID(d.ChannelID, uid)
+		normalized := NormalizeDMChannelID(d.ChannelID, uid, 1)
+		channels = append(channels, ChannelInfo{
+			ChannelID:   normalized,
+			ChannelType: 1,
+			ChannelName: fmt.Sprintf("私聊-%s", peerUID),
+			PeerUID:     peerUID,
+		})
+	}
+
+	// Thread channels (channelType=5) — write path fails closed.
+	type threadRow struct {
+		ChannelID   string `gorm:"column:channel_id"`
+		ChannelType int    `gorm:"column:channel_type"`
+		ChannelName string `gorm:"column:channel_name"`
+		SpaceID     string `gorm:"column:space_id"`
+	}
+	var threadChannels []threadRow
+	threadStatusCond := "t.status = 1"
+	threadArgs := []interface{}{uid}
+	if len(selectedThreadIDs) > 0 {
+		threadStatusCond = "(t.status = 1 OR (t.status = 2 AND CONCAT(t.group_no, '____', t.short_id) IN ?))"
+		threadArgs = append(threadArgs, selectedThreadIDs)
+	}
+	threadQuery := `
+		SELECT CONCAT(t.group_no, '____', t.short_id) AS channel_id,
+		       5 AS channel_type,
+		       CONCAT(t.name, ' · ', g.name) AS channel_name,
+		       COALESCE(g.space_id, '') AS space_id
+		FROM thread t
+		INNER JOIN ` + "`group`" + ` g ON g.group_no COLLATE utf8mb4_unicode_ci = t.group_no
+		INNER JOIN thread_member tm ON tm.thread_id = t.id
+		WHERE tm.uid = ?
+		  AND ` + threadStatusCond + `
+		  AND g.status = 1
+		ORDER BY t.updated_at DESC
+	`
+	err = imDB.WithContext(ctx).Raw(threadQuery, threadArgs...).Scan(&threadChannels).Error
+	if err != nil {
+		return nil, fmt.Errorf("query thread channels: %w", err)
+	}
+	for _, tc := range threadChannels {
+		channels = append(channels, ChannelInfo{
+			ChannelID:   tc.ChannelID,
+			ChannelType: 5,
+			ChannelName: tc.ChannelName,
+			SpaceID:     tc.SpaceID,
+		})
+	}
+
+	return channels, nil
 }

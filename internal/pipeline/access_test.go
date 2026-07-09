@@ -89,3 +89,33 @@ func itoaSrcType(n int) string {
 		return "?"
 	}
 }
+
+// TestValidateUserAccessibleSources_DMQueryFail asserts write-path fail-closed
+// on IM DM query error: dropping conversation_extra makes the DM sub-query fail,
+// the strict helper must surface the error instead of returning a partial
+// allowed-set (which would let a legitimate DM look like "missing" and cause
+// false 40017/403). Regression guard for reviewer thread e0640d10.
+func TestValidateUserAccessibleSources_DMQueryFail(t *testing.T) {
+	imDB := setupPipelineImDB(t)
+	// Drop conversation_extra so the DM query hits "no such table".
+	imDB.Exec(`DROP TABLE conversation_extra`)
+
+	_, err := ValidateUserAccessibleSources(context.Background(), "uid1", imDB,
+		[]SourceRef{{SourceType: 3, SourceID: "peerX"}})
+	if err == nil {
+		t.Fatalf("expected error when DM query fails, got nil")
+	}
+}
+
+// TestValidateUserAccessibleSources_ThreadQueryFail: same guard for the thread
+// sub-query — dropping thread_member makes the join fail.
+func TestValidateUserAccessibleSources_ThreadQueryFail(t *testing.T) {
+	imDB := setupPipelineImDB(t)
+	imDB.Exec(`DROP TABLE thread_member`)
+
+	_, err := ValidateUserAccessibleSources(context.Background(), "uid1", imDB,
+		[]SourceRef{{SourceType: 2, SourceID: "grp1____sh1"}})
+	if err == nil {
+		t.Fatalf("expected error when thread query fails, got nil")
+	}
+}
