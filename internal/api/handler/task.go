@@ -2,6 +2,8 @@ package handler
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,16 +29,33 @@ import (
 // maxSourceCount is the maximum number of information sources allowed per task.
 const maxSourceCount = 30
 
+const defaultCustomTemplateLimit = 30
+
 // TaskHandler handles summary task endpoints.
 type TaskHandler struct {
-	db               *gorm.DB
-	imDB             *gorm.DB
-	workerTriggerURL string
+	db                  *gorm.DB
+	imDB                *gorm.DB
+	workerTriggerURL    string
+	customTemplateLimit int
 }
 
 // NewTaskHandler creates a new TaskHandler.
 func NewTaskHandler(db, imDB *gorm.DB, workerTriggerURL string) *TaskHandler {
-	return &TaskHandler{db: db, imDB: imDB, workerTriggerURL: workerTriggerURL}
+	return &TaskHandler{db: db, imDB: imDB, workerTriggerURL: workerTriggerURL, customTemplateLimit: defaultCustomTemplateLimit}
+}
+
+func (h *TaskHandler) SetCustomTemplateLimit(limit int) {
+	if limit <= 0 {
+		limit = defaultCustomTemplateLimit
+	}
+	h.customTemplateLimit = limit
+}
+
+func (h *TaskHandler) getCustomTemplateLimit() int {
+	if h.customTemplateLimit <= 0 {
+		return defaultCustomTemplateLimit
+	}
+	return h.customTemplateLimit
 }
 
 // canAccessTask reports whether userID may read the task: creator or explicit
@@ -1020,61 +1039,424 @@ func (h *TaskHandler) InferScope(c *gin.Context) {
 	ok(c, result)
 }
 
-// GetTemplates handles GET /api/v1/summary-templates
-func (h *TaskHandler) GetTemplates(c *gin.Context) {
-	type placeholder struct {
-		Key      string `json:"key"`
-		Label    string `json:"label"`
-		Position []int  `json:"position,omitempty"`
-	}
-	type tmpl struct {
-		ID           string        `json:"id"`
-		Label        string        `json:"label"`
-		Icon         string        `json:"icon"`
-		Description  string        `json:"description"`
-		Type         string        `json:"type"`
-		Pattern      string        `json:"pattern"`
-		Placeholders []placeholder `json:"placeholders,omitempty"`
-	}
+type templatePlaceholder struct {
+	Key      string `json:"key"`
+	Label    string `json:"label"`
+	Position []int  `json:"position,omitempty"`
+}
 
-	templates := []tmpl{
+type topicTemplate struct {
+	ID           string                `json:"id"`
+	Label        string                `json:"label"`
+	Icon         string                `json:"icon"`
+	Description  string                `json:"description"`
+	Type         string                `json:"type"`
+	Pattern      string                `json:"pattern"`
+	Placeholders []templatePlaceholder `json:"placeholders,omitempty"`
+	IsCustom     bool                  `json:"is_custom,omitempty"`
+	IsOverridden bool                  `json:"is_overridden,omitempty"`
+	SortOrder    int                   `json:"sort_order,omitempty"`
+}
+
+func builtinTopicTemplates() []topicTemplate {
+	return []topicTemplate{
 		{
-			ID:           "project_progress",
-			Label:        "汇总项目进展",
-			Icon:         "FileText",
-			Description:  "与团队成员一起总结进展",
-			Type:         "parameterized",
-			Pattern:      "总结 {project_name} 的项目进展",
-			Placeholders: []placeholder{{Key: "project_name", Label: "输入项目名称", Position: []int{3, 9}}},
+			ID:          "project_progress",
+			Label:       "汇总项目进展",
+			Icon:        "FileText",
+			Description: "总结项目当前进展，按已完成、进行中、风险阻塞、下一步计划整理",
+			Type:        "fixed",
+			Pattern:     "总结项目当前进展，按已完成、进行中、风险阻塞、下一步计划整理",
 		},
 		{
-			ID:           "task_tracking",
-			Label:        "跟踪任务进度",
-			Icon:         "ListChecks",
-			Description:  "邀请同事汇总任务完成情况",
-			Type:         "parameterized",
-			Pattern:      "总结 {task_name} 的完成情况",
-			Placeholders: []placeholder{{Key: "task_name", Label: "输入任务名称", Position: []int{3, 9}}},
+			ID:          "task_tracking",
+			Label:       "跟踪任务进度",
+			Icon:        "ListChecks",
+			Description: "总结任务完成情况，按任务、负责人、当前状态、待办事项整理",
+			Type:        "fixed",
+			Pattern:     "总结任务完成情况，按任务、负责人、当前状态、待办事项整理",
 		},
 		{
 			ID:          "weekly_report",
 			Label:       "总结团队周报",
 			Icon:        "Calendar",
-			Description: "总结团队成员每周的工作",
+			Description: "总结团队成员每周工作，按成员、重点进展、成果产出、风险问题、下周计划整理",
 			Type:        "fixed",
-			Pattern:     "总结每周的工作周报",
+			Pattern:     "总结团队成员每周工作，按成员、重点进展、成果产出、风险问题、下周计划整理",
 		},
 		{
 			ID:          "chat_content",
 			Label:       "总结聊天内容",
 			Icon:        "MessageSquare",
-			Description: "总结指定聊天中的事情进展",
+			Description: "总结聊天中的关键内容、核心结论、待办事项和需要关注的问题",
 			Type:        "fixed",
-			Pattern:     "总结本群中的关键内容",
+			Pattern:     "总结聊天中的关键内容、核心结论、待办事项和需要关注的问题",
+		},
+		{
+			ID:          "personal_weekly_report",
+			Label:       "生成个人工作周报",
+			Icon:        "Calendar",
+			Description: "总结我最近一周的主要工作，按重点进展、完成事项、风险阻塞、下周计划分点整理",
+			Type:        "fixed",
+			Pattern:     "总结我最近一周的主要工作，按重点进展、完成事项、风险阻塞、下周计划分点整理",
+		},
+		{
+			ID:          "okr_alignment",
+			Label:       "OKR 进展对齐",
+			Icon:        "ListChecks",
+			Description: "根据聊天内容总结当前进展，并对照目标/OKR 分析已完成、未完成、风险差距和下一步动作",
+			Type:        "fixed",
+			Pattern:     "根据聊天内容总结当前进展，并对照目标/OKR 分析已完成、未完成、风险差距和下一步动作",
+		},
+		{
+			ID:          "todo_extraction",
+			Label:       "提取待办事项",
+			Icon:        "ListChecks",
+			Description: "从聊天内容中提取需要跟进的待办事项，按事项、负责人、截止时间、当前状态、上下文说明整理",
+			Type:        "fixed",
+			Pattern:     "从聊天内容中提取需要跟进的待办事项，按事项、负责人、截止时间、当前状态、上下文说明整理",
+		},
+		{
+			ID:          "feedback_triage",
+			Label:       "归类用户反馈",
+			Icon:        "MessageSquare",
+			Description: "整理聊天中的用户反馈、Bug、体验问题和改进建议，按问题类型、影响范围、优先级、建议动作分类",
+			Type:        "fixed",
+			Pattern:     "整理聊天中的用户反馈、Bug、体验问题和改进建议，按问题类型、影响范围、优先级、建议动作分类",
 		},
 	}
+}
 
-	ok(c, gin.H{"templates": templates})
+func findBuiltinTopicTemplate(id string) (topicTemplate, bool) {
+	for _, tpl := range builtinTopicTemplates() {
+		if tpl.ID == id {
+			return tpl, true
+		}
+	}
+	return topicTemplate{}, false
+}
+
+func applyTemplateOverride(tpl topicTemplate, rec model.SummaryUserTemplate) topicTemplate {
+	if strings.TrimSpace(rec.Label) != "" {
+		tpl.Label = rec.Label
+	}
+	if strings.TrimSpace(rec.Description) != "" {
+		tpl.Description = rec.Description
+	} else if strings.TrimSpace(rec.Pattern) != "" {
+		tpl.Description = rec.Pattern
+	}
+	if strings.TrimSpace(rec.Pattern) != "" {
+		tpl.Pattern = rec.Pattern
+	}
+	tpl.IsOverridden = true
+	tpl.Placeholders = nil
+	tpl.Type = "fixed"
+	return tpl
+}
+
+// GetTemplates handles GET /api/v1/summary-templates
+func (h *TaskHandler) GetTemplates(c *gin.Context) {
+	templates := builtinTopicTemplates()
+	spaceID := middleware.GetSpaceID(c)
+	userID := middleware.GetUserID(c)
+	if spaceID != "" && userID != "" {
+		var records []model.SummaryUserTemplate
+		err := h.db.Where("space_id = ? AND user_id = ? AND deleted_at IS NULL", spaceID, userID).
+			Order("is_custom ASC, sort_order ASC, id ASC").Find(&records).Error
+		if err == nil {
+			var customs []topicTemplate
+			for _, rec := range records {
+				if rec.IsCustom {
+					customs = append(customs, topicTemplate{
+						ID:          rec.TemplateID,
+						Label:       rec.Label,
+						Icon:        "FileText",
+						Description: rec.Description,
+						Type:        "fixed",
+						Pattern:     rec.Pattern,
+						IsCustom:    true,
+						SortOrder:   rec.SortOrder,
+					})
+					continue
+				}
+				for i, tpl := range templates {
+					if tpl.ID == rec.TemplateID {
+						templates[i] = applyTemplateOverride(tpl, rec)
+						break
+					}
+				}
+			}
+			templates = append(templates, customs...)
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			log.Printf("[handler] query summary_user_template failed: %v", err)
+		}
+	}
+
+	ok(c, gin.H{"templates": templates, "custom_template_limit": h.getCustomTemplateLimit()})
+}
+
+type customTemplateReq struct {
+	Label       string `json:"label"`
+	Description string `json:"description"`
+	Pattern     string `json:"pattern"`
+}
+
+func validateTemplatePattern(c *gin.Context, pattern string) (string, bool) {
+	pattern = strings.TrimSpace(pattern)
+	if utf8.RuneCountInString(pattern) > 1000 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "pattern 不能超过 1000 字符"})
+		return "", false
+	}
+	return pattern, true
+}
+
+func validateCustomTemplateReq(c *gin.Context, req customTemplateReq) (customTemplateReq, bool) {
+	req.Label = strings.TrimSpace(req.Label)
+	req.Description = strings.TrimSpace(req.Description)
+	req.Pattern = strings.TrimSpace(req.Pattern)
+	if req.Pattern == "" {
+		req.Pattern = req.Description
+	}
+	pattern, valid := validateTemplatePattern(c, req.Pattern)
+	if !valid {
+		return req, false
+	}
+	req.Pattern = pattern
+	if req.Label == "" {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "label 不能为空"})
+		return req, false
+	}
+	if req.Description == "" {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "description 不能为空"})
+		return req, false
+	}
+	if utf8.RuneCountInString(req.Label) > 100 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "label 不能超过 100 字符"})
+		return req, false
+	}
+	if utf8.RuneCountInString(req.Description) > 200 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "description 不能超过 200 字符"})
+		return req, false
+	}
+	return req, true
+}
+
+func randomCustomTemplateID() (string, error) {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return "custom_" + hex.EncodeToString(b), nil
+}
+
+func templateFromRecord(rec model.SummaryUserTemplate) topicTemplate {
+	return topicTemplate{
+		ID:          rec.TemplateID,
+		Label:       rec.Label,
+		Icon:        "FileText",
+		Description: rec.Description,
+		Type:        "fixed",
+		Pattern:     rec.Pattern,
+		IsCustom:    rec.IsCustom,
+		SortOrder:   rec.SortOrder,
+	}
+}
+
+// UpdateMyTemplate handles PUT /api/v1/summary-templates/:id/my for built-in template overrides.
+func (h *TaskHandler) UpdateMyTemplate(c *gin.Context) {
+	spaceID := middleware.GetSpaceID(c)
+	userID := middleware.GetUserID(c)
+	if spaceID == "" || userID == "" {
+		c.JSON(http.StatusUnauthorized, apiResponse{Code: 4010, Message: "authentication required"})
+		return
+	}
+
+	templateID := c.Param("id")
+	builtin, exists := findBuiltinTopicTemplate(templateID)
+	if !exists {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "模板不存在"})
+		return
+	}
+
+	var req customTemplateReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: err.Error()})
+		return
+	}
+	var valid bool
+	req, valid = validateCustomTemplateReq(c, req)
+	if !valid {
+		return
+	}
+
+	now := timezone.Now()
+	record := model.SummaryUserTemplate{
+		SpaceID:     spaceID,
+		UserID:      userID,
+		TemplateID:  templateID,
+		Label:       req.Label,
+		Description: req.Description,
+		Pattern:     req.Pattern,
+		IsCustom:    false,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := h.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "space_id"}, {Name: "user_id"}, {Name: "template_id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"label", "description", "pattern", "is_custom", "deleted_at", "updated_at"}),
+	}).Create(&record).Error; err != nil {
+		log.Printf("[handler] upsert summary_user_template failed: %v", err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
+		return
+	}
+
+	ok(c, gin.H{"template": applyTemplateOverride(builtin, record)})
+}
+
+// DeleteMyTemplate handles DELETE /api/v1/summary-templates/:id/my for built-in template overrides.
+func (h *TaskHandler) DeleteMyTemplate(c *gin.Context) {
+	spaceID := middleware.GetSpaceID(c)
+	userID := middleware.GetUserID(c)
+	if spaceID == "" || userID == "" {
+		c.JSON(http.StatusUnauthorized, apiResponse{Code: 4010, Message: "authentication required"})
+		return
+	}
+	templateID := c.Param("id")
+	builtin, exists := findBuiltinTopicTemplate(templateID)
+	if !exists {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "模板不存在"})
+		return
+	}
+
+	if err := h.db.Where("space_id = ? AND user_id = ? AND template_id = ? AND is_custom = 0", spaceID, userID, templateID).Delete(&model.SummaryUserTemplate{}).Error; err != nil {
+		log.Printf("[handler] delete summary_user_template failed: %v", err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
+		return
+	}
+
+	ok(c, gin.H{"template": builtin})
+}
+
+// CreateCustomTemplate handles POST /api/v1/summary-templates/my.
+func (h *TaskHandler) CreateCustomTemplate(c *gin.Context) {
+	spaceID := middleware.GetSpaceID(c)
+	userID := middleware.GetUserID(c)
+	if spaceID == "" || userID == "" {
+		c.JSON(http.StatusUnauthorized, apiResponse{Code: 4010, Message: "authentication required"})
+		return
+	}
+	var req customTemplateReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: err.Error()})
+		return
+	}
+	var valid bool
+	req, valid = validateCustomTemplateReq(c, req)
+	if !valid {
+		return
+	}
+	var count int64
+	if err := h.db.Model(&model.SummaryUserTemplate{}).
+		Where("space_id = ? AND user_id = ? AND is_custom = 1 AND deleted_at IS NULL", spaceID, userID).
+		Count(&count).Error; err != nil {
+		log.Printf("[handler] count custom templates failed: %v", err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
+		return
+	}
+	limit := h.getCustomTemplateLimit()
+	if count >= int64(limit) {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: fmt.Sprintf("自定义模板不能超过 %d 个", limit)})
+		return
+	}
+	templateID, err := randomCustomTemplateID()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
+		return
+	}
+	now := timezone.Now()
+	record := model.SummaryUserTemplate{
+		SpaceID:     spaceID,
+		UserID:      userID,
+		TemplateID:  templateID,
+		Label:       req.Label,
+		Description: req.Description,
+		Pattern:     req.Pattern,
+		IsCustom:    true,
+		SortOrder:   int(count) + 1,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := h.db.Create(&record).Error; err != nil {
+		log.Printf("[handler] create custom template failed: %v", err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
+		return
+	}
+	ok(c, gin.H{"template": templateFromRecord(record)})
+}
+
+// UpdateCustomTemplate handles PUT /api/v1/summary-templates/my/:id.
+func (h *TaskHandler) UpdateCustomTemplate(c *gin.Context) {
+	spaceID := middleware.GetSpaceID(c)
+	userID := middleware.GetUserID(c)
+	if spaceID == "" || userID == "" {
+		c.JSON(http.StatusUnauthorized, apiResponse{Code: 4010, Message: "authentication required"})
+		return
+	}
+	var req customTemplateReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: err.Error()})
+		return
+	}
+	var valid bool
+	req, valid = validateCustomTemplateReq(c, req)
+	if !valid {
+		return
+	}
+	templateID := c.Param("id")
+	now := timezone.Now()
+	updates := map[string]interface{}{"label": req.Label, "description": req.Description, "pattern": req.Pattern, "updated_at": now}
+	res := h.db.Model(&model.SummaryUserTemplate{}).
+		Where("space_id = ? AND user_id = ? AND template_id = ? AND is_custom = 1 AND deleted_at IS NULL", spaceID, userID, templateID).
+		Updates(updates)
+	if res.Error != nil {
+		log.Printf("[handler] update custom template failed: %v", res.Error)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: res.Error.Error()})
+		return
+	}
+	if res.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "模板不存在"})
+		return
+	}
+	var record model.SummaryUserTemplate
+	if err := h.db.Where("space_id = ? AND user_id = ? AND template_id = ?", spaceID, userID, templateID).First(&record).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
+		return
+	}
+	ok(c, gin.H{"template": templateFromRecord(record)})
+}
+
+// DeleteCustomTemplate handles DELETE /api/v1/summary-templates/my/:id.
+func (h *TaskHandler) DeleteCustomTemplate(c *gin.Context) {
+	spaceID := middleware.GetSpaceID(c)
+	userID := middleware.GetUserID(c)
+	if spaceID == "" || userID == "" {
+		c.JSON(http.StatusUnauthorized, apiResponse{Code: 4010, Message: "authentication required"})
+		return
+	}
+	now := timezone.Now()
+	res := h.db.Model(&model.SummaryUserTemplate{}).
+		Where("space_id = ? AND user_id = ? AND template_id = ? AND is_custom = 1 AND deleted_at IS NULL", spaceID, userID, c.Param("id")).
+		Updates(map[string]interface{}{"deleted_at": now, "updated_at": now})
+	if res.Error != nil {
+		log.Printf("[handler] delete custom template failed: %v", res.Error)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: res.Error.Error()})
+		return
+	}
+	if res.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "模板不存在"})
+		return
+	}
+	ok(c, gin.H{})
 }
 
 func (h *TaskHandler) triggerWorker(req model.WorkerTriggerRequest) {

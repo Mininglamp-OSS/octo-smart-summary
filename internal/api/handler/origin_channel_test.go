@@ -403,11 +403,11 @@ func TestGetTemplates_ReturnsCorrectStructure(t *testing.T) {
 	data := resp["data"].(map[string]interface{})
 	templates := data["templates"].([]interface{})
 
-	if len(templates) != 4 {
-		t.Fatalf("expected 4 templates, got %d", len(templates))
+	if len(templates) != 8 {
+		t.Fatalf("expected 8 templates, got %d", len(templates))
 	}
 
-	expectedIDs := []string{"project_progress", "task_tracking", "weekly_report", "chat_content"}
+	expectedIDs := []string{"project_progress", "task_tracking", "weekly_report", "chat_content", "personal_weekly_report", "okr_alignment", "todo_extraction", "feedback_triage"}
 	for i, tmpl := range templates {
 		m := tmpl.(map[string]interface{})
 		if m["id"] != expectedIDs[i] {
@@ -427,18 +427,13 @@ func TestGetTemplates_ReturnsCorrectStructure(t *testing.T) {
 		}
 	}
 
-	// Verify parameterized template has placeholders
+	// Built-in templates use the two-field model; no parameterized placeholders are exposed.
 	taskTracking := templates[1].(map[string]interface{})
-	if taskTracking["type"] != "parameterized" {
-		t.Errorf("task_tracking type: want parameterized, got %v", taskTracking["type"])
+	if taskTracking["type"] != "fixed" {
+		t.Errorf("task_tracking type: want fixed, got %v", taskTracking["type"])
 	}
-	placeholders := taskTracking["placeholders"].([]interface{})
-	if len(placeholders) != 1 {
-		t.Fatalf("task_tracking placeholders: want 1, got %d", len(placeholders))
-	}
-	ph := placeholders[0].(map[string]interface{})
-	if ph["key"] != "task_name" {
-		t.Errorf("placeholder key: want task_name, got %v", ph["key"])
+	if _, ok := taskTracking["placeholders"]; ok {
+		t.Errorf("task_tracking placeholders should be omitted in two-field model")
 	}
 }
 

@@ -95,7 +95,7 @@ func main() {
 	}
 
 	// Public API server
-	publicRouter := router.SetupPublic(summaryDB, imDB, hub, authResolver, cfg.WorkerTriggerURL, cfg.CandidateQueryLimit, cfg.FeatureTeamSchedule)
+	publicRouter := router.SetupPublic(summaryDB, imDB, hub, authResolver, cfg.WorkerTriggerURL, cfg.CandidateQueryLimit, cfg.FeatureTeamSchedule, cfg.SummaryCustomTemplateLimit)
 	publicSrv := &http.Server{
 		Addr:    ":" + cfg.APIPort,
 		Handler: publicRouter,

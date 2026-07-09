@@ -82,3 +82,19 @@ func TestResolveCharsPerTokenCJK_ExplicitEnvOverride(t *testing.T) {
 		t.Errorf("ResolveCharsPerTokenCJK() with explicit env = %d, want 3", got)
 	}
 }
+
+func TestLoad_SummaryCustomTemplateLimit(t *testing.T) {
+	t.Setenv("SUMMARY_CUSTOM_TEMPLATE_LIMIT", "50")
+	cfg := Load()
+	if cfg.SummaryCustomTemplateLimit != 50 {
+		t.Fatalf("SummaryCustomTemplateLimit=%d want 50", cfg.SummaryCustomTemplateLimit)
+	}
+}
+
+func TestLoad_SummaryCustomTemplateLimitDefault(t *testing.T) {
+	t.Setenv("SUMMARY_CUSTOM_TEMPLATE_LIMIT", "")
+	cfg := Load()
+	if cfg.SummaryCustomTemplateLimit != 30 {
+		t.Fatalf("SummaryCustomTemplateLimit=%d want 30", cfg.SummaryCustomTemplateLimit)
+	}
+}
