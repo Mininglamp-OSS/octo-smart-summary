@@ -28,16 +28,6 @@ type scheduleParticipantConfig struct {
 	UserName string `json:"user_name"`
 }
 
-func syncScheduledTaskConfig(tx *gorm.DB, imDB *gorm.DB, sched model.SummarySchedule, task model.SummaryTask, now time.Time) error {
-	if err := syncScheduledTaskSources(tx, imDB, task.ID, sched.SourceConfig); err != nil {
-		return err
-	}
-	if err := syncScheduledTaskParticipants(tx, task, sched.ParticipantConfig, now); err != nil {
-		return err
-	}
-	return nil
-}
-
 // buildScheduledTaskChildren creates the source / participant / personal_result
 // subtable rows for a freshly INSERTed scheduled task. Under the 1->N model every
 // run is a brand-new task_id, so its three subtables start empty and must be
@@ -208,37 +198,6 @@ func materializeAcceptedParticipant(tx *gorm.DB, task model.SummaryTask, userID,
 		return err
 	}
 	return tx.Model(&row).Update("personal_result_id", pr.ID).Error
-}
-
-func syncScheduledTaskSources(tx *gorm.DB, imDB *gorm.DB, taskID int64, raw model.JSON) error {
-	if len(raw) == 0 {
-		return nil
-	}
-
-	var sources []scheduleSourceConfig
-	if err := json.Unmarshal(raw, &sources); err != nil {
-		return service.NewBizError(40000, "定时来源配置无效", http.StatusBadRequest)
-	}
-	if err := tx.Where("task_id = ?", taskID).Delete(&model.SummarySource{}).Error; err != nil {
-		return err
-	}
-	for _, src := range sources {
-		if src.SourceID == "" {
-			return fmt.Errorf("scheduled source_id is required")
-		}
-		// Always resolve the canonical source name from the IM DB; never trust a
-		// client-supplied source_name (see buildScheduledTaskSources).
-		sourceName := service.ResolveSourceNameWithType(src.SourceID, src.SourceType, imDB)
-		if err := tx.Create(&model.SummarySource{
-			TaskID:     taskID,
-			SourceType: src.SourceType,
-			SourceID:   src.SourceID,
-			SourceName: sourceName,
-		}).Error; err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func syncScheduledTaskParticipants(tx *gorm.DB, task model.SummaryTask, raw model.JSON, now time.Time) error {
