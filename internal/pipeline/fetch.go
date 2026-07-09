@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"gorm.io/gorm"
 )
 
@@ -701,10 +702,13 @@ func FilterMessagesByRelevance(messages []Message, topic string, participantUIDs
 // - Target persons (for post-fetch filtering)
 //
 // Returns messages, intent result (for target person filtering), and error.
-func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, participantUIDs []string, participantNames []string, specifiedSources []map[string]interface{}, topic string, timeStart, timeEnd time.Time, imDB *gorm.DB, octoClient octoSearchClient, messageFetchBackend string, toolCallFn LLMToolCallFn, llmFn LLMCallFn, tableCount int, maxPerChannel int, fetchConcurrency int, octoSearchPollSec int, channelScopeOpts *ChannelScopeOptions) ([]Message, *IntentResult, error) {
+func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, participantUIDs []string, participantNames []string, specifiedSources []map[string]interface{}, topic string, timeStart, timeEnd time.Time, imDB *gorm.DB, octoClient octoSearchClient, messageFetchBackend string, toolCallFn LLMToolCallFn, llmFn LLMCallFn, tableCount int, maxPerChannel int, fetchConcurrency int, octoSearchPollSec int, channelScopeOpts *ChannelScopeOptions, reportStage func(string)) ([]Message, *IntentResult, error) {
 	maxDays := DefaultTimeRangeDays
 	if timeEnd.Sub(timeStart) > time.Duration(maxDays)*24*time.Hour {
 		return nil, nil, fmt.Errorf("时间范围不能超过 %d 天", maxDays)
+	}
+	if reportStage != nil {
+		reportStage(model.WorkflowStageUnderstandQuestion)
 	}
 
 	pipelineStart := time.Now()
@@ -766,6 +770,9 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 	}
 	log.Printf("[pipeline-personal] Intent recognition took %dms (skipped=%v)",
 		time.Since(intentStart).Milliseconds(), intentResult.Skipped)
+	if reportStage != nil {
+		reportStage(model.WorkflowStageFindRelevantChats)
+	}
 
 	// Apply time range from intent
 	if intentResult.TimeRange.Narrowed {
@@ -804,6 +811,9 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 	}
 	log.Printf("[pipeline-personal] Layer 4 (%s): fetched %d messages from %d candidates in %dms",
 		messageFetchBackend, len(allMessages), len(candidates), time.Since(fetchStart).Milliseconds())
+	if reportStage != nil {
+		reportStage(model.WorkflowStageFilterUsefulContent)
+	}
 
 	// Layer 4.5: mutual activity filter
 	l45Start := time.Now()

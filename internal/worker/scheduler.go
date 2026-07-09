@@ -444,7 +444,10 @@ func scanStuckPersonalTasks(db *gorm.DB, workerTriggerURL string) {
 		// Reset personal_result to PENDING
 		db.Model(&model.PersonalResult{}).
 			Where("participant_ref_id = ? AND worker_status = ?", p.ID, model.PersonalStatusProcessing).
-			Update("worker_status", model.PersonalStatusPending)
+			Updates(map[string]interface{}{
+				"worker_status":  model.PersonalStatusPending,
+				"workflow_stage": "",
+			})
 		// Reset participant to accepted
 		db.Model(&p).Updates(map[string]interface{}{
 			"status":            model.ParticipantAccepted,

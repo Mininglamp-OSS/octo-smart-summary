@@ -216,7 +216,7 @@ func TestResolveAndFetch_SelectedArchivedThread_ProducesMessages(t *testing.T) {
 
 	msgs, _, err := ResolveAndFetchMessagesForPersonal(
 		context.Background(), "user1", nil, nil, specifiedSources, "",
-		start, end, db, echoOctoClient(), "batch", nil, nil, 1, 0, 2, 1, nil,
+		start, end, db, echoOctoClient(), "batch", nil, nil, 1, 0, 2, 1, nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("ResolveAndFetchMessagesForPersonal: %v", err)
@@ -246,7 +246,7 @@ func TestResolveAndFetch_MySQLBackend_UsesLegacyMessageFilter(t *testing.T) {
 
 	msgs, _, err := ResolveAndFetchMessagesForPersonal(
 		context.Background(), "user1", nil, nil, specifiedSources, "",
-		start, end, db, nil, "mysql", nil, nil, 1, 0, 2, 1, nil,
+		start, end, db, nil, "mysql", nil, nil, 1, 0, 2, 1, nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("ResolveAndFetchMessagesForPersonal: %v", err)
@@ -270,7 +270,7 @@ func TestResolveAndFetch_NoSources_ArchivedExcluded(t *testing.T) {
 	// No explicit sources -> auto discovery -> only the active thread's message.
 	msgs, _, err := ResolveAndFetchMessagesForPersonal(
 		context.Background(), "user1", nil, nil, nil, "",
-		start, end, db, echoOctoClient(), "batch", nil, nil, 1, 0, 2, 1, nil,
+		start, end, db, echoOctoClient(), "batch", nil, nil, 1, 0, 2, 1, nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("ResolveAndFetchMessagesForPersonal: %v", err)
@@ -377,7 +377,7 @@ func TestResolveAndFetch_MultiPerson_SelectedArchivedThread_Retained(t *testing.
 
 	msgs, _, err := ResolveAndFetchMessagesForPersonal(
 		context.Background(), "user1", []string{"user2"}, nil, specifiedSources, "",
-		start, end, db, echoOctoClient("user1", "user2"), "batch", nil, nil, 1, 0, 2, 1, nil,
+		start, end, db, echoOctoClient("user1", "user2"), "batch", nil, nil, 1, 0, 2, 1, nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("ResolveAndFetchMessagesForPersonal: %v", err)

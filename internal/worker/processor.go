@@ -754,7 +754,7 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 		ctx, task.CreatorID, participantUIDs, participantNames, specifiedSources, task.Title,
 		task.TimeRangeStart, task.TimeRangeEnd,
 		p.imDB, p.octoClient, p.cfg.MessageFetchBackend, toolCallFn, llmFn, p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency, p.cfg.OctoSearchPollSec,
-		channelScopeOpts,
+		channelScopeOpts, nil,
 	)
 	timing.Observe(task.TaskNo, "fetch_messages", fetchStart)
 	if err != nil {

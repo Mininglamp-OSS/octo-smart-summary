@@ -768,13 +768,15 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 
 	var pr model.PersonalResult
 	personalOut := gin.H{
-		"worker_status": 0,
-		"content":       "",
-		"submitted_at":  nil,
+		"worker_status":  0,
+		"workflow_stage": "",
+		"content":        "",
+		"submitted_at":   nil,
 	}
 	if userID != "" {
 		if err := h.db.Where("task_id = ? AND user_id = ?", taskID, userID).First(&pr).Error; err == nil {
 			personalOut["worker_status"] = pr.WorkerStatus
+			personalOut["workflow_stage"] = pr.WorkflowStage
 			personalOut["content"] = pr.Content
 			if pr.SubmittedAt != nil {
 				personalOut["submitted_at"] = pr.SubmittedAt.Format(time.RFC3339)
@@ -962,6 +964,7 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 		}
 		if err := tx.Model(&model.PersonalResult{}).Where("task_id = ?", taskID).Updates(map[string]interface{}{
 			"worker_status":  model.PersonalStatusPending,
+			"workflow_stage": "",
 			"content":        "",
 			"citations_json": "",
 			"error_message":  nil,

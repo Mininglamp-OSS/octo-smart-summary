@@ -13,6 +13,14 @@ const (
 	PersonalStatusFailed     = 3
 )
 
+const (
+	WorkflowStageUnderstandQuestion  = "understand_question"
+	WorkflowStageFindRelevantChats   = "find_relevant_chats"
+	WorkflowStageFilterUsefulContent = "filter_useful_content"
+	WorkflowStageAnalyzeChatContent  = "analyze_chat_content"
+	WorkflowStageGenerateSummary     = "generate_summary"
+)
+
 // Participant status constants for by-person mode.
 const (
 	ParticipantPending    = 0
@@ -35,6 +43,7 @@ type PersonalResult struct {
 	TotalTokenUsed   int        `gorm:"column:total_token_used;not null;default:0" json:"total_token_used"`
 	ModelVersion     string     `gorm:"column:model_version;type:varchar(50);not null;default:''" json:"model_version"`
 	WorkerStatus     int        `gorm:"column:worker_status;type:tinyint;not null;default:0" json:"worker_status"`
+	WorkflowStage    string     `gorm:"column:workflow_stage;type:varchar(32);not null;default:''" json:"workflow_stage"`
 	RetryCount       int        `gorm:"column:retry_count;type:tinyint;not null;default:0" json:"retry_count"`
 	ErrorMessage     *string    `gorm:"column:error_message;type:varchar(500)" json:"error_message"`
 	EditedAt         *time.Time `gorm:"column:edited_at" json:"edited_at"`

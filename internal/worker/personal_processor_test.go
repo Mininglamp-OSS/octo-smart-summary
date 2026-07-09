@@ -90,6 +90,18 @@ func TestDecidePersonalMessages_FilteredEmpty_SelfPlusOther_FallsBackToAll(t *te
 	}
 }
 
+func TestCompletedPersonalResultUpdates_SetGenerateStageOnAllPaths(t *testing.T) {
+	now := time.Now()
+	full := completedPersonalResultUpdates(model.PersonalResult{}, "content", nil, 3, 10, "model", now, false)
+	if full["workflow_stage"] != model.WorkflowStageGenerateSummary {
+		t.Fatalf("full workflow_stage=%v", full["workflow_stage"])
+	}
+	skip := completedPersonalResultUpdates(model.PersonalResult{}, "content", nil, 3, 10, "model", now, true)
+	if skip["workflow_stage"] != model.WorkflowStageGenerateSummary {
+		t.Fatalf("skip workflow_stage=%v", skip["workflow_stage"])
+	}
+}
+
 // normalizeTargetMsgCount mirrors the F1 fix in executePersonalPipeline: on
 // untrimmed / fallback paths no message has IsTargetUser set, so the accumulated
 // count is 0 and must be normalized to the full message count.
@@ -306,6 +318,7 @@ func seedFailFixture(t *testing.T, db *gorm.DB, taskNo string, participantCount,
 		pr := model.PersonalResult{
 			TaskID: task.ID, ParticipantRefID: part.ID, UserID: userIDForIdx(i),
 			WorkerStatus: model.PersonalStatusProcessing, RetryCount: retryCount,
+			WorkflowStage: model.WorkflowStageFilterUsefulContent,
 		}
 		if err := db.Create(&pr).Error; err != nil {
 			t.Fatalf("create personal_result: %v", err)
@@ -336,6 +349,9 @@ func TestMarkPersonalFailed_UnderMaxRetry_ResetsToPending(t *testing.T) {
 	if gotPR.RetryCount != 1 {
 		t.Errorf("retry_count=%d, want 1", gotPR.RetryCount)
 	}
+	if gotPR.WorkflowStage != "" {
+		t.Errorf("workflow_stage=%q, want empty after retry reset", gotPR.WorkflowStage)
+	}
 	var gotPart model.SummaryParticipant
 	db.First(&gotPart, part.ID)
 	if gotPart.Status != model.ParticipantAccepted {
@@ -343,6 +359,41 @@ func TestMarkPersonalFailed_UnderMaxRetry_ResetsToPending(t *testing.T) {
 	}
 	if gotPart.WorkerStartedAt != nil {
 		t.Errorf("worker_started_at should be cleared on retry reset, got %v", gotPart.WorkerStartedAt)
+	}
+}
+
+func TestUpdatePersonalWorkflowStage_GuardsProcessingStatus(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	now := time.Now()
+	processing := model.PersonalResult{
+		TaskID: 1, ParticipantRefID: 1, UserID: "u1",
+		WorkerStatus: model.PersonalStatusProcessing,
+		CreatedAt:    now, UpdatedAt: now,
+	}
+	completed := model.PersonalResult{
+		TaskID: 1, ParticipantRefID: 2, UserID: "u2",
+		WorkerStatus: model.PersonalStatusCompleted,
+		CreatedAt:    now, UpdatedAt: now,
+	}
+	if err := db.Create(&processing).Error; err != nil {
+		t.Fatalf("create processing pr: %v", err)
+	}
+	if err := db.Create(&completed).Error; err != nil {
+		t.Fatalf("create completed pr: %v", err)
+	}
+
+	p := &Processor{db: db}
+	p.updatePersonalWorkflowStage(processing.ID, model.WorkflowStageFindRelevantChats)
+	p.updatePersonalWorkflowStage(completed.ID, model.WorkflowStageFindRelevantChats)
+
+	var gotProcessing, gotCompleted model.PersonalResult
+	db.First(&gotProcessing, processing.ID)
+	db.First(&gotCompleted, completed.ID)
+	if gotProcessing.WorkflowStage != model.WorkflowStageFindRelevantChats {
+		t.Fatalf("processing workflow_stage=%q", gotProcessing.WorkflowStage)
+	}
+	if gotCompleted.WorkflowStage != "" {
+		t.Fatalf("completed workflow_stage=%q, want unchanged", gotCompleted.WorkflowStage)
 	}
 }
 
@@ -476,7 +527,7 @@ func TestMarkPersonalFailed_ConcurrentRetry_NoLostIncrement(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			prCopy := pr           // each worker gets its own struct (mirrors real workers)
+			prCopy := pr // each worker gets its own struct (mirrors real workers)
 			partCopy := part
 			p.markPersonalFailed(&prCopy, &partCopy, "LLM API error: boom")
 		}()

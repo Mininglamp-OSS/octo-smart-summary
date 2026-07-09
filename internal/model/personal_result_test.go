@@ -64,3 +64,18 @@ func TestWorkerTriggerRequestTypes(t *testing.T) {
 		t.Error("expected participant_ref_id 456")
 	}
 }
+
+func TestWorkflowStageConstants(t *testing.T) {
+	tests := []string{
+		WorkflowStageUnderstandQuestion,
+		WorkflowStageFindRelevantChats,
+		WorkflowStageFilterUsefulContent,
+		WorkflowStageAnalyzeChatContent,
+		WorkflowStageGenerateSummary,
+	}
+	for _, stage := range tests {
+		if stage == "" {
+			t.Fatal("workflow stage must not be empty")
+		}
+	}
+}
