@@ -31,9 +31,9 @@ type scheduleParticipantConfig struct {
 // buildScheduledTaskChildren creates the source / participant / personal_result
 // subtable rows for a freshly INSERTed scheduled task. Under the 1->N model every
 // run is a brand-new task_id, so its three subtables start empty and must be
-// rebuilt from the schedule config (the source of truth). This is the same shape
-// as syncScheduledTaskConfig but assumes no pre-existing children (no deletes) and
-// always materializes the creator participant even when ParticipantConfig is empty.
+// rebuilt from the schedule config (the source of truth). Assumes no
+// pre-existing children (no deletes) and always materializes the creator
+// participant even when ParticipantConfig is empty.
 //
 // Returns the number of Accepted participants materialized. For a V5 CONFIRM
 // schedule this is the count of already-confirmed members this round; 0 means the

@@ -169,6 +169,48 @@ func TestValidateUserAccessibleSources_ThreadQueryFail(t *testing.T) {
 	}
 }
 
+// TestValidateUserAccessibleSources_ArchivedThreadSelected exercises the
+// selectedThreadIDs archived-thread relaxation on the write path: an archived
+// thread (t.status=2) is normally excluded from GetUserChannels output, but
+// when the caller explicitly names it (its id shows up in the current sources
+// list), it must still be judged accessible. Regression guard so a legitimate
+// edit that preserves an archived thread source doesn't get false-403'd.
+func TestValidateUserAccessibleSources_ArchivedThreadSelected(t *testing.T) {
+	imDB := setupPipelineImDB(t)
+	imDB.Exec(`INSERT INTO "group" (group_no, name, status) VALUES ('grp1','g1',1)`)
+	imDB.Exec(`INSERT INTO group_member (group_no, uid, is_deleted) VALUES ('grp1','uid1',0)`)
+	// status=2 (archived) — excluded by the default t.status=1 predicate,
+	// only admitted when the id appears in selectedThreadIDs.
+	imDB.Exec(`INSERT INTO thread (id, short_id, name, group_no, status) VALUES (10,'sh_arch','archived','grp1',2)`)
+
+	missing, err := ValidateUserAccessibleSources(context.Background(), "uid1", imDB,
+		[]SourceRef{{SourceType: 2, SourceID: "grp1____sh_arch"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(missing) != 0 {
+		t.Fatalf("archived thread named in sources must be accessible; missing=%v", missing)
+	}
+}
+
+// TestValidateUserAccessibleSources_UnknownSourceTypeFailsClosed pins the
+// fail-closed default for sourceKey's ct==0 branch: an unknown source_type
+// bypasses every allowed-set lookup and must land in the missing slice
+// (caller returns 403/40017), not be silently accepted.
+func TestValidateUserAccessibleSources_UnknownSourceTypeFailsClosed(t *testing.T) {
+	imDB := setupPipelineImDB(t)
+	// No seed needed: the check should reject before any allowed-set lookup.
+
+	missing, err := ValidateUserAccessibleSources(context.Background(), "uid1", imDB,
+		[]SourceRef{{SourceType: 99, SourceID: "whatever"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(missing) != 1 || missing[0].SourceType != 99 || missing[0].SourceID != "whatever" {
+		t.Fatalf("unknown source_type must fail closed into missing; got=%v", missing)
+	}
+}
+
 func itoaSrcType(n int) string {
 	switch n {
 	case 1:
