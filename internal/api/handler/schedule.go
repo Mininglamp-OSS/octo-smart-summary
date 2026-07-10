@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -22,21 +23,174 @@ import (
 // ScheduleHandler handles schedule endpoints.
 type ScheduleHandler struct {
 	db *gorm.DB
+	// imDB is the IM database used to verify that a user actually has access to
+	// the group/thread sources they attach to a schedule (#143). When nil the
+	// source-access check is skipped (fail-open) with a warning; production
+	// wiring in router.SetupPublic always injects it, so fail-open is limited to
+	// tests/tools that construct the handler without an IM DB.
+	imDB *gorm.DB
 	// featureTeamSchedule, when true, bypasses the multi-person rejection guards
 	// (FEATURE_TEAM_SCHEDULE). Default false keeps the existing 40015 behavior.
 	featureTeamSchedule bool
+	// collate is the SQL COLLATE clause used for cross-table group_no comparisons
+	// in the IM DB (MySQL collation mismatch between `thread`/`group` and their
+	// member tables). Production wiring uses scheduleSourceCollate; tests against
+	// sqlite set it to "" so the thread/group-status path can actually run (sqlite
+	// rejects the MySQL-only COLLATE name). Mirrors CandidateHandler.collate.
+	collate string
 }
 
 // NewScheduleHandler creates a new ScheduleHandler.
+//
+// Deprecated for production wiring: it leaves imDB nil, which disables the
+// source-access check. Kept for tests/tools; production must use
+// NewScheduleHandlerWithIMDB / NewScheduleHandlerWithFlag so imDB is injected.
 func NewScheduleHandler(db *gorm.DB) *ScheduleHandler {
-	return &ScheduleHandler{db: db}
+	return &ScheduleHandler{db: db, collate: scheduleSourceCollate}
 }
 
 // NewScheduleHandlerWithFlag creates a ScheduleHandler with the team-schedule
 // feature flag explicitly set. When featureTeamSchedule is true the multi-person
 // rejection guards are bypassed so multi-participant schedules can be created.
+//
+// Deprecated for production wiring: prefer NewScheduleHandlerWithIMDB which also
+// injects imDB for the source-access check. Retained for existing test callers.
 func NewScheduleHandlerWithFlag(db *gorm.DB, featureTeamSchedule bool) *ScheduleHandler {
-	return &ScheduleHandler{db: db, featureTeamSchedule: featureTeamSchedule}
+	return &ScheduleHandler{db: db, featureTeamSchedule: featureTeamSchedule, collate: scheduleSourceCollate}
+}
+
+// NewScheduleHandlerWithIMDB creates a ScheduleHandler with both the IM DB (for
+// the #143 source-access check) and the team-schedule feature flag. This is the
+// constructor production wiring must use so schedule sources are validated
+// against real group/thread membership.
+func NewScheduleHandlerWithIMDB(db *gorm.DB, imDB *gorm.DB, featureTeamSchedule bool) *ScheduleHandler {
+	return &ScheduleHandler{db: db, imDB: imDB, featureTeamSchedule: featureTeamSchedule, collate: scheduleSourceCollate}
+}
+
+// scheduleSourceCollate is the COLLATE clause required for cross-table group_no
+// comparisons in the IM DB (MySQL collation mismatch between `thread`/`group`
+// and `group_member`). Mirrors CandidateHandler.collate and the raw SQL in
+// pipeline/resolve_channel.go and service/summary.go. Production wiring passes
+// this via ScheduleHandler.collate; sqlite tests pass "" (see F3).
+const scheduleSourceCollate = " COLLATE utf8mb4_unicode_ci"
+
+// validateSourcesAccessible verifies that userID may access every source in the
+// list, using IM DB membership. Fail-closed: any source the user cannot be
+// shown to access returns an error. When imDB is nil the check is skipped
+// (fail-open) with a warning — production always injects imDB.
+//
+// collate is the cross-table COLLATE clause (scheduleSourceCollate in production,
+// "" under sqlite tests) applied to every group_no join, mirroring
+// pipeline/fetch.go (GetUserChannels) and candidates.go so the same membership
+// semantics are enforced here.
+//
+//   - source_type=1 (group): user must be a non-deleted member of a live group
+//     (g.status=1). source_id may carry a "____{space_id}" suffix; only the
+//     group_no prefix is used (see ResolveSourceNameWithType case 1).
+//   - source_type=2 (thread/子区): source_id is "{group_no}____{short_id}"; the
+//     user must be a member of a non-deleted thread (t.status IN (1,2), i.e.
+//     Active|Archived, NOT Deleted=3) whose parent group is live (g.status=1).
+//     group_no is compared across tables with COLLATE. A deleted thread with a
+//     residual thread_member row is rejected (F2).
+//   - source_type=3 (DM): fail-closed. An empty source_id is rejected (F1); a
+//     non-empty peer must be a conversation the user actually holds — verified
+//     against conversation_extra (uid=current, channel_id=peer, channel_type=1),
+//     the same DM-ownership source of truth as GetUserChannels. Unknown types
+//     are rejected fail-closed.
+func validateSourcesAccessible(imDB *gorm.DB, collate string, userID string, sources []sourceReq) error {
+	if imDB == nil {
+		log.Printf("[schedule] validateSourcesAccessible: imDB not injected, skipping source-access check (fail-open) for user=%q sources=%d", userID, len(sources))
+		return nil
+	}
+	if userID == "" {
+		return errors.New("missing user id for source access check")
+	}
+	for _, s := range sources {
+		switch s.SourceType {
+		case 1: // group
+			groupNo := s.SourceID
+			if idx := strings.Index(groupNo, "____"); idx > 0 {
+				groupNo = groupNo[:idx]
+			}
+			if groupNo == "" {
+				return errors.New("invalid group source id")
+			}
+			var cnt int64
+			// Membership + live-group guard (mirrors GetUserChannels: g.status=1 and
+			// gm.is_deleted=0). group_no is compared across `group`/group_member with
+			// COLLATE, matching candidates.go's group-thread joins.
+			if err := imDB.Raw(
+				"SELECT 1 FROM group_member gm "+
+					"INNER JOIN `group` g ON g.group_no"+collate+" = gm.group_no "+
+					"WHERE gm.uid = ? AND gm.group_no = ? AND gm.is_deleted = 0 AND g.status = 1 "+
+					"LIMIT 1",
+				userID, groupNo,
+			).Scan(&cnt).Error; err != nil {
+				log.Printf("[schedule] validateSourcesAccessible: group query failed user=%q group=%q: %v", userID, groupNo, err)
+				return err
+			}
+			if cnt == 0 {
+				return errors.New("user not a member of group source")
+			}
+		case 2: // thread / 子区
+			parts := strings.SplitN(s.SourceID, "____", 2)
+			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+				return errors.New("invalid thread source id")
+			}
+			groupNo := parts[0]
+			shortID := parts[1]
+			var cnt int64
+			// Membership of a NON-DELETED thread whose parent group is live (F2):
+			//   - t.status IN (1,2): Active|Archived; Deleted=3 is excluded so a
+			//     residual thread_member row on a deleted thread no longer passes.
+			//   - g.status=1: parent group must still be live.
+			// group_no is compared across `group`/thread with COLLATE, matching
+			// GetUserChannels' thread join. The literal group_no bind on t.group_no
+			// disambiguates the (group_no, short_id) composite key.
+			if err := imDB.Raw(
+				"SELECT 1 FROM thread t "+
+					"INNER JOIN thread_member tm ON tm.thread_id = t.id "+
+					"INNER JOIN `group` g ON g.group_no"+collate+" = t.group_no "+
+					"WHERE tm.uid = ? AND t.group_no"+collate+" = ? AND t.short_id = ? "+
+					"AND t.status IN (1, 2) AND g.status = 1 "+
+					"LIMIT 1",
+				userID, groupNo, shortID,
+			).Scan(&cnt).Error; err != nil {
+				log.Printf("[schedule] validateSourcesAccessible: thread query failed user=%q group=%q short=%q: %v", userID, groupNo, shortID, err)
+				return err
+			}
+			if cnt == 0 {
+				return errors.New("user not a member of thread source")
+			}
+		case 3: // DM / 私聊
+			// F1 fail-closed: never accept an empty DM peer id (empty id would also
+			// break later source materialization). source_id is the peer uid, matching
+			// ResolveSourceNameWithType case 3 and conversation_extra.channel_id.
+			peer := s.SourceID
+			if peer == "" {
+				return errors.New("invalid dm source id")
+			}
+			var cnt int64
+			// Deep ownership check: the current user must actually hold this P2P
+			// conversation. conversation_extra(uid=current, channel_id=peer,
+			// channel_type=1) is the same DM source of truth GetUserChannels reads
+			// (internal/pipeline/fetch.go). No arbitrary/other users' DM peer can be
+			// attached.
+			if err := imDB.Raw(
+				"SELECT 1 FROM conversation_extra WHERE uid = ? AND channel_id = ? AND channel_type = 1 LIMIT 1",
+				userID, peer,
+			).Scan(&cnt).Error; err != nil {
+				log.Printf("[schedule] validateSourcesAccessible: dm query failed user=%q peer=%q: %v", userID, peer, err)
+				return err
+			}
+			if cnt == 0 {
+				return errors.New("user does not own dm source conversation")
+			}
+		default:
+			return errors.New("unknown source type")
+		}
+	}
+	return nil
 }
 
 type createScheduleReq struct {
@@ -536,6 +690,11 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 
 	var sourceConfig model.JSON
 	if len(req.Sources) > 0 {
+		if err := validateSourcesAccessible(h.imDB, h.collate, userID, req.Sources); err != nil {
+			log.Printf("[schedule] CreateSchedule: source access denied user=%q: %v", userID, err)
+			c.JSON(http.StatusForbidden, apiResponse{Code: 40004, Message: "无权将来源修改为无权访问的群/子区"})
+			return
+		}
 		b, _ := json.Marshal(req.Sources)
 		sourceConfig = b
 	}
@@ -1137,6 +1296,11 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		updates["time_range_type"] = *req.TimeRangeType
 	}
 	if req.Sources != nil {
+		if err := validateSourcesAccessible(h.imDB, h.collate, userID, req.Sources); err != nil {
+			log.Printf("[schedule] UpdateSchedule: source access denied user=%q sched=%d: %v", userID, schedID, err)
+			c.JSON(http.StatusForbidden, apiResponse{Code: 40004, Message: "无权将来源修改为无权访问的群/子区"})
+			return
+		}
 		b, _ := json.Marshal(req.Sources)
 		updates["source_config"] = model.JSON(b)
 	}

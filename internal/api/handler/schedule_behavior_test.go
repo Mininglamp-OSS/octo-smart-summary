@@ -1296,3 +1296,326 @@ func TestUpdateSchedule_ManualToScheduled_BackfillsTaskParticipants(t *testing.T
 		t.Errorf("manual->confirm conversion must reset everyone to unconfirmed, got %+v", cfg.Participants)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// #143: schedule "source" access/permission validation on create/update.
+//
+// A schedule creator must not be able to point a schedule at a group/thread they
+// have no access to (which would later let the scheduler pull those channels'
+// messages on their behalf). These tests seed a minimal IM DB (group_member /
+// thread / thread_member) in sqlite and drive the HTTP contract.
+// ---------------------------------------------------------------------------
+
+// newSourceAccessIMDB returns an in-memory sqlite DB shaped like the minimal
+// slice of the IM schema the source-access check reads from.
+func newSourceAccessIMDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	imDB, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open imDB: %v", err)
+	}
+	stmts := []string{
+		"CREATE TABLE `group` (group_no TEXT, status INTEGER DEFAULT 1)",
+		"CREATE TABLE group_member (uid TEXT, group_no TEXT, is_deleted INTEGER DEFAULT 0)",
+		// thread carries status (1=Active,2=Archived,3=Deleted) so the F2 status
+		// filter can be exercised; short_id + group_no form the composite key.
+		"CREATE TABLE thread (id INTEGER PRIMARY KEY, group_no TEXT, short_id TEXT, status INTEGER DEFAULT 1)",
+		"CREATE TABLE thread_member (thread_id INTEGER, uid TEXT)",
+		// conversation_extra is the DM (P2P) ownership source of truth (channel_type=1).
+		"CREATE TABLE conversation_extra (uid TEXT, channel_id TEXT, channel_type INTEGER DEFAULT 1)",
+	}
+	for _, s := range stmts {
+		if err := imDB.Exec(s).Error; err != nil {
+			t.Fatalf("create im table: %v", err)
+		}
+	}
+	return imDB
+}
+
+// newScheduleTestRouterWithIMDB wires the schedule handler with an injected IM
+// DB so the #143 source-access check is active.
+func newScheduleTestRouterWithIMDB(db, imDB *gorm.DB) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(middleware.AuthMiddleware(&mockTokenResolver{}), middleware.SpaceMiddleware())
+	sh := NewScheduleHandlerWithIMDB(db, imDB, true)
+	// sqlite rejects the MySQL-only " COLLATE utf8mb4_unicode_ci" name; blank the
+	// collate so the group/thread status joins run under the test harness (F3).
+	sh.collate = ""
+	r.POST("/api/v1/summary-schedules", sh.CreateSchedule)
+	r.PUT("/api/v1/summary-schedules/:id", sh.UpdateSchedule)
+	return r
+}
+
+// seedScheduleWithSource creates a bound schedule (via handler create) whose
+// source_config is a single group the creator IS a member of, and returns it.
+func seedAccessibleSchedule(t *testing.T, db, imDB *gorm.DB, r *gin.Engine) model.SummarySchedule {
+	t.Helper()
+	taskID := seedScheduleTask(t, db, "T143", "s1", "u1")
+	// u1 is a member of the live "old" group so the initial create passes the check.
+	imDB.Exec("INSERT INTO `group` (group_no, status) VALUES (?, 1)", "gOld")
+	imDB.Exec("INSERT INTO group_member (uid, group_no, is_deleted) VALUES (?, ?, 0)", "u1", "gOld")
+	wc := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID, "interval_days": 1, "run_time": "09:00",
+		"confirm_policy": 0,
+		"sources":        []map[string]interface{}{{"source_type": 1, "source_id": "gOld", "source_name": "Old"}},
+	})
+	if wc.Code != http.StatusOK {
+		t.Fatalf("seed create schedule: %d %s", wc.Code, wc.Body.String())
+	}
+	var sched model.SummarySchedule
+	db.Where("creator_id = ?", "u1").First(&sched)
+	return sched
+}
+
+func TestUpdateSchedule_SourceAccess_AllowedGroupUpdates(t *testing.T) {
+	db := newScheduleTestDB(t)
+	imDB := newSourceAccessIMDB(t)
+	r := newScheduleTestRouterWithIMDB(db, imDB)
+	sched := seedAccessibleSchedule(t, db, imDB, r)
+
+	// u1 is also a member of the new live target group "gNew" -> allowed.
+	imDB.Exec("INSERT INTO `group` (group_no, status) VALUES (?, 1)", "gNew")
+	imDB.Exec("INSERT INTO group_member (uid, group_no, is_deleted) VALUES (?, ?, 0)", "u1", "gNew")
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(sched.ID), map[string]interface{}{
+		"sources": []map[string]interface{}{{"source_type": 1, "source_id": "gNew", "source_name": "New"}},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 updating to accessible group, got %d: %s", w.Code, w.Body.String())
+	}
+	var got model.SummarySchedule
+	db.First(&got, sched.ID)
+	if !bytes.Contains(got.SourceConfig, []byte("gNew")) {
+		t.Fatalf("source_config should have been updated to gNew, got %s", string(got.SourceConfig))
+	}
+}
+
+func TestUpdateSchedule_SourceAccess_DeniedGroupRejected(t *testing.T) {
+	db := newScheduleTestDB(t)
+	imDB := newSourceAccessIMDB(t)
+	r := newScheduleTestRouterWithIMDB(db, imDB)
+	sched := seedAccessibleSchedule(t, db, imDB, r)
+	before := string(sched.SourceConfig)
+
+	// u1 is NOT a member of "gSecret" -> fail-closed 403, source_config unchanged.
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(sched.ID), map[string]interface{}{
+		"sources": []map[string]interface{}{{"source_type": 1, "source_id": "gSecret", "source_name": "Secret"}},
+	})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for inaccessible group, got %d: %s", w.Code, w.Body.String())
+	}
+	var got model.SummarySchedule
+	db.First(&got, sched.ID)
+	if string(got.SourceConfig) != before {
+		t.Fatalf("source_config must NOT change on denied update; before=%s after=%s", before, string(got.SourceConfig))
+	}
+	if bytes.Contains(got.SourceConfig, []byte("gSecret")) {
+		t.Fatalf("BUG: inaccessible source gSecret leaked into source_config: %s", string(got.SourceConfig))
+	}
+}
+
+func TestUpdateSchedule_SourceAccess_NilIMDBSkipsCheck(t *testing.T) {
+	db := newScheduleTestDB(t)
+	// Router without imDB -> fail-open (check skipped), must not panic.
+	r := newScheduleTestRouterWithFlag(db, true)
+	taskID := seedScheduleTask(t, db, "T143N", "s1", "u1")
+	wc := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID, "interval_days": 1, "run_time": "09:00", "confirm_policy": 0,
+	})
+	if wc.Code != http.StatusOK {
+		t.Fatalf("seed create: %d %s", wc.Code, wc.Body.String())
+	}
+	var sched model.SummarySchedule
+	db.Where("creator_id = ?", "u1").First(&sched)
+
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(sched.ID), map[string]interface{}{
+		"sources": []map[string]interface{}{{"source_type": 1, "source_id": "gAnything", "source_name": "X"}},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("nil imDB should skip check and allow update, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #143 R2: thread (source_type=2) access, thread status filtering (F2), and the
+// "all-or-nothing" mixed-source contract. These run with collate="" so the
+// group/thread status joins execute under sqlite (F3).
+// ---------------------------------------------------------------------------
+
+// seedThread inserts a thread row (+ optional membership) and its live parent
+// group into the source-access IM DB.
+func seedThread(t *testing.T, imDB *gorm.DB, id int64, groupNo, shortID string, status int, memberUID string) {
+	t.Helper()
+	imDB.Exec("INSERT OR IGNORE INTO `group` (group_no, status) VALUES (?, 1)", groupNo)
+	imDB.Exec("INSERT INTO thread (id, group_no, short_id, status) VALUES (?, ?, ?, ?)", id, groupNo, shortID, status)
+	if memberUID != "" {
+		imDB.Exec("INSERT INTO thread_member (thread_id, uid) VALUES (?, ?)", id, memberUID)
+	}
+}
+
+// thread the user is an active member of -> update to it is allowed.
+func TestUpdateSchedule_SourceAccess_ThreadActiveAllowed(t *testing.T) {
+	db := newScheduleTestDB(t)
+	imDB := newSourceAccessIMDB(t)
+	r := newScheduleTestRouterWithIMDB(db, imDB)
+	sched := seedAccessibleSchedule(t, db, imDB, r)
+
+	// Active thread (status=1) in live group gT1, u1 is a member.
+	seedThread(t, imDB, 1, "gT1", "th1", 1, "u1")
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(sched.ID), map[string]interface{}{
+		"sources": []map[string]interface{}{{"source_type": 2, "source_id": "gT1____th1", "source_name": "Th1"}},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for active thread the user belongs to, got %d: %s", w.Code, w.Body.String())
+	}
+	var got model.SummarySchedule
+	db.First(&got, sched.ID)
+	if !bytes.Contains(got.SourceConfig, []byte("gT1____th1")) {
+		t.Fatalf("source_config should have been updated to the thread, got %s", string(got.SourceConfig))
+	}
+}
+
+// user is NOT a member of the thread -> 403, source_config unchanged.
+func TestUpdateSchedule_SourceAccess_ThreadNoMembershipRejected(t *testing.T) {
+	db := newScheduleTestDB(t)
+	imDB := newSourceAccessIMDB(t)
+	r := newScheduleTestRouterWithIMDB(db, imDB)
+	sched := seedAccessibleSchedule(t, db, imDB, r)
+	before := string(sched.SourceConfig)
+
+	// Active thread but only "other" is a member; u1 is not.
+	seedThread(t, imDB, 2, "gT2", "th2", 1, "other")
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(sched.ID), map[string]interface{}{
+		"sources": []map[string]interface{}{{"source_type": 2, "source_id": "gT2____th2", "source_name": "Th2"}},
+	})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for thread the user is not in, got %d: %s", w.Code, w.Body.String())
+	}
+	var got model.SummarySchedule
+	db.First(&got, sched.ID)
+	if string(got.SourceConfig) != before {
+		t.Fatalf("source_config must NOT change on denied thread update; before=%s after=%s", before, string(got.SourceConfig))
+	}
+}
+
+// F2: a DELETED thread (status=3) with a residual thread_member row must be
+// rejected even though membership exists.
+func TestUpdateSchedule_SourceAccess_DeletedThreadRejected(t *testing.T) {
+	db := newScheduleTestDB(t)
+	imDB := newSourceAccessIMDB(t)
+	r := newScheduleTestRouterWithIMDB(db, imDB)
+	sched := seedAccessibleSchedule(t, db, imDB, r)
+	before := string(sched.SourceConfig)
+
+	// Deleted thread (status=3) but u1 still has a residual membership row.
+	seedThread(t, imDB, 3, "gT3", "th3", 3, "u1")
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(sched.ID), map[string]interface{}{
+		"sources": []map[string]interface{}{{"source_type": 2, "source_id": "gT3____th3", "source_name": "Th3"}},
+	})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for DELETED thread (status=3) despite residual membership, got %d: %s", w.Code, w.Body.String())
+	}
+	var got model.SummarySchedule
+	db.First(&got, sched.ID)
+	if string(got.SourceConfig) != before {
+		t.Fatalf("source_config must NOT change for a deleted thread; before=%s after=%s", before, string(got.SourceConfig))
+	}
+}
+
+// Mixed "all-or-nothing": one accessible group + one inaccessible group in the
+// same update must reject the WHOLE request (403) and leave source_config intact.
+func TestUpdateSchedule_SourceAccess_MixedSourcesAllOrNothing(t *testing.T) {
+	db := newScheduleTestDB(t)
+	imDB := newSourceAccessIMDB(t)
+	r := newScheduleTestRouterWithIMDB(db, imDB)
+	sched := seedAccessibleSchedule(t, db, imDB, r)
+	before := string(sched.SourceConfig)
+
+	// gOK is live and u1 is a member; gDenied is one u1 cannot access.
+	imDB.Exec("INSERT INTO `group` (group_no, status) VALUES (?, 1)", "gOK")
+	imDB.Exec("INSERT INTO group_member (uid, group_no, is_deleted) VALUES (?, ?, 0)", "u1", "gOK")
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(sched.ID), map[string]interface{}{
+		"sources": []map[string]interface{}{
+			{"source_type": 1, "source_id": "gOK", "source_name": "OK"},
+			{"source_type": 1, "source_id": "gDenied", "source_name": "Denied"},
+		},
+	})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 rejecting the whole mixed request, got %d: %s", w.Code, w.Body.String())
+	}
+	var got model.SummarySchedule
+	db.First(&got, sched.ID)
+	if string(got.SourceConfig) != before {
+		t.Fatalf("all-or-nothing: source_config must be unchanged; before=%s after=%s", before, string(got.SourceConfig))
+	}
+	if bytes.Contains(got.SourceConfig, []byte("gOK")) || bytes.Contains(got.SourceConfig, []byte("gDenied")) {
+		t.Fatalf("BUG: partial mixed source leaked into source_config: %s", string(got.SourceConfig))
+	}
+}
+
+// F1: DM (source_type=3) with an EMPTY source_id must be rejected (fail-closed).
+func TestUpdateSchedule_SourceAccess_DMEmptyIDRejected(t *testing.T) {
+	db := newScheduleTestDB(t)
+	imDB := newSourceAccessIMDB(t)
+	r := newScheduleTestRouterWithIMDB(db, imDB)
+	sched := seedAccessibleSchedule(t, db, imDB, r)
+	before := string(sched.SourceConfig)
+
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(sched.ID), map[string]interface{}{
+		"sources": []map[string]interface{}{{"source_type": 3, "source_id": "", "source_name": "DM"}},
+	})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for empty DM source_id (fail-closed), got %d: %s", w.Code, w.Body.String())
+	}
+	var got model.SummarySchedule
+	db.First(&got, sched.ID)
+	if string(got.SourceConfig) != before {
+		t.Fatalf("source_config must NOT change for empty DM id; before=%s after=%s", before, string(got.SourceConfig))
+	}
+}
+
+// F1: DM (source_type=3) the user does NOT own (no conversation_extra row) must
+// be rejected (fail-closed deep check).
+func TestUpdateSchedule_SourceAccess_DMNotOwnedRejected(t *testing.T) {
+	db := newScheduleTestDB(t)
+	imDB := newSourceAccessIMDB(t)
+	r := newScheduleTestRouterWithIMDB(db, imDB)
+	sched := seedAccessibleSchedule(t, db, imDB, r)
+	before := string(sched.SourceConfig)
+
+	// A conversation between OTHER users; u1 holds no such conversation.
+	imDB.Exec("INSERT INTO conversation_extra (uid, channel_id, channel_type) VALUES (?, ?, 1)", "other", "peerX")
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(sched.ID), map[string]interface{}{
+		"sources": []map[string]interface{}{{"source_type": 3, "source_id": "peerX", "source_name": "DM"}},
+	})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a DM the user does not own, got %d: %s", w.Code, w.Body.String())
+	}
+	var got model.SummarySchedule
+	db.First(&got, sched.ID)
+	if string(got.SourceConfig) != before {
+		t.Fatalf("source_config must NOT change for an unowned DM; before=%s after=%s", before, string(got.SourceConfig))
+	}
+}
+
+// F1 counterpart: a DM the user DOES own (conversation_extra row present) passes.
+func TestUpdateSchedule_SourceAccess_DMOwnedAllowed(t *testing.T) {
+	db := newScheduleTestDB(t)
+	imDB := newSourceAccessIMDB(t)
+	r := newScheduleTestRouterWithIMDB(db, imDB)
+	sched := seedAccessibleSchedule(t, db, imDB, r)
+
+	// u1 holds the P2P conversation with peerA (channel_type=1).
+	imDB.Exec("INSERT INTO conversation_extra (uid, channel_id, channel_type) VALUES (?, ?, 1)", "u1", "peerA")
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(sched.ID), map[string]interface{}{
+		"sources": []map[string]interface{}{{"source_type": 3, "source_id": "peerA", "source_name": "DM"}},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for a DM the user owns, got %d: %s", w.Code, w.Body.String())
+	}
+	var got model.SummarySchedule
+	db.First(&got, sched.ID)
+	if !bytes.Contains(got.SourceConfig, []byte("peerA")) {
+		t.Fatalf("source_config should have been updated to the owned DM, got %s", string(got.SourceConfig))
+	}
+}
