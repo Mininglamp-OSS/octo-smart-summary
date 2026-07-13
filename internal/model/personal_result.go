@@ -62,15 +62,15 @@ func (PersonalResult) TableName() string { return "summary_personal_result" }
 // used by read paths; this table is only version history.
 type PersonalResultVersion struct {
 	ID               int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	TaskID           int64     `gorm:"column:task_id;not null" json:"task_id"`
+	TaskID           int64     `gorm:"column:task_id;not null;uniqueIndex:uk_personal_result_version_task_user_version" json:"task_id"`
 	ParticipantRefID int64     `gorm:"column:participant_ref_id;not null" json:"participant_ref_id"`
-	UserID           string    `gorm:"column:user_id;type:varchar(64);not null" json:"user_id"`
+	UserID           string    `gorm:"column:user_id;type:varchar(64);not null;uniqueIndex:uk_personal_result_version_task_user_version" json:"user_id"`
 	Content          string    `gorm:"column:content;type:mediumtext;not null" json:"content"`
 	CitationsJSON    string    `gorm:"column:citations_json;type:mediumtext" json:"-"`
 	MsgCount         int       `gorm:"column:msg_count;not null;default:0" json:"msg_count"`
 	TotalTokenUsed   int       `gorm:"column:total_token_used;not null;default:0" json:"total_token_used"`
 	ModelVersion     string    `gorm:"column:model_version;type:varchar(50);not null;default:''" json:"model_version"`
-	Version          int       `gorm:"column:version;not null;default:1" json:"version"`
+	Version          int       `gorm:"column:version;not null;default:1;uniqueIndex:uk_personal_result_version_task_user_version" json:"version"`
 	OperationType    string    `gorm:"column:operation_type;type:varchar(32);not null;default:'generate'" json:"operation_type"`
 	OperationNote    string    `gorm:"column:operation_note;type:text" json:"operation_note"`
 	ParentVersionID  *int64    `gorm:"column:parent_version_id" json:"parent_version_id,omitempty"`

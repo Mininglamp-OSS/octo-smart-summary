@@ -16,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const maxContentBytes = 500 * 1024
@@ -309,16 +310,16 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 	newResult.SetCitations(cleanedCitations)
 
 	err = h.db.Transaction(func(tx *gorm.DB) error {
+		var taskCheck model.SummaryTask
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", taskID).First(&taskCheck).Error; err != nil {
+			return err
+		}
 		latest, err := queryDisplayResult(tx, taskID)
 		if err != nil {
 			return err
 		}
 		if latest.ID != baseResult.ID {
 			return service.NewBizError(40009, "内容已更新，请刷新后重试", http.StatusConflict)
-		}
-		var taskCheck model.SummaryTask
-		if err := tx.Where("id = ?", taskID).First(&taskCheck).Error; err != nil {
-			return err
 		}
 		if taskCheck.Status != model.StatusCompleted {
 			return service.NewBizError(40005, "任务状态已变更", http.StatusBadRequest)
@@ -503,11 +504,33 @@ func (h *EditHandler) RestoreSummaryVersion(c *gin.Context) {
 		return
 	}
 	err = h.db.Transaction(func(tx *gorm.DB) error {
-		return tx.Model(&model.SummaryTask{}).
+		var taskCheck model.SummaryTask
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", taskID).First(&taskCheck).Error; err != nil {
+			return err
+		}
+		if taskCheck.Status != model.StatusCompleted {
+			return service.NewBizError(40005, "任务状态已变更", http.StatusBadRequest)
+		}
+		res := tx.Model(&model.SummaryTask{}).
 			Where("id = ? AND status = ?", taskID, model.StatusCompleted).
-			Update("current_result_id", source.ID).Error
+			Update("current_result_id", source.ID)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return gorm.ErrRecordNotFound
+		}
+		return nil
 	})
 	if err != nil {
+		if bizError, isBiz := err.(*service.BizError); isBiz {
+			bizErr(c, bizError)
+			return
+		}
+		if err == gorm.ErrRecordNotFound {
+			c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
+			return
+		}
 		log.Printf("[restore] transaction error task=%d result=%d: %v", taskID, resultID, err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
 		return

@@ -18,9 +18,9 @@ CREATE TABLE IF NOT EXISTS `summary_personal_result_version` (
   `created_at` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
   `updated_at` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
   PRIMARY KEY (`id`),
-  KEY `idx_personal_result_version_task_user_version` (`task_id`, `user_id`, `version`),
+  UNIQUE KEY `uk_personal_result_version_task_user_version` (`task_id`, `user_id`, `version`),
   KEY `idx_personal_result_version_parent` (`parent_version_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- +migrate Down
 DROP TABLE IF EXISTS `summary_personal_result_version`;

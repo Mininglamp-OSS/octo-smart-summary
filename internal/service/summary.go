@@ -199,7 +199,9 @@ func GetNextVersion(db *gorm.DB, taskID int64) (int, error) {
 const SummaryResultVersionKeepLimit = 5
 const PersonalResultVersionKeepLimit = 5
 
-// PruneSummaryResultVersions keeps the newest summary result versions and deletes older rows.
+// PruneSummaryResultVersions keeps the newest auto-generated summary result versions.
+// Hand-edited rows are retained as user data, and the current display pointer is
+// never pruned even when it points to an older restored version.
 func PruneSummaryResultVersions(db *gorm.DB, taskID int64, keep int) error {
 	if keep <= 0 {
 		keep = SummaryResultVersionKeepLimit
@@ -216,7 +218,20 @@ func PruneSummaryResultVersions(db *gorm.DB, taskID int64, keep int) error {
 	if len(keepIDs) < keep {
 		return nil
 	}
-	return db.Where("task_id = ? AND id NOT IN ?", taskID, keepIDs).Delete(&model.SummaryResult{}).Error
+	var current struct {
+		CurrentResultID *int64
+	}
+	if err := db.Model(&model.SummaryTask{}).
+		Where("id = ?", taskID).
+		Select("current_result_id").
+		Scan(&current).Error; err != nil {
+		return err
+	}
+	deleteQuery := db.Where("task_id = ? AND id NOT IN ? AND edited_at IS NULL", taskID, keepIDs)
+	if current.CurrentResultID != nil {
+		deleteQuery = deleteQuery.Where("id <> ?", *current.CurrentResultID)
+	}
+	return deleteQuery.Delete(&model.SummaryResult{}).Error
 }
 
 func SplitIntoChunks(messages []map[string]interface{}, chunkSize int) [][]map[string]interface{} {
@@ -305,6 +320,8 @@ func GetNextPersonalVersion(db *gorm.DB, taskID int64, userID string) (int, erro
 }
 
 // PrunePersonalResultVersions keeps the newest personal result versions for a user.
+// The current_version_id pointer is always retained, including after restoring
+// an older version.
 func PrunePersonalResultVersions(db *gorm.DB, taskID int64, userID string, keep int) error {
 	if keep <= 0 {
 		keep = PersonalResultVersionKeepLimit
@@ -321,5 +338,18 @@ func PrunePersonalResultVersions(db *gorm.DB, taskID int64, userID string, keep 
 	if len(keepIDs) < keep {
 		return nil
 	}
-	return db.Where("task_id = ? AND user_id = ? AND id NOT IN ?", taskID, userID, keepIDs).Delete(&model.PersonalResultVersion{}).Error
+	var current struct {
+		CurrentVersionID *int64
+	}
+	if err := db.Model(&model.PersonalResult{}).
+		Where("task_id = ? AND user_id = ?", taskID, userID).
+		Select("current_version_id").
+		Scan(&current).Error; err != nil {
+		return err
+	}
+	deleteQuery := db.Where("task_id = ? AND user_id = ? AND id NOT IN ?", taskID, userID, keepIDs)
+	if current.CurrentVersionID != nil {
+		deleteQuery = deleteQuery.Where("id <> ?", *current.CurrentVersionID)
+	}
+	return deleteQuery.Delete(&model.PersonalResultVersion{}).Error
 }

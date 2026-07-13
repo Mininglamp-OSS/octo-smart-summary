@@ -16,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timing"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/tokenizer"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func escapeCitationMarkers(content string) string {
@@ -88,7 +89,13 @@ func (p *Processor) persistCompletedPersonalResult(task model.SummaryTask, pr mo
 	}
 
 	return p.db.Transaction(func(tx *gorm.DB) error {
-		nextVer, err := service.GetNextPersonalVersion(tx, pr.TaskID, pr.UserID)
+		var lockedPR model.PersonalResult
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND task_id = ? AND user_id = ?", pr.ID, pr.TaskID, pr.UserID).
+			First(&lockedPR).Error; err != nil {
+			return err
+		}
+		nextVer, err := service.GetNextPersonalVersion(tx, lockedPR.TaskID, lockedPR.UserID)
 		if err != nil {
 			return err
 		}
@@ -100,9 +107,9 @@ func (p *Processor) persistCompletedPersonalResult(task model.SummaryTask, pr mo
 		}
 
 		version := model.PersonalResultVersion{
-			TaskID:           pr.TaskID,
-			ParticipantRefID: pr.ParticipantRefID,
-			UserID:           pr.UserID,
+			TaskID:           lockedPR.TaskID,
+			ParticipantRefID: lockedPR.ParticipantRefID,
+			UserID:           lockedPR.UserID,
 			Content:          content,
 			MsgCount:         msgCount,
 			TotalTokenUsed:   totalTokens,
@@ -110,7 +117,7 @@ func (p *Processor) persistCompletedPersonalResult(task model.SummaryTask, pr mo
 			Version:          nextVer,
 			OperationType:    operationType,
 			OperationNote:    task.Title,
-			CreatedBy:        pr.UserID,
+			CreatedBy:        lockedPR.UserID,
 			GeneratedAt:      genAt,
 		}
 		version.SetCitations(citations)
@@ -118,7 +125,10 @@ func (p *Processor) persistCompletedPersonalResult(task model.SummaryTask, pr mo
 			return err
 		}
 		updates["current_version_id"] = version.ID
-		return tx.Model(&pr).Updates(updates).Error
+		if err := tx.Model(&lockedPR).Updates(updates).Error; err != nil {
+			return err
+		}
+		return service.PrunePersonalResultVersions(tx, lockedPR.TaskID, lockedPR.UserID, service.PersonalResultVersionKeepLimit)
 	})
 }
 

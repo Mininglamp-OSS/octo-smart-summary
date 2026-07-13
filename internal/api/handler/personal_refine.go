@@ -18,6 +18,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type refinePersonalReq struct {
@@ -130,18 +131,24 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 	var newVersion model.PersonalResultVersion
 	err = h.db.Transaction(func(tx *gorm.DB) error {
 		var latestPR model.PersonalResult
-		if err := tx.Where("id = ? AND task_id = ? AND user_id = ?", pr.ID, taskID, userID).First(&latestPR).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND task_id = ? AND user_id = ?", pr.ID, taskID, userID).
+			First(&latestPR).Error; err != nil {
 			return err
 		}
 		if latestPR.WorkerStatus != model.PersonalStatusCompleted || strings.TrimSpace(latestPR.Content) == "" {
 			return service.NewBizError(40005, "个人总结状态已变更", http.StatusBadRequest)
 		}
-		latestVersion, err := ensurePersonalVersionBaseline(tx, latestPR)
+		versionBeforeBaseline, err := currentPersonalVersion(tx, taskID, userID, latestPR)
 		if err != nil {
 			return err
 		}
-		if req.BaseVersion > 0 && req.BaseVersion != latestVersion.Version {
+		if req.BaseVersion > 0 && req.BaseVersion != versionBeforeBaseline {
 			return service.NewBizError(40009, "内容已更新，请刷新后重试", http.StatusConflict)
+		}
+		latestVersion, err := ensurePersonalVersionBaseline(tx, latestPR)
+		if err != nil {
+			return err
 		}
 
 		nextVer, err := service.GetNextPersonalVersion(tx, taskID, userID)
@@ -343,11 +350,17 @@ func (h *PersonalHandler) RestorePersonalVersion(c *gin.Context) {
 
 	now := timezone.Now()
 	err = h.db.Transaction(func(tx *gorm.DB) error {
-		if _, err := ensurePersonalVersionBaseline(tx, pr); err != nil {
+		var latestPR model.PersonalResult
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND task_id = ? AND user_id = ?", pr.ID, taskID, userID).
+			First(&latestPR).Error; err != nil {
+			return err
+		}
+		if _, err := ensurePersonalVersionBaseline(tx, latestPR); err != nil {
 			return err
 		}
 		res := tx.Model(&model.PersonalResult{}).
-			Where("id = ? AND task_id = ? AND user_id = ?", pr.ID, taskID, userID).
+			Where("id = ? AND task_id = ? AND user_id = ?", latestPR.ID, taskID, userID).
 			Updates(map[string]interface{}{
 				"content":            source.Content,
 				"citations_json":     source.CitationsJSON,
@@ -445,11 +458,17 @@ func (h *PersonalHandler) RegeneratePersonalSummary(c *gin.Context) {
 	}
 
 	err := h.db.Transaction(func(tx *gorm.DB) error {
-		if _, err := ensurePersonalVersionBaseline(tx, pr); err != nil && strings.TrimSpace(pr.Content) != "" {
+		var latestPR model.PersonalResult
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND task_id = ? AND user_id = ?", pr.ID, taskID, userID).
+			First(&latestPR).Error; err != nil {
+			return err
+		}
+		if _, err := ensurePersonalVersionBaseline(tx, latestPR); err != nil {
 			return err
 		}
 		res := tx.Model(&model.PersonalResult{}).
-			Where("id = ? AND task_id = ? AND user_id = ? AND worker_status IN ?", pr.ID, taskID, userID, []int{model.PersonalStatusCompleted, model.PersonalStatusFailed}).
+			Where("id = ? AND task_id = ? AND user_id = ? AND worker_status IN ?", latestPR.ID, taskID, userID, []int{model.PersonalStatusCompleted, model.PersonalStatusFailed}).
 			Updates(map[string]interface{}{
 				"worker_status":      model.PersonalStatusPending,
 				"workflow_stage":     "",
@@ -507,6 +526,14 @@ func (h *PersonalHandler) RegeneratePersonalSummary(c *gin.Context) {
 }
 
 func currentPersonalVersion(db *gorm.DB, taskID int64, userID string, pr model.PersonalResult) (int, error) {
+	if pr.CurrentVersionID != nil {
+		var current model.PersonalResultVersion
+		if err := db.Where("id = ? AND task_id = ? AND user_id = ?", *pr.CurrentVersionID, taskID, userID).First(&current).Error; err == nil {
+			return current.Version, nil
+		} else if err != gorm.ErrRecordNotFound {
+			return 0, err
+		}
+	}
 	var version int
 	if err := db.Model(&model.PersonalResultVersion{}).
 		Where("task_id = ? AND user_id = ?", taskID, userID).
@@ -523,6 +550,9 @@ func ensurePersonalVersionBaseline(tx *gorm.DB, pr model.PersonalResult) (model.
 	var latest model.PersonalResultVersion
 	if pr.CurrentVersionID != nil {
 		if err := tx.Where("id = ? AND task_id = ? AND user_id = ?", *pr.CurrentVersionID, pr.TaskID, pr.UserID).First(&latest).Error; err == nil {
+			if personalCanonicalDiffersFromVersion(pr, latest) {
+				return createPersonalVersionSnapshot(tx, pr, &latest, "edit")
+			}
 			return latest, nil
 		} else if err != gorm.ErrRecordNotFound {
 			return latest, err
@@ -532,6 +562,9 @@ func ensurePersonalVersionBaseline(tx *gorm.DB, pr model.PersonalResult) (model.
 	err := tx.Where("task_id = ? AND user_id = ?", pr.TaskID, pr.UserID).
 		Order("version DESC").Order("id DESC").First(&latest).Error
 	if err == nil {
+		if personalCanonicalDiffersFromVersion(pr, latest) {
+			return createPersonalVersionSnapshot(tx, pr, &latest, "edit")
+		}
 		if pr.CurrentVersionID == nil {
 			if err := tx.Model(&model.PersonalResult{}).Where("id = ? AND current_version_id IS NULL", pr.ID).Update("current_version_id", latest.ID).Error; err != nil {
 				return latest, err
@@ -542,13 +575,40 @@ func ensurePersonalVersionBaseline(tx *gorm.DB, pr model.PersonalResult) (model.
 	if err != gorm.ErrRecordNotFound {
 		return latest, err
 	}
+	return createPersonalVersionSnapshot(tx, pr, nil, "generate")
+}
+
+func personalCanonicalDiffersFromVersion(pr model.PersonalResult, version model.PersonalResultVersion) bool {
+	if pr.EditedAt == nil {
+		return false
+	}
+	return pr.Content != version.Content ||
+		pr.CitationsJSON != version.CitationsJSON ||
+		pr.MsgCount != version.MsgCount ||
+		pr.TotalTokenUsed != version.TotalTokenUsed ||
+		pr.ModelVersion != version.ModelVersion
+}
+
+func createPersonalVersionSnapshot(tx *gorm.DB, pr model.PersonalResult, parent *model.PersonalResultVersion, operationType string) (model.PersonalResultVersion, error) {
 	generatedAt := timezone.Now()
-	if pr.GeneratedAt != nil {
+	if pr.EditedAt != nil {
+		generatedAt = *pr.EditedAt
+	} else if pr.GeneratedAt != nil {
 		generatedAt = *pr.GeneratedAt
 	} else if !pr.CreatedAt.IsZero() {
 		generatedAt = pr.CreatedAt
 	}
-	latest = model.PersonalResultVersion{
+	version := 1
+	var parentID *int64
+	if parent != nil {
+		parentID = &parent.ID
+		nextVer, err := service.GetNextPersonalVersion(tx, pr.TaskID, pr.UserID)
+		if err != nil {
+			return model.PersonalResultVersion{}, err
+		}
+		version = nextVer
+	}
+	latest := model.PersonalResultVersion{
 		TaskID:           pr.TaskID,
 		ParticipantRefID: pr.ParticipantRefID,
 		UserID:           pr.UserID,
@@ -557,15 +617,16 @@ func ensurePersonalVersionBaseline(tx *gorm.DB, pr model.PersonalResult) (model.
 		MsgCount:         pr.MsgCount,
 		TotalTokenUsed:   pr.TotalTokenUsed,
 		ModelVersion:     pr.ModelVersion,
-		Version:          1,
-		OperationType:    "generate",
+		Version:          version,
+		OperationType:    operationType,
+		ParentVersionID:  parentID,
 		CreatedBy:        pr.UserID,
 		GeneratedAt:      generatedAt,
 	}
 	if err := tx.Create(&latest).Error; err != nil {
 		return latest, err
 	}
-	if err := tx.Model(&model.PersonalResult{}).Where("id = ? AND current_version_id IS NULL", pr.ID).Update("current_version_id", latest.ID).Error; err != nil {
+	if err := tx.Model(&model.PersonalResult{}).Where("id = ?", pr.ID).Update("current_version_id", latest.ID).Error; err != nil {
 		return latest, err
 	}
 	return latest, nil
