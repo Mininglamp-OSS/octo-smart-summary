@@ -399,7 +399,25 @@ func saveLatestResultAndCompleteTask(db *gorm.DB, taskID int64, result *model.Su
 		}
 		result.TaskID = taskID
 		result.Version = nextVer
+		if result.OperationType == "" {
+			if nextVer <= 1 {
+				result.OperationType = "generate"
+			} else if isScheduled {
+				result.OperationType = "scheduled_generate"
+			} else {
+				result.OperationType = "regenerate"
+			}
+		}
+		if result.OperationNote == "" && result.OperationType != "scheduled_generate" {
+			var task model.SummaryTask
+			if err := tx.Select("title").Where("id = ?", taskID).First(&task).Error; err == nil {
+				result.OperationNote = task.Title
+			}
+		}
 		if err := tx.Create(result).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&model.SummaryTask{}).Where("id = ?", taskID).Update("current_result_id", result.ID).Error; err != nil {
 			return err
 		}
 		if isScheduled {
@@ -415,6 +433,9 @@ func saveLatestResultAndCompleteTask(db *gorm.DB, taskID int64, result *model.Su
 			if err := tx.Where("task_id = ?", taskID).Delete(&model.SummaryChunk{}).Error; err != nil {
 				return err
 			}
+		}
+		if err := service.PruneSummaryResultVersions(tx, taskID, service.SummaryResultVersionKeepLimit); err != nil {
+			return err
 		}
 		return markTaskCompleted(tx, taskID)
 	})

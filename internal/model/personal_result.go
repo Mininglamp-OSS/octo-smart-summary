@@ -42,6 +42,7 @@ type PersonalResult struct {
 	MsgCount         int        `gorm:"column:msg_count;not null;default:0" json:"msg_count"`
 	TotalTokenUsed   int        `gorm:"column:total_token_used;not null;default:0" json:"total_token_used"`
 	ModelVersion     string     `gorm:"column:model_version;type:varchar(50);not null;default:''" json:"model_version"`
+	CurrentVersionID *int64     `gorm:"column:current_version_id" json:"current_version_id"`
 	WorkerStatus     int        `gorm:"column:worker_status;type:tinyint;not null;default:0" json:"worker_status"`
 	WorkflowStage    string     `gorm:"column:workflow_stage;type:varchar(32);not null;default:''" json:"workflow_stage"`
 	RetryCount       int        `gorm:"column:retry_count;type:tinyint;not null;default:0" json:"retry_count"`
@@ -55,6 +56,55 @@ type PersonalResult struct {
 }
 
 func (PersonalResult) TableName() string { return "summary_personal_result" }
+
+// PersonalResultVersion stores lightweight history for the caller-owned
+// PersonalResult. summary_personal_result remains the current materialized row
+// used by read paths; this table is only version history.
+type PersonalResultVersion struct {
+	ID               int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	TaskID           int64     `gorm:"column:task_id;not null" json:"task_id"`
+	ParticipantRefID int64     `gorm:"column:participant_ref_id;not null" json:"participant_ref_id"`
+	UserID           string    `gorm:"column:user_id;type:varchar(64);not null" json:"user_id"`
+	Content          string    `gorm:"column:content;type:mediumtext;not null" json:"content"`
+	CitationsJSON    string    `gorm:"column:citations_json;type:mediumtext" json:"-"`
+	MsgCount         int       `gorm:"column:msg_count;not null;default:0" json:"msg_count"`
+	TotalTokenUsed   int       `gorm:"column:total_token_used;not null;default:0" json:"total_token_used"`
+	ModelVersion     string    `gorm:"column:model_version;type:varchar(50);not null;default:''" json:"model_version"`
+	Version          int       `gorm:"column:version;not null;default:1" json:"version"`
+	OperationType    string    `gorm:"column:operation_type;type:varchar(32);not null;default:'generate'" json:"operation_type"`
+	OperationNote    string    `gorm:"column:operation_note;type:text" json:"operation_note"`
+	ParentVersionID  *int64    `gorm:"column:parent_version_id" json:"parent_version_id,omitempty"`
+	CreatedBy        string    `gorm:"column:created_by;type:varchar(64);not null;default:''" json:"created_by"`
+	GeneratedAt      time.Time `gorm:"column:generated_at;not null" json:"generated_at"`
+	CreatedAt        time.Time `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt        time.Time `gorm:"column:updated_at;not null" json:"updated_at"`
+}
+
+func (PersonalResultVersion) TableName() string { return "summary_personal_result_version" }
+
+func (r *PersonalResultVersion) GetCitations() []Citation {
+	if r.CitationsJSON == "" {
+		return []Citation{}
+	}
+	var citations []Citation
+	if err := json.Unmarshal([]byte(r.CitationsJSON), &citations); err != nil {
+		return []Citation{}
+	}
+	return citations
+}
+
+func (r *PersonalResultVersion) SetCitations(citations []Citation) {
+	if len(citations) == 0 {
+		r.CitationsJSON = "[]"
+		return
+	}
+	data, err := json.Marshal(citations)
+	if err != nil {
+		r.CitationsJSON = "[]"
+		return
+	}
+	r.CitationsJSON = string(data)
+}
 
 // GetCitations deserializes CitationsJSON into a slice of Citation.
 func (r *PersonalResult) GetCitations() []Citation {

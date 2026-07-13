@@ -691,6 +691,9 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 			"total_token_used": latestResult.TotalTokenUsed,
 			"model_version":    latestResult.ModelVersion,
 			"version":          latestResult.Version,
+			"operation_type":   latestResult.OperationType,
+			"operation_note":   latestResult.OperationNote,
+			"parent_result_id": latestResult.ParentResultID,
 			"generated_at":     latestResult.GeneratedAt.Format(time.RFC3339),
 		}
 	}
@@ -884,6 +887,9 @@ func (h *TaskHandler) GetResult(c *gin.Context) {
 		"total_token_used": result.TotalTokenUsed,
 		"model_version":    result.ModelVersion,
 		"version":          result.Version,
+		"operation_type":   result.OperationType,
+		"operation_note":   result.OperationNote,
+		"parent_result_id": result.ParentResultID,
 		"generated_at":     result.GeneratedAt.Format(time.RFC3339),
 		"result_is_edited": result.EditedAt != nil,
 		"result_edited_at": func() interface{} {
@@ -944,6 +950,7 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 	}
 
 	nextVer, _ := service.GetNextVersion(h.db, taskID)
+	now := timezone.Now()
 
 	err = h.db.Transaction(func(tx *gorm.DB) error {
 		// Atomic status transition: only proceed if the task is still in a
@@ -967,30 +974,43 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 			return service.NewBizError(40005, "任务已在处理中，请稍后再试", http.StatusConflict)
 		}
 
-		if err := tx.Where("task_id = ?", taskID).Delete(&model.SummaryResult{}).Error; err != nil {
-			return err
-		}
+		// Keep previous summary_result rows as lightweight version history.
+		// Chunks are intermediate pipeline data and are still cleared before rerun.
 		if err := tx.Where("task_id = ?", taskID).Delete(&model.SummaryChunk{}).Error; err != nil {
 			return err
 		}
-		if err := tx.Model(&model.SummaryParticipant{}).Where("task_id = ?", taskID).Updates(map[string]interface{}{
-			"status":             model.ParticipantPending,
-			"worker_started_at":  nil,
-			"confirmed_at":       nil,
-			"personal_result_id": nil,
-		}).Error; err != nil {
+		// Regenerate is not a new invitation round. Participants who were already
+		// in the accepted roster keep that consent and are re-armed directly;
+		// pending/declined invitees stay out of this round.
+		acceptedParticipantIDs := tx.Model(&model.SummaryParticipant{}).
+			Select("id").
+			Where("task_id = ? AND status NOT IN ?", taskID, []int{model.ParticipantPending, model.ParticipantDeclined})
+		if err := tx.Model(&model.SummaryParticipant{}).
+			Where("task_id = ? AND status NOT IN ?", taskID, []int{model.ParticipantPending, model.ParticipantDeclined}).
+			Updates(map[string]interface{}{
+				"status":            model.ParticipantAccepted,
+				"worker_started_at": nil,
+				"confirmed_at":      now,
+			}).Error; err != nil {
 			return err
 		}
-		if err := tx.Model(&model.PersonalResult{}).Where("task_id = ?", taskID).Updates(map[string]interface{}{
-			"worker_status":  model.PersonalStatusPending,
-			"workflow_stage": "",
-			"content":        "",
-			"citations_json": "",
-			"error_message":  nil,
-			"submitted_at":   nil,
-			"generated_at":   nil,
-			"edited_at":      nil,
-		}).Error; err != nil {
+		if err := tx.Model(&model.PersonalResult{}).
+			Where("task_id = ? AND participant_ref_id IN (?)", taskID, acceptedParticipantIDs).
+			Updates(map[string]interface{}{
+				"worker_status":      model.PersonalStatusPending,
+				"workflow_stage":     "",
+				"content":            "",
+				"citations_json":     "",
+				"msg_count":          0,
+				"total_token_used":   0,
+				"model_version":      "",
+				"current_version_id": nil,
+				"error_message":      nil,
+				"submitted_at":       nil,
+				"submit_source":      model.SubmitSourceSystem,
+				"generated_at":       nil,
+				"edited_at":          nil,
+			}).Error; err != nil {
 			return err
 		}
 		// Regenerate must re-arm notification delivery: clear all prior rows so
@@ -1011,13 +1031,20 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 		return
 	}
 
-	var creatorParticipant model.SummaryParticipant
-	if err := h.db.Where("task_id = ? AND user_id = ?", taskID, task.CreatorID).First(&creatorParticipant).Error; err == nil {
-		go h.triggerWorker(model.WorkerTriggerRequest{
-			Type:             "personal_summary",
-			TaskID:           taskID,
-			ParticipantRefID: creatorParticipant.ID,
-		})
+	var triggerParticipants []model.SummaryParticipant
+	triggerQuery := h.db.Where("task_id = ? AND status NOT IN (?, ?)", taskID, model.ParticipantPending, model.ParticipantDeclined)
+	if task.SummaryMode != model.ModeByPerson {
+		triggerQuery = triggerQuery.Where("user_id = ?", task.CreatorID)
+	}
+	if err := triggerQuery.Find(&triggerParticipants).Error; err == nil {
+		for _, participant := range triggerParticipants {
+			ptID := participant.ID
+			go h.triggerWorker(model.WorkerTriggerRequest{
+				Type:             "personal_summary",
+				TaskID:           taskID,
+				ParticipantRefID: ptID,
+			})
+		}
 	}
 
 	ok(c, gin.H{

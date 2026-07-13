@@ -81,8 +81,57 @@ func (p *Processor) updatePersonalWorkflowStage(personalResultID int64, stage st
 	}
 }
 
+func (p *Processor) persistCompletedPersonalResult(task model.SummaryTask, pr model.PersonalResult, content string, citations []model.Citation, msgCount, totalTokens int, modelVer string, genAt time.Time, skipContent bool) error {
+	updates := completedPersonalResultUpdates(pr, content, citations, msgCount, totalTokens, modelVer, genAt, skipContent)
+	if skipContent {
+		return p.db.Model(&pr).Updates(updates).Error
+	}
+
+	return p.db.Transaction(func(tx *gorm.DB) error {
+		nextVer, err := service.GetNextPersonalVersion(tx, pr.TaskID, pr.UserID)
+		if err != nil {
+			return err
+		}
+		operationType := "regenerate"
+		if nextVer <= 1 {
+			operationType = "generate"
+		} else if task.TriggerType == model.TriggerScheduled {
+			operationType = "scheduled_generate"
+		}
+
+		version := model.PersonalResultVersion{
+			TaskID:           pr.TaskID,
+			ParticipantRefID: pr.ParticipantRefID,
+			UserID:           pr.UserID,
+			Content:          content,
+			MsgCount:         msgCount,
+			TotalTokenUsed:   totalTokens,
+			ModelVersion:     modelVer,
+			Version:          nextVer,
+			OperationType:    operationType,
+			OperationNote:    task.Title,
+			CreatedBy:        pr.UserID,
+			GeneratedAt:      genAt,
+		}
+		version.SetCitations(citations)
+		if err := tx.Create(&version).Error; err != nil {
+			return err
+		}
+		updates["current_version_id"] = version.ID
+		return tx.Model(&pr).Updates(updates).Error
+	})
+}
+
 func (p *Processor) processPersonalSummary(ctx context.Context, taskID, participantRefID int64) {
-	log.Printf("[personal-worker] start task=%d participant=%d", taskID, participantRefID)
+	p.processPersonalSummaryWithOptions(ctx, taskID, participantRefID, false)
+}
+
+func (p *Processor) processPersonalSummaryAllowCompleted(ctx context.Context, taskID, participantRefID int64) {
+	p.processPersonalSummaryWithOptions(ctx, taskID, participantRefID, true)
+}
+
+func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskID, participantRefID int64, allowCompletedTask bool) {
+	log.Printf("[personal-worker] start task=%d participant=%d allow_completed=%t", taskID, participantRefID, allowCompletedTask)
 
 	// Load participant
 	var participant model.SummaryParticipant
@@ -112,7 +161,11 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 		"worker_started_at": now,
 	})
 
-	// CAS update task status to PROCESSING (from any earlier state)
+	// CAS update task status to PROCESSING (from any earlier state).
+	// personal_regenerate is allowed to run against an already-Completed task
+	// without flipping the whole task back to Processing; the user will explicitly
+	// submit the regenerated personal result later, and Submit revives the task for
+	// meta recompute at that point.
 	deadline := timezone.Now().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute)
 	taskCAS := p.db.Model(&model.SummaryTask{}).
 		Where("id = ? AND status IN (?, ?)", taskID, model.StatusPending, model.StatusWaitingConfirm).
@@ -126,13 +179,16 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 	}
 	if taskCAS.RowsAffected == 0 {
 		var currentTask model.SummaryTask
-		if err := p.db.Select("status").First(&currentTask, taskID).Error; err != nil || currentTask.Status != model.StatusProcessing {
-			log.Printf("[personal-worker] task=%d not in processing state, aborting", taskID)
+		if err := p.db.Select("status").First(&currentTask, taskID).Error; err != nil ||
+			(currentTask.Status != model.StatusProcessing && !(allowCompletedTask && currentTask.Status == model.StatusCompleted)) {
+			log.Printf("[personal-worker] task=%d not in runnable state, aborting", taskID)
 			return
 		}
-		// Refresh deadline for already-processing task (prevents scheduler false-positive)
-		p.db.Model(&model.SummaryTask{}).Where("id = ?", taskID).
-			Update("processing_deadline", deadline)
+		if currentTask.Status == model.StatusProcessing {
+			// Refresh deadline for already-processing task (prevents scheduler false-positive)
+			p.db.Model(&model.SummaryTask{}).Where("id = ?", taskID).
+				Update("processing_deadline", deadline)
+		}
 	}
 
 	// Load task
@@ -204,14 +260,18 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 	// Best-effort check: abort early if task is no longer Processing.
 	// Final safety is guaranteed by the task-level CAS in the completion path below.
 	var taskCheck model.SummaryTask
-	if err := p.db.Select("status").First(&taskCheck, taskID).Error; err != nil || taskCheck.Status != model.StatusProcessing {
-		log.Printf("[personal-worker] task=%d no longer processing before result write, aborting", taskID)
+	if err := p.db.Select("status").First(&taskCheck, taskID).Error; err != nil ||
+		(taskCheck.Status != model.StatusProcessing && !(allowCompletedTask && taskCheck.Status == model.StatusCompleted)) {
+		log.Printf("[personal-worker] task=%d no longer runnable before result write, aborting", taskID)
 		return
 	}
 
 	genAt := timezone.Now()
 	persistStart := time.Now()
-	p.db.Model(&pr).Updates(completedPersonalResultUpdates(pr, content, citations, msgCount, totalTokens, modelVer, genAt, isScheduledEmptyWindow))
+	if err := p.persistCompletedPersonalResult(task, pr, content, citations, msgCount, totalTokens, modelVer, genAt, isScheduledEmptyWindow); err != nil {
+		log.Printf("[personal-worker] persist personal result task=%d pr=%d: %v", taskID, pr.ID, err)
+		return
+	}
 	p.db.Model(&participant).Updates(map[string]interface{}{
 		"status": model.ParticipantCompleted,
 	})
@@ -275,6 +335,11 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 		// completeTaskWithoutNewResult succeeded). Fire the terminal notification.
 		p.notifyTaskTerminal(taskID, model.StatusCompleted)
 		log.Printf("[personal-worker] task %d single-person completed directly", taskID)
+	} else if allowCompletedTask && taskCheck.Status == model.StatusCompleted {
+		// Personal-only regenerate: keep the team summary as-is until the user
+		// explicitly submits this regenerated personal result. Submit will revive
+		// the task and trigger meta recompute.
+		log.Printf("[personal-worker] task=%d user=%s personal regenerate completed; waiting for submit", taskID, participant.UserID)
 	} else {
 		// Multi-person mode: trigger meta-summary to check if all participants completed.
 		//
@@ -287,8 +352,8 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 		// submit_source=2 (system) when the participant has confirmed (status NOT IN
 		// Pending,Declined -- same gate as meta's totalAccepted), idempotently
 		// (WHERE submitted_at IS NULL, so a racing manual /submit is never overwritten).
-		if task.TriggerType == model.TriggerScheduled {
-			p.backfillScheduledSubmittedAt(taskID, &pr)
+		if task.TriggerType == model.TriggerScheduled || pr.SubmitSource == model.SubmitSourceSystem {
+			p.backfillSystemSubmittedAt(taskID, &pr)
 		}
 		p.meta.TriggerMetaSummary(taskID)
 	}
@@ -296,8 +361,8 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 	log.Printf("[personal-worker] completed task=%d user=%s msgs=%d", taskID, participant.UserID, msgCount)
 }
 
-// backfillScheduledSubmittedAt system-back-fills submitted_at for a scheduled
-// multi-person personal result so the meta gate (submitted_at IS NOT NULL) can
+// backfillSystemSubmittedAt system-back-fills submitted_at for a scheduled
+// or task-level-regenerated multi-person personal result so the meta gate (submitted_at IS NOT NULL) can
 // progress without a manual /submit (§4.4-2). It runs in a single transaction:
 //   - re-reads the participant's current status under the same tx (the confirm
 //     gate must reflect committed state, not the in-memory pr loaded earlier);
@@ -309,7 +374,7 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 //
 // participantCount>1 is the caller's branch invariant (this is only reached from
 // the multi-person path), so it is not re-checked here.
-func (p *Processor) backfillScheduledSubmittedAt(taskID int64, pr *model.PersonalResult) {
+func (p *Processor) backfillSystemSubmittedAt(taskID int64, pr *model.PersonalResult) {
 	now := timezone.Now()
 	err := p.db.Transaction(func(tx *gorm.DB) error {
 		var status int
