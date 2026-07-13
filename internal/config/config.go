@@ -126,8 +126,8 @@ type Config struct {
 	// summary_notification.last_error. Prod + NotifyEnabled but empty => startup
 	// fatal (fail-fast on misconfig); dev only warns.
 	NotifyInternalToken string
-	// SummaryWebBaseURL is the base for a result link in the notification text.
-	// Empty => no link appended.
+	// SummaryWebBaseURL is the front-end base for the completed-notification
+	// detail deep link. Empty => no link appended.
 	SummaryWebBaseURL string
 	// AppEnv is the deployment environment ("prod" | "dev"). Drives the
 	// prod-fatal / dev-warn handling of a missing NotifyInternalToken.

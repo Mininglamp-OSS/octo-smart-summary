@@ -113,6 +113,7 @@ func main() {
 			notifier = notify.New(summaryDB, imDB, deliverer, notify.Config{
 				Enabled:     true,
 				MaxAttempts: cfg.MaxNotifyAttempts,
+				WebBaseURL:  cfg.SummaryWebBaseURL,
 			}).WithErrorSanitizer(worker.SanitizeErrorForUser)
 			log.Printf("[worker] terminal-state notifications ENABLED (internal-notify transport)")
 		}

@@ -37,6 +37,9 @@ import (
 type Config struct {
 	Enabled     bool
 	MaxAttempts int
+	// WebBaseURL is the front-end base for the completed-notification detail
+	// deep link; empty disables it (safe plain-text fallback).
+	WebBaseURL string
 }
 
 // Notifier wires the dedup state machine (summary DB) to the bot Deliverer.
@@ -393,8 +396,7 @@ func (n *Notifier) buildText(task model.SummaryTask, kind, errMsg string) string
 		// - 参与成员：多人任务的成员数（单人任务无意义，省略）；
 		// - 消息数量：本次总结处理的消息条数；
 		// - 生成时间：结果产出的本地时间。
-		// 之前这里追加的是「查看结果：<link>」外链，但该链接与前端真实入口
-		// （WKApp 内部路由 /summary/detail?taskId=）三重错位、根本打不开，已移除。
+		// 详情深链在元信息之后追加：仅 completed 加，且 WebBaseURL 为空时不加。
 		if tr := formatTimeRange(task); tr != "" {
 			fmt.Fprintf(&b, "\n时间范围：%s", tr)
 		}
@@ -407,6 +409,9 @@ func (n *Notifier) buildText(task model.SummaryTask, kind, errMsg string) string
 		}
 		if !meta.generatedAt.IsZero() {
 			fmt.Fprintf(&b, "\n生成时间：%s", timezone.In(meta.generatedAt).Format("2006-01-02 15:04"))
+		}
+		if strings.TrimSpace(n.cfg.WebBaseURL) != "" {
+			fmt.Fprintf(&b, "\n查看详情：%s/summary/detail?taskId=%d", strings.TrimRight(n.cfg.WebBaseURL, "/"), task.ID)
 		}
 		return b.String()
 	case model.NotifyKindFailed:
