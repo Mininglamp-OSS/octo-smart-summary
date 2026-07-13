@@ -114,10 +114,10 @@ func TestOnTaskTerminal_CompletedDelivers(t *testing.T) {
 	if !strings.Contains(text, "今日群聊") {
 		t.Fatalf("completed text missing title: %q", text)
 	}
-	// The unreachable WKApp-internal result link was removed (see notify.go
-	// buildText); success notifications must NOT carry a browser URL anymore.
-	if strings.Contains(text, "http://") || strings.Contains(text, "https://") || strings.Contains(text, "查看结果") {
-		t.Fatalf("completed text must not carry a result link anymore: %q", text)
+	// WebBaseURL is empty here, so the detail deep link must NOT be appended
+	// (safe plain-text fallback); the old unreachable WKApp result link is gone too.
+	if strings.Contains(text, "http://") || strings.Contains(text, "https://") || strings.Contains(text, "查看结果") || strings.Contains(text, "/summary/detail?taskId=") {
+		t.Fatalf("completed text must not carry a link when WebBaseURL is empty: %q", text)
 	}
 	// octo-server recognizes a plain-text bot message by ContentType type=1 (Text)
 	// carrying "content"; a bare {"text":...} renders empty. Assert the wire shape.
@@ -800,8 +800,45 @@ func TestBuildText_CompletedIncludesSpaceAndTitle(t *testing.T) {
 	if !strings.Contains(text, "总结「今日群聊」") {
 		t.Fatalf("completed text missing title: %q", text)
 	}
-	if strings.Contains(text, "http://") || strings.Contains(text, "https://") || strings.Contains(text, "查看结果") {
-		t.Fatalf("completed text must not carry a result link anymore: %q", text)
+	// WebBaseURL empty -> no detail link appended (plain-text fallback).
+	if strings.Contains(text, "http://") || strings.Contains(text, "https://") || strings.Contains(text, "查看结果") || strings.Contains(text, "/summary/detail?taskId=") {
+		t.Fatalf("completed text must not carry a link when WebBaseURL is empty: %q", text)
+	}
+}
+
+// TestBuildText_CompletedIncludesDetailLink 验证 WebBaseURL 已配置时 completed
+// 通知正文追加详情深链，且 taskId 正确（base 末尾斜杠会被裁掉）。
+func TestBuildText_CompletedIncludesDetailLink(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	d := &fakeDeliverer{}
+	n := newTestNotifier(db, d, Config{Enabled: true, WebBaseURL: "https://web.example.com/"})
+
+	n.OnTaskTerminal(baseTask(701, model.TriggerManual), model.StatusCompleted, "")
+
+	if len(d.sendCalls) != 1 {
+		t.Fatalf("expected 1 send, got %d", len(d.sendCalls))
+	}
+	text, _ := d.sendCalls[0].Payload["content"].(string)
+	want := "查看详情：https://web.example.com/summary/detail?taskId=701"
+	if !strings.Contains(text, want) {
+		t.Fatalf("completed text missing detail link %q: %q", want, text)
+	}
+}
+
+// TestBuildText_FailedOmitsDetailLink 验证即便 WebBaseURL 已配置，failed 通知也不追加详情链接。
+func TestBuildText_FailedOmitsDetailLink(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	d := &fakeDeliverer{}
+	n := newTestNotifier(db, d, Config{Enabled: true, WebBaseURL: "https://web.example.com"})
+
+	n.OnTaskTerminal(baseTask(702, model.TriggerManual), model.StatusFailed, "boom")
+
+	if len(d.sendCalls) != 1 {
+		t.Fatalf("expected 1 send, got %d", len(d.sendCalls))
+	}
+	text, _ := d.sendCalls[0].Payload["content"].(string)
+	if strings.Contains(text, "/summary/detail?taskId=") || strings.Contains(text, "查看详情") {
+		t.Fatalf("failed text must not carry the detail link: %q", text)
 	}
 }
 
