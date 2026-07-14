@@ -376,3 +376,42 @@ func TestSameInt64Set(t *testing.T) {
 		})
 	}
 }
+
+func TestScheduledResultAppendsVersionOnSameTask(t *testing.T) {
+	db := newReplaceTestDB(t)
+	now := time.Now()
+	task := model.SummaryTask{TaskNo: "T-SCHED-VERSION", CreatorID: "creator", SummaryMode: model.ModeByPerson, Status: model.StatusProcessing, TriggerType: model.TriggerScheduled, TimeRangeStart: now, TimeRangeEnd: now}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatal(err)
+	}
+	old := model.SummaryResult{TaskID: task.ID, Content: "old", Version: 1, OperationType: "generate", GeneratedAt: now}
+	if err := db.Create(&old).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&model.SummaryTask{}).Where("id = ?", task.ID).Update("current_result_id", old.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	result := &model.SummaryResult{Content: "scheduled", OperationNote: "scheduled instruction", GeneratedAt: now.Add(time.Minute)}
+	if err := saveLatestResultAndCompleteTask(db, task.ID, result, true, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	var rows []model.SummaryResult
+	if err := db.Where("task_id = ?", task.ID).Order("version ASC").Find(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected old and scheduled versions to be kept, got %d", len(rows))
+	}
+	if rows[1].Version != 2 || rows[1].OperationType != "scheduled_generate" {
+		t.Fatalf("expected scheduled version 2, got version=%d operation=%s", rows[1].Version, rows[1].OperationType)
+	}
+	var refreshed model.SummaryTask
+	if err := db.First(&refreshed, task.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.CurrentResultID == nil || *refreshed.CurrentResultID != rows[1].ID {
+		t.Fatalf("current_result_id should point to scheduled version, got %v want %d", refreshed.CurrentResultID, rows[1].ID)
+	}
+}

@@ -301,15 +301,16 @@ func (SummaryResult) TableName() string { return "summary_result" }
 
 // SummarySchedule represents a recurring schedule configuration.
 type SummarySchedule struct {
-	ID             int64  `gorm:"primaryKey;autoIncrement" json:"id"`
-	SpaceID        string `gorm:"column:space_id;type:varchar(64);not null;default:''" json:"space_id"`
-	CreatorID      string `gorm:"column:creator_id;type:varchar(64);not null" json:"creator_id"`
-	Title          string `gorm:"column:title;type:varchar(1000);not null;default:''" json:"title"`
-	SummaryMode    int    `gorm:"column:summary_mode;type:tinyint;not null" json:"summary_mode"`
-	CronExpr       string `gorm:"column:cron_expr;type:varchar(50);not null" json:"cron_expr"`
-	IntervalDays   int    `gorm:"column:interval_days;type:int;not null;default:0" json:"interval_days"`
-	IntervalMonths int    `gorm:"column:interval_months;type:int;not null;default:0" json:"interval_months"`
-	RunTime        string `gorm:"column:run_time;type:varchar(5);not null;default:''" json:"run_time"`
+	ID                    int64  `gorm:"primaryKey;autoIncrement" json:"id"`
+	SpaceID               string `gorm:"column:space_id;type:varchar(64);not null;default:''" json:"space_id"`
+	CreatorID             string `gorm:"column:creator_id;type:varchar(64);not null" json:"creator_id"`
+	Title                 string `gorm:"column:title;type:varchar(1000);not null;default:''" json:"title"`
+	GenerationInstruction string `gorm:"column:generation_instruction;type:text" json:"generation_instruction"`
+	SummaryMode           int    `gorm:"column:summary_mode;type:tinyint;not null" json:"summary_mode"`
+	CronExpr              string `gorm:"column:cron_expr;type:varchar(50);not null" json:"cron_expr"`
+	IntervalDays          int    `gorm:"column:interval_days;type:int;not null;default:0" json:"interval_days"`
+	IntervalMonths        int    `gorm:"column:interval_months;type:int;not null;default:0" json:"interval_months"`
+	RunTime               string `gorm:"column:run_time;type:varchar(5);not null;default:''" json:"run_time"`
 	// DayOfWeek aligns WEEK mode (interval_days multiple of 7) to a specific
 	// weekday: 1=Mon..7=Sun, 0=unconstrained. Ignored for non-week modes.
 	DayOfWeek int `gorm:"column:day_of_week;type:tinyint;not null;default:0" json:"day_of_week"`

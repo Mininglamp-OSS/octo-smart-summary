@@ -200,8 +200,9 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 				})
 			}
 
+			generationTopic := m.proc.generationTopic(task)
 			reduceStart := time.Now()
-			content, tokens, err := m.proc.llm.CallReduceByPerson(ctx, participantSummaries, startTime, endTime, task.Title)
+			content, tokens, err := m.proc.llm.CallReduceByPerson(ctx, participantSummaries, startTime, endTime, generationTopic)
 			reportKey := "team#" + strconv.FormatInt(taskID, 10)
 			timing.RecordLLMSince(reportKey, "团队汇总: 合并各成员总结", reduceStart, tokens)
 			timing.FlushReport(reportKey, time.Since(reduceStart).Milliseconds(), nil)
@@ -262,10 +263,13 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 		// full version history. Determine isScheduled from the task's trigger type.
 		var metaTask model.SummaryTask
 		isScheduled := false
-		if err := m.proc.db.Select("trigger_type").First(&metaTask, taskID).Error; err != nil {
+		if err := m.proc.db.Select("trigger_type", "schedule_id", "title").First(&metaTask, taskID).Error; err != nil {
 			log.Printf("[meta-worker] task %d trigger_type lookup failed (defaulting isScheduled=false): %v", taskID, err)
 		} else {
 			isScheduled = metaTask.TriggerType == model.TriggerScheduled
+			if isScheduled {
+				result.OperationNote = m.proc.scheduledOperationNote(metaTask)
+			}
 		}
 		if err := saveLatestResultAndCompleteTask(m.proc.db, taskID, &result, isScheduled, snapshotContributorIDs); err != nil {
 			if errors.Is(err, errTaskNoLongerProcessing) {

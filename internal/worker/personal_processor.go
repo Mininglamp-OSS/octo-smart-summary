@@ -100,10 +100,12 @@ func (p *Processor) persistCompletedPersonalResult(task model.SummaryTask, pr mo
 			return err
 		}
 		operationType := "regenerate"
+		operationNote := task.Title
 		if nextVer <= 1 {
 			operationType = "generate"
 		} else if task.TriggerType == model.TriggerScheduled {
 			operationType = "scheduled_generate"
+			operationNote = p.scheduledOperationNote(task)
 		}
 
 		version := model.PersonalResultVersion{
@@ -116,7 +118,7 @@ func (p *Processor) persistCompletedPersonalResult(task model.SummaryTask, pr mo
 			ModelVersion:     modelVer,
 			Version:          nextVer,
 			OperationType:    operationType,
-			OperationNote:    task.Title,
+			OperationNote:    operationNote,
 			CreatedBy:        lockedPR.UserID,
 			GeneratedAt:      genAt,
 		}
@@ -886,6 +888,8 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		userName = userID
 	}
 
+	generationTopic := p.generationTopic(task)
+
 	var finalContent string
 	var totalTokens int
 
@@ -907,7 +911,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		var err error
 		finalContent, totalTokens, err = p.llm.CallMap(ctx,
 			joinStrings(formatted), sourceName, 0, len(userMessages),
-			startTime, endTime, task.Title, userName,
+			startTime, endTime, generationTopic, userName,
 		)
 		timing.RecordLLMSince(taskNo, "Map: 单次总结(跳过Map-Reduce)", mapCallStart, totalTokens)
 		timing.Observe(taskNo, "llm_map_summary", mapStart)
@@ -968,7 +972,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 				callStart := time.Now()
 				summary, tokens, err := p.llm.CallMap(ctx,
 					joinStrings(formatted), sourceName, idx, len(c),
-					startTime, endTime, task.Title, userName,
+					startTime, endTime, generationTopic, userName,
 				)
 				timing.RecordLLMSince(taskNo, fmt.Sprintf("Map: 分块总结 chunk#%d", idx), callStart, tokens)
 				if err != nil {
@@ -1029,7 +1033,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 			var err error
 			reduceCallStart := time.Now()
 			finalContent, reduceTokens, err = p.llm.CallReduce(ctx,
-				chunkSummaries, sourceName, startTime, endTime, targetMsgCount, task.Title,
+				chunkSummaries, sourceName, startTime, endTime, targetMsgCount, generationTopic,
 			)
 			timing.RecordLLMSince(taskNo, "Reduce: 合并分块总结", reduceCallStart, reduceTokens)
 			if err != nil {

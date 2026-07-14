@@ -421,15 +421,10 @@ func saveLatestResultAndCompleteTask(db *gorm.DB, taskID int64, result *model.Su
 			return err
 		}
 		if isScheduled {
-			// Scheduled-only: prune stale auto-generated prior-cycle versions after
-			// the replacement result is durably inserted. Hand-edited rows
-			// (edited_at IS NOT NULL) are retained permanently as user data, even
-			// across later scheduled cycles.
-			if err := tx.Where("task_id = ? AND id <> ? AND edited_at IS NULL", taskID, result.ID).Delete(&model.SummaryResult{}).Error; err != nil {
-				return err
-			}
-			// summary_chunk currently has no version column, so cleanup must happen
-			// only after the replacement result is durably inserted.
+			// Scheduled runs are versioned on the same task. Keep prior summary_result
+			// rows so the detail page can show scheduled_generate entries in Recent
+			// versions. summary_chunk has no version column, so only transient chunks
+			// are replaced after the new result is durably inserted.
 			if err := tx.Where("task_id = ?", taskID).Delete(&model.SummaryChunk{}).Error; err != nil {
 				return err
 			}

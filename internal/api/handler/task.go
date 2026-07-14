@@ -1018,6 +1018,11 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 		if err := tx.Where("task_id = ?", taskID).Delete(&model.SummaryNotification{}).Error; err != nil {
 			return err
 		}
+		if topic != "" {
+			if err := resetBoundScheduleGenerationInstruction(tx, task, topic); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil {

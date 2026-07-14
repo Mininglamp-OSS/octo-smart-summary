@@ -335,7 +335,10 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 		if err := tx.Model(&model.SummaryTask{}).Where("id = ?", taskID).Update("current_result_id", newResult.ID).Error; err != nil {
 			return err
 		}
-		return service.PruneSummaryResultVersions(tx, taskID, service.SummaryResultVersionKeepLimit)
+		if err := service.PruneSummaryResultVersions(tx, taskID, service.SummaryResultVersionKeepLimit); err != nil {
+			return err
+		}
+		return appendBoundScheduleGenerationInstruction(tx, taskCheck, feedback)
 	})
 	if err != nil {
 		if bizError, isBiz := err.(*service.BizError); isBiz {

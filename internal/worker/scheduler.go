@@ -63,7 +63,7 @@ func scanPendingSchedules(db *gorm.DB, imDB *gorm.DB, maxWindowDays int, feature
 	}
 
 	for _, sched := range schedules {
-		taskID, claimed, err := claimAndCreateScheduledTask(db, imDB, sched, now, maxWindowDays, featureTeamSchedule)
+		taskID, claimed, err := claimAndRequeueScheduledTask(db, imDB, sched, now, maxWindowDays, featureTeamSchedule)
 		if err != nil {
 			log.Printf("[scheduler] create task for schedule %d: %v", sched.ID, err)
 			continue
@@ -78,20 +78,19 @@ func scanPendingSchedules(db *gorm.DB, imDB *gorm.DB, maxWindowDays int, feature
 	}
 }
 
-func claimAndCreateScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.SummarySchedule, now time.Time, maxWindowDays int, featureTeamSchedule bool) (int64, bool, error) {
+func claimAndRequeueScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.SummarySchedule, now time.Time, maxWindowDays int, featureTeamSchedule bool) (int64, bool, error) {
 	if sched.NextRunAt == nil {
 		return 0, false, nil
 	}
 
-	var newTask model.SummaryTask
+	var runTaskID int64
 	claimed := false
 	requeued := false
 
-	// The schedule claim (FOR UPDATE re-read + next_run advance) and the task reset share
-	// ONE transaction: a reset failure rolls back the next_run_at advance too (60s scan
-	// retries), avoiding a dropped cycle. Business skips (no bound task, overlapping
-	// Processing, multi-person) still commit the advanced next_run_at to avoid re-scanning
-	// forever; only real errors roll back.
+	// The schedule claim (FOR UPDATE re-read + next_run advance) and task requeue share
+	// one transaction. Scheduled runs are modeled as new versions of the bound summary
+	// task, not as new user-visible tasks: the left list keeps one item, and the result
+	// history grows via scheduled_generate versions on that same task.
 	if err := db.Transaction(func(tx *gorm.DB) error {
 		var lockedSched model.SummarySchedule
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -103,208 +102,157 @@ func claimAndCreateScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.Summary
 			return err
 		}
 		if lockedSched.IsActive != 1 || lockedSched.NextRunAt == nil || !lockedSched.NextRunAt.Equal(*sched.NextRunAt) || lockedSched.NextRunAt.After(now) {
-			// The due snapshot was deactivated, retimed or already claimed after scan().
-			// Skip instead of using stale schedule fields from the pre-scan snapshot.
 			return nil
 		}
 
-		// Recompute from the FOR UPDATE re-read row so claim sees the latest config
-		// even when non-recurrence fields changed without bumping next_run_at.
 		nextRun, err := service.NextRunScheduledAdvance(lockedSched.CronExpr, lockedSched.IntervalDays, lockedSched.IntervalMonths, lockedSched.RunTime, lockedSched.DayOfWeek, lockedSched.DayOfMonth, lockedSched.AnchorDOM, *lockedSched.NextRunAt, now)
 		if err != nil {
 			log.Printf("[scheduler] ALERT schedule %d has invalid recurrence (%v); disabling to stop repeated re-scan/cost", lockedSched.ID, err)
-			if err := tx.Model(&model.SummarySchedule{}).
+			return tx.Model(&model.SummarySchedule{}).
 				Where("id = ?", lockedSched.ID).
-				Update("is_active", 0).Error; err != nil {
-				return err
-			}
-			return nil
+				Update("is_active", 0).Error
 		}
 		start, end, err := service.ComputeTimeRange(lockedSched.TimeRangeType, now, lockedSched.LastRunAt, lockedSched.CronExpr, lockedSched.IntervalDays, lockedSched.IntervalMonths, maxWindowDays)
 		if err != nil {
 			log.Printf("[scheduler] ALERT schedule %d has invalid time range (%v); disabling to stop repeated re-scan/cost", lockedSched.ID, err)
-			if err := tx.Model(&model.SummarySchedule{}).
+			return tx.Model(&model.SummarySchedule{}).
 				Where("id = ?", lockedSched.ID).
-				Update("is_active", 0).Error; err != nil {
-				return err
-			}
-			return nil
+				Update("is_active", 0).Error
 		}
-		// Advance ONLY next_run_at here (the scheduling cadence) so a due schedule
-		// is not re-scanned every 60s. last_run_at (the type=4 incremental window
-		// anchor) must NOT advance at claim time: it is advanced later, only when we
-		// actually requeue the task to run (see below). Coupling them here was the
-		// bug -- a business skip would commit last_run_at=now without producing a
-		// summary, permanently dropping the skipped window for type=4.
 		if err := tx.Model(&model.SummarySchedule{}).
 			Where("id = ?", lockedSched.ID).
-			Updates(map[string]interface{}{
-				"next_run_at": nextRun,
-			}).Error; err != nil {
+			Update("next_run_at", nextRun).Error; err != nil {
 			return err
 		}
 		claimed = true
 
-		// 1->N model: find the LATEST task under this schedule only to enforce the
-		// overlap guard. We no longer reuse/reset it -- each run INSERTs a brand-new
-		// task. ErrRecordNotFound (no task yet) is fine: the very first run has no
-		// predecessor, so there is nothing to overlap with.
-		var latest model.SummaryTask
-		hasLatest := false
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("schedule_id = ? AND deleted_at IS NULL", lockedSched.ID).
-			Order("id DESC").
-			First(&latest).Error; err != nil {
-			if !errors.Is(err, gorm.ErrRecordNotFound) {
-				return err
-			}
-		} else {
-			hasLatest = true
-		}
-
-		// Overlap guard: skip creating a new run if ANY non-terminal task already
-		// exists under this schedule (status IN Pending/WaitingConfirm/Processing,
-		// not soft-deleted). Previously this only checked whether the LATEST task was
-		// Processing -- but scanStuckTasks revives an expired Processing run back to
-		// Pending, so the latest could be Pending (not Processing) while still being a
-		// live placeholder; the old guard then created a SECOND executable task for
-		// the same schedule/window (duplicate-execution race, no DB unique key).
-		// Treating every non-terminal status as an occupying placeholder closes that
-		// gap. Skip WITHOUT advancing last_run_at (same transient-overlap semantics):
-		// the window is preserved and covered by the next cycle once the in-flight run
-		// reaches a terminal state. A task hitting WorkerMaxRetry is marked Failed
-		// (terminal) by scanStuckTasks, which naturally releases this skip -- so it
-		// never blocks the schedule permanently.
-		var liveCount int64
-		if err := tx.Model(&model.SummaryTask{}).
-			Where("schedule_id = ? AND deleted_at IS NULL AND status IN ?",
-				lockedSched.ID,
-				[]int{model.StatusPending, model.StatusWaitingConfirm, model.StatusProcessing}).
-			Count(&liveCount).Error; err != nil {
-			return err
-		}
-		if liveCount > 0 {
-			log.Printf("[scheduler] schedule %d has %d non-terminal task(s); skipping overlapping new task (last_run_at preserved)", lockedSched.ID, liveCount)
+		acceptedCount := scheduledAcceptedParticipantCount(lockedSched, lockedSched.CreatorID)
+		if acceptedCount == 0 {
+			log.Printf("[scheduler] schedule %d: zero confirmed participants; skipping round without changing task (last_run_at preserved)", lockedSched.ID)
 			return nil
 		}
 
-		// Scheduled summary is single-person only unless FEATURE_TEAM_SCHEDULE is on.
-		// If the schedule's participant config went multi-person and the flag is OFF, it
-		// is structurally unsupported for scheduling: disable + alert. When the flag is
-		// ON, multi-person schedules are allowed through to the multi-person execution
-		// path (children built by buildScheduledTaskChildren, all participants Accepted
-		// under AUTO; meta aggregation via the submit-gate back-fill).
+		var task model.SummaryTask
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("schedule_id = ? AND deleted_at IS NULL", lockedSched.ID).
+			Order("id ASC").
+			First(&task).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				task = model.SummaryTask{
+					TaskNo:         service.GenerateTaskNo(),
+					SpaceID:        lockedSched.SpaceID,
+					CreatorID:      lockedSched.CreatorID,
+					Title:          lockedSched.Title,
+					SummaryMode:    lockedSched.SummaryMode,
+					TimeRangeStart: start,
+					TimeRangeEnd:   end,
+					Status:         model.StatusPending,
+					TriggerType:    model.TriggerScheduled,
+					ScheduleID:     &lockedSched.ID,
+					CreatedAt:      now,
+					UpdatedAt:      now,
+				}
+				if err := tx.Create(&task).Error; err != nil {
+					return err
+				}
+			} else {
+				return err
+			}
+		}
+
+		if task.Status == model.StatusPending || task.Status == model.StatusWaitingConfirm || task.Status == model.StatusProcessing {
+			log.Printf("[scheduler] schedule %d task %d is non-terminal (status=%d); skipping overlapping run (last_run_at preserved)", lockedSched.ID, task.ID, task.Status)
+			return nil
+		}
+
 		if multiPerson, err := scheduleConfigMultiPerson(lockedSched); err != nil {
 			return err
 		} else if multiPerson && !featureTeamSchedule {
 			log.Printf("[scheduler] ALERT schedule %d participant config is multi-person; scheduled summary not supported for team tasks (FEATURE_TEAM_SCHEDULE off), disabling + notifying creator", lockedSched.ID)
-			if err := tx.Model(&model.SummarySchedule{}).
+			return tx.Model(&model.SummarySchedule{}).
 				Where("id = ?", lockedSched.ID).
-				Update("is_active", 0).Error; err != nil {
-				return err
-			}
-			// NOTE: creator notification is a follow-up.
-			return nil
+				Update("is_active", 0).Error
 		}
 
-		requeued = true
-
-		// INSERT a brand-new task for this run (1->N). Title/origin/space carry over
-		// from the schedule; the rest is a fresh Pending scheduled task.
-		newTask = model.SummaryTask{
-			TaskNo:         service.GenerateTaskNo(),
-			SpaceID:        lockedSched.SpaceID,
-			CreatorID:      lockedSched.CreatorID,
-			Title:          lockedSched.Title,
-			SummaryMode:    lockedSched.SummaryMode,
-			TimeRangeStart: start,
-			TimeRangeEnd:   end,
-			Status:         model.StatusPending,
-			TriggerType:    model.TriggerScheduled,
-			ScheduleID:     &lockedSched.ID,
-			CreatedAt:      now,
-			UpdatedAt:      now,
-		}
-		if hasLatest {
-			// Preserve origin channel from the previous run so the new summary keeps
-			// the same delivery context.
-			newTask.OriginChannelID = latest.OriginChannelID
-			newTask.OriginChannelType = latest.OriginChannelType
-		}
-		if err := tx.Create(&newTask).Error; err != nil {
+		if err := tx.Where("task_id = ?", task.ID).Delete(&model.SummarySource{}).Error; err != nil {
 			return err
 		}
-
-		// Rebuild the three subtables (source / participant / personal_result) from
-		// the schedule config -- the new task_id starts with no children. The returned
-		// count is the number of Accepted participants materialized this round.
-		//
-		// V5 §4.3/Q2: for a CONFIRM schedule where NOBODY (creator included) has
-		// confirmed yet, no children are built (acceptedCount==0). The round is skipped:
-		// the freshly-created placeholder task is SOFT-DELETED (deleted_at set) so it
-		// produces no result, never surfaces in any deleted_at IS NULL query (list/
-		// detail), does not occupy the overlap guard, and is not picked up by the
-		// processor. The next cycle re-checks the confirm list (already-advanced
-		// next_run_at avoids a busy re-scan). last_run_at is NOT advanced for a skipped
-		// round so a type=4 incremental window is preserved.
-		acceptedCount, err := buildScheduledTaskChildren(tx, imDB, lockedSched, newTask, now)
+		if err := tx.Where("task_id = ?", task.ID).Delete(&model.PersonalResult{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("task_id = ?", task.ID).Delete(&model.SummaryParticipant{}).Error; err != nil {
+			return err
+		}
+		if err := buildScheduledTaskSources(tx, imDB, task.ID, lockedSched.SourceConfig); err != nil {
+			return err
+		}
+		materialized, err := buildScheduledTaskParticipants(tx, task, lockedSched.ParticipantConfig, lockedSched.ConfirmPolicy, now)
 		if err != nil {
 			return err
 		}
-		if acceptedCount == 0 {
-			log.Printf("[scheduler] schedule %d: CONFIRM round has zero confirmed participants; skipping round (placeholder task %d soft-deleted, no result, last_run_at preserved)", lockedSched.ID, newTask.ID)
-			// Soft-delete the placeholder task instead of marking it Cancelled, so it
-			// never surfaces in any deleted_at IS NULL query (list/detail). DeletedAt is
-			// a plain *time.Time (not gorm.DeletedAt), so set it explicitly with now to
-			// stay transaction-consistent. The overlap guard ignores it (deleted_at non-
-			// null), next_run_at is already advanced, last_run_at stays put: the plan
-			// silently rolls to the next time point.
-			// Clean up the summary_source child rows already materialized this round.
-			// buildScheduledTaskChildren builds sources BEFORE counting accepted
-			// participants, so on a zero-confirm round the source rows exist while the
-			// parent task is only soft-deleted -- they would become invisible orphans
-			// accumulating every skipped round. SummarySource has no DeletedAt, so this
-			// is a physical delete (correct: they are valueless, unreferenced garbage).
-			if err := tx.Where("task_id = ?", newTask.ID).Delete(&model.SummarySource{}).Error; err != nil {
-				return err
-			}
-			if err := tx.Model(&model.SummaryTask{}).
-				Where("id = ?", newTask.ID).
-				Update("deleted_at", now).Error; err != nil {
-				return err
-			}
-			requeued = false
+		if materialized == 0 {
+			log.Printf("[scheduler] schedule %d: zero participants materialized; skipping round without running task %d", lockedSched.ID, task.ID)
 			return nil
 		}
 
-		// Advance last_run_at ONLY now that the new task is actually created to run.
-		// The type=4 incremental window anchor moves only on a real run, never on a
-		// business skip, so a skipped interval's messages are still covered by the
-		// next window instead of being permanently dropped.
+		updates := map[string]interface{}{
+			"title":               lockedSched.Title,
+			"summary_mode":        lockedSched.SummaryMode,
+			"time_range_start":    start,
+			"time_range_end":      end,
+			"status":              model.StatusPending,
+			"trigger_type":        model.TriggerScheduled,
+			"retry_count":         0,
+			"error_message":       nil,
+			"processing_deadline": nil,
+		}
+		if err := tx.Model(&model.SummaryTask{}).
+			Where("id = ?", task.ID).
+			Updates(updates).Error; err != nil {
+			return err
+		}
+
 		if err := tx.Model(&model.SummarySchedule{}).
 			Where("id = ?", lockedSched.ID).
 			Update("last_run_at", now).Error; err != nil {
 			return err
 		}
 
+		runTaskID = task.ID
+		requeued = true
 		return nil
 	}); err != nil {
-		// Technical failure: whole tx (including the next_run_at advance) rolled
-		// back. next_run_at stays in the past so the next 60s scan retries.
 		return 0, false, err
 	}
 
 	if !claimed {
 		return 0, false, nil
 	}
-
-	// Only report a real requeue when we actually created a new task. Skipped cases
-	// (still processing or multi-person guard) return taskID=0 so scanPendingSchedules
-	// does not log a misleading "requeued task" line.
 	if !requeued {
 		return 0, true, nil
 	}
-	return newTask.ID, true, nil
+	return runTaskID, true, nil
+}
+
+// claimAndCreateScheduledTask is kept as a compatibility wrapper for older tests.
+// Scheduled runs now requeue the bound task and append a new result version.
+func claimAndCreateScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.SummarySchedule, now time.Time, maxWindowDays int, featureTeamSchedule bool) (int64, bool, error) {
+	return claimAndRequeueScheduledTask(db, imDB, sched, now, maxWindowDays, featureTeamSchedule)
+}
+
+func scheduledAcceptedParticipantCount(sched model.SummarySchedule, creatorID string) int {
+	cfg := model.ParseScheduleParticipantConfig(sched.ParticipantConfig)
+	if sched.ConfirmPolicy == model.SchedConfirmAuto {
+		return len(cfg.EffectiveUserIDs(creatorID))
+	}
+	cfg.EnsureCreatorEntry(creatorID)
+	count := 0
+	for _, uid := range cfg.EffectiveUserIDs(creatorID) {
+		if cfg.IsConfirmed(uid) {
+			count++
+		}
+	}
+	return count
 }
 
 // scheduleConfigMultiPerson reports whether a schedule's participant config

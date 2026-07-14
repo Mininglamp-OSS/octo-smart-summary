@@ -191,7 +191,10 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 		if res.RowsAffected == 0 {
 			return errPersonalResultGone
 		}
-		return service.PrunePersonalResultVersions(tx, taskID, userID, service.PersonalResultVersionKeepLimit)
+		if err := service.PrunePersonalResultVersions(tx, taskID, userID, service.PersonalResultVersionKeepLimit); err != nil {
+			return err
+		}
+		return appendBoundScheduleGenerationInstruction(tx, *task, feedback)
 	})
 	if err != nil {
 		if bizError, isBiz := err.(*service.BizError); isBiz {
@@ -493,6 +496,11 @@ func (h *PersonalHandler) RegeneratePersonalSummary(c *gin.Context) {
 		}
 		if newTitle != task.Title {
 			if err := tx.Model(&model.SummaryTask{}).Where("id = ?", taskID).Update("title", newTitle).Error; err != nil {
+				return err
+			}
+		}
+		if topic != "" {
+			if err := resetBoundScheduleGenerationInstruction(tx, *task, topic); err != nil {
 				return err
 			}
 		}
