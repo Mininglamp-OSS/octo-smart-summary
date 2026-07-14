@@ -294,20 +294,21 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 	}
 
 	cleanedCitations := service.CleanUnreferencedCitations(newContent, baseResult.GetCitations())
+	cleanedTeamCitations := cleanUnreferencedTeamCitations(newContent, baseResult.GetTeamCitations())
 	newResult := model.SummaryResult{
-		TaskID:            taskID,
-		Content:           newContent,
-		TeamCitationsJSON: baseResult.TeamCitationsJSON,
-		TotalMsgCount:     baseResult.TotalMsgCount,
-		TotalTokenUsed:    baseResult.TotalTokenUsed + tokens,
-		ModelVersion:      h.llm.ModelVersion(),
-		OperationType:     "refine",
-		OperationNote:     feedback,
-		ParentResultID:    &baseResult.ID,
-		CreatedBy:         userID,
-		GeneratedAt:       timezone.Now(),
+		TaskID:         taskID,
+		Content:        newContent,
+		TotalMsgCount:  baseResult.TotalMsgCount,
+		TotalTokenUsed: baseResult.TotalTokenUsed + tokens,
+		ModelVersion:   h.llm.ModelVersion(),
+		OperationType:  "refine",
+		OperationNote:  feedback,
+		ParentResultID: &baseResult.ID,
+		CreatedBy:      userID,
+		GeneratedAt:    timezone.Now(),
 	}
 	newResult.SetCitations(cleanedCitations)
+	newResult.SetTeamCitations(cleanedTeamCitations)
 
 	err = h.db.Transaction(func(tx *gorm.DB) error {
 		var taskCheck model.SummaryTask
@@ -539,6 +540,27 @@ func (h *EditHandler) RestoreSummaryVersion(c *gin.Context) {
 		return
 	}
 	ok(c, gin.H{"task_id": taskID, "result_id": source.ID, "version": source.Version})
+}
+
+func cleanUnreferencedTeamCitations(content string, citations []model.TeamCitation) []model.TeamCitation {
+	if len(citations) == 0 {
+		return []model.TeamCitation{}
+	}
+	kept := make([]model.TeamCitation, 0, len(citations))
+	seen := make(map[int]bool, len(citations))
+	for _, citation := range citations {
+		if citation.Index <= 0 || seen[citation.Index] {
+			continue
+		}
+		if strings.Contains(content, fmt.Sprintf("[P%d]", citation.Index)) {
+			kept = append(kept, citation)
+			seen[citation.Index] = true
+		}
+	}
+	if kept == nil {
+		return []model.TeamCitation{}
+	}
+	return kept
 }
 
 func buildRefineSystemPrompt() string {

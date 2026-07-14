@@ -70,9 +70,9 @@ func TestMarkTaskCompleted_CASOnlyFromProcessing(t *testing.T) {
 	}
 }
 
-// Scheduled runs overwrite in place: after inserting the new result, prior
-// auto-generated results are pruned so only the latest remains.
-func TestSaveLatestResult_ScheduledPrunesPriorAutoVersions(t *testing.T) {
+// Scheduled runs append a new result version on the same task. Prior result
+// rows are retained for the version-history UI, while stale chunks are cleared.
+func TestSaveLatestResult_ScheduledKeepsPriorVersions(t *testing.T) {
 	db := newReplaceTestDB(t)
 	taskID := seedProcessingTask(t, db)
 
@@ -84,13 +84,13 @@ func TestSaveLatestResult_ScheduledPrunesPriorAutoVersions(t *testing.T) {
 	if err := saveLatestResultAndCompleteTask(db, taskID, newRes, true, nil); err != nil {
 		t.Fatalf("save scheduled: %v", err)
 	}
-	if got := countResults(t, db, taskID); got != 1 {
-		t.Fatalf("scheduled run should keep only the latest result, got %d", got)
+	if got := countResults(t, db, taskID); got != 2 {
+		t.Fatalf("scheduled run should keep prior versions, got %d", got)
 	}
-	var remaining model.SummaryResult
-	db.Where("task_id = ?", taskID).First(&remaining)
-	if remaining.Content != "new" {
-		t.Errorf("remaining result content = %q, want \"new\"", remaining.Content)
+	var latest model.SummaryResult
+	db.Where("task_id = ?", taskID).Order("version DESC, id DESC").First(&latest)
+	if latest.Content != "new" || latest.OperationType != "scheduled_generate" {
+		t.Errorf("latest result = content %q operation %q, want new/scheduled_generate", latest.Content, latest.OperationType)
 	}
 	// Chunks are cleaned up on scheduled overwrite.
 	var chunkCount int64

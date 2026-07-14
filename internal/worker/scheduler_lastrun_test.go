@@ -24,6 +24,7 @@ func newSchedulerTestDB(t *testing.T) *gorm.DB {
 		&model.SummaryParticipant{},
 		&model.PersonalResult{},
 		&model.SummarySource{},
+		&model.SummaryEvent{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

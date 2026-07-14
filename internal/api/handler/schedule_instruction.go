@@ -61,11 +61,7 @@ func resetBoundScheduleGenerationInstruction(tx *gorm.DB, task model.SummaryTask
 	if err != nil {
 		return err
 	}
-	updates := map[string]interface{}{"generation_instruction": next}
-	if next != "" {
-		updates["title"] = next
-	}
 	return tx.Model(&model.SummarySchedule{}).
 		Where("id = ? AND space_id = ? AND deleted_at IS NULL", *task.ScheduleID, task.SpaceID).
-		Updates(updates).Error
+		Update("generation_instruction", next).Error
 }

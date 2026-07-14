@@ -132,7 +132,17 @@ func claimAndRequeueScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.Summar
 			return nil
 		}
 
+		if multiPerson, err := scheduleConfigMultiPerson(lockedSched); err != nil {
+			return err
+		} else if multiPerson && !featureTeamSchedule {
+			log.Printf("[scheduler] ALERT schedule %d participant config is multi-person; scheduled summary not supported for team tasks (FEATURE_TEAM_SCHEDULE off), disabling + notifying creator", lockedSched.ID)
+			return tx.Model(&model.SummarySchedule{}).
+				Where("id = ?", lockedSched.ID).
+				Update("is_active", 0).Error
+		}
+
 		var task model.SummaryTask
+		createdTask := false
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("schedule_id = ? AND deleted_at IS NULL", lockedSched.ID).
 			Order("id ASC").
@@ -155,23 +165,15 @@ func claimAndRequeueScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.Summar
 				if err := tx.Create(&task).Error; err != nil {
 					return err
 				}
+				createdTask = true
 			} else {
 				return err
 			}
 		}
 
-		if task.Status == model.StatusPending || task.Status == model.StatusWaitingConfirm || task.Status == model.StatusProcessing {
+		if !createdTask && (task.Status == model.StatusPending || task.Status == model.StatusWaitingConfirm || task.Status == model.StatusProcessing) {
 			log.Printf("[scheduler] schedule %d task %d is non-terminal (status=%d); skipping overlapping run (last_run_at preserved)", lockedSched.ID, task.ID, task.Status)
 			return nil
-		}
-
-		if multiPerson, err := scheduleConfigMultiPerson(lockedSched); err != nil {
-			return err
-		} else if multiPerson && !featureTeamSchedule {
-			log.Printf("[scheduler] ALERT schedule %d participant config is multi-person; scheduled summary not supported for team tasks (FEATURE_TEAM_SCHEDULE off), disabling + notifying creator", lockedSched.ID)
-			return tx.Model(&model.SummarySchedule{}).
-				Where("id = ?", lockedSched.ID).
-				Update("is_active", 0).Error
 		}
 
 		if err := tx.Where("task_id = ?", task.ID).Delete(&model.SummarySource{}).Error; err != nil {
