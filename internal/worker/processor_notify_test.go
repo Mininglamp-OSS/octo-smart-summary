@@ -12,8 +12,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/notify"
 )
 
-// fakeNotifyDeliverer captures the SendMessage payloads so we can assert the
-// failure-reason text actually reaching the IM bot has been sanitized.
+// fakeNotifyDeliverer captures SendMessage calls so we can assert the
+// failure-reason card field has been sanitized.
 type fakeNotifyDeliverer struct {
 	mu        sync.Mutex
 	sendCalls []notify.SendMessageRequest
@@ -31,9 +31,8 @@ func (f *fakeNotifyDeliverer) SendMessage(_ context.Context, _ string, msg notif
 }
 
 // notifyTaskTerminal must run task.error_message through sanitizeErrorForUser
-// before it reaches the IM payload. This guards against raw internal errors
-// (DSN credentials, IPs, goroutine stack heads) being delivered to the user's
-// DM via the failure-reason line of buildText.
+// before it reaches the notification card. This guards against raw internal
+// errors (DSN credentials, IPs, goroutine stack heads) being delivered to users.
 //
 // Regression test for PR#113 review by Jerry-Xin (2026-06-29): the task-level
 // failure path previously fed *task.ErrorMessage straight to OnTaskTerminal,
@@ -112,7 +111,7 @@ func TestNotifyTaskTerminal_SanitizesRawErrorBeforeDM(t *testing.T) {
 			fake := &fakeNotifyDeliverer{}
 			// Production wiring: cmd/summary-worker/main.go injects
 			// worker.SanitizeErrorForUser via WithErrorSanitizer so the single
-			// render-point sanitizer in notify.buildText covers both the
+			// render-point sanitizer in notify covers both the
 			// synchronous and the sweep/redeliver paths. Mirror that wiring
 			// here so the test exercises the same behavior as production.
 			n := notify.New(db, nil, fake, notify.Config{Enabled: true, MaxAttempts: 3}).
@@ -125,17 +124,16 @@ func TestNotifyTaskTerminal_SanitizesRawErrorBeforeDM(t *testing.T) {
 			if len(fake.sendCalls) != 1 {
 				t.Fatalf("expected exactly 1 SendMessage call, got %d", len(fake.sendCalls))
 			}
-			// octo-server recognizes a plain-text bot message by "content" (type=1),
-			// not "text"; assert against the server-recognized payload key.
-			text, _ := fake.sendCalls[0].Payload["content"].(string)
-			// The failure-reason line is "失败原因：<sanitized>" — assert the
-			// sanitized whitelist mapping is what landed in the IM payload.
-			if !strings.Contains(text, tc.wantOut) {
-				t.Fatalf("expected DM text to contain sanitized %q, got %q", tc.wantOut, text)
+			card := fake.sendCalls[0].Card
+			if card == nil {
+				t.Fatalf("expected card send, got payload=%v", fake.sendCalls[0].Payload)
+			}
+			if card.Reason != tc.wantOut {
+				t.Fatalf("expected card reason %q, got %+v", tc.wantOut, card)
 			}
 			for _, bad := range tc.mustNot {
-				if strings.Contains(text, bad) {
-					t.Fatalf("DM text leaked raw substring %q (full text: %q)", bad, text)
+				if strings.Contains(card.Reason, bad) {
+					t.Fatalf("card reason leaked raw substring %q (card: %+v)", bad, card)
 				}
 			}
 		})

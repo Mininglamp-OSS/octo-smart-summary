@@ -93,6 +93,17 @@ func newTestNotifier(db *gorm.DB, d Deliverer, cfg Config) *Notifier {
 	return n
 }
 
+func sentCard(t *testing.T, msg SendMessageRequest) notifyCard {
+	t.Helper()
+	if msg.Card == nil {
+		t.Fatalf("expected card send, got nil card (payload=%v)", msg.Payload)
+	}
+	if msg.Payload != nil {
+		t.Fatalf("card send must omit payload, got %v", msg.Payload)
+	}
+	return *msg.Card
+}
+
 func TestOnTaskTerminal_CompletedDelivers(t *testing.T) {
 	db := setupNotifyTestDB(t)
 	d := &fakeDeliverer{}
@@ -110,26 +121,16 @@ func TestOnTaskTerminal_CompletedDelivers(t *testing.T) {
 	if msg.ChannelType != WireChannelDM || msg.ChannelID != "user-1" {
 		t.Fatalf("expected DM to user-1, got type=%d id=%s", msg.ChannelType, msg.ChannelID)
 	}
-	text, _ := msg.Payload["content"].(string)
-	if !strings.Contains(text, "今日群聊") {
-		t.Fatalf("completed text missing title: %q", text)
+	card := sentCard(t, msg)
+	if card.Kind != model.NotifyKindCompleted || card.TaskNo != "TST-1" || card.Title != "今日群聊" {
+		t.Fatalf("unexpected completed card: %+v", card)
 	}
-	// The unreachable WKApp-internal result link was removed (see notify.go
-	// buildText); success notifications must NOT carry a browser URL anymore.
-	if strings.Contains(text, "http://") || strings.Contains(text, "https://") || strings.Contains(text, "查看结果") {
-		t.Fatalf("completed text must not carry a result link anymore: %q", text)
+	rawCard, err := json.Marshal(card)
+	if err != nil {
+		t.Fatalf("marshal completed card: %v", err)
 	}
-	// octo-server recognizes a plain-text bot message by ContentType type=1 (Text)
-	// carrying "content"; a bare {"text":...} renders empty. Assert the wire shape.
-	if tp, _ := msg.Payload["type"].(int); tp != 1 {
-		t.Fatalf("expected payload type=1 (Text), got %v", msg.Payload["type"])
-	}
-	if _, ok := msg.Payload["text"]; ok {
-		t.Fatalf("payload must not carry legacy 'text' key, got %v", msg.Payload)
-	}
-	// OBO reserved fields must not be present.
-	if payloadHasOBOReserved(msg.Payload) {
-		t.Fatalf("payload leaked OBO reserved field: %v", msg.Payload)
+	if strings.Contains(string(rawCard), "\"reason\"") {
+		t.Fatalf("completed card must omit reason on the wire, got %s", rawCard)
 	}
 
 	var row model.SummaryNotification
@@ -149,9 +150,9 @@ func TestOnTaskTerminal_FailedCarriesReason(t *testing.T) {
 	if len(d.sendCalls) != 1 {
 		t.Fatalf("expected 1 send, got %d", len(d.sendCalls))
 	}
-	text, _ := d.sendCalls[0].Payload["content"].(string)
-	if !strings.Contains(text, "失败") || !strings.Contains(text, "LLM timeout") {
-		t.Fatalf("failed text missing reason: %q", text)
+	card := sentCard(t, d.sendCalls[0])
+	if card.Kind != model.NotifyKindFailed || card.Reason != "LLM timeout" {
+		t.Fatalf("failed card missing reason: %+v", card)
 	}
 }
 
@@ -574,22 +575,24 @@ func TestSweep_DisabledIsNoop(t *testing.T) {
 // InternalNotifyDeliverer tests (发送层：octo-server /v1/internal/notify)
 //
 // 验证：POST 到 /v1/internal/notify、带 X-Internal-Token 头、body 字段
-// (space_id/service/targets 单 uid/actor_uid 空/payload.message)、非 2xx 返 error、
+// (space_id/service/targets 单 uid/actor_uid 空/card)、非 2xx 返 error、
 // EnsureFriend no-op。
 // ---------------------------------------------------------------------------
 
 // TestInternalNotifyDeliverer_PostsToInternalNotify asserts the request path,
 // X-Internal-Token header, and NotifyReq body shape for a single recipient.
-// Payload must be forwarded verbatim (IM-recognized {type:1, content}), NOT
-// reshaped into {message_key,message,...} which would render an empty message.
+// Card sends must omit payload because octo-server owns card layout/deep-link.
 func TestInternalNotifyDeliverer_PostsToInternalNotify(t *testing.T) {
 	var gotPath, gotToken, gotCT string
 	var gotBody notifyReq
+	var gotRaw map[string]json.RawMessage
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotToken = r.Header.Get("X-Internal-Token")
 		gotCT = r.Header.Get("Content-Type")
-		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		_ = json.NewDecoder(r.Body).Decode(&gotRaw)
+		raw, _ := json.Marshal(gotRaw)
+		_ = json.Unmarshal(raw, &gotBody)
 		_ = json.NewEncoder(w).Encode(notifyResp{Delivered: []string{"u1"}})
 	}))
 	defer srv.Close()
@@ -598,7 +601,15 @@ func TestInternalNotifyDeliverer_PostsToInternalNotify(t *testing.T) {
 	msg := SendMessageRequest{
 		ChannelID:   "u1",
 		ChannelType: WireChannelDM,
-		Payload:     map[string]any{"type": 1, "content": "你的总结已生成完成。", "space_id": "space-9"},
+		Card: &notifyCard{
+			TaskNo:      "TST-1",
+			Kind:        model.NotifyKindCompleted,
+			Title:       "空间「研发一组」·今日群聊",
+			TimeRange:   "2026-06-25 00:00 ~ 2026-06-25 23:59",
+			Members:     3,
+			MsgCount:    128,
+			GeneratedAt: "2026-06-26 09:30",
+		},
 	}
 	if err := d.SendMessage(context.Background(), "space-9", msg); err != nil {
 		t.Fatalf("send failed: %v", err)
@@ -626,18 +637,23 @@ func TestInternalNotifyDeliverer_PostsToInternalNotify(t *testing.T) {
 	if gotBody.ActorUID != "" {
 		t.Fatalf("expected empty actor_uid, got %q", gotBody.ActorUID)
 	}
-	// Payload forwarded verbatim: the IM-recognized {type:1, content} shape.
-	if tp, _ := gotBody.Payload["type"].(float64); tp != 1 { // JSON numbers decode as float64
-		t.Fatalf("expected payload.type=1 forwarded verbatim, got %v", gotBody.Payload["type"])
+	if _, ok := gotRaw["payload"]; ok {
+		t.Fatalf("card request must omit payload, got raw body %s", string(gotRaw["payload"]))
 	}
-	if c, _ := gotBody.Payload["content"].(string); c != "你的总结已生成完成。" {
-		t.Fatalf("expected payload.content forwarded verbatim, got %v", gotBody.Payload["content"])
+	if gotBody.Card == nil {
+		t.Fatalf("expected card in request")
 	}
-	if _, ok := gotBody.Payload["message"]; ok {
-		t.Fatalf("payload must NOT be reshaped into {message:...}, got %v", gotBody.Payload)
+	if gotBody.Card.TaskNo != "TST-1" || gotBody.Card.Kind != model.NotifyKindCompleted || gotBody.Card.Title != "空间「研发一组」·今日群聊" {
+		t.Fatalf("unexpected card: %+v", gotBody.Card)
 	}
-	if ru, _ := gotBody.Payload["result_url"].(string); ru != "https://web.example.com" {
-		t.Fatalf("expected payload.result_url from web base, got %v", gotBody.Payload["result_url"])
+	if gotBody.Card.TimeRange != "2026-06-25 00:00 ~ 2026-06-25 23:59" ||
+		gotBody.Card.Members != 3 ||
+		gotBody.Card.MsgCount != 128 ||
+		gotBody.Card.GeneratedAt != "2026-06-26 09:30" {
+		t.Fatalf("card meta mismatch: %+v", gotBody.Card)
+	}
+	if strings.Contains(string(gotRaw["card"]), "\"reason\"") {
+		t.Fatalf("completed card request must omit reason, got %s", gotRaw["card"])
 	}
 }
 
@@ -758,7 +774,7 @@ func TestInternalNotifyDeliverer_SpaceIDFallsBackToPayload(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// PR#113 notify — payload wire shape + 「空间名 + 总结名称」文本
+// PR#113 notify — card wire shape + 「空间名 + 总结名称」标题
 // ---------------------------------------------------------------------------
 
 // setupIMTestDB builds an in-memory IM DB with just the `space` table that
@@ -776,9 +792,9 @@ func setupIMTestDB(t *testing.T) *gorm.DB {
 	return db
 }
 
-// TestBuildText_CompletedIncludesSpaceAndTitle 注入可控 imDB 让 resolveSpaceName
-// 返回已知空间名，断言成功文本同时含「空间「<名>」」与「总结「<Title>」」。
-func TestBuildText_CompletedIncludesSpaceAndTitle(t *testing.T) {
+// TestBuildCard_CompletedFoldsSpaceAndTitle 注入可控 imDB 让 resolveSpaceName
+// 返回已知空间名，断言 card.title 同时携带空间名与总结标题。
+func TestBuildCard_CompletedFoldsSpaceAndTitle(t *testing.T) {
 	db := setupNotifyTestDB(t)
 	imDB := setupIMTestDB(t)
 	if err := imDB.Exec("INSERT INTO space (space_id, name) VALUES (?, ?)", "space-9", "研发一组").Error; err != nil {
@@ -793,22 +809,15 @@ func TestBuildText_CompletedIncludesSpaceAndTitle(t *testing.T) {
 	if len(d.sendCalls) != 1 {
 		t.Fatalf("expected 1 send, got %d", len(d.sendCalls))
 	}
-	text, _ := d.sendCalls[0].Payload["content"].(string)
-	if !strings.Contains(text, "空间「研发一组」") {
-		t.Fatalf("completed text missing space name: %q", text)
-	}
-	if !strings.Contains(text, "总结「今日群聊」") {
-		t.Fatalf("completed text missing title: %q", text)
-	}
-	if strings.Contains(text, "http://") || strings.Contains(text, "https://") || strings.Contains(text, "查看结果") {
-		t.Fatalf("completed text must not carry a result link anymore: %q", text)
+	card := sentCard(t, d.sendCalls[0])
+	if card.Title != "空间「研发一组」·今日群聊" {
+		t.Fatalf("completed card title mismatch: %+v", card)
 	}
 }
 
-// TestBuildText_CompletedIncludesRichMeta 验证成功通知追加的完整元信息：
-// 时间范围 + 参与成员数 + 消息数量 + 生成时间（替代已删除的不可达链接）。
-// 都是 best-effort，此处 seed 齐数据确认都渲染出来。
-func TestBuildText_CompletedIncludesRichMeta(t *testing.T) {
+// TestBuildCard_CompletedIncludesRichMeta 验证成功通知的完整元信息：
+// 时间范围 + 参与成员数 + 消息数量 + 生成时间。
+func TestBuildCard_CompletedIncludesRichMeta(t *testing.T) {
 	db := setupNotifyTestDB(t)
 	// Seed the read-only source tables buildText best-effort queries.
 	if err := db.Exec("CREATE TABLE summary_result (id INTEGER PRIMARY KEY, task_id INTEGER, total_msg_count INTEGER, version INTEGER, generated_at DATETIME)").Error; err != nil {
@@ -834,20 +843,13 @@ func TestBuildText_CompletedIncludesRichMeta(t *testing.T) {
 	if len(d.sendCalls) != 1 {
 		t.Fatalf("expected 1 send, got %d", len(d.sendCalls))
 	}
-	text, _ := d.sendCalls[0].Payload["content"].(string)
-	for _, want := range []string{
-		"已生成完成",
-		"时间范围：2026-06-25 00:00 ~ 2026-06-25 23:59",
-		"参与成员：3 人",
-		"消息数量：128 条",
-		"生成时间：2026-06-26 09:30",
-	} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("completed text missing %q; full text:\n%s", want, text)
-		}
-	}
-	if strings.Contains(text, "http://") || strings.Contains(text, "https://") {
-		t.Fatalf("completed text must not carry a link: %q", text)
+	card := sentCard(t, d.sendCalls[0])
+	if card.Kind != model.NotifyKindCompleted ||
+		card.TimeRange != "2026-06-25 00:00 ~ 2026-06-25 23:59" ||
+		card.Members != 3 ||
+		card.MsgCount != 128 ||
+		card.GeneratedAt != "2026-06-26 09:30" {
+		t.Fatalf("completed card meta mismatch: %+v", card)
 	}
 }
 
@@ -864,12 +866,47 @@ func TestParticipantCount_SinglePersonOmitted(t *testing.T) {
 	if len(d.sendCalls) != 1 {
 		t.Fatalf("expected 1 send (best-effort must not block), got %d", len(d.sendCalls))
 	}
-	text, _ := d.sendCalls[0].Payload["content"].(string)
-	if strings.Contains(text, "参与成员") {
-		t.Fatalf("single-person task must omit member line; got %q", text)
+	card := sentCard(t, d.sendCalls[0])
+	if card.Members != 0 {
+		t.Fatalf("single-person task must omit member count; got %+v", card)
 	}
 }
-func TestBuildText_FailedIncludesSpaceAndReason(t *testing.T) {
+
+func TestBuildCard_CompletedOmitsNonPositiveCountsOnWire(t *testing.T) {
+	db := setupNotifyTestDB(t)
+	if err := db.Exec("CREATE TABLE summary_result (id INTEGER PRIMARY KEY, task_id INTEGER, total_msg_count INTEGER, version INTEGER, generated_at DATETIME)").Error; err != nil {
+		t.Fatalf("create summary_result: %v", err)
+	}
+	if err := db.Exec("CREATE TABLE summary_participant (id INTEGER PRIMARY KEY, task_id INTEGER)").Error; err != nil {
+		t.Fatalf("create summary_participant: %v", err)
+	}
+	db.Exec("INSERT INTO summary_result (task_id, total_msg_count, version, generated_at) VALUES (?,?,?,?)",
+		603, -7, 1, time.Date(2026, 6, 26, 9, 30, 0, 0, timezone.Location()))
+
+	d := &fakeDeliverer{}
+	n := New(db, nil, d, Config{Enabled: true})
+	n.now = func() time.Time { return time.Date(2026, 6, 26, 10, 0, 0, 0, timezone.Location()) }
+
+	n.OnTaskTerminal(baseTask(603, model.TriggerManual), model.StatusCompleted, "")
+
+	if len(d.sendCalls) != 1 {
+		t.Fatalf("expected 1 send, got %d", len(d.sendCalls))
+	}
+	card := sentCard(t, d.sendCalls[0])
+	if card.Members != 0 || card.MsgCount != 0 {
+		t.Fatalf("non-positive counts must stay zero for omitempty, got %+v", card)
+	}
+	rawCard, err := json.Marshal(card)
+	if err != nil {
+		t.Fatalf("marshal completed card: %v", err)
+	}
+	body := string(rawCard)
+	if strings.Contains(body, "\"msg_count\"") || strings.Contains(body, "\"members\"") {
+		t.Fatalf("completed card must omit non-positive counts on the wire, got %s", body)
+	}
+}
+
+func TestBuildCard_FailedIncludesSpaceAndReason(t *testing.T) {
 	db := setupNotifyTestDB(t)
 	imDB := setupIMTestDB(t)
 	if err := imDB.Exec("INSERT INTO space (space_id, name) VALUES (?, ?)", "space-9", "研发一组").Error; err != nil {
@@ -884,20 +921,14 @@ func TestBuildText_FailedIncludesSpaceAndReason(t *testing.T) {
 
 	n.OnTaskTerminal(baseTask(302, model.TriggerManual), model.StatusFailed, "LLM timeout")
 
-	text, _ := d.sendCalls[0].Payload["content"].(string)
-	if !strings.Contains(text, "空间「研发一组」") {
-		t.Fatalf("failed text missing space name: %q", text)
-	}
-	if !strings.Contains(text, "总结「今日群聊」") || !strings.Contains(text, "失败") {
-		t.Fatalf("failed text missing title/失败: %q", text)
-	}
-	if !strings.Contains(text, "LLM timeout") {
-		t.Fatalf("failed text missing reason: %q", text)
+	card := sentCard(t, d.sendCalls[0])
+	if card.Kind != model.NotifyKindFailed || card.Title != "空间「研发一组」·今日群聊" || card.Reason != "LLM timeout" {
+		t.Fatalf("failed card mismatch: %+v", card)
 	}
 }
 
-// TestBuildText_DegradesWhenIMDBNil 降级路径：imDB 为 nil 时退回不带空间名的旧文案。
-func TestBuildText_DegradesWhenIMDBNil(t *testing.T) {
+// TestBuildCard_DegradesWhenIMDBNil 降级路径：imDB 为 nil 时 title 只保留总结名。
+func TestBuildCard_DegradesWhenIMDBNil(t *testing.T) {
 	db := setupNotifyTestDB(t)
 	d := &fakeDeliverer{}
 	n := New(db, nil, d, Config{Enabled: true})
@@ -905,18 +936,15 @@ func TestBuildText_DegradesWhenIMDBNil(t *testing.T) {
 
 	n.OnTaskTerminal(baseTask(303, model.TriggerManual), model.StatusCompleted, "")
 
-	text, _ := d.sendCalls[0].Payload["content"].(string)
-	if strings.Contains(text, "空间「") {
-		t.Fatalf("nil imDB must degrade to space-less wording, got %q", text)
-	}
-	if text != "你的总结「今日群聊」已生成完成。" {
-		t.Fatalf("degraded text mismatch: %q", text)
+	card := sentCard(t, d.sendCalls[0])
+	if card.Title != "今日群聊" {
+		t.Fatalf("degraded card title mismatch: %+v", card)
 	}
 }
 
-// TestBuildText_DegradesWhenSpaceNotFound 降级路径：imDB 在但查不到该 space_id，
-// 同样退回旧文案，且绝不阻断投递。
-func TestBuildText_DegradesWhenSpaceNotFound(t *testing.T) {
+// TestBuildCard_DegradesWhenSpaceNotFound 降级路径：imDB 在但查不到该 space_id，
+// 同样只保留总结名，且绝不阻断投递。
+func TestBuildCard_DegradesWhenSpaceNotFound(t *testing.T) {
 	db := setupNotifyTestDB(t)
 	imDB := setupIMTestDB(t) // table exists but no matching row
 	d := &fakeDeliverer{}
@@ -928,12 +956,9 @@ func TestBuildText_DegradesWhenSpaceNotFound(t *testing.T) {
 	if len(d.sendCalls) != 1 {
 		t.Fatalf("delivery must not be blocked by missing space, got %d sends", len(d.sendCalls))
 	}
-	text, _ := d.sendCalls[0].Payload["content"].(string)
-	if strings.Contains(text, "空间「") {
-		t.Fatalf("missing space row must degrade to space-less wording, got %q", text)
-	}
-	if !strings.Contains(text, "你的总结「今日群聊」已生成完成。") {
-		t.Fatalf("degraded text mismatch: %q", text)
+	card := sentCard(t, d.sendCalls[0])
+	if card.Title != "今日群聊" {
+		t.Fatalf("degraded card title mismatch: %+v", card)
 	}
 }
 
@@ -958,13 +983,9 @@ func TestResolveSpaceName_NilReceiverAndNilDB(t *testing.T) {
 
 // --- space_id in payload (system-bot space filter fix) ---
 
-// TestDeliver_PayloadCarriesSpaceID_WhenKnown asserts the delivered payload
-// includes space_id when the target SpaceID is non-empty. Summary runs as a
-// system bot; octo-server's filterPersonMessagesBySpace drops a system-bot
-// message whose payload has an empty space_id, so it must be carried through.
-// fail-before: deliver previously built the payload without space_id, so this
-// key assertion would have failed.
-func TestDeliver_PayloadCarriesSpaceID_WhenKnown(t *testing.T) {
+// TestDeliver_CardOmitsPayload_WhenSpaceKnown asserts terminal card sends do
+// not include the legacy payload object.
+func TestDeliver_CardOmitsPayload_WhenSpaceKnown(t *testing.T) {
 	db := setupNotifyTestDB(t)
 	d := &fakeDeliverer{}
 	n := newTestNotifier(db, d, Config{Enabled: true})
@@ -975,19 +996,12 @@ func TestDeliver_PayloadCarriesSpaceID_WhenKnown(t *testing.T) {
 	if len(d.sendCalls) != 1 {
 		t.Fatalf("expected 1 send, got %d", len(d.sendCalls))
 	}
-	got, ok := d.sendCalls[0].Payload["space_id"]
-	if !ok {
-		t.Fatalf("payload must carry space_id when target.SpaceID is set, got %v", d.sendCalls[0].Payload)
-	}
-	if got != "space-9" {
-		t.Fatalf("expected space_id=space-9, got %v", got)
-	}
+	_ = sentCard(t, d.sendCalls[0])
 }
 
-// TestDeliver_PayloadOmitsSpaceID_WhenEmpty asserts the payload does NOT
-// include a space_id key when the target SpaceID is empty, avoiding a
-// regression on the empty-SpaceID path.
-func TestDeliver_PayloadOmitsSpaceID_WhenEmpty(t *testing.T) {
+// TestDeliver_CardOmitsPayload_WhenSpaceEmpty asserts the empty-SpaceID path
+// also sends card without payload.
+func TestDeliver_CardOmitsPayload_WhenSpaceEmpty(t *testing.T) {
 	db := setupNotifyTestDB(t)
 	d := &fakeDeliverer{}
 	n := newTestNotifier(db, d, Config{Enabled: true})
@@ -999,9 +1013,7 @@ func TestDeliver_PayloadOmitsSpaceID_WhenEmpty(t *testing.T) {
 	if len(d.sendCalls) != 1 {
 		t.Fatalf("expected 1 send, got %d", len(d.sendCalls))
 	}
-	if _, ok := d.sendCalls[0].Payload["space_id"]; ok {
-		t.Fatalf("payload must not carry space_id when target.SpaceID is empty, got %v", d.sendCalls[0].Payload)
-	}
+	_ = sentCard(t, d.sendCalls[0])
 }
 
 // --- spaceID propagation to the send layer ---
@@ -1124,14 +1136,14 @@ func TestSweep_RedeliverSanitizesRawError(t *testing.T) {
 		t.Fatalf("sanitizer must be invoked on BOTH the synchronous AND the redeliver render; got calls=%d", sanitizerCalls)
 	}
 	for i, call := range d.sendCalls {
-		text, _ := call.Payload["content"].(string)
+		card := sentCard(t, call)
 		for _, m := range rawMarkers {
-			if strings.Contains(text, m) {
-				t.Fatalf("send #%d leaked raw marker %q into DM text:\n%s", i, m, text)
+			if strings.Contains(card.Reason, m) {
+				t.Fatalf("send #%d leaked raw marker %q into card reason: %+v", i, m, card)
 			}
 		}
-		if !strings.Contains(text, "AI 处理失败，请稍后重试") {
-			t.Fatalf("send #%d missing safe failure reason; got:\n%s", i, text)
+		if card.Reason != "AI 处理失败，请稍后重试" {
+			t.Fatalf("send #%d missing safe failure reason; got %+v", i, card)
 		}
 	}
 
@@ -1141,7 +1153,6 @@ func TestSweep_RedeliverSanitizesRawError(t *testing.T) {
 		t.Fatalf("after sweep retry expected sent, got %s (attempts=%d)", row.Status, row.AttemptCount)
 	}
 }
-
 
 // ---------------------------------------------------------------------------
 // 轻量防护：接收人非该 space 活跃成员时，deliver 应显式失败，而非静默「已发送」
@@ -1228,11 +1239,9 @@ func TestDeliver_NilIMDB_AllowsDelivery(t *testing.T) {
 	}
 }
 
-// TestBuildText_NilSanitizerFallsBackToSafeString asserts the defensive
-// fallback: if Notifier is constructed without WithErrorSanitizer (production
-// misconfig), buildText still refuses to render raw err.Error() to the user
-// DM. This guards against future call sites accidentally forgetting the wiring.
-func TestBuildText_NilSanitizerFallsBackToSafeString(t *testing.T) {
+// TestBuildCard_NilSanitizerFallsBackToSafeString asserts the defensive
+// fallback if Notifier is constructed without WithErrorSanitizer.
+func TestBuildCard_NilSanitizerFallsBackToSafeString(t *testing.T) {
 	db := setupNotifyTestDB(t)
 	d := &fakeDeliverer{}
 	// Bypass newTestNotifier so we get a Notifier with nil errorSanitizer.
@@ -1247,17 +1256,16 @@ func TestBuildText_NilSanitizerFallsBackToSafeString(t *testing.T) {
 	if len(d.sendCalls) != 1 {
 		t.Fatalf("expected 1 send, got %d", len(d.sendCalls))
 	}
-	text, _ := d.sendCalls[0].Payload["content"].(string)
+	card := sentCard(t, d.sendCalls[0])
 	for _, m := range []string{"dial tcp", "10.2.3.4", "postgres://", "secretpw"} {
-		if strings.Contains(text, m) {
-			t.Fatalf("nil sanitizer must not leak raw marker %q to DM; text=%q", m, text)
+		if strings.Contains(card.Reason, m) {
+			t.Fatalf("nil sanitizer must not leak raw marker %q to card reason: %+v", m, card)
 		}
 	}
-	if !strings.Contains(text, "AI 处理失败，请稍后重试") {
-		t.Fatalf("nil sanitizer fallback must render the safe default; text=%q", text)
+	if card.Reason != "AI 处理失败，请稍后重试" {
+		t.Fatalf("nil sanitizer fallback must render the safe default; got %+v", card)
 	}
 }
-
 
 // ---------------------------------------------------------------------------
 // by-person 多目标逐人 DM (feat/notify-delivery)
@@ -1570,7 +1578,7 @@ func TestResolveTargets_ByPerson_ExcludesPendingAndDeclined(t *testing.T) {
 	db := setupByPersonDB(t)
 	n := newTestNotifier(db, &fakeDeliverer{}, Config{Enabled: true})
 
-	task := byPersonTask(1010) // creator=user-1, ModeByPerson
+	task := byPersonTask(1010)                                                    // creator=user-1, ModeByPerson
 	seedParticipantStatus(t, db, 1010, "p-pending", model.ParticipantPending)     // 0 -> excluded
 	seedParticipantStatus(t, db, 1010, "p-declined", model.ParticipantDeclined)   // 2 -> excluded
 	seedParticipantStatus(t, db, 1010, "p-accepted", model.ParticipantAccepted)   // 1 -> included

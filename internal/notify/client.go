@@ -37,13 +37,24 @@ type Deliverer interface {
 }
 
 // SendMessageRequest is the state-machine-internal message shape. deliver()
-// fills ChannelID with the recipient uid, ChannelType=WireChannelDM, and Payload
-// with the IM-recognized shape {type:1, content:text, space_id?}. The
-// InternalNotifyDeliverer forwards Payload verbatim into the NotifyReq.
+// fills ChannelID with the recipient uid, ChannelType=WireChannelDM, and Card
+// with the octo-server notification card fields.
 type SendMessageRequest struct {
 	ChannelID   string         `json:"channel_id"`
 	ChannelType int            `json:"channel_type"`
-	Payload     map[string]any `json:"payload"`
+	Payload     map[string]any `json:"payload,omitempty"`
+	Card        *notifyCard    `json:"card,omitempty"`
+}
+
+type notifyCard struct {
+	TaskNo      string `json:"task_no"`
+	Kind        string `json:"kind"`
+	Title       string `json:"title"`
+	TimeRange   string `json:"time_range,omitempty"`
+	Members     int    `json:"members,omitempty"`
+	MsgCount    int    `json:"msg_count,omitempty"`
+	GeneratedAt string `json:"generated_at,omitempty"`
+	Reason      string `json:"reason,omitempty"`
 }
 
 // oboReservedKeys are OBO markers that must never appear in a payload.
@@ -73,7 +84,8 @@ type notifyReq struct {
 	Event    string         `json:"event"`
 	Targets  []string       `json:"targets"`
 	ActorUID string         `json:"actor_uid"`
-	Payload  map[string]any `json:"payload"`
+	Payload  map[string]any `json:"payload,omitempty"`
+	Card     *notifyCard    `json:"card,omitempty"`
 }
 
 const (
@@ -91,7 +103,7 @@ const (
 type InternalNotifyDeliverer struct {
 	baseURL string
 	token   string
-	// webBaseURL builds the result link folded into payload.result_url. Empty => omitted.
+	// Kept for constructor compatibility; card deep links are built server-side.
 	webBaseURL string
 	client     *http.Client
 }
@@ -120,21 +132,17 @@ type notifyResp struct {
 	Filtered  map[string]string `json:"filtered"`
 }
 
-// SendMessage posts one recipient's message to /v1/internal/notify. Payload is
-// forwarded verbatim: octo-server passes it straight to the IM message builder,
-// which requires the {type:1, content} shape — reshaping it here would render an
-// empty message under a 2xx and silently lose the notification.
+// SendMessage posts one recipient's message to /v1/internal/notify.
 func (d *InternalNotifyDeliverer) SendMessage(ctx context.Context, spaceID string, msg SendMessageRequest) error {
 	if payloadHasOBOReserved(msg.Payload) {
 		return fmt.Errorf("notify payload contains forbidden OBO reserved field")
 	}
-	// Copy so appending result_url never mutates the caller's payload.
-	payload := make(map[string]any, len(msg.Payload)+1)
-	for k, v := range msg.Payload {
-		payload[k] = v
-	}
-	if d.webBaseURL != "" {
-		payload["result_url"] = d.webBaseURL
+	var payload map[string]any
+	if msg.Card == nil && len(msg.Payload) > 0 {
+		payload = make(map[string]any, len(msg.Payload))
+		for k, v := range msg.Payload {
+			payload[k] = v
+		}
 	}
 
 	// NotifyReq.space_id is required (binding); fall back to payload.space_id.
@@ -152,6 +160,7 @@ func (d *InternalNotifyDeliverer) SendMessage(ctx context.Context, spaceID strin
 		Targets:  []string{msg.ChannelID}, // single recipient — keep per-uid granularity
 		ActorUID: "",
 		Payload:  payload,
+		Card:     msg.Card,
 	}
 	return d.post(ctx, notifyEndpoint, req, msg.ChannelID)
 }
