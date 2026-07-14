@@ -122,6 +122,21 @@ func (h *TaskHandler) pickDisplayResult(taskID int64) (model.SummaryResult, bool
 	return result, true
 }
 
+func (h *TaskHandler) resolveSummaryTaskParam(c *gin.Context) (int64, bool) {
+	param := c.Param("id")
+	taskID, err := strconv.ParseInt(param, 10, 64)
+	if err == nil {
+		return taskID, true
+	}
+
+	var task model.SummaryTask
+	if err := h.db.Where("task_no = ? AND deleted_at IS NULL", param).First(&task).Error; err != nil {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
+		return 0, false
+	}
+	return task.ID, true
+}
+
 // callerPlainCitationsVisible decides whether the caller may see a display
 // SummaryResult's plain (non-team) citations.
 //
@@ -626,9 +641,8 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 
 // GetSummary handles GET /api/v1/summaries/:id
 func (h *TaskHandler) GetSummary(c *gin.Context) {
-	taskID, err := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid task id"})
+	taskID, resolved := h.resolveSummaryTaskParam(c)
+	if !resolved {
 		return
 	}
 
