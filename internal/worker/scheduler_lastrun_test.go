@@ -24,6 +24,7 @@ func newSchedulerTestDB(t *testing.T) *gorm.DB {
 		&model.SummaryParticipant{},
 		&model.PersonalResult{},
 		&model.SummarySource{},
+		&model.SummaryNotification{},
 		&model.SummaryEvent{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
@@ -133,6 +134,38 @@ func TestClaim_RequeueAdvancesLastRunAt(t *testing.T) {
 	}
 	if got.NextRunAt == nil || !got.NextRunAt.After(now) {
 		t.Errorf("next_run_at should move forward, got %v", got.NextRunAt)
+	}
+}
+
+func TestClaim_RequeueClearsPriorNotifications(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	sched := seedDueSchedule(t, db, &old)
+	prior := seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
+	now := time.Now().UTC()
+	if err := db.Create(&model.SummaryNotification{
+		TaskID:       prior.ID,
+		NotifyKind:   model.NotifyKindCompleted,
+		RecipientUID: "u1",
+		Status:       model.NotifyStatusSent,
+		CreatedAt:    now.Add(-time.Hour),
+		UpdatedAt:    now.Add(-time.Hour),
+	}).Error; err != nil {
+		t.Fatalf("seed notification: %v", err)
+	}
+
+	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30, false)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if !claimed || taskID != prior.ID {
+		t.Fatalf("expected requeue on same task, got claimed=%v taskID=%d want %d", claimed, taskID, prior.ID)
+	}
+
+	var notifCount int64
+	db.Model(&model.SummaryNotification{}).Where("task_id = ?", prior.ID).Count(&notifCount)
+	if notifCount != 0 {
+		t.Fatalf("requeue must clear stale notification dedup rows, got %d", notifCount)
 	}
 }
 

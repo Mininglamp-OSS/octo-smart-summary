@@ -45,12 +45,21 @@ func appendBoundScheduleGenerationInstruction(tx *gorm.DB, task model.SummaryTas
 	if current != "" {
 		next = current + "\n" + addition
 	}
-	if utf8.RuneCountInString(next) > maxScheduleInstructionRunes {
-		return service.NewBizError(40010, "定时生成要求不能超过 8000 字符", http.StatusBadRequest)
-	}
+	next = keepLatestRunes(next, maxScheduleInstructionRunes)
 	return tx.Model(&model.SummarySchedule{}).
 		Where("id = ?", sched.ID).
 		Update("generation_instruction", next).Error
+}
+
+func keepLatestRunes(value string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= maxRunes {
+		return value
+	}
+	return strings.TrimSpace(string(runes[len(runes)-maxRunes:]))
 }
 
 func resetBoundScheduleGenerationInstruction(tx *gorm.DB, task model.SummaryTask, instruction string) error {

@@ -182,6 +182,9 @@ func claimAndRequeueScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.Summar
 		if err := tx.Where("task_id = ?", task.ID).Delete(&model.PersonalResult{}).Error; err != nil {
 			return err
 		}
+		if err := tx.Where("task_id = ?", task.ID).Delete(&model.SummaryNotification{}).Error; err != nil {
+			return err
+		}
 		if err := tx.Where("task_id = ?", task.ID).Delete(&model.SummaryParticipant{}).Error; err != nil {
 			return err
 		}
