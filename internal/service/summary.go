@@ -195,6 +195,45 @@ func GetNextVersion(db *gorm.DB, taskID int64) (int, error) {
 }
 
 // SplitIntoChunks splits messages into chunks of roughly chunkSize.
+
+const SummaryResultVersionKeepLimit = 5
+const PersonalResultVersionKeepLimit = 5
+
+// PruneSummaryResultVersions keeps the newest auto-generated summary result versions.
+// Hand-edited rows are retained as user data, and the current display pointer is
+// never pruned even when it points to an older restored version.
+func PruneSummaryResultVersions(db *gorm.DB, taskID int64, keep int) error {
+	if keep <= 0 {
+		keep = SummaryResultVersionKeepLimit
+	}
+	var keepIDs []int64
+	if err := db.Model(&model.SummaryResult{}).
+		Where("task_id = ?", taskID).
+		Order("version DESC").
+		Order("id DESC").
+		Limit(keep).
+		Pluck("id", &keepIDs).Error; err != nil {
+		return err
+	}
+	if len(keepIDs) < keep {
+		return nil
+	}
+	var current struct {
+		CurrentResultID *int64
+	}
+	if err := db.Model(&model.SummaryTask{}).
+		Where("id = ?", taskID).
+		Select("current_result_id").
+		Scan(&current).Error; err != nil {
+		return err
+	}
+	deleteQuery := db.Where("task_id = ? AND id NOT IN ? AND edited_at IS NULL", taskID, keepIDs)
+	if current.CurrentResultID != nil {
+		deleteQuery = deleteQuery.Where("id <> ?", *current.CurrentResultID)
+	}
+	return deleteQuery.Delete(&model.SummaryResult{}).Error
+}
+
 func SplitIntoChunks(messages []map[string]interface{}, chunkSize int) [][]map[string]interface{} {
 	if chunkSize <= 0 {
 		chunkSize = 500
@@ -263,4 +302,54 @@ func containsAny(s string, keywords []string) bool {
 		}
 	}
 	return false
+}
+
+func GetNextPersonalVersion(db *gorm.DB, taskID int64, userID string) (int, error) {
+	var maxVer *int
+	err := db.Model(&model.PersonalResultVersion{}).
+		Where("task_id = ? AND user_id = ?", taskID, userID).
+		Select("MAX(version)").
+		Scan(&maxVer).Error
+	if err != nil {
+		return 0, err
+	}
+	if maxVer == nil {
+		return 1, nil
+	}
+	return *maxVer + 1, nil
+}
+
+// PrunePersonalResultVersions keeps the newest personal result versions for a user.
+// The current_version_id pointer is always retained, including after restoring
+// an older version.
+func PrunePersonalResultVersions(db *gorm.DB, taskID int64, userID string, keep int) error {
+	if keep <= 0 {
+		keep = PersonalResultVersionKeepLimit
+	}
+	var keepIDs []int64
+	if err := db.Model(&model.PersonalResultVersion{}).
+		Where("task_id = ? AND user_id = ?", taskID, userID).
+		Order("version DESC").
+		Order("id DESC").
+		Limit(keep).
+		Pluck("id", &keepIDs).Error; err != nil {
+		return err
+	}
+	if len(keepIDs) < keep {
+		return nil
+	}
+	var current struct {
+		CurrentVersionID *int64
+	}
+	if err := db.Model(&model.PersonalResult{}).
+		Where("task_id = ? AND user_id = ?", taskID, userID).
+		Select("current_version_id").
+		Scan(&current).Error; err != nil {
+		return err
+	}
+	deleteQuery := db.Where("task_id = ? AND user_id = ? AND id NOT IN ?", taskID, userID, keepIDs)
+	if current.CurrentVersionID != nil {
+		deleteQuery = deleteQuery.Where("id <> ?", *current.CurrentVersionID)
+	}
+	return deleteQuery.Delete(&model.PersonalResultVersion{}).Error
 }

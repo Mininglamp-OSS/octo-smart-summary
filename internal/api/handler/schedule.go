@@ -40,16 +40,17 @@ func NewScheduleHandlerWithFlag(db *gorm.DB, featureTeamSchedule bool) *Schedule
 }
 
 type createScheduleReq struct {
-	Title          string           `json:"title"`
-	CronExpr       string           `json:"cron_expr"`
-	IntervalDays   int              `json:"interval_days"`
-	IntervalMonths int              `json:"interval_months"`
-	RunTime        string           `json:"run_time"`
-	DayOfWeek      int              `json:"day_of_week"`
-	DayOfMonth     int              `json:"day_of_month"`
-	TimeRangeType  int              `json:"time_range_type"`
-	Sources        []sourceReq      `json:"sources"`
-	Participants   []participantReq `json:"participants"`
+	Title                 string           `json:"title"`
+	GenerationInstruction string           `json:"generation_instruction"`
+	CronExpr              string           `json:"cron_expr"`
+	IntervalDays          int              `json:"interval_days"`
+	IntervalMonths        int              `json:"interval_months"`
+	RunTime               string           `json:"run_time"`
+	DayOfWeek             int              `json:"day_of_week"`
+	DayOfMonth            int              `json:"day_of_month"`
+	TimeRangeType         int              `json:"time_range_type"`
+	Sources               []sourceReq      `json:"sources"`
+	Participants          []participantReq `json:"participants"`
 	// ConfirmPolicy: 0=AUTO (no confirm), 1=CONFIRM (V5 one-time schedule-level
 	// confirm). Pointer so "not sent" is distinguishable from an explicit 0; the
 	// handler defaults multi-person schedules to CONFIRM. confirm_lead_minutes is
@@ -60,19 +61,20 @@ type createScheduleReq struct {
 }
 
 type updateScheduleReq struct {
-	Title          *string          `json:"title"`
-	CronExpr       *string          `json:"cron_expr"`
-	IntervalDays   *int             `json:"interval_days"`
-	IntervalMonths *int             `json:"interval_months"`
-	RunTime        *string          `json:"run_time"`
-	DayOfWeek      *int             `json:"day_of_week"`
-	DayOfMonth     *int             `json:"day_of_month"`
-	TimeRangeType  *int             `json:"time_range_type"`
-	Sources        []sourceReq      `json:"sources,omitempty"`
-	Participants   []participantReq `json:"participants,omitempty"`
-	ConfirmPolicy  *int             `json:"confirm_policy"`
-	Scope          string           `json:"scope,omitempty"`
-	TaskID         *int64           `json:"task_id,omitempty"`
+	Title                 *string          `json:"title"`
+	GenerationInstruction *string          `json:"generation_instruction"`
+	CronExpr              *string          `json:"cron_expr"`
+	IntervalDays          *int             `json:"interval_days"`
+	IntervalMonths        *int             `json:"interval_months"`
+	RunTime               *string          `json:"run_time"`
+	DayOfWeek             *int             `json:"day_of_week"`
+	DayOfMonth            *int             `json:"day_of_month"`
+	TimeRangeType         *int             `json:"time_range_type"`
+	Sources               []sourceReq      `json:"sources,omitempty"`
+	Participants          []participantReq `json:"participants,omitempty"`
+	ConfirmPolicy         *int             `json:"confirm_policy"`
+	Scope                 string           `json:"scope,omitempty"`
+	TaskID                *int64           `json:"task_id,omitempty"`
 }
 
 type toggleScheduleReq struct {
@@ -497,6 +499,15 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 1000 字符"})
 		return
 	}
+	generationInstruction, err := normalizeScheduleGenerationInstruction(req.GenerationInstruction)
+	if err != nil {
+		if biz, ok := err.(*service.BizError); ok {
+			bizErr(c, biz)
+			return
+		}
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: err.Error()})
+		return
+	}
 
 	// Multi-person guard needs task.CreatorID, so the participant check runs in the
 	// transaction after loadTaskForTaskScope locks the task.
@@ -560,20 +571,21 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 	}
 
 	sched := model.SummarySchedule{
-		SpaceID:           spaceID,
-		CreatorID:         userID,
-		Title:             req.Title,
-		SummaryMode:       summaryMode,
-		CronExpr:          req.CronExpr,
-		IntervalDays:      req.IntervalDays,
-		IntervalMonths:    req.IntervalMonths,
-		RunTime:           req.RunTime,
-		DayOfWeek:         req.DayOfWeek,
-		DayOfMonth:        req.DayOfMonth,
-		TimeRangeType:     req.TimeRangeType,
-		SourceConfig:      sourceConfig,
-		ParticipantConfig: participantConfig,
-		ConfirmPolicy:     confirmPolicy,
+		SpaceID:               spaceID,
+		CreatorID:             userID,
+		Title:                 req.Title,
+		GenerationInstruction: generationInstruction,
+		SummaryMode:           summaryMode,
+		CronExpr:              req.CronExpr,
+		IntervalDays:          req.IntervalDays,
+		IntervalMonths:        req.IntervalMonths,
+		RunTime:               req.RunTime,
+		DayOfWeek:             req.DayOfWeek,
+		DayOfMonth:            req.DayOfMonth,
+		TimeRangeType:         req.TimeRangeType,
+		SourceConfig:          sourceConfig,
+		ParticipantConfig:     participantConfig,
+		ConfirmPolicy:         confirmPolicy,
 	}
 
 	if req.Scope != "task" {
@@ -687,19 +699,20 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 			// Reuse the (possibly inactive) schedule and re-activate it so the
 			// scheduler picks it up; first-run semantics via nextRun.
 			updates := map[string]interface{}{
-				"title":              sched.Title,
-				"cron_expr":          sched.CronExpr,
-				"interval_days":      sched.IntervalDays,
-				"interval_months":    sched.IntervalMonths,
-				"run_time":           sched.RunTime,
-				"day_of_week":        sched.DayOfWeek,
-				"day_of_month":       sched.DayOfMonth,
-				"time_range_type":    sched.TimeRangeType,
-				"source_config":      sched.SourceConfig,
-				"participant_config": sched.ParticipantConfig,
-				"confirm_policy":     sched.ConfirmPolicy,
-				"next_run_at":        nextRun,
-				"is_active":          1,
+				"title":                  sched.Title,
+				"generation_instruction": sched.GenerationInstruction,
+				"cron_expr":              sched.CronExpr,
+				"interval_days":          sched.IntervalDays,
+				"interval_months":        sched.IntervalMonths,
+				"run_time":               sched.RunTime,
+				"day_of_week":            sched.DayOfWeek,
+				"day_of_month":           sched.DayOfMonth,
+				"time_range_type":        sched.TimeRangeType,
+				"source_config":          sched.SourceConfig,
+				"participant_config":     sched.ParticipantConfig,
+				"confirm_policy":         sched.ConfirmPolicy,
+				"next_run_at":            nextRun,
+				"is_active":              1,
 			}
 			if sched.IntervalMonths > 0 {
 				updates["anchor_dom"] = finalAnchorDOM
@@ -803,21 +816,22 @@ func (h *ScheduleHandler) ListSchedules(c *gin.Context) {
 	items := make([]gin.H, 0, len(schedules))
 	for _, s := range schedules {
 		item := gin.H{
-			"schedule_id":        s.ID,
-			"title":              s.Title,
-			"summary_mode":       s.SummaryMode,
-			"cron_expr":          s.CronExpr,
-			"interval_days":      s.IntervalDays,
-			"interval_months":    s.IntervalMonths,
-			"run_time":           s.RunTime,
-			"day_of_week":        s.DayOfWeek,
-			"day_of_month":       s.DayOfMonth,
-			"time_range_type":    s.TimeRangeType,
-			"source_config":      s.SourceConfig,
-			"participant_config": s.ParticipantConfig,
-			"confirm_policy":     s.ConfirmPolicy,
-			"is_active":          s.IsActive,
-			"created_at":         s.CreatedAt.Format(time.RFC3339),
+			"schedule_id":            s.ID,
+			"title":                  s.Title,
+			"generation_instruction": s.GenerationInstruction,
+			"summary_mode":           s.SummaryMode,
+			"cron_expr":              s.CronExpr,
+			"interval_days":          s.IntervalDays,
+			"interval_months":        s.IntervalMonths,
+			"run_time":               s.RunTime,
+			"day_of_week":            s.DayOfWeek,
+			"day_of_month":           s.DayOfMonth,
+			"time_range_type":        s.TimeRangeType,
+			"source_config":          s.SourceConfig,
+			"participant_config":     s.ParticipantConfig,
+			"confirm_policy":         s.ConfirmPolicy,
+			"is_active":              s.IsActive,
+			"created_at":             s.CreatedAt.Format(time.RFC3339),
 		}
 		if s.LastRunAt != nil {
 			item["last_run_at"] = s.LastRunAt.Format(time.RFC3339)
@@ -855,21 +869,22 @@ func (h *ScheduleHandler) GetSchedule(c *gin.Context) {
 	}
 
 	item := gin.H{
-		"schedule_id":        sched.ID,
-		"title":              sched.Title,
-		"summary_mode":       sched.SummaryMode,
-		"cron_expr":          sched.CronExpr,
-		"interval_days":      sched.IntervalDays,
-		"interval_months":    sched.IntervalMonths,
-		"run_time":           sched.RunTime,
-		"day_of_week":        sched.DayOfWeek,
-		"day_of_month":       sched.DayOfMonth,
-		"time_range_type":    sched.TimeRangeType,
-		"source_config":      sched.SourceConfig,
-		"participant_config": sched.ParticipantConfig,
-		"confirm_policy":     sched.ConfirmPolicy,
-		"is_active":          sched.IsActive,
-		"created_at":         sched.CreatedAt.Format(time.RFC3339),
+		"schedule_id":            sched.ID,
+		"title":                  sched.Title,
+		"generation_instruction": sched.GenerationInstruction,
+		"summary_mode":           sched.SummaryMode,
+		"cron_expr":              sched.CronExpr,
+		"interval_days":          sched.IntervalDays,
+		"interval_months":        sched.IntervalMonths,
+		"run_time":               sched.RunTime,
+		"day_of_week":            sched.DayOfWeek,
+		"day_of_month":           sched.DayOfMonth,
+		"time_range_type":        sched.TimeRangeType,
+		"source_config":          sched.SourceConfig,
+		"participant_config":     sched.ParticipantConfig,
+		"confirm_policy":         sched.ConfirmPolicy,
+		"is_active":              sched.IsActive,
+		"created_at":             sched.CreatedAt.Format(time.RFC3339),
 	}
 	if sched.LastRunAt != nil {
 		item["last_run_at"] = sched.LastRunAt.Format(time.RFC3339)
@@ -998,6 +1013,18 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 1000 字符"})
 		return
 	}
+	if req.GenerationInstruction != nil {
+		generationInstruction, err := normalizeScheduleGenerationInstruction(*req.GenerationInstruction)
+		if err != nil {
+			if biz, ok := err.(*service.BizError); ok {
+				bizErr(c, biz)
+				return
+			}
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: err.Error()})
+			return
+		}
+		req.GenerationInstruction = &generationInstruction
+	}
 	// Fail-closed multi-person guard on update; only when participants are sent
 	// (nil = leave untouched). Stored-config bind path is checked later in the tx.
 	// Bypassed when team schedules are enabled.
@@ -1013,6 +1040,9 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 	updates := make(map[string]interface{})
 	if req.Title != nil {
 		updates["title"] = *req.Title
+	}
+	if req.GenerationInstruction != nil {
+		updates["generation_instruction"] = *req.GenerationInstruction
 	}
 
 	// Determine effective cron/interval after this update to recompute next_run_at

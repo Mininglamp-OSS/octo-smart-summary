@@ -70,9 +70,9 @@ func TestMarkTaskCompleted_CASOnlyFromProcessing(t *testing.T) {
 	}
 }
 
-// Scheduled runs overwrite in place: after inserting the new result, prior
-// auto-generated results are pruned so only the latest remains.
-func TestSaveLatestResult_ScheduledPrunesPriorAutoVersions(t *testing.T) {
+// Scheduled runs append a new result version on the same task. Prior result
+// rows are retained for the version-history UI, while stale chunks are cleared.
+func TestSaveLatestResult_ScheduledKeepsPriorVersions(t *testing.T) {
 	db := newReplaceTestDB(t)
 	taskID := seedProcessingTask(t, db)
 
@@ -84,13 +84,13 @@ func TestSaveLatestResult_ScheduledPrunesPriorAutoVersions(t *testing.T) {
 	if err := saveLatestResultAndCompleteTask(db, taskID, newRes, true, nil); err != nil {
 		t.Fatalf("save scheduled: %v", err)
 	}
-	if got := countResults(t, db, taskID); got != 1 {
-		t.Fatalf("scheduled run should keep only the latest result, got %d", got)
+	if got := countResults(t, db, taskID); got != 2 {
+		t.Fatalf("scheduled run should keep prior versions, got %d", got)
 	}
-	var remaining model.SummaryResult
-	db.Where("task_id = ?", taskID).First(&remaining)
-	if remaining.Content != "new" {
-		t.Errorf("remaining result content = %q, want \"new\"", remaining.Content)
+	var latest model.SummaryResult
+	db.Where("task_id = ?", taskID).Order("version DESC, id DESC").First(&latest)
+	if latest.Content != "new" || latest.OperationType != "scheduled_generate" {
+		t.Errorf("latest result = content %q operation %q, want new/scheduled_generate", latest.Content, latest.OperationType)
 	}
 	// Chunks are cleaned up on scheduled overwrite.
 	var chunkCount int64
@@ -374,5 +374,44 @@ func TestSameInt64Set(t *testing.T) {
 				t.Errorf("sameInt64Set(%v, %v) [reversed] = %v, want %v", tc.b, tc.a, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestScheduledResultAppendsVersionOnSameTask(t *testing.T) {
+	db := newReplaceTestDB(t)
+	now := time.Now()
+	task := model.SummaryTask{TaskNo: "T-SCHED-VERSION", CreatorID: "creator", SummaryMode: model.ModeByPerson, Status: model.StatusProcessing, TriggerType: model.TriggerScheduled, TimeRangeStart: now, TimeRangeEnd: now}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatal(err)
+	}
+	old := model.SummaryResult{TaskID: task.ID, Content: "old", Version: 1, OperationType: "generate", GeneratedAt: now}
+	if err := db.Create(&old).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&model.SummaryTask{}).Where("id = ?", task.ID).Update("current_result_id", old.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	result := &model.SummaryResult{Content: "scheduled", OperationNote: "scheduled instruction", GeneratedAt: now.Add(time.Minute)}
+	if err := saveLatestResultAndCompleteTask(db, task.ID, result, true, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	var rows []model.SummaryResult
+	if err := db.Where("task_id = ?", task.ID).Order("version ASC").Find(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected old and scheduled versions to be kept, got %d", len(rows))
+	}
+	if rows[1].Version != 2 || rows[1].OperationType != "scheduled_generate" {
+		t.Fatalf("expected scheduled version 2, got version=%d operation=%s", rows[1].Version, rows[1].OperationType)
+	}
+	var refreshed model.SummaryTask
+	if err := db.First(&refreshed, task.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.CurrentResultID == nil || *refreshed.CurrentResultID != rows[1].ID {
+		t.Fatalf("current_result_id should point to scheduled version, got %v want %d", refreshed.CurrentResultID, rows[1].ID)
 	}
 }

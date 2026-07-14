@@ -182,6 +182,10 @@ func (p *Processor) handleTrigger(req model.WorkerTriggerRequest) {
 		p.pool.Submit(func() {
 			p.processPersonalSummary(context.Background(), req.TaskID, req.ParticipantRefID)
 		})
+	case "personal_regenerate":
+		p.pool.Submit(func() {
+			p.processPersonalSummaryAllowCompleted(context.Background(), req.TaskID, req.ParticipantRefID)
+		})
 	case "meta_summary":
 		p.meta.TriggerMetaSummary(req.TaskID)
 	default:
