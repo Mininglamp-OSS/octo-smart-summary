@@ -372,6 +372,184 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 	})
 }
 
+func (h *EditHandler) RefineSummaryStream(c *gin.Context) {
+	if h.llm == nil {
+		c.JSON(http.StatusServiceUnavailable, apiResponse{Code: 50001, Message: "refine service is not configured"})
+		return
+	}
+	userID := middleware.GetUserID(c)
+	taskID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid task id"})
+		return
+	}
+	var req refineSummaryReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid request body"})
+		return
+	}
+	feedback := strings.TrimSpace(req.Feedback)
+	if feedback == "" {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "feedback cannot be empty"})
+		return
+	}
+	if utf8.RuneCountInString(feedback) > maxFeedbackRunes {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "feedback 不能超过 2000 字符"})
+		return
+	}
+
+	spaceID := middleware.GetSpaceID(c)
+	var task model.SummaryTask
+	if err := h.db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).First(&task).Error; err != nil {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
+		return
+	}
+	if task.CreatorID != userID {
+		c.JSON(http.StatusForbidden, apiResponse{Code: 40003, Message: "仅创建者可调整"})
+		return
+	}
+	if task.Status != model.StatusCompleted {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "仅已完成的任务可调整"})
+		return
+	}
+
+	baseResult, err := queryDisplayResult(h.db, taskID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "总结结果不存在"})
+		return
+	}
+	if baseResult.ID != req.BaseResultID {
+		c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "内容已更新，请刷新后重试"})
+		return
+	}
+
+	w := c.Writer
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	_ = writeSSE(w, "start", gin.H{"type": "start", "task_id": taskID, "scope": "team"})
+	w.Flush()
+
+	writeStreamError := func(message string) {
+		_ = writeSSE(w, "error", gin.H{"type": "error", "task_id": taskID, "scope": "team", "message": message})
+		w.Flush()
+	}
+
+	llmCtx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
+	defer cancel()
+	newContent, tokens, err := h.llm.CallStream(llmCtx, []service.ChatMessage{
+		{Role: "system", Content: buildRefineSystemPrompt()},
+		{Role: "user", Content: fmt.Sprintf("当前总结：\n%s\n\n用户修改意见：\n%s", baseResult.Content, feedback)},
+	}, 0.1, func(delta string) error {
+		if delta == "" {
+			return nil
+		}
+		if err := writeSSE(w, "delta", gin.H{"type": "delta", "task_id": taskID, "scope": "team", "delta": delta}); err != nil {
+			return err
+		}
+		w.Flush()
+		return nil
+	})
+	if err != nil {
+		log.Printf("[refine-stream] llm error task=%d result=%d: %v", taskID, baseResult.ID, err)
+		writeStreamError("调整失败，请稍后重试")
+		return
+	}
+	newContent = strings.TrimSpace(stripMarkdownFence(newContent))
+	if newContent == "" {
+		writeStreamError("调整结果为空")
+		return
+	}
+	if len(newContent) > maxContentBytes {
+		writeStreamError("调整结果超过 500KB 限制")
+		return
+	}
+
+	basePlainCitations := baseResult.GetCitations()
+	if !callerPlainCitationsVisible(h.db, &task, userID, &baseResult) {
+		basePlainCitations = []model.Citation{}
+	}
+	cleanedCitations := service.CleanUnreferencedCitations(newContent, basePlainCitations)
+	cleanedTeamCitations := cleanUnreferencedTeamCitations(newContent, baseResult.GetTeamCitations())
+	newResult := model.SummaryResult{
+		TaskID:         taskID,
+		Content:        newContent,
+		TotalMsgCount:  baseResult.TotalMsgCount,
+		TotalTokenUsed: baseResult.TotalTokenUsed + tokens,
+		ModelVersion:   h.llm.ModelVersion(),
+		OperationType:  "refine",
+		OperationNote:  feedback,
+		ParentResultID: &baseResult.ID,
+		CreatedBy:      userID,
+		GeneratedAt:    timezone.Now(),
+	}
+	newResult.SetCitations(cleanedCitations)
+	newResult.SetTeamCitations(cleanedTeamCitations)
+
+	err = h.db.Transaction(func(tx *gorm.DB) error {
+		var taskCheck model.SummaryTask
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", taskID).First(&taskCheck).Error; err != nil {
+			return err
+		}
+		latest, err := queryDisplayResult(tx, taskID)
+		if err != nil {
+			return err
+		}
+		if latest.ID != baseResult.ID {
+			return service.NewBizError(40009, "内容已更新，请刷新后重试", http.StatusConflict)
+		}
+		if taskCheck.Status != model.StatusCompleted {
+			return service.NewBizError(40005, "任务状态已变更", http.StatusBadRequest)
+		}
+		nextVer, err := service.GetNextVersion(tx, taskID)
+		if err != nil {
+			return err
+		}
+		newResult.Version = nextVer
+		if err := tx.Create(&newResult).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&model.SummaryTask{}).Where("id = ?", taskID).Update("current_result_id", newResult.ID).Error; err != nil {
+			return err
+		}
+		if err := service.PruneSummaryResultVersions(tx, taskID, service.SummaryResultVersionKeepLimit); err != nil {
+			return err
+		}
+		return appendBoundScheduleGenerationInstruction(tx, taskCheck, feedback)
+	})
+	if err != nil {
+		if bizError, isBiz := err.(*service.BizError); isBiz {
+			writeStreamError(bizError.Message)
+			return
+		}
+		log.Printf("[refine-stream] transaction error task=%d: %v", taskID, err)
+		writeStreamError("internal error")
+		return
+	}
+
+	_ = writeSSE(w, "done", gin.H{
+		"type":             "done",
+		"task_id":          taskID,
+		"scope":            "team",
+		"result_id":        newResult.ID,
+		"version":          newResult.Version,
+		"content":          newResult.Content,
+		"citations":        newResult.GetCitations(),
+		"team_citations":   newResult.GetTeamCitations(),
+		"total_msg_count":  newResult.TotalMsgCount,
+		"total_token_used": newResult.TotalTokenUsed,
+		"model_version":    newResult.ModelVersion,
+		"operation_type":   newResult.OperationType,
+		"operation_note":   newResult.OperationNote,
+		"parent_result_id": newResult.ParentResultID,
+		"generated_at":     newResult.GeneratedAt.Format(time.RFC3339),
+	})
+	w.Flush()
+}
+
 func (h *EditHandler) ListSummaryVersions(c *gin.Context) {
 	userID := middleware.GetUserID(c)
 	taskID, err := strconv.ParseInt(c.Param("id"), 10, 64)

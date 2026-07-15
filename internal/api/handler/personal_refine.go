@@ -248,6 +248,243 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 	})
 }
 
+func (h *PersonalHandler) RefinePersonalSummaryStream(c *gin.Context) {
+	if h.llm == nil {
+		c.JSON(http.StatusServiceUnavailable, apiResponse{Code: 50001, Message: "refine service is not configured"})
+		return
+	}
+	userID := middleware.GetUserID(c)
+	taskID, valid := h.parseTaskID(c)
+	if !valid {
+		return
+	}
+	var req refinePersonalReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid request body"})
+		return
+	}
+	feedback := strings.TrimSpace(req.Feedback)
+	if feedback == "" {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "feedback cannot be empty"})
+		return
+	}
+	if utf8.RuneCountInString(feedback) > maxFeedbackRunes {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "feedback 不能超过 2000 字符"})
+		return
+	}
+	if req.BaseVersion <= 0 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "base_version is required"})
+		return
+	}
+
+	task, taskOK := h.requireTaskInSpace(c, taskID)
+	if !taskOK {
+		return
+	}
+	if task.SummaryMode != model.ModeByPerson {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "该任务不支持个人调整"})
+		return
+	}
+	if task.Status != model.StatusCompleted {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "仅已完成的任务可调整"})
+		return
+	}
+
+	var pr model.PersonalResult
+	if err := h.db.Where("task_id = ? AND user_id = ?", taskID, userID).First(&pr).Error; err != nil {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "个人总结不存在"})
+		return
+	}
+	if req.BaseResultID > 0 && req.BaseResultID != pr.ID {
+		c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "内容已更新，请刷新后重试"})
+		return
+	}
+	if pr.WorkerStatus != model.PersonalStatusCompleted || strings.TrimSpace(pr.Content) == "" {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "个人总结未完成，无法调整"})
+		return
+	}
+
+	currentVersion, err := currentPersonalVersion(h.db, taskID, userID, pr)
+	if err != nil {
+		log.Printf("[personal-refine-stream] query current version task=%d user=%s: %v", taskID, userID, err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
+		return
+	}
+	if req.BaseVersion != currentVersion {
+		c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "内容已更新，请刷新后重试"})
+		return
+	}
+
+	w := c.Writer
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	_ = writeSSE(w, "start", gin.H{"type": "start", "task_id": taskID, "scope": "personal"})
+	w.Flush()
+
+	writeStreamError := func(message string) {
+		_ = writeSSE(w, "error", gin.H{"type": "error", "task_id": taskID, "scope": "personal", "message": message})
+		w.Flush()
+	}
+
+	llmCtx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
+	defer cancel()
+	newContent, tokens, err := h.llm.CallStream(llmCtx, []service.ChatMessage{
+		{Role: "system", Content: buildRefineSystemPrompt()},
+		{Role: "user", Content: fmt.Sprintf("当前总结：\n%s\n\n用户修改意见：\n%s", pr.Content, feedback)},
+	}, 0.1, func(delta string) error {
+		if delta == "" {
+			return nil
+		}
+		if err := writeSSE(w, "delta", gin.H{"type": "delta", "task_id": taskID, "scope": "personal", "delta": delta}); err != nil {
+			return err
+		}
+		w.Flush()
+		return nil
+	})
+	if err != nil {
+		log.Printf("[personal-refine-stream] llm error task=%d personal_result=%d: %v", taskID, pr.ID, err)
+		writeStreamError("调整失败，请稍后重试")
+		return
+	}
+	newContent = strings.TrimSpace(stripMarkdownFence(newContent))
+	if newContent == "" {
+		writeStreamError("调整结果为空")
+		return
+	}
+	if len(newContent) > maxContentBytes {
+		writeStreamError("调整结果超过 500KB 限制")
+		return
+	}
+
+	cleanedCitations := service.CleanUnreferencedCitations(newContent, pr.GetCitations())
+	tmp := &model.PersonalResult{}
+	tmp.SetCitations(cleanedCitations)
+	citationsJSON := tmp.CitationsJSON
+
+	now := timezone.Now()
+	var newVersion model.PersonalResultVersion
+	shouldTriggerMeta := false
+	err = h.db.Transaction(func(tx *gorm.DB) error {
+		var latestPR model.PersonalResult
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND task_id = ? AND user_id = ?", pr.ID, taskID, userID).
+			First(&latestPR).Error; err != nil {
+			return err
+		}
+		if latestPR.WorkerStatus != model.PersonalStatusCompleted || strings.TrimSpace(latestPR.Content) == "" {
+			return service.NewBizError(40005, "个人总结状态已变更", http.StatusBadRequest)
+		}
+		versionBeforeBaseline, err := currentPersonalVersion(tx, taskID, userID, latestPR)
+		if err != nil {
+			return err
+		}
+		if req.BaseVersion != versionBeforeBaseline {
+			return service.NewBizError(40009, "内容已更新，请刷新后重试", http.StatusConflict)
+		}
+		latestVersion, err := ensurePersonalVersionBaseline(tx, latestPR)
+		if err != nil {
+			return err
+		}
+
+		nextVer, err := service.GetNextPersonalVersion(tx, taskID, userID)
+		if err != nil {
+			return err
+		}
+		newVersion = model.PersonalResultVersion{
+			TaskID:           taskID,
+			ParticipantRefID: latestPR.ParticipantRefID,
+			UserID:           userID,
+			Content:          newContent,
+			CitationsJSON:    citationsJSON,
+			MsgCount:         latestPR.MsgCount,
+			TotalTokenUsed:   latestPR.TotalTokenUsed + tokens,
+			ModelVersion:     h.llm.ModelVersion(),
+			Version:          nextVer,
+			OperationType:    "refine",
+			OperationNote:    feedback,
+			ParentVersionID:  &latestVersion.ID,
+			CreatedBy:        userID,
+			GeneratedAt:      now,
+		}
+		if err := tx.Create(&newVersion).Error; err != nil {
+			return err
+		}
+		res := tx.Model(&model.PersonalResult{}).
+			Where("id = ? AND task_id = ? AND user_id = ?", latestPR.ID, taskID, userID).
+			Updates(map[string]interface{}{
+				"content":            newContent,
+				"citations_json":     citationsJSON,
+				"total_token_used":   latestPR.TotalTokenUsed + tokens,
+				"model_version":      h.llm.ModelVersion(),
+				"current_version_id": newVersion.ID,
+				"generated_at":       now,
+				"edited_at":          now,
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return errPersonalResultGone
+		}
+		if err := service.PrunePersonalResultVersions(tx, taskID, userID, service.PersonalResultVersionKeepLimit); err != nil {
+			return err
+		}
+		var participantCount int64
+		if err := tx.Model(&model.SummaryParticipant{}).Where("task_id = ?", taskID).Count(&participantCount).Error; err != nil {
+			return err
+		}
+		if participantCount > 1 {
+			if err := h.reviveCompletedForRecompute(tx, taskID); err != nil {
+				return err
+			}
+			shouldTriggerMeta = true
+		}
+		return appendBoundScheduleGenerationInstruction(tx, *task, feedback)
+	})
+	if err != nil {
+		if bizError, isBiz := err.(*service.BizError); isBiz {
+			writeStreamError(bizError.Message)
+			return
+		}
+		if err == gorm.ErrRecordNotFound || err == errPersonalResultGone {
+			writeStreamError("个人总结不存在")
+			return
+		}
+		log.Printf("[personal-refine-stream] transaction error task=%d user=%s: %v", taskID, userID, err)
+		writeStreamError("internal error")
+		return
+	}
+	if shouldTriggerMeta {
+		go h.triggerWorker(model.WorkerTriggerRequest{
+			Type:   "meta_summary",
+			TaskID: taskID,
+		})
+	}
+
+	_ = writeSSE(w, "done", gin.H{
+		"type":             "done",
+		"task_id":          taskID,
+		"scope":            "personal",
+		"result_id":        pr.ID,
+		"version_id":       newVersion.ID,
+		"version":          newVersion.Version,
+		"content":          newContent,
+		"citations":        newVersion.GetCitations(),
+		"msg_count":        newVersion.MsgCount,
+		"total_token_used": newVersion.TotalTokenUsed,
+		"model_version":    newVersion.ModelVersion,
+		"operation_type":   newVersion.OperationType,
+		"operation_note":   newVersion.OperationNote,
+		"parent_result_id": newVersion.ParentVersionID,
+		"generated_at":     newVersion.GeneratedAt.Format(time.RFC3339),
+	})
+	w.Flush()
+}
+
 func (h *PersonalHandler) ListPersonalVersions(c *gin.Context) {
 	userID := middleware.GetUserID(c)
 	taskID, valid := h.parseTaskID(c)

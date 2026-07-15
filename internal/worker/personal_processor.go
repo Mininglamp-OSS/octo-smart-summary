@@ -12,6 +12,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/streaming"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timing"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/tokenizer"
@@ -255,6 +256,32 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 
 	workerStartAt := now
 	lastWorkflowStageAt := workerStartAt
+	runID := newSummaryRunID(taskID, participant.UserID)
+	var streamSender *summaryStreamSender
+	streamFinalized := false
+	ensureStream := func() *summaryStreamSender {
+		if streamSender == nil {
+			streamSender = newSummaryStreamSender(ctx, p.cfg, taskID, participant.UserID, streaming.ScopePersonal, runID)
+		}
+		return streamSender
+	}
+	finishStreamDone := func(status int) {
+		if streamSender != nil && !streamFinalized {
+			streamSender.Done(status)
+			streamFinalized = true
+		}
+	}
+	finishStreamError := func(message string) {
+		if streamSender != nil && !streamFinalized {
+			streamSender.Error(message)
+			streamFinalized = true
+		}
+	}
+	defer func() {
+		if streamSender != nil {
+			streamSender.Close()
+		}
+	}()
 	reportStage := func(stage string) {
 		stageAt := timezone.Now()
 		sinceWorkerStartMs := stageAt.Sub(workerStartAt).Milliseconds()
@@ -276,12 +303,20 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 		log.Printf("[personal-worker] workflow stage task=%s pr=%d stage=%s since_worker_start=%dms delta=%dms",
 			task.TaskNo, pr.ID, stage, sinceWorkerStartMs, deltaMs)
 		p.updatePersonalWorkflowStage(pr.ID, stage)
+		if stage == model.WorkflowStageGenerateSummary {
+			ensureStream().Stage(stage)
+		}
+	}
+
+	streamDelta := func(delta string) error {
+		return ensureStream().Delta(delta)
 	}
 
 	// Execute pipeline
-	content, citations, msgCount, totalTokens, modelVer, err := p.executePersonalPipeline(ctx, task, participant.UserID, reportStage)
+	content, citations, msgCount, totalTokens, modelVer, err := p.executePersonalPipeline(ctx, task, participant.UserID, reportStage, streamDelta)
 	if err != nil {
 		log.Printf("[personal-worker] pipeline error task=%d user=%s: %v", taskID, participant.UserID, err)
+		finishStreamError("summary generation failed")
 		p.markPersonalFailed(&pr, &participant, err.Error())
 		return
 	}
@@ -296,6 +331,7 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 	if err := p.db.Select("status").First(&taskCheck, taskID).Error; err != nil ||
 		(taskCheck.Status != model.StatusProcessing && !(allowCompletedTask && taskCheck.Status == model.StatusCompleted)) {
 		log.Printf("[personal-worker] task=%d no longer runnable before result write, aborting", taskID)
+		finishStreamError("summary generation cancelled")
 		return
 	}
 
@@ -303,6 +339,7 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 	persistStart := time.Now()
 	if err := p.persistCompletedPersonalResult(task, pr, content, citations, msgCount, totalTokens, modelVer, genAt, isScheduledEmptyWindow); err != nil {
 		log.Printf("[personal-worker] persist personal result task=%d pr=%d: %v", taskID, pr.ID, err)
+		finishStreamError("summary persistence failed")
 		return
 	}
 	p.db.Model(&participant).Updates(map[string]interface{}{
@@ -330,9 +367,11 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 			if err := completeTaskWithoutNewResult(p.db, taskID); err != nil {
 				if errors.Is(err, errTaskNoLongerProcessing) {
 					log.Printf("[personal-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
+					finishStreamError("summary generation cancelled")
 					return
 				}
 				log.Printf("[personal-worker] task=%d complete-without-result error: %v", taskID, err)
+				finishStreamError("summary completion failed")
 				return
 			}
 			log.Printf("[personal-worker] task %d scheduled empty-window: kept previous result, skipped prune", taskID)
@@ -352,9 +391,11 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 			if err := saveLatestResultAndCompleteTask(p.db, taskID, &result, isScheduled, nil); err != nil {
 				if errors.Is(err, errTaskNoLongerProcessing) {
 					log.Printf("[personal-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
+					finishStreamError("summary generation cancelled")
 					return
 				}
 				log.Printf("[personal-worker] save result error task=%d: %v", taskID, err)
+				finishStreamError("summary completion failed")
 				return
 			}
 		}
@@ -364,16 +405,19 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 			Progress: 100,
 			Message:  "总结完成",
 		})
+		finishStreamDone(model.StatusCompleted)
 		// Task durably reached Completed above (saveLatestResultAndCompleteTask /
 		// completeTaskWithoutNewResult succeeded). Fire the terminal notification.
 		p.notifyTaskTerminal(taskID, model.StatusCompleted)
 		log.Printf("[personal-worker] task %d single-person completed directly", taskID)
 	} else if allowCompletedTask && taskCheck.Status == model.StatusCompleted {
+		finishStreamDone(model.StatusCompleted)
 		// Personal-only regenerate: keep the team summary as-is until the user
 		// explicitly submits this regenerated personal result. Submit will revive
 		// the task and trigger meta recompute.
 		log.Printf("[personal-worker] task=%d user=%s personal regenerate completed; waiting for submit", taskID, participant.UserID)
 	} else {
+		finishStreamDone(model.StatusProcessing)
 		// Multi-person mode: trigger meta-summary to check if all participants completed.
 		//
 		// System back-fill of submitted_at: the meta completion gate
@@ -606,7 +650,7 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 	log.Printf("[personal-worker] task=%d marked failed (terminal), sanitizedMsg=%s", pr.TaskID, sanitized)
 }
 
-func (p *Processor) executePersonalPipeline(ctx context.Context, task model.SummaryTask, userID string, reportStage func(string)) (string, []model.Citation, int, int, string, error) {
+func (p *Processor) executePersonalPipeline(ctx context.Context, task model.SummaryTask, userID string, reportStage func(string), streamDelta func(string) error) (string, []model.Citation, int, int, string, error) {
 	totalStart := time.Now()
 	taskNo := task.TaskNo
 	defer func() {
@@ -930,9 +974,9 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		mapStart := time.Now()
 		mapCallStart := time.Now()
 		var err error
-		finalContent, totalTokens, err = p.llm.CallMap(ctx,
+		finalContent, totalTokens, err = p.llm.CallMapStream(ctx,
 			joinStrings(formatted), sourceName, 0, len(userMessages),
-			startTime, endTime, generationTopic, userName,
+			startTime, endTime, generationTopic, userName, streamDelta,
 		)
 		timing.RecordLLMSince(taskNo, "Map: 单次总结(跳过Map-Reduce)", mapCallStart, totalTokens)
 		timing.Observe(taskNo, "llm_map_summary", mapStart)
@@ -991,10 +1035,20 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 				}
 
 				callStart := time.Now()
-				summary, tokens, err := p.llm.CallMap(ctx,
-					joinStrings(formatted), sourceName, idx, len(c),
-					startTime, endTime, generationTopic, userName,
-				)
+				var summary string
+				var tokens int
+				var err error
+				if len(chunks) == 1 {
+					summary, tokens, err = p.llm.CallMapStream(ctx,
+						joinStrings(formatted), sourceName, idx, len(c),
+						startTime, endTime, generationTopic, userName, streamDelta,
+					)
+				} else {
+					summary, tokens, err = p.llm.CallMap(ctx,
+						joinStrings(formatted), sourceName, idx, len(c),
+						startTime, endTime, generationTopic, userName,
+					)
+				}
 				timing.RecordLLMSince(taskNo, fmt.Sprintf("Map: 分块总结 chunk#%d", idx), callStart, tokens)
 				if err != nil {
 					log.Printf("[personal-worker] Map chunk %d failed: %v", idx, err)
@@ -1053,8 +1107,8 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 			// Multiple chunks: execute Reduce to merge
 			var err error
 			reduceCallStart := time.Now()
-			finalContent, reduceTokens, err = p.llm.CallReduce(ctx,
-				chunkSummaries, sourceName, startTime, endTime, targetMsgCount, generationTopic,
+			finalContent, reduceTokens, err = p.llm.CallReduceStream(ctx,
+				chunkSummaries, sourceName, startTime, endTime, targetMsgCount, generationTopic, streamDelta,
 			)
 			timing.RecordLLMSince(taskNo, "Reduce: 合并分块总结", reduceCallStart, reduceTokens)
 			if err != nil {

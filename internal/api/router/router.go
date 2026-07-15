@@ -7,12 +7,13 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/ws"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/streaming"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
 
 // SetupPublic configures the public API router on :8080.
-func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middleware.TokenResolver, workerTriggerURL string, candidateQueryLimit int, featureTeamSchedule bool, customTemplateLimit int, llm ...*service.LLMClient) *gin.Engine {
+func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middleware.TokenResolver, workerTriggerURL string, candidateQueryLimit int, featureTeamSchedule bool, customTemplateLimit int, streamHub *streaming.Hub, llm ...*service.LLMClient) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
 
@@ -20,7 +21,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	r.Use(func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type,Authorization,Token,X-Space-Id")
+		c.Header("Access-Control-Allow-Headers", "Content-Type,Authorization,Token,X-Space-Id,Accept,Accept-Language")
 		if c.Request.Method == http.MethodOptions {
 			c.AbortWithStatus(http.StatusNoContent)
 			return
@@ -47,6 +48,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	}
 	editH := handler.NewEditHandler(db, refineLLM)
 	personalH.SetLLM(refineLLM)
+	streamH := handler.NewStreamHandler(db, streamHub)
 
 	v1 := r.Group("/api/v1")
 	v1.Use(middleware.StrictAuthMiddleware(authResolver), middleware.StrictSpaceMiddleware())
@@ -55,13 +57,16 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		v1.POST("/summaries/batch-status", taskH.BatchStatus)
 		v1.GET("/summaries", taskH.ListSummaries)
 		v1.GET("/summaries/:id", taskH.GetSummary)
+		v1.GET("/summaries/:id/stream", streamH.StreamSummary)
 		v1.GET("/summaries/:id/result", taskH.GetResult)
 		v1.POST("/summaries/:id/regenerate", taskH.Regenerate)
 		v1.POST("/summaries/:id/refine", editH.RefineSummary)
+		v1.POST("/summaries/:id/refine/stream", editH.RefineSummaryStream)
 		v1.GET("/summaries/:id/versions", editH.ListSummaryVersions)
 		v1.GET("/summaries/:id/versions/:result_id", editH.GetSummaryVersion)
 		v1.POST("/summaries/:id/versions/:result_id/restore", editH.RestoreSummaryVersion)
 		v1.POST("/summaries/:id/personal-refine", personalH.RefinePersonalSummary)
+		v1.POST("/summaries/:id/personal-refine/stream", personalH.RefinePersonalSummaryStream)
 		v1.POST("/summaries/:id/personal-regenerate", personalH.RegeneratePersonalSummary)
 		v1.GET("/summaries/:id/personal-versions", personalH.ListPersonalVersions)
 		v1.GET("/summaries/:id/personal-versions/:version_id", personalH.GetPersonalVersion)
@@ -124,7 +129,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 
 // SetupInternal configures the internal API router on :8081.
 // Returns the engine and the InternalHandler so the caller can wire the worker trigger channel.
-func SetupInternal(hub *ws.Hub) (*gin.Engine, *handler.InternalHandler) {
+func SetupInternal(hub *ws.Hub, streamHub ...*streaming.Hub) (*gin.Engine, *handler.InternalHandler) {
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
 
@@ -134,6 +139,10 @@ func SetupInternal(hub *ws.Hub) (*gin.Engine, *handler.InternalHandler) {
 	})
 	r.POST("/internal/task-event", intH.TaskEvent)
 	r.POST("/internal/worker-trigger", intH.WorkerTrigger)
+	if len(streamHub) > 0 && streamHub[0] != nil {
+		streamH := handler.NewStreamHandler(nil, streamHub[0])
+		r.POST("/internal/summary-stream", streamH.Ingest)
+	}
 
 	return r, intH
 }
