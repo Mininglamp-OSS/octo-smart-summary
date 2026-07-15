@@ -125,6 +125,7 @@ type SummaryTask struct {
 	RetryCount         int        `gorm:"column:retry_count;type:tinyint;not null;default:0" json:"retry_count"`
 	ErrorMessage       *string    `gorm:"column:error_message;type:varchar(500)" json:"error_message"`
 	ScheduleID         *int64     `gorm:"column:schedule_id" json:"schedule_id"`
+	CurrentResultID    *int64     `gorm:"column:current_result_id" json:"current_result_id"`
 	OriginChannelID    string     `gorm:"column:origin_channel_id;type:varchar(64);not null;default:'';index:idx_origin_channel" json:"origin_channel_id"`
 	OriginChannelType  int        `gorm:"column:origin_channel_type;type:tinyint;not null;default:0" json:"origin_channel_type"`
 	ProcessingDeadline *time.Time `gorm:"column:processing_deadline" json:"processing_deadline"`
@@ -234,6 +235,10 @@ type SummaryResult struct {
 	TotalTokenUsed    int        `gorm:"column:total_token_used;not null;default:0" json:"total_token_used"`
 	ModelVersion      string     `gorm:"column:model_version;type:varchar(50);not null;default:''" json:"model_version"`
 	Version           int        `gorm:"column:version;not null;default:1" json:"version"`
+	OperationType     string     `gorm:"column:operation_type;type:varchar(32);not null;default:'generate'" json:"operation_type"`
+	OperationNote     string     `gorm:"column:operation_note;type:text" json:"operation_note"`
+	ParentResultID    *int64     `gorm:"column:parent_result_id" json:"parent_result_id,omitempty"`
+	CreatedBy         string     `gorm:"column:created_by;type:varchar(64);not null;default:''" json:"created_by"`
 	EditedAt          *time.Time `gorm:"column:edited_at" json:"edited_at"`
 	GeneratedAt       time.Time  `gorm:"column:generated_at;not null" json:"generated_at"`
 	CreatedAt         time.Time  `gorm:"column:created_at;not null" json:"created_at"`
@@ -296,15 +301,16 @@ func (SummaryResult) TableName() string { return "summary_result" }
 
 // SummarySchedule represents a recurring schedule configuration.
 type SummarySchedule struct {
-	ID             int64  `gorm:"primaryKey;autoIncrement" json:"id"`
-	SpaceID        string `gorm:"column:space_id;type:varchar(64);not null;default:''" json:"space_id"`
-	CreatorID      string `gorm:"column:creator_id;type:varchar(64);not null" json:"creator_id"`
-	Title          string `gorm:"column:title;type:varchar(1000);not null;default:''" json:"title"`
-	SummaryMode    int    `gorm:"column:summary_mode;type:tinyint;not null" json:"summary_mode"`
-	CronExpr       string `gorm:"column:cron_expr;type:varchar(50);not null" json:"cron_expr"`
-	IntervalDays   int    `gorm:"column:interval_days;type:int;not null;default:0" json:"interval_days"`
-	IntervalMonths int    `gorm:"column:interval_months;type:int;not null;default:0" json:"interval_months"`
-	RunTime        string `gorm:"column:run_time;type:varchar(5);not null;default:''" json:"run_time"`
+	ID                    int64  `gorm:"primaryKey;autoIncrement" json:"id"`
+	SpaceID               string `gorm:"column:space_id;type:varchar(64);not null;default:''" json:"space_id"`
+	CreatorID             string `gorm:"column:creator_id;type:varchar(64);not null" json:"creator_id"`
+	Title                 string `gorm:"column:title;type:varchar(1000);not null;default:''" json:"title"`
+	GenerationInstruction string `gorm:"column:generation_instruction;type:text" json:"generation_instruction"`
+	SummaryMode           int    `gorm:"column:summary_mode;type:tinyint;not null" json:"summary_mode"`
+	CronExpr              string `gorm:"column:cron_expr;type:varchar(50);not null" json:"cron_expr"`
+	IntervalDays          int    `gorm:"column:interval_days;type:int;not null;default:0" json:"interval_days"`
+	IntervalMonths        int    `gorm:"column:interval_months;type:int;not null;default:0" json:"interval_months"`
+	RunTime               string `gorm:"column:run_time;type:varchar(5);not null;default:''" json:"run_time"`
 	// DayOfWeek aligns WEEK mode (interval_days multiple of 7) to a specific
 	// weekday: 1=Mon..7=Sun, 0=unconstrained. Ignored for non-week modes.
 	DayOfWeek int `gorm:"column:day_of_week;type:tinyint;not null;default:0" json:"day_of_week"`

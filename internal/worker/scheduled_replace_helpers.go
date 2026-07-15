@@ -399,22 +399,38 @@ func saveLatestResultAndCompleteTask(db *gorm.DB, taskID int64, result *model.Su
 		}
 		result.TaskID = taskID
 		result.Version = nextVer
+		if result.OperationType == "" {
+			if nextVer <= 1 {
+				result.OperationType = "generate"
+			} else if isScheduled {
+				result.OperationType = "scheduled_generate"
+			} else {
+				result.OperationType = "regenerate"
+			}
+		}
+		if result.OperationNote == "" && result.OperationType != "scheduled_generate" {
+			var task model.SummaryTask
+			if err := tx.Select("title").Where("id = ?", taskID).First(&task).Error; err == nil {
+				result.OperationNote = task.Title
+			}
+		}
 		if err := tx.Create(result).Error; err != nil {
 			return err
 		}
+		if err := tx.Model(&model.SummaryTask{}).Where("id = ?", taskID).Update("current_result_id", result.ID).Error; err != nil {
+			return err
+		}
 		if isScheduled {
-			// Scheduled-only: prune stale auto-generated prior-cycle versions after
-			// the replacement result is durably inserted. Hand-edited rows
-			// (edited_at IS NOT NULL) are retained permanently as user data, even
-			// across later scheduled cycles.
-			if err := tx.Where("task_id = ? AND id <> ? AND edited_at IS NULL", taskID, result.ID).Delete(&model.SummaryResult{}).Error; err != nil {
-				return err
-			}
-			// summary_chunk currently has no version column, so cleanup must happen
-			// only after the replacement result is durably inserted.
+			// Scheduled runs are versioned on the same task. Keep prior summary_result
+			// rows so the detail page can show scheduled_generate entries in Recent
+			// versions. summary_chunk has no version column, so only transient chunks
+			// are replaced after the new result is durably inserted.
 			if err := tx.Where("task_id = ?", taskID).Delete(&model.SummaryChunk{}).Error; err != nil {
 				return err
 			}
+		}
+		if err := service.PruneSummaryResultVersions(tx, taskID, service.SummaryResultVersionKeepLimit); err != nil {
+			return err
 		}
 		return markTaskCompleted(tx, taskID)
 	})

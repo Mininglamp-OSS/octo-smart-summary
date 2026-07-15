@@ -192,7 +192,7 @@ func TestBackfillSubmittedAt_SchedAccepted_BackfillsSystemSource(t *testing.T) {
 	}
 
 	p := &Processor{db: db}
-	p.backfillScheduledSubmittedAt(task.ID, &pr)
+	p.backfillSystemSubmittedAt(task.ID, &pr)
 
 	var got model.PersonalResult
 	if err := db.First(&got, pr.ID).Error; err != nil {
@@ -231,7 +231,7 @@ func TestBackfillSubmittedAt_DeclinedParticipant_NotBackfilled(t *testing.T) {
 	}
 
 	p := &Processor{db: db}
-	p.backfillScheduledSubmittedAt(task.ID, &pr)
+	p.backfillSystemSubmittedAt(task.ID, &pr)
 
 	var got model.PersonalResult
 	if err := db.First(&got, pr.ID).Error; err != nil {
@@ -273,7 +273,7 @@ func TestBackfillSubmittedAt_AlreadySubmitted_Idempotent(t *testing.T) {
 	}
 
 	p := &Processor{db: db}
-	p.backfillScheduledSubmittedAt(task.ID, &pr)
+	p.backfillSystemSubmittedAt(task.ID, &pr)
 
 	var got model.PersonalResult
 	if err := db.First(&got, pr.ID).Error; err != nil {

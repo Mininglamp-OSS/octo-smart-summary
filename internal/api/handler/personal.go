@@ -117,11 +117,16 @@ type PersonalHandler struct {
 	db               *gorm.DB
 	workerTriggerURL string
 	hub              *ws.Hub
+	llm              *service.LLMClient
 }
 
 // NewPersonalHandler creates a new PersonalHandler.
 func NewPersonalHandler(db *gorm.DB, workerTriggerURL string, hub *ws.Hub) *PersonalHandler {
 	return &PersonalHandler{db: db, workerTriggerURL: workerTriggerURL, hub: hub}
+}
+
+func (h *PersonalHandler) SetLLM(llm *service.LLMClient) {
+	h.llm = llm
 }
 
 func (h *PersonalHandler) parseTaskID(c *gin.Context) (int64, bool) {
@@ -420,6 +425,8 @@ func (h *PersonalHandler) GetPersonal(c *gin.Context) {
 	if err := h.db.Where("task_id = ? AND user_id = ?", taskID, userID).First(&pr).Error; err != nil {
 		// Not found → return default
 		ok(c, gin.H{
+			"id":             0,
+			"version":        0,
 			"worker_status":  0,
 			"workflow_stage": "",
 			"content":        "",
@@ -430,7 +437,23 @@ func (h *PersonalHandler) GetPersonal(c *gin.Context) {
 		return
 	}
 
+	version := 0
+	if pr.CurrentVersionID != nil {
+		var currentVersion model.PersonalResultVersion
+		if err := h.db.Where("id = ? AND task_id = ? AND user_id = ?", *pr.CurrentVersionID, taskID, userID).First(&currentVersion).Error; err == nil {
+			version = currentVersion.Version
+		}
+	}
+	if version == 0 {
+		_ = h.db.Model(&model.PersonalResultVersion{}).Where("task_id = ? AND user_id = ?", taskID, userID).Select("COALESCE(MAX(version), 0)").Scan(&version).Error
+	}
+	if version == 0 && strings.TrimSpace(pr.Content) != "" {
+		version = 1
+	}
+
 	result := gin.H{
+		"id":             pr.ID,
+		"version":        version,
 		"worker_status":  pr.WorkerStatus,
 		"workflow_stage": pr.WorkflowStage,
 		"content":        pr.Content,
@@ -489,28 +512,48 @@ func (h *PersonalHandler) Submit(c *gin.Context) {
 	// Use a conditional UPDATE ... WHERE submitted_at IS NULL so exactly one writer
 	// (manual OR system) ever sets submitted_at; the loser sees RowsAffected==0 and
 	// returns the idempotent "already submitted" response WITHOUT rewriting source.
-	res := h.db.Model(&model.PersonalResult{}).
-		Where("id = ? AND submitted_at IS NULL", pr.ID).
-		Updates(map[string]interface{}{
-			"submitted_at":  now,
-			"submit_source": model.SubmitSourceManual,
-		})
-	if res.Error != nil {
-		log.Printf("[personal] submit conditional update error: %v", res.Error)
-		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: res.Error.Error()})
+	var alreadySubmitted bool
+	err := h.db.Transaction(func(tx *gorm.DB) error {
+		res := tx.Model(&model.PersonalResult{}).
+			Where("id = ? AND submitted_at IS NULL", pr.ID).
+			Updates(map[string]interface{}{
+				"submitted_at":  now,
+				"submit_source": model.SubmitSourceManual,
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			alreadySubmitted = true
+			return nil
+		}
+
+		if err := tx.Model(&model.SummaryParticipant{}).
+			Where("task_id = ? AND user_id = ?", taskID, userID).
+			Update("status", model.ParticipantSubmitted).Error; err != nil {
+			return err
+		}
+
+		var participantCount int64
+		if err := tx.Model(&model.SummaryParticipant{}).Where("task_id = ?", taskID).Count(&participantCount).Error; err != nil {
+			return err
+		}
+		if participantCount > 1 {
+			return h.reviveCompletedForRecompute(tx, taskID)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("[personal] submit transaction error: %v", err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
 		return
 	}
-	if res.RowsAffected == 0 {
+	if alreadySubmitted {
 		// Already submitted by a concurrent manual /submit or the system back-fill.
 		// Do NOT rewrite submit_source; return the same idempotent "submitted" semantics.
 		ok(c, gin.H{"status": "submitted"})
 		return
 	}
-
-	// Update participant status to submitted
-	h.db.Model(&model.SummaryParticipant{}).
-		Where("task_id = ? AND user_id = ?", taskID, userID).
-		Update("status", model.ParticipantSubmitted)
 
 	// Broadcast MEMBER_SUBMITTED event to all subscribers
 	if h.hub != nil {

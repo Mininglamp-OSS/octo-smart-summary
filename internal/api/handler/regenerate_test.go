@@ -157,17 +157,17 @@ func TestRegenerate_ResetsAllAssociatedData(t *testing.T) {
 	// Verify participant reset
 	var participant model.SummaryParticipant
 	db.First(&participant, participantID)
-	if participant.Status != model.ParticipantPending {
-		t.Errorf("participant status: want %d, got %d", model.ParticipantPending, participant.Status)
+	if participant.Status != model.ParticipantAccepted {
+		t.Errorf("participant status: want %d, got %d", model.ParticipantAccepted, participant.Status)
 	}
 	if participant.WorkerStartedAt != nil {
 		t.Error("participant worker_started_at should be nil")
 	}
-	if participant.ConfirmedAt != nil {
-		t.Error("participant confirmed_at should be nil")
+	if participant.ConfirmedAt == nil {
+		t.Error("participant confirmed_at should be kept for regenerate")
 	}
-	if participant.PersonalResultID != nil {
-		t.Error("participant personal_result_id should be nil")
+	if participant.PersonalResultID == nil || *participant.PersonalResultID != prID {
+		t.Errorf("participant personal_result_id should keep %d, got %v", prID, participant.PersonalResultID)
 	}
 
 	// Verify PersonalResult reset
@@ -178,6 +178,9 @@ func TestRegenerate_ResetsAllAssociatedData(t *testing.T) {
 	}
 	if pr.Content != "" {
 		t.Errorf("personal_result content: want empty, got %q", pr.Content)
+	}
+	if pr.SubmitSource != model.SubmitSourceSystem {
+		t.Errorf("personal_result submit_source: want system, got %d", pr.SubmitSource)
 	}
 	if pr.CitationsJSON != "" {
 		t.Errorf("personal_result citations_json: want empty, got %q", pr.CitationsJSON)
@@ -192,11 +195,11 @@ func TestRegenerate_ResetsAllAssociatedData(t *testing.T) {
 		t.Error("personal_result submitted_at should be nil")
 	}
 
-	// Verify SummaryResult deleted
+	// Verify SummaryResult retained as version history.
 	var resultCount int64
 	db.Model(&model.SummaryResult{}).Where("task_id = ?", taskID).Count(&resultCount)
-	if resultCount != 0 {
-		t.Errorf("summary_result count: want 0, got %d", resultCount)
+	if resultCount != 1 {
+		t.Errorf("summary_result count: want 1, got %d", resultCount)
 	}
 
 	// Verify SummaryChunk deleted
@@ -385,6 +388,84 @@ func TestRegenerate_TriggersWorker(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Error("triggerWorker was not called within 2s")
+	}
+}
+
+func TestRegenerate_MultiPersonDoesNotReinviteAndTriggersAllAccepted(t *testing.T) {
+	db := setupRegenerateDB(t)
+	imDB, _ := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	imDB.Exec("CREATE TABLE group_member (group_no TEXT NOT NULL, uid TEXT NOT NULL, is_deleted INTEGER DEFAULT 0)")
+	imDB.Exec("INSERT INTO group_member (group_no, uid, is_deleted) VALUES ('grp_abc', 'creator1', 0), ('grp_abc', 'member2', 0)")
+
+	taskID, participantID, _ := seedCompletedTask(t, db)
+	now := time.Now().UTC()
+	member := model.SummaryParticipant{
+		TaskID:      taskID,
+		UserID:      "member2",
+		UserName:    "Member2",
+		Status:      model.ParticipantSubmitted,
+		ConfirmedAt: &now,
+	}
+	db.Create(&member)
+	memberPR := model.PersonalResult{
+		TaskID:           taskID,
+		ParticipantRefID: member.ID,
+		UserID:           "member2",
+		WorkerStatus:     model.PersonalStatusCompleted,
+		Content:          "old member content",
+		SubmittedAt:      &now,
+		GeneratedAt:      &now,
+	}
+	db.Create(&memberPR)
+	db.Model(&member).Update("personal_result_id", memberPR.ID)
+
+	triggered := make(chan model.WorkerTriggerRequest, 2)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req model.WorkerTriggerRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		triggered <- req
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	h := NewTaskHandler(db, imDB, ts.URL)
+	r := setupRegenerateRouter(h)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/summaries/%d/regenerate", taskID), nil)
+	req.Header.Set("Token", "creator1")
+	req.Header.Set("X-Space-Id", "space1")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	gotIDs := map[int64]bool{}
+	for i := 0; i < 2; i++ {
+		select {
+		case got := <-triggered:
+			if got.Type != "personal_summary" {
+				t.Errorf("trigger type: want personal_summary, got %s", got.Type)
+			}
+			gotIDs[got.ParticipantRefID] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected trigger %d", i+1)
+		}
+	}
+	if !gotIDs[participantID] || !gotIDs[member.ID] {
+		t.Fatalf("expected triggers for creator %d and member %d, got %v", participantID, member.ID, gotIDs)
+	}
+
+	var participants []model.SummaryParticipant
+	db.Where("task_id = ?", taskID).Order("id ASC").Find(&participants)
+	for _, p := range participants {
+		if p.Status != model.ParticipantAccepted {
+			t.Errorf("participant %s should stay accepted for regenerate, got %d", p.UserID, p.Status)
+		}
+		if p.ConfirmedAt == nil {
+			t.Errorf("participant %s confirmed_at should not be cleared", p.UserID)
+		}
 	}
 }
 

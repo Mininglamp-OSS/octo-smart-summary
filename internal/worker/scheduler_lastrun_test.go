@@ -3,6 +3,7 @@
 package worker
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -24,6 +25,9 @@ func newSchedulerTestDB(t *testing.T) *gorm.DB {
 		&model.SummaryParticipant{},
 		&model.PersonalResult{},
 		&model.SummarySource{},
+		&model.SummaryNotification{},
+		&model.PersonalResultVersion{},
+		&model.SummaryEvent{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -79,9 +83,13 @@ func seedDueScheduleWithPolicy(t *testing.T, db *gorm.DB, lastRunAt *time.Time, 
 
 func seedBoundTask(t *testing.T, db *gorm.DB, scheduleID int64, status int, participants int) model.SummaryTask {
 	t.Helper()
+	var existingTasks int64
 	now := time.Now().UTC()
+	if err := db.Model(&model.SummaryTask{}).Count(&existingTasks).Error; err != nil {
+		t.Fatalf("count tasks: %v", err)
+	}
 	task := model.SummaryTask{
-		TaskNo: "T", SpaceID: "sp", CreatorID: "u1", SummaryMode: model.ModeByPerson,
+		TaskNo: fmt.Sprintf("T-%d", existingTasks+1), SpaceID: "sp", CreatorID: "u1", SummaryMode: model.ModeByPerson,
 		Status: status, TimeRangeStart: now, TimeRangeEnd: now, ScheduleID: &scheduleID,
 	}
 	if err := db.Create(&task).Error; err != nil {
@@ -132,6 +140,93 @@ func TestClaim_RequeueAdvancesLastRunAt(t *testing.T) {
 	}
 	if got.NextRunAt == nil || !got.NextRunAt.After(now) {
 		t.Errorf("next_run_at should move forward, got %v", got.NextRunAt)
+	}
+}
+
+func TestClaim_RequeueClearsPriorNotifications(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	sched := seedDueSchedule(t, db, &old)
+	prior := seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
+	now := time.Now().UTC()
+	if err := db.Create(&model.SummaryNotification{
+		TaskID:       prior.ID,
+		NotifyKind:   model.NotifyKindCompleted,
+		RecipientUID: "u1",
+		Status:       model.NotifyStatusSent,
+		CreatedAt:    now.Add(-time.Hour),
+		UpdatedAt:    now.Add(-time.Hour),
+	}).Error; err != nil {
+		t.Fatalf("seed notification: %v", err)
+	}
+
+	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30, false)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if !claimed || taskID != prior.ID {
+		t.Fatalf("expected requeue on same task, got claimed=%v taskID=%d want %d", claimed, taskID, prior.ID)
+	}
+
+	var notifCount int64
+	db.Model(&model.SummaryNotification{}).Where("task_id = ?", prior.ID).Count(&notifCount)
+	if notifCount != 0 {
+		t.Fatalf("requeue must clear stale notification dedup rows, got %d", notifCount)
+	}
+}
+
+func TestClaim_RequeueUsesLatestLegacyTask(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	oldRun := time.Now().UTC().Add(-48 * time.Hour)
+	sched := seedDueSchedule(t, db, &oldRun)
+	oldTask := seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
+	latestTask := seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
+
+	now := time.Now().UTC()
+	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30, false)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if !claimed || taskID != latestTask.ID {
+		t.Fatalf("requeue should bind latest legacy task, got claimed=%v taskID=%d want %d (old=%d)", claimed, taskID, latestTask.ID, oldTask.ID)
+	}
+}
+
+func TestPersistCompletedPersonalResult_ScheduledEmptyCarriesLatestVersion(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	now := time.Now().UTC()
+	task := model.SummaryTask{TaskNo: "T", CreatorID: "u1", SummaryMode: model.ModeByPerson, TriggerType: model.TriggerScheduled, Status: model.StatusProcessing, TimeRangeStart: now, TimeRangeEnd: now}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+	participant := model.SummaryParticipant{TaskID: task.ID, UserID: "u1", Status: model.ParticipantAccepted}
+	if err := db.Create(&participant).Error; err != nil {
+		t.Fatalf("seed participant: %v", err)
+	}
+	pr := model.PersonalResult{TaskID: task.ID, ParticipantRefID: participant.ID, UserID: "u1", WorkerStatus: model.PersonalStatusProcessing}
+	if err := db.Create(&pr).Error; err != nil {
+		t.Fatalf("seed personal result: %v", err)
+	}
+	version := model.PersonalResultVersion{TaskID: task.ID, ParticipantRefID: participant.ID, UserID: "u1", Content: "previous personal summary", Version: 1, OperationType: "generate", CreatedBy: "u1", GeneratedAt: now.Add(-time.Hour)}
+	version.SetCitations([]model.Citation{{Index: 1, Content: "evidence"}})
+	if err := db.Create(&version).Error; err != nil {
+		t.Fatalf("seed version: %v", err)
+	}
+
+	processor := &Processor{db: db}
+	if err := processor.persistCompletedPersonalResult(task, pr, noRelevantContentMessage, nil, 0, 0, "model", now, true); err != nil {
+		t.Fatalf("persist skip content: %v", err)
+	}
+
+	var got model.PersonalResult
+	if err := db.First(&got, pr.ID).Error; err != nil {
+		t.Fatalf("load personal result: %v", err)
+	}
+	if got.Content != version.Content || got.CurrentVersionID == nil || *got.CurrentVersionID != version.ID {
+		t.Fatalf("empty scheduled window should carry latest version, content=%q current=%v want content=%q current=%d", got.Content, got.CurrentVersionID, version.Content, version.ID)
+	}
+	if got.WorkerStatus != model.PersonalStatusCompleted || got.WorkflowStage != model.WorkflowStageGenerateSummary {
+		t.Fatalf("status/stage = %d/%q, want completed/%q", got.WorkerStatus, got.WorkflowStage, model.WorkflowStageGenerateSummary)
 	}
 }
 
@@ -362,9 +457,10 @@ func TestClaim_AutoRequeue_AllParticipantsAccepted_DispatchSelectsAll(t *testing
 	old := time.Now().UTC().Add(-48 * time.Hour)
 	// AUTO (confirm_policy=0) + creator u1 + u2 + u3 configured.
 	sched := seedDueScheduleWithPolicy(t, db, &old, model.SchedConfirmAuto, "u2", "u3")
-	// Prior terminal bound task under the schedule => this is the REQUEUE path
-	// (latest exists, terminal so no overlap skip), distinct from first-run.
-	seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
+	// Prior terminal bound task under the schedule => this is the REQUEUE path.
+	// Scheduled runs reuse this task and append result versions instead of creating
+	// another user-visible task.
+	prior := seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
 
 	now := time.Now().UTC()
 	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30, true /* featureTeamSchedule */)
@@ -372,10 +468,18 @@ func TestClaim_AutoRequeue_AllParticipantsAccepted_DispatchSelectsAll(t *testing
 		t.Fatalf("claim: %v", err)
 	}
 	if !claimed || taskID == 0 {
-		t.Fatalf("AUTO requeue should create a task, got claimed=%v taskID=%d", claimed, taskID)
+		t.Fatalf("AUTO requeue should reuse a task, got claimed=%v taskID=%d", claimed, taskID)
+	}
+	if taskID != prior.ID {
+		t.Fatalf("AUTO requeue should reuse bound task %d, got %d", prior.ID, taskID)
+	}
+	var taskCount int64
+	db.Model(&model.SummaryTask{}).Where("schedule_id = ? AND deleted_at IS NULL", sched.ID).Count(&taskCount)
+	if taskCount != 1 {
+		t.Fatalf("AUTO requeue must not create another visible task, got %d", taskCount)
 	}
 
-	// New task must be a scheduled task (trigger_type=2).
+	// Reused task must be a scheduled task (trigger_type=2).
 	var task model.SummaryTask
 	if err := db.First(&task, taskID).Error; err != nil {
 		t.Fatalf("load task: %v", err)
@@ -462,7 +566,7 @@ func TestClaim_ConfirmV5_PartialConfirm_OnlyConfirmedMaterialized(t *testing.T) 
 		t.Fatalf("claim: %v", err)
 	}
 	if !claimed || taskID == 0 {
-		t.Fatalf("partial-confirm round should create a task, got claimed=%v taskID=%d", claimed, taskID)
+		t.Fatalf("partial-confirm round should reuse a task, got claimed=%v taskID=%d", claimed, taskID)
 	}
 
 	var total, accepted int64
@@ -520,62 +624,45 @@ func TestClaim_ConfirmV5_ZeroConfirmed_NextRunAdvancesLastRunPreserved(t *testin
 	}
 }
 
-// V5 §4.3/Q2 (soft-delete behavior): when NOBODY (creator included) has confirmed,
-// the whole round is skipped. The freshly-created placeholder task is SOFT-DELETED
-// (deleted_at set), NOT left as a Cancelled shell -- so it never surfaces in any
-// deleted_at IS NULL query (list/detail). No participants/personal_results are
-// built and no result is produced. (creator is no longer auto-accepted.)
+// V5 §4.3/Q2: when NOBODY (creator included) has confirmed, the whole
+// round is skipped without creating another task or mutating the existing bound task.
 func TestClaim_ConfirmV5_ZeroConfirmed_RoundSkipped(t *testing.T) {
 	db := newSchedulerTestDB(t)
 	old := time.Now().UTC().Add(-48 * time.Hour)
 	// u1(creator)+u2+u3 all unconfirmed.
 	sched := seedDueScheduleV5Confirm(t, db, &old, []string{"u2", "u3"} /* none confirmed */)
-	seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
+	prior := seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
 
 	now := time.Now().UTC()
 	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30, true)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	// The round is claimed (next_run_at advances) but produces no runnable task.
 	if !claimed {
 		t.Fatalf("zero-confirmed round should still claim (advance next_run), got claimed=%v", claimed)
 	}
 	if taskID != 0 {
 		t.Fatalf("zero-confirmed round must report taskID=0 (skipped), got %d", taskID)
 	}
-	// The placeholder task must NOT appear in a deleted_at IS NULL query (list/detail
-	// filter): it has been soft-deleted, so the schedule has zero LIVE tasks beyond
-	// the prior terminal one. Specifically the round's new task must be unfindable
-	// when filtering deleted_at IS NULL.
-	var liveLatest model.SummaryTask
-	err = db.Where("schedule_id = ? AND deleted_at IS NULL AND trigger_type = ?",
-		sched.ID, model.TriggerScheduled).Order("id DESC").First(&liveLatest).Error
-	if err != gorm.ErrRecordNotFound {
-		t.Fatalf("zero-confirmed placeholder must be soft-deleted (unfindable under deleted_at IS NULL), got err=%v task=%+v", err, liveLatest)
+
+	var taskCount int64
+	db.Model(&model.SummaryTask{}).Where("schedule_id = ? AND deleted_at IS NULL", sched.ID).Count(&taskCount)
+	if taskCount != 1 {
+		t.Fatalf("zero-confirmed skip must not create/delete visible tasks, got %d", taskCount)
 	}
-	// And the row physically still exists but with deleted_at set (Unscoped read).
 	var task model.SummaryTask
-	if err := db.Where("schedule_id = ?", sched.ID).Order("id DESC").First(&task).Error; err != nil {
-		t.Fatalf("load latest task (incl soft-deleted): %v", err)
+	if err := db.First(&task, prior.ID).Error; err != nil {
+		t.Fatalf("load prior task: %v", err)
 	}
-	if task.DeletedAt == nil {
-		t.Errorf("zero-confirmed placeholder must have deleted_at set (soft-deleted), got nil")
+	if task.Status != model.StatusCompleted || task.DeletedAt != nil {
+		t.Fatalf("prior task should remain completed and visible, got status=%d deleted_at=%v", task.Status, task.DeletedAt)
 	}
-	// No children built for the skipped round.
-	var parts, prs int64
-	db.Model(&model.SummaryParticipant{}).Where("task_id = ?", task.ID).Count(&parts)
-	db.Model(&model.PersonalResult{}).Where("task_id = ?", task.ID).Count(&prs)
-	if parts != 0 || prs != 0 {
-		t.Errorf("zero-confirmed round must build no children, got participants=%d personal_results=%d", parts, prs)
-	}
-	// summary_source rows are built BEFORE the accepted-count gate, so the
-	// zero-confirm branch must physically clean them up; otherwise they leak as
-	// orphans (parent task only soft-deleted) every skipped round.
-	var srcs int64
-	db.Model(&model.SummarySource{}).Where("task_id = ?", task.ID).Count(&srcs)
-	if srcs != 0 {
-		t.Errorf("zero-confirmed round must leave no orphan summary_source rows, got %d", srcs)
+	var parts, prs, srcs int64
+	db.Model(&model.SummaryParticipant{}).Where("task_id = ?", prior.ID).Count(&parts)
+	db.Model(&model.PersonalResult{}).Where("task_id = ?", prior.ID).Count(&prs)
+	db.Model(&model.SummarySource{}).Where("task_id = ?", prior.ID).Count(&srcs)
+	if parts != 1 || prs != 0 || srcs != 0 {
+		t.Errorf("zero-confirmed skip should preserve existing task children without rebuilding, got participants=%d personal_results=%d sources=%d", parts, prs, srcs)
 	}
 }
 
@@ -613,8 +700,13 @@ func TestClaim_ConfirmV5_AllConfirmed_MultiRoundNoReconfirm(t *testing.T) {
 
 	t1 := runRound("round1")
 	t2 := runRound("round2")
-	if t1 == t2 {
-		t.Fatalf("each round must create a distinct task, got %d twice", t1)
+	if t1 != t2 {
+		t.Fatalf("scheduled rounds should reuse the same task, got %d then %d", t1, t2)
+	}
+	var taskCount int64
+	db.Model(&model.SummaryTask{}).Where("schedule_id = ? AND deleted_at IS NULL", sched.ID).Count(&taskCount)
+	if taskCount != 1 {
+		t.Fatalf("multi-round schedule must keep one visible task, got %d", taskCount)
 	}
 }
 
