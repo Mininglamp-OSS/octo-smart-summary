@@ -173,8 +173,8 @@ func (n *Notifier) deliverToRecipient(task model.SummaryTask, kind, errMsg strin
 	}
 
 	// 2) Build + deliver.
-	text := n.buildText(task, kind, errMsg)
-	deliverErr := n.deliver(task.ID, target, text)
+	card := n.buildCard(task, kind, errMsg)
+	deliverErr := n.deliver(task.ID, target, card)
 
 	// 3) Persist outcome.
 	if deliverErr == nil {
@@ -247,7 +247,7 @@ func (n *Notifier) claimRetry(taskID int64, kind, uid string) (bool, error) {
 	return res.RowsAffected == 1, nil
 }
 
-func (n *Notifier) deliver(taskID int64, target deliveryTarget, text string) error {
+func (n *Notifier) deliver(taskID int64, target deliveryTarget, card notifyCard) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -270,24 +270,10 @@ func (n *Notifier) deliver(taskID int64, target deliveryTarget, text string) err
 			return fmt.Errorf("ensureFriend: %w", err)
 		}
 	}
-	// octo-server identifies a plain-text bot message by its ContentType enum
-	// (type=1=Text) carrying the body in "content"; a bare {"text":...} payload is
-	// not recognized and renders as an empty/unopenable message. Send the
-	// server-recognized shape instead.
-	//
-	// summary is registered as a system bot, so its messages must carry space_id:
-	// octo-server's filterPersonMessagesBySpace drops a system-bot message whose
-	// payload has an empty space_id (it would otherwise be unopenable in the UI).
-	// Include space_id only when known, to hit the "exact match keep" branch and
-	// avoid regressing the empty-SpaceID case.
-	payload := map[string]any{"type": 1, "content": text}
-	if target.SpaceID != "" {
-		payload["space_id"] = target.SpaceID
-	}
 	msg := SendMessageRequest{
 		ChannelID:   target.ChannelID,
 		ChannelType: target.ChannelType,
-		Payload:     payload,
+		Card:        &card,
 	}
 	if err := n.deliverer.SendMessage(ctx, target.SpaceID, msg); err != nil {
 		return fmt.Errorf("sendMessage: %w", err)
@@ -298,14 +284,10 @@ func (n *Notifier) deliver(taskID int64, target deliveryTarget, text string) err
 // recipientIsActiveMember reports whether uid is an active member (status=1) of
 // an active Space (status=1), mirroring octo-server's space.CheckMembership.
 //
-// Why this matters: for a system-bot DM, octo-server only adopts the X-Space-ID
-// header (and thus injects the authoritative payload.space_id) when the
-// RECIPIENT is an active member of that Space. If they are not, the server
-// STRIPS space_id yet still returns 200 — the message is then dropped by
-// filterPersonMessagesBySpace and the user silently never sees it, while the
-// worker would otherwise record it as "sent". Pre-checking here turns that
-// silent loss into an explicit delivery failure (retried/visible), instead of a
-// false success.
+// Why this matters: octo-server only binds a system-bot DM to a Space when the
+// recipient is an active member of that Space. If they are not, the server may
+// still return 200 while the user never sees the message. Pre-checking here
+// turns that silent loss into an explicit delivery failure.
 //
 // Conservative failure mode: on a nil imDB or a query error we return true
 // (do NOT block delivery) — the server-side CheckMembership still guards
@@ -369,9 +351,58 @@ func (n *Notifier) markFailed(taskID int64, kind, uid string, cause error) {
 // "token not yet provisioned" state. All delivery errors are real failures and
 // go through markFailed (attempt+last_error, bounded by MaxAttempts + sweep).
 
-// buildText composes the user-facing notification body. Success carries the
-// result link (when a base URL is configured); failure carries the sanitized
-// error message.
+func (n *Notifier) buildCard(task model.SummaryTask, kind, errMsg string) notifyCard {
+	card := notifyCard{
+		TaskNo: task.TaskNo,
+		Kind:   kind,
+		Title:  n.foldedTitle(task),
+	}
+	if kind == model.NotifyKindCompleted {
+		card.TimeRange = formatTimeRange(task)
+		meta := n.resultMeta(task)
+		if members := n.participantCount(task); members > 0 {
+			card.Members = members
+		}
+		if meta.msgCount > 0 {
+			card.MsgCount = meta.msgCount
+		}
+		if !meta.generatedAt.IsZero() {
+			card.GeneratedAt = timezone.In(meta.generatedAt).Format("2006-01-02 15:04")
+		}
+	}
+	if kind == model.NotifyKindFailed {
+		card.Reason = n.sanitizedFailureReason(errMsg)
+	}
+	return card
+}
+
+func (n *Notifier) foldedTitle(task model.SummaryTask) string {
+	space := n.resolveSpaceName(task)
+	title := strings.TrimSpace(task.Title)
+	switch {
+	case space != "" && title != "":
+		return fmt.Sprintf("空间「%s」·%s", space, title)
+	case space != "":
+		return fmt.Sprintf("空间「%s」总结", space)
+	case title != "":
+		return title
+	default:
+		return "总结"
+	}
+}
+
+func (n *Notifier) sanitizedFailureReason(errMsg string) string {
+	reason := strings.TrimSpace(errMsg)
+	if reason == "" {
+		return ""
+	}
+	if n.errorSanitizer != nil {
+		return n.errorSanitizer(reason)
+	}
+	return "AI 处理失败，请稍后重试"
+}
+
+// buildText composes the legacy plain-text notification body.
 func (n *Notifier) buildText(task model.SummaryTask, kind, errMsg string) string {
 	title := strings.TrimSpace(task.Title)
 	space := n.resolveSpaceName(task)
@@ -425,14 +456,7 @@ func (n *Notifier) buildText(task model.SummaryTask, kind, errMsg string) string
 		// via the synchronous worker path (OnTaskTerminal) or the sweep/redeliver
 		// path that reloads task.ErrorMessage raw from DB — is scrubbed here before
 		// it can reach the user DM. See WithErrorSanitizer / PR#113 R3.
-		if reason := strings.TrimSpace(errMsg); reason != "" {
-			safe := reason
-			if n.errorSanitizer != nil {
-				safe = n.errorSanitizer(reason)
-			} else {
-				// Defensive: never leak raw internals if no sanitizer wired.
-				safe = "AI 处理失败，请稍后重试"
-			}
+		if safe := n.sanitizedFailureReason(errMsg); safe != "" {
 			fmt.Fprintf(&b, "\n失败原因：%s", safe)
 		}
 		return b.String()
@@ -462,7 +486,6 @@ func (n *Notifier) resolveSpaceName(task model.SummaryTask) string {
 	return strings.TrimSpace(name)
 }
 
-// resultLink builds the result URL from the configured base. Empty base → no link.
 // notifyResultMeta carries the best-effort metadata pulled from summary_result
 // for a completed task's notification text. Zero values mean "unknown / omit".
 type notifyResultMeta struct {
@@ -666,8 +689,8 @@ func (n *Notifier) redeliver(taskID int64, kind, uid string) {
 	if task.ErrorMessage != nil {
 		errMsg = *task.ErrorMessage
 	}
-	text := n.buildText(task, kind, errMsg)
-	if deliverErr := n.deliver(taskID, target, text); deliverErr != nil {
+	card := n.buildCard(task, kind, errMsg)
+	if deliverErr := n.deliver(taskID, target, card); deliverErr != nil {
 		n.markFailed(taskID, kind, uid, deliverErr)
 		log.Printf("[notify] sweep: task=%d kind=%s uid=%s delivery failed: %v", taskID, kind, uid, sanitize(deliverErr.Error()))
 		return
