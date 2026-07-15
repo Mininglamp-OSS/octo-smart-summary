@@ -50,6 +50,7 @@ go build ./cmd
 export LLM_API_URL=https://api.example.com/v1
 export LLM_API_KEY=sk-your-key-here
 export SUMMARY_LISTEN_ADDR=:8090
+export TZ=Asia/Shanghai  # 可选；应用时区，缺省 Asia/Shanghai
 
 ./cmd serve
 ```

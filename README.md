@@ -55,6 +55,7 @@ export OCTO_SEARCH_URL=http://octo-search-batch:8080
 export OCTO_SEARCH_TOKEN=your-s2s-token
 export OCTO_SEARCH_POLL_INTERVAL_SECONDS=1
 export SUMMARY_LISTEN_ADDR=:8090
+export TZ=Asia/Shanghai  # optional; app timezone, defaults to Asia/Shanghai
 
 ./cmd serve
 ```

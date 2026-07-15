@@ -42,6 +42,7 @@ All configuration is done via environment variables.
 | `FETCH_CONCURRENCY` | Parallel channel message fetch concurrency | No | `10` |
 | `CHANNEL_SCOPE_ENABLED` | Enable channel scope narrowing | No | `true` |
 | `TOOL_CALL_TIMEOUT` | Tool call per-attempt timeout in seconds | No | `30` |
+| `TZ` | Container / application timezone (IANA name). Empty preserves the default. | No | `Asia/Shanghai` |
 
 ## LLM Gateway Options
 
