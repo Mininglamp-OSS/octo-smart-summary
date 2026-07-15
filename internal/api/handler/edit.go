@@ -293,7 +293,11 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 		return
 	}
 
-	cleanedCitations := service.CleanUnreferencedCitations(newContent, baseResult.GetCitations())
+	basePlainCitations := baseResult.GetCitations()
+	if !callerPlainCitationsVisible(h.db, &task, userID, &baseResult) {
+		basePlainCitations = []model.Citation{}
+	}
+	cleanedCitations := service.CleanUnreferencedCitations(newContent, basePlainCitations)
 	cleanedTeamCitations := cleanUnreferencedTeamCitations(newContent, baseResult.GetTeamCitations())
 	newResult := model.SummaryResult{
 		TaskID:         taskID,
@@ -461,6 +465,10 @@ func (h *EditHandler) GetSummaryVersion(c *gin.Context) {
 	if row.EditedAt != nil {
 		editedAt = row.EditedAt.Format(time.RFC3339)
 	}
+	plainCitations := row.GetCitations()
+	if !callerPlainCitationsVisible(h.db, &task, userID, &row) {
+		plainCitations = []model.Citation{}
+	}
 	ok(c, gin.H{
 		"result_id":        row.ID,
 		"version":          row.Version,
@@ -471,7 +479,7 @@ func (h *EditHandler) GetSummaryVersion(c *gin.Context) {
 		"generated_at":     row.GeneratedAt.Format(time.RFC3339),
 		"edited_at":        editedAt,
 		"content":          row.Content,
-		"citations":        row.GetCitations(),
+		"citations":        plainCitations,
 		"team_citations":   row.GetTeamCitations(),
 	})
 }

@@ -85,7 +85,28 @@ func (p *Processor) updatePersonalWorkflowStage(personalResultID int64, stage st
 func (p *Processor) persistCompletedPersonalResult(task model.SummaryTask, pr model.PersonalResult, content string, citations []model.Citation, msgCount, totalTokens int, modelVer string, genAt time.Time, skipContent bool) error {
 	updates := completedPersonalResultUpdates(pr, content, citations, msgCount, totalTokens, modelVer, genAt, skipContent)
 	if skipContent {
-		return p.db.Model(&pr).Updates(updates).Error
+		return p.db.Transaction(func(tx *gorm.DB) error {
+			var lockedPR model.PersonalResult
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ? AND task_id = ? AND user_id = ?", pr.ID, pr.TaskID, pr.UserID).
+				First(&lockedPR).Error; err != nil {
+				return err
+			}
+			var latest model.PersonalResultVersion
+			if err := tx.Where("task_id = ? AND user_id = ?", lockedPR.TaskID, lockedPR.UserID).
+				Order("version DESC").Order("id DESC").First(&latest).Error; err == nil {
+				updates["content"] = latest.Content
+				updates["citations_json"] = latest.CitationsJSON
+				updates["msg_count"] = latest.MsgCount
+				updates["total_token_used"] = latest.TotalTokenUsed
+				updates["model_version"] = latest.ModelVersion
+				updates["current_version_id"] = latest.ID
+				updates["generated_at"] = latest.GeneratedAt
+			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+			return tx.Model(&lockedPR).Updates(updates).Error
+		})
 	}
 
 	return p.db.Transaction(func(tx *gorm.DB) error {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -145,7 +146,7 @@ func claimAndRequeueScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.Summar
 		createdTask := false
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("schedule_id = ? AND deleted_at IS NULL", lockedSched.ID).
-			Order("id ASC").
+			Order("id DESC").
 			First(&task).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				task = model.SummaryTask{
@@ -176,6 +177,9 @@ func claimAndRequeueScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.Summar
 			return nil
 		}
 
+		if err := preservePersonalResultVersionsBeforeRequeue(tx, task.ID); err != nil {
+			return err
+		}
 		if err := tx.Where("task_id = ?", task.ID).Delete(&model.SummarySource{}).Error; err != nil {
 			return err
 		}
@@ -237,6 +241,76 @@ func claimAndRequeueScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.Summar
 		return 0, true, nil
 	}
 	return runTaskID, true, nil
+}
+
+func preservePersonalResultVersionsBeforeRequeue(tx *gorm.DB, taskID int64) error {
+	var rows []model.PersonalResult
+	if err := tx.Where("task_id = ?", taskID).Find(&rows).Error; err != nil {
+		return err
+	}
+	for _, pr := range rows {
+		if strings.TrimSpace(pr.Content) == "" {
+			continue
+		}
+		var latest model.PersonalResultVersion
+		err := tx.Where("task_id = ? AND user_id = ?", pr.TaskID, pr.UserID).
+			Order("version DESC").Order("id DESC").First(&latest).Error
+		if err == nil && latest.Content == pr.Content && latest.CitationsJSON == pr.CitationsJSON {
+			if pr.CurrentVersionID == nil {
+				if err := tx.Model(&model.PersonalResult{}).Where("id = ?", pr.ID).Update("current_version_id", latest.ID).Error; err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+
+		nextVer, err := service.GetNextPersonalVersion(tx, pr.TaskID, pr.UserID)
+		if err != nil {
+			return err
+		}
+		operationType := "generate"
+		var parentID *int64
+		if latest.ID > 0 {
+			operationType = "manual_edit"
+			parentID = &latest.ID
+		}
+		generatedAt := timezone.Now()
+		if pr.EditedAt != nil {
+			generatedAt = *pr.EditedAt
+		} else if pr.GeneratedAt != nil {
+			generatedAt = *pr.GeneratedAt
+		} else if !pr.CreatedAt.IsZero() {
+			generatedAt = pr.CreatedAt
+		}
+		snapshot := model.PersonalResultVersion{
+			TaskID:           pr.TaskID,
+			ParticipantRefID: pr.ParticipantRefID,
+			UserID:           pr.UserID,
+			Content:          pr.Content,
+			CitationsJSON:    pr.CitationsJSON,
+			MsgCount:         pr.MsgCount,
+			TotalTokenUsed:   pr.TotalTokenUsed,
+			ModelVersion:     pr.ModelVersion,
+			Version:          nextVer,
+			OperationType:    operationType,
+			ParentVersionID:  parentID,
+			CreatedBy:        pr.UserID,
+			GeneratedAt:      generatedAt,
+		}
+		if err := tx.Create(&snapshot).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&model.PersonalResult{}).Where("id = ?", pr.ID).Update("current_version_id", snapshot.ID).Error; err != nil {
+			return err
+		}
+		if err := service.PrunePersonalResultVersions(tx, pr.TaskID, pr.UserID, service.PersonalResultVersionKeepLimit); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // claimAndCreateScheduledTask is kept as a compatibility wrapper for older tests.

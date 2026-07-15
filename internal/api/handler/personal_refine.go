@@ -62,6 +62,10 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "feedback 不能超过 2000 字符"})
 		return
 	}
+	if req.BaseVersion <= 0 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "base_version is required"})
+		return
+	}
 
 	task, taskOK := h.requireTaskInSpace(c, taskID)
 	if !taskOK {
@@ -96,7 +100,7 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
 		return
 	}
-	if req.BaseVersion > 0 && req.BaseVersion != currentVersion {
+	if req.BaseVersion != currentVersion {
 		c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "内容已更新，请刷新后重试"})
 		return
 	}
@@ -129,6 +133,7 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 
 	now := timezone.Now()
 	var newVersion model.PersonalResultVersion
+	shouldTriggerMeta := false
 	err = h.db.Transaction(func(tx *gorm.DB) error {
 		var latestPR model.PersonalResult
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -143,7 +148,7 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 		if err != nil {
 			return err
 		}
-		if req.BaseVersion > 0 && req.BaseVersion != versionBeforeBaseline {
+		if req.BaseVersion != versionBeforeBaseline {
 			return service.NewBizError(40009, "内容已更新，请刷新后重试", http.StatusConflict)
 		}
 		latestVersion, err := ensurePersonalVersionBaseline(tx, latestPR)
@@ -175,7 +180,7 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 			return err
 		}
 		res := tx.Model(&model.PersonalResult{}).
-			Where("id = ? AND task_id = ? AND user_id = ?", latestPR.ID, taskID, userID).
+			Where("id = ? AND task_id = ? AND user_id = ? AND worker_status = ?", latestPR.ID, taskID, userID, model.PersonalStatusCompleted).
 			Updates(map[string]interface{}{
 				"content":            newContent,
 				"citations_json":     citationsJSON,
@@ -189,12 +194,22 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 			return res.Error
 		}
 		if res.RowsAffected == 0 {
-			return errPersonalResultGone
+			return service.NewBizError(40009, "内容已更新，请刷新后重试", http.StatusConflict)
 		}
 		if err := service.PrunePersonalResultVersions(tx, taskID, userID, service.PersonalResultVersionKeepLimit); err != nil {
 			return err
 		}
-		return appendBoundScheduleGenerationInstruction(tx, *task, feedback)
+		var participantCount int64
+		if err := tx.Model(&model.SummaryParticipant{}).Where("task_id = ?", taskID).Count(&participantCount).Error; err != nil {
+			return err
+		}
+		if participantCount > 1 {
+			if err := h.reviveCompletedForRecompute(tx, taskID); err != nil {
+				return err
+			}
+			shouldTriggerMeta = true
+		}
+		return nil
 	})
 	if err != nil {
 		if bizError, isBiz := err.(*service.BizError); isBiz {
@@ -208,6 +223,12 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 		log.Printf("[personal-refine] transaction error task=%d user=%s: %v", taskID, userID, err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
 		return
+	}
+	if shouldTriggerMeta {
+		go h.triggerWorker(model.WorkerTriggerRequest{
+			Type:   "meta_summary",
+			TaskID: taskID,
+		})
 	}
 
 	ok(c, gin.H{
@@ -352,6 +373,7 @@ func (h *PersonalHandler) RestorePersonalVersion(c *gin.Context) {
 	}
 
 	now := timezone.Now()
+	shouldTriggerMeta := false
 	err = h.db.Transaction(func(tx *gorm.DB) error {
 		var latestPR model.PersonalResult
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -384,6 +406,16 @@ func (h *PersonalHandler) RestorePersonalVersion(c *gin.Context) {
 		if res.RowsAffected == 0 {
 			return errPersonalResultGone
 		}
+		var participantCount int64
+		if err := tx.Model(&model.SummaryParticipant{}).Where("task_id = ?", taskID).Count(&participantCount).Error; err != nil {
+			return err
+		}
+		if participantCount > 1 {
+			if err := h.reviveCompletedForRecompute(tx, taskID); err != nil {
+				return err
+			}
+			shouldTriggerMeta = true
+		}
 		return nil
 	})
 	if err != nil {
@@ -394,6 +426,12 @@ func (h *PersonalHandler) RestorePersonalVersion(c *gin.Context) {
 		log.Printf("[personal-restore] transaction error task=%d user=%s version=%d: %v", taskID, userID, versionID, err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
 		return
+	}
+	if shouldTriggerMeta {
+		go h.triggerWorker(model.WorkerTriggerRequest{
+			Type:   "meta_summary",
+			TaskID: taskID,
+		})
 	}
 	ok(c, gin.H{"task_id": taskID, "result_id": pr.ID, "version_id": source.ID, "version": source.Version})
 }
@@ -455,11 +493,6 @@ func (h *PersonalHandler) RegeneratePersonalSummary(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "topic 不能超过 1000 字符"})
 		return
 	}
-	newTitle := task.Title
-	if topic != "" && topic != task.Title {
-		newTitle = topic
-	}
-
 	err := h.db.Transaction(func(tx *gorm.DB) error {
 		var latestPR model.PersonalResult
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -493,16 +526,6 @@ func (h *PersonalHandler) RegeneratePersonalSummary(c *gin.Context) {
 		}
 		if res.RowsAffected == 0 {
 			return service.NewBizError(40005, "个人总结正在生成中", http.StatusConflict)
-		}
-		if newTitle != task.Title {
-			if err := tx.Model(&model.SummaryTask{}).Where("id = ?", taskID).Update("title", newTitle).Error; err != nil {
-				return err
-			}
-		}
-		if topic != "" {
-			if err := resetBoundScheduleGenerationInstruction(tx, *task, topic); err != nil {
-				return err
-			}
 		}
 		if err := tx.Model(&model.SummaryParticipant{}).
 			Where("id = ? AND task_id = ?", participant.ID, taskID).

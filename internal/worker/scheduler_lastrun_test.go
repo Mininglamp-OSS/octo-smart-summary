@@ -3,6 +3,7 @@
 package worker
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -25,6 +26,7 @@ func newSchedulerTestDB(t *testing.T) *gorm.DB {
 		&model.PersonalResult{},
 		&model.SummarySource{},
 		&model.SummaryNotification{},
+		&model.PersonalResultVersion{},
 		&model.SummaryEvent{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
@@ -81,9 +83,13 @@ func seedDueScheduleWithPolicy(t *testing.T, db *gorm.DB, lastRunAt *time.Time, 
 
 func seedBoundTask(t *testing.T, db *gorm.DB, scheduleID int64, status int, participants int) model.SummaryTask {
 	t.Helper()
+	var existingTasks int64
 	now := time.Now().UTC()
+	if err := db.Model(&model.SummaryTask{}).Count(&existingTasks).Error; err != nil {
+		t.Fatalf("count tasks: %v", err)
+	}
 	task := model.SummaryTask{
-		TaskNo: "T", SpaceID: "sp", CreatorID: "u1", SummaryMode: model.ModeByPerson,
+		TaskNo: fmt.Sprintf("T-%d", existingTasks+1), SpaceID: "sp", CreatorID: "u1", SummaryMode: model.ModeByPerson,
 		Status: status, TimeRangeStart: now, TimeRangeEnd: now, ScheduleID: &scheduleID,
 	}
 	if err := db.Create(&task).Error; err != nil {
@@ -166,6 +172,61 @@ func TestClaim_RequeueClearsPriorNotifications(t *testing.T) {
 	db.Model(&model.SummaryNotification{}).Where("task_id = ?", prior.ID).Count(&notifCount)
 	if notifCount != 0 {
 		t.Fatalf("requeue must clear stale notification dedup rows, got %d", notifCount)
+	}
+}
+
+func TestClaim_RequeueUsesLatestLegacyTask(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	oldRun := time.Now().UTC().Add(-48 * time.Hour)
+	sched := seedDueSchedule(t, db, &oldRun)
+	oldTask := seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
+	latestTask := seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
+
+	now := time.Now().UTC()
+	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, now, 30, false)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if !claimed || taskID != latestTask.ID {
+		t.Fatalf("requeue should bind latest legacy task, got claimed=%v taskID=%d want %d (old=%d)", claimed, taskID, latestTask.ID, oldTask.ID)
+	}
+}
+
+func TestPersistCompletedPersonalResult_ScheduledEmptyCarriesLatestVersion(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	now := time.Now().UTC()
+	task := model.SummaryTask{TaskNo: "T", CreatorID: "u1", SummaryMode: model.ModeByPerson, TriggerType: model.TriggerScheduled, Status: model.StatusProcessing, TimeRangeStart: now, TimeRangeEnd: now}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+	participant := model.SummaryParticipant{TaskID: task.ID, UserID: "u1", Status: model.ParticipantAccepted}
+	if err := db.Create(&participant).Error; err != nil {
+		t.Fatalf("seed participant: %v", err)
+	}
+	pr := model.PersonalResult{TaskID: task.ID, ParticipantRefID: participant.ID, UserID: "u1", WorkerStatus: model.PersonalStatusProcessing}
+	if err := db.Create(&pr).Error; err != nil {
+		t.Fatalf("seed personal result: %v", err)
+	}
+	version := model.PersonalResultVersion{TaskID: task.ID, ParticipantRefID: participant.ID, UserID: "u1", Content: "previous personal summary", Version: 1, OperationType: "generate", CreatedBy: "u1", GeneratedAt: now.Add(-time.Hour)}
+	version.SetCitations([]model.Citation{{Index: 1, Content: "evidence"}})
+	if err := db.Create(&version).Error; err != nil {
+		t.Fatalf("seed version: %v", err)
+	}
+
+	processor := &Processor{db: db}
+	if err := processor.persistCompletedPersonalResult(task, pr, noRelevantContentMessage, nil, 0, 0, "model", now, true); err != nil {
+		t.Fatalf("persist skip content: %v", err)
+	}
+
+	var got model.PersonalResult
+	if err := db.First(&got, pr.ID).Error; err != nil {
+		t.Fatalf("load personal result: %v", err)
+	}
+	if got.Content != version.Content || got.CurrentVersionID == nil || *got.CurrentVersionID != version.ID {
+		t.Fatalf("empty scheduled window should carry latest version, content=%q current=%v want content=%q current=%d", got.Content, got.CurrentVersionID, version.Content, version.ID)
+	}
+	if got.WorkerStatus != model.PersonalStatusCompleted || got.WorkflowStage != model.WorkflowStageGenerateSummary {
+		t.Fatalf("status/stage = %d/%q, want completed/%q", got.WorkerStatus, got.WorkflowStage, model.WorkflowStageGenerateSummary)
 	}
 }
 

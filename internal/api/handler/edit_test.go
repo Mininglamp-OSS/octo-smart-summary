@@ -13,6 +13,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/gin-gonic/gin"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -40,6 +41,8 @@ func setupEditRouter(h *EditHandler) *gin.Engine {
 	r := gin.New()
 	r.Use(middleware.AuthMiddleware(&mockTokenResolver{}), middleware.SpaceMiddleware())
 	r.PUT("/api/v1/summaries/:id/edit", h.EditSummary)
+	r.POST("/api/v1/summaries/:id/refine", h.RefineSummary)
+	r.GET("/api/v1/summaries/:id/versions/:result_id", h.GetSummaryVersion)
 	return r
 }
 
@@ -589,5 +592,165 @@ func TestEditSummary_ContentTooLarge(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 for oversized content, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func newTestRefineLLM(t *testing.T, content string) (*service.LLMClient, func()) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Fatalf("unexpected LLM path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"choices":[{"message":{"content":%q},"finish_reason":"stop"}],"usage":{"total_tokens":7,"completion_tokens":3}}`, content)
+	}))
+	return service.NewLLMClient(srv.URL, "test-key", "test-model", 5, 256, false, 5), srv.Close
+}
+
+func seedVersionCitationPrivacyTask(t *testing.T, db *gorm.DB) (taskID int64, resultID int64) {
+	t.Helper()
+	now := time.Now().UTC()
+	task := model.SummaryTask{
+		TaskNo:      "TST-VERSION-PRIVACY",
+		SpaceID:     "space1",
+		CreatorID:   "creator1",
+		SummaryMode: model.ModeByPerson,
+		Status:      model.StatusCompleted,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+	participant := model.SummaryParticipant{TaskID: task.ID, UserID: "member_a", UserName: "Member A", Status: model.ParticipantCompleted}
+	if err := db.Create(&participant).Error; err != nil {
+		t.Fatalf("seed participant: %v", err)
+	}
+	citations := []model.Citation{{
+		Index:       1,
+		Sender:      "Member A",
+		Content:     "private raw message from member A",
+		SentAt:      "2026-01-01T00:00:00Z",
+		Source:      "grp",
+		ChannelID:   "ch1",
+		ChannelType: 2,
+		MessageSeq:  100,
+	}}
+	pr := model.PersonalResult{
+		TaskID:           task.ID,
+		ParticipantRefID: participant.ID,
+		UserID:           "member_a",
+		WorkerStatus:     model.PersonalStatusCompleted,
+		Content:          "member A personal content with [1]",
+		GeneratedAt:      &now,
+	}
+	pr.SetCitations(citations)
+	if err := db.Create(&pr).Error; err != nil {
+		t.Fatalf("seed personal result: %v", err)
+	}
+	result := model.SummaryResult{
+		TaskID:         task.ID,
+		Content:        "team content copied from member A with [1]",
+		TotalMsgCount:  1,
+		TotalTokenUsed: 10,
+		ModelVersion:   "test-v1",
+		Version:        1,
+		CreatedBy:      "member_a",
+		GeneratedAt:    now,
+	}
+	result.SetCitations(citations)
+	if err := db.Create(&result).Error; err != nil {
+		t.Fatalf("seed summary result: %v", err)
+	}
+	return task.ID, result.ID
+}
+
+func doGetSummaryVersionRequest(r *gin.Engine, taskID, resultID int64, userID string) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", fmt.Sprintf("/api/v1/summaries/%d/versions/%d", taskID, resultID), nil)
+	if userID != "" {
+		req.Header.Set("Token", userID)
+	}
+	req.Header.Set("X-Space-Id", "space1")
+	r.ServeHTTP(w, req)
+	return w
+}
+
+func doRefineSummaryRequest(r *gin.Engine, taskID int64, userID string, body interface{}) *httptest.ResponseRecorder {
+	var bodyBytes []byte
+	if body != nil {
+		bodyBytes, _ = json.Marshal(body)
+	}
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/summaries/%d/refine", taskID), bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	if userID != "" {
+		req.Header.Set("Token", userID)
+	}
+	req.Header.Set("X-Space-Id", "space1")
+	r.ServeHTTP(w, req)
+	return w
+}
+
+func responseCitationsLen(t *testing.T, w *httptest.ResponseRecorder) int {
+	t.Helper()
+	var resp struct {
+		Data struct {
+			Citations []json.RawMessage `json:"citations"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, w.Body.String())
+	}
+	return len(resp.Data.Citations)
+}
+
+func TestGetSummaryVersion_RedactsPlainCitationsForNonProducer(t *testing.T) {
+	db := setupEditDB(t)
+	taskID, resultID := seedVersionCitationPrivacyTask(t, db)
+
+	h := NewEditHandler(db)
+	r := setupEditRouter(h)
+
+	w := doGetSummaryVersionRequest(r, taskID, resultID, "creator1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := responseCitationsLen(t, w); got != 0 {
+		t.Fatalf("non-producer creator must not see member plain citations, got %d: %s", got, w.Body.String())
+	}
+
+	producer := doGetSummaryVersionRequest(r, taskID, resultID, "member_a")
+	if producer.Code != http.StatusOK {
+		t.Fatalf("expected producer 200, got %d: %s", producer.Code, producer.Body.String())
+	}
+	if got := responseCitationsLen(t, producer); got == 0 {
+		t.Fatalf("producer should keep own plain citations, body=%s", producer.Body.String())
+	}
+}
+
+func TestRefineSummary_DoesNotCopyInvisiblePlainCitations(t *testing.T) {
+	db := setupEditDB(t)
+	taskID, resultID := seedVersionCitationPrivacyTask(t, db)
+	llm, closeLLM := newTestRefineLLM(t, "refined team content still referencing [1]")
+	defer closeLLM()
+
+	h := NewEditHandler(db, llm)
+	r := setupEditRouter(h)
+	w := doRefineSummaryRequest(r, taskID, "creator1", map[string]interface{}{
+		"feedback":       "make it clearer",
+		"base_result_id": resultID,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := responseCitationsLen(t, w); got != 0 {
+		t.Fatalf("refine response must not return invisible member citations, got %d: %s", got, w.Body.String())
+	}
+
+	var refined model.SummaryResult
+	if err := db.Where("task_id = ? AND operation_type = ?", taskID, "refine").First(&refined).Error; err != nil {
+		t.Fatalf("load refined result: %v", err)
+	}
+	if got := len(refined.GetCitations()); got != 0 {
+		t.Fatalf("refined result must not persist invisible member citations, got %d", got)
 	}
 }
