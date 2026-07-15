@@ -74,14 +74,34 @@ func setupRouter(h *TaskHandler) *gin.Engine {
 }
 
 func doRequest(r *gin.Engine, method, path, userID string) *httptest.ResponseRecorder {
+	return doRequestWithSpace(r, method, path, userID, "space1")
+}
+
+func doRequestWithSpace(r *gin.Engine, method, path, userID, spaceID string) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(method, path, nil)
 	if userID != "" {
 		req.Header.Set("Token", userID)
 	}
-	req.Header.Set("X-Space-Id", "space1")
+	if spaceID != "" {
+		req.Header.Set("X-Space-Id", spaceID)
+	}
 	r.ServeHTTP(w, req)
 	return w
+}
+
+func summaryTaskIdentity(t *testing.T, w *httptest.ResponseRecorder) (int64, string) {
+	t.Helper()
+	var resp struct {
+		Data struct {
+			TaskID int64  `json:"task_id"`
+			TaskNo string `json:"task_no"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal GetSummary body: %v; body=%s", err, w.Body.String())
+	}
+	return resp.Data.TaskID, resp.Data.TaskNo
 }
 
 func TestAuthorizeTaskAccess_NonMember(t *testing.T) {
@@ -118,6 +138,70 @@ func TestAuthorizeTaskAccess_Creator(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200 for creator, got %d: %s", w.Code, w.Body.String())
 	}
+}
+
+func TestGetSummary_NumericIDStillResolves(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	taskID := seedTask(t, db, imDB)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupRouter(h)
+
+	w := doRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d", taskID), "creator1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for numeric id, got %d: %s", w.Code, w.Body.String())
+	}
+	gotID, gotNo := summaryTaskIdentity(t, w)
+	if gotID != taskID || gotNo != "TST-001" {
+		t.Fatalf("expected task_id=%d task_no=TST-001, got task_id=%d task_no=%s", taskID, gotID, gotNo)
+	}
+}
+
+func TestGetSummary_TaskNoResolvesSameTask(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	taskID := seedTask(t, db, imDB)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupRouter(h)
+
+	w := doRequest(r, "GET", "/api/v1/summaries/TST-001", "creator1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for task_no, got %d: %s", w.Code, w.Body.String())
+	}
+	gotID, gotNo := summaryTaskIdentity(t, w)
+	if gotID != taskID || gotNo != "TST-001" {
+		t.Fatalf("expected task_id=%d task_no=TST-001, got task_id=%d task_no=%s", taskID, gotID, gotNo)
+	}
+}
+
+func TestGetSummary_UnknownTaskNoReturnsNotFound(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	seedTask(t, db, imDB)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupRouter(h)
+
+	w := doRequest(r, "GET", "/api/v1/summaries/NO-SUCH-TASK", "creator1")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown task_no, got %d: %s", w.Code, w.Body.String())
+	}
+	assertBizCode(t, w, 40008)
+}
+
+func TestGetSummary_TaskNoWrongSpaceMatchesNumericDenial(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	taskID := seedTask(t, db, imDB)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupRouter(h)
+
+	wNumeric := doRequestWithSpace(r, "GET", fmt.Sprintf("/api/v1/summaries/%d", taskID), "participant1", "other_space")
+	if wNumeric.Code != http.StatusNotFound {
+		t.Fatalf("expected numeric wrong-space 404, got %d: %s", wNumeric.Code, wNumeric.Body.String())
+	}
+	assertBizCode(t, wNumeric, 40008)
+
+	wTaskNo := doRequestWithSpace(r, "GET", "/api/v1/summaries/TST-001", "participant1", "other_space")
+	if wTaskNo.Code != wNumeric.Code {
+		t.Fatalf("expected task_no wrong-space status %d, got %d: %s", wNumeric.Code, wTaskNo.Code, wTaskNo.Body.String())
+	}
+	assertBizCode(t, wTaskNo, 40008)
 }
 
 func TestAuthorizeTaskAccess_Participant(t *testing.T) {
@@ -521,9 +605,9 @@ func TestGetSummary_PermissionsSinglePersonCreator(t *testing.T) {
 	assertPerm(t, perms, "can_edit_team", true)
 	assertPerm(t, perms, "can_schedule", true)
 	assertPerm(t, perms, "can_add_member", true)
-	assertPerm(t, perms, "can_view_schedule", true)  // creator is also the participant
-	assertPerm(t, perms, "can_edit_personal", true)  // creator is also the participant
-	assertPerm(t, perms, "can_edit", true)           // legacy: single-person creator completed
+	assertPerm(t, perms, "can_view_schedule", true) // creator is also the participant
+	assertPerm(t, perms, "can_edit_personal", true) // creator is also the participant
+	assertPerm(t, perms, "can_edit", true)          // legacy: single-person creator completed
 }
 
 // --- P1-A: plain-citation stripping must be gated on TRUE multi-person
@@ -567,6 +651,7 @@ func setupResultRouter(t *testing.T) (*gorm.DB, *gorm.DB, *gin.Engine) {
 //   - multi-person: producer is participant2 (NOT the creator). The team
 //     SummaryResult in this fixture still carries plain citations to model the
 //     leak scenario; creator1 must be redacted because they are not the producer.
+//
 // Returns the task ID.
 func seedResultTask(t *testing.T, db *gorm.DB, nParticipants int) int64 {
 	t.Helper()
