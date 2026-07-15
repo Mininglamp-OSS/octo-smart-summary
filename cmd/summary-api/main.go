@@ -16,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/db"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/streaming"
 )
 
 func main() {
@@ -68,8 +69,10 @@ func main() {
 	httpResolver := auth.NewHTTPTokenResolver(cfg.OctoAPIURL)
 	authResolver := auth.NewCachedResolver(httpResolver, 30*time.Second, 10000)
 
-	// Init WebSocket hub
+	// Init realtime hubs. streamHub is in-memory and Phase 1 requires summary-api single-replica
+	// deployment (or sticky routing); multi-replica needs Redis Pub/Sub.
 	hub := ws.NewHub(summaryDB)
+	streamHub := streaming.NewHub(60 * time.Second)
 
 	// Inject IM DB resolvers
 	if imDB != nil {
@@ -100,14 +103,14 @@ func main() {
 	if cfg.LLMApiURL != "" && cfg.LLMApiKey != "" && cfg.LLMModel != "" {
 		refineLLM = service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, cfg.ToolCallTimeout)
 	}
-	publicRouter := router.SetupPublic(summaryDB, imDB, hub, authResolver, cfg.WorkerTriggerURL, cfg.CandidateQueryLimit, cfg.FeatureTeamSchedule, cfg.SummaryCustomTemplateLimit, refineLLM)
+	publicRouter := router.SetupPublic(summaryDB, imDB, hub, authResolver, cfg.WorkerTriggerURL, cfg.CandidateQueryLimit, cfg.FeatureTeamSchedule, cfg.SummaryCustomTemplateLimit, streamHub, refineLLM)
 	publicSrv := &http.Server{
 		Addr:    ":" + cfg.APIPort,
 		Handler: publicRouter,
 	}
 
 	// Internal callback server (Docker network accessible for worker callbacks)
-	internalRouter, _ := router.SetupInternal(hub)
+	internalRouter, _ := router.SetupInternal(hub, streamHub)
 	internalSrv := &http.Server{
 		Addr:    ":" + cfg.APIInternalPort,
 		Handler: internalRouter,

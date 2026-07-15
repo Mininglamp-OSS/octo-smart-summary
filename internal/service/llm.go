@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -92,6 +93,7 @@ type chatRequestWithTools struct {
 	ToolChoice         interface{}            `json:"tool_choice"`
 	ChatTemplateKwargs map[string]interface{} `json:"chat_template_kwargs,omitempty"`
 	Thinking           *ThinkingParam         `json:"thinking,omitempty"`
+	Stream             bool                   `json:"stream,omitempty"`
 }
 
 type chatResponseWithTools struct {
@@ -112,6 +114,10 @@ type chatResponseWithTools struct {
 	} `json:"usage"`
 }
 
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
 type chatRequest struct {
 	Model              string                 `json:"model"`
 	Messages           []ChatMessage          `json:"messages"`
@@ -119,6 +125,8 @@ type chatRequest struct {
 	MaxTokens          int                    `json:"max_tokens"`
 	ChatTemplateKwargs map[string]interface{} `json:"chat_template_kwargs,omitempty"`
 	Thinking           *ThinkingParam         `json:"thinking,omitempty"`
+	Stream             bool                   `json:"stream,omitempty"`
+	StreamOptions      *streamOptions         `json:"stream_options,omitempty"`
 }
 
 type chatResponse struct {
@@ -222,6 +230,120 @@ func (c *LLMClient) Call(ctx context.Context, messages []ChatMessage, temperatur
 	}
 
 	return content, chatResp.Usage.TotalTokens, nil
+}
+
+type chatStreamResponse struct {
+	Choices []struct {
+		Delta struct {
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
+			Reasoning        string `json:"reasoning"`
+		} `json:"delta"`
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage struct {
+		TotalTokens      int `json:"total_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	} `json:"usage"`
+}
+
+// CallStream makes a chat completion streaming request. onDelta is called for
+// each user-visible content delta. It returns the accumulated full content so
+// downstream citation building and DB persistence remain source-of-truth.
+func (c *LLMClient) CallStream(ctx context.Context, messages []ChatMessage, temperature float64, onDelta func(string) error) (string, int, error) {
+	if config.IsKimiModel(c.model) && temperature != kimiRequiredTemperature {
+		log.Printf("[llm] overriding stream temperature from %.2f to %.2f (model constraint)",
+			temperature, kimiRequiredTemperature)
+		temperature = kimiRequiredTemperature
+	} else if config.IsKimiModel(c.model) {
+		temperature = kimiRequiredTemperature
+	}
+	log.Printf("[llm] streaming model=%s temperature=%.2f max_tokens=%d", c.model, temperature, c.maxTokens)
+
+	reqBody := chatRequest{
+		Model:         c.model,
+		Messages:      messages,
+		Temperature:   temperature,
+		MaxTokens:     c.maxTokens,
+		Stream:        true,
+		StreamOptions: &streamOptions{IncludeUsage: true},
+	}
+	thinking, kwargs := c.buildThinkingConfig()
+	reqBody.Thinking = thinking
+	reqBody.ChatTemplateKwargs = kwargs
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return "", 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", 0, fmt.Errorf("LLM stream API error: status=%d body=%s", resp.StatusCode, string(respBody))
+	}
+
+	var sb strings.Builder
+	var totalTokens int
+	var reasoningLen int
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, ":") {
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			break
+		}
+		var chunk chatStreamResponse
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			return sb.String(), totalTokens, fmt.Errorf("unmarshal LLM stream chunk: %w", err)
+		}
+		if chunk.Usage.TotalTokens > 0 {
+			totalTokens = chunk.Usage.TotalTokens
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		delta := chunk.Choices[0].Delta.Content
+		if delta == "" {
+			reasoningLen += len(chunk.Choices[0].Delta.ReasoningContent) + len(chunk.Choices[0].Delta.Reasoning)
+			continue
+		}
+		sb.WriteString(delta)
+		if onDelta != nil {
+			if err := onDelta(delta); err != nil {
+				return sb.String(), totalTokens, err
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return sb.String(), totalTokens, fmt.Errorf("read LLM stream: %w", err)
+	}
+	content := sb.String()
+	if content == "" && reasoningLen > 0 {
+		return "", totalTokens, fmt.Errorf("LLM returned empty streamed content: reasoning consumed output budget")
+	}
+	if content == "" {
+		return "", totalTokens, fmt.Errorf("LLM returned empty streamed content")
+	}
+	return content, totalTokens, nil
 }
 
 // CallRaw is a simple single-turn call returning text only. Used for topic narrowing.
@@ -524,9 +646,73 @@ func (c *LLMClient) CallReduce(ctx context.Context, chunkSummaries []string, sou
 	}, 0.1)
 }
 
-// CallReduceByPerson merges participant-level summaries.
-// Each participant is assigned a [Pn] tag that the LLM should reference in the output.
-func (c *LLMClient) CallReduceByPerson(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string) (string, int, error) {
+// CallMapStream runs the Map phase for a user-visible single chunk and streams
+// the generated summary deltas.
+func (c *LLMClient) CallMapStream(ctx context.Context, formattedMessages string, sourceName string, chunkIndex int, msgCount int, timeStart, timeEnd string, topic string, userName string, onDelta func(string) error) (string, int, error) {
+	if strings.TrimSpace(formattedMessages) == "" {
+		return "(该时段无文本消息)", 0, nil
+	}
+	systemPrompt := buildMapSystemPrompt(userName, topic)
+	userPrompt := fmt.Sprintf("来源：%s\n时间范围：%s ~ %s\n消息数：%d 条\n\n聊天记录：\n%s",
+		sourceName, timeStart, timeEnd, msgCount, formattedMessages)
+
+	var emitted bool
+	wrappedDelta := func(delta string) error {
+		emitted = true
+		if onDelta == nil {
+			return nil
+		}
+		return onDelta(delta)
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		content, tokens, err := c.CallStream(ctx, []ChatMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userPrompt},
+		}, 0.1, wrappedDelta)
+		if err == nil {
+			return content, tokens, nil
+		}
+		log.Printf("[llm] Stream Map chunk %d attempt %d failed: %v", chunkIndex, attempt+1, err)
+		if emitted {
+			return content, tokens, err
+		}
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "reasoning consumed") || strings.Contains(errMsg, "empty content") {
+			return "", tokens, fmt.Errorf("reasoning budget exhausted on chunk %d", chunkIndex)
+		}
+		if attempt < 2 {
+			time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
+		}
+	}
+	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, nil
+}
+
+// CallReduceStream merges chunk summaries and streams the final user-visible
+// reduced summary.
+func (c *LLMClient) CallReduceStream(ctx context.Context, chunkSummaries []string, sourceNames string, startTime, endTime string, totalMsgCount int, topic string, onDelta func(string) error) (string, int, error) {
+	if len(chunkSummaries) == 1 {
+		if onDelta != nil && chunkSummaries[0] != "" {
+			_ = onDelta(chunkSummaries[0])
+		}
+		return chunkSummaries[0], 0, nil
+	}
+
+	var parts []string
+	for i, s := range chunkSummaries {
+		parts = append(parts, fmt.Sprintf("【分片 %d】\n%s", i+1, s))
+	}
+	summariesText := strings.Join(parts, "\n\n---\n\n")
+	system := buildReduceSystemPrompt(topic)
+	userPrompt := fmt.Sprintf("信息来源：%s\n时间范围：%s ~ %s\n消息总量：%d 条\n\n以下是各分片的总结，请合并：\n\n%s",
+		sourceNames, startTime, endTime, totalMsgCount, summariesText)
+
+	return c.CallStream(ctx, []ChatMessage{
+		{Role: "system", Content: system},
+		{Role: "user", Content: userPrompt},
+	}, 0.1, onDelta)
+}
+
+func buildReduceByPersonMessages(participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string) []ChatMessage {
 	var parts []string
 	for i, ps := range participantSummaries {
 		parts = append(parts, fmt.Sprintf("[P%d]【%s 的工作总结】\n%s", i+1, ps.Name, ps.Summary))
@@ -544,8 +730,21 @@ func (c *LLMClient) CallReduceByPerson(ctx context.Context, participantSummaries
 - 如果总结主题中包含输出结构、详细程度、分点方式、待办格式等要求，必须优先遵循；如果主题没有指定结构，再根据实际内容自行组织结构
 - 用显示名称指代人，绝对不要输出 UID 或用户 ID`
 
-	return c.Call(ctx, []ChatMessage{
+	return []ChatMessage{
 		{Role: "system", Content: system},
 		{Role: "user", Content: fmt.Sprintf("总结主题：%s\n时间范围：%s ~ %s\n\n%s", topic, startTime, endTime, text)},
-	}, 0.1)
+	}
+}
+
+// CallReduceByPerson merges participant-level summaries.
+// Each participant is assigned a [Pn] tag that the LLM should reference in the output.
+func (c *LLMClient) CallReduceByPerson(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string) (string, int, error) {
+	return c.Call(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1)
+}
+
+// CallReduceByPersonStream merges participant-level summaries and streams the
+// final team summary. Each participant is assigned a [Pn] tag that the LLM should
+// reference in the output.
+func (c *LLMClient) CallReduceByPersonStream(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string, onDelta func(string) error) (string, int, error) {
+	return c.CallStream(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1, onDelta)
 }
