@@ -507,7 +507,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	if strings.ToLower(sortOrder) != "asc" {
 		sortOrder = "desc"
 	}
-	orderClause := sortBy + " " + sortOrder
+	orderClause := "sub." + sortBy + " " + sortOrder
 
 	// Folding (1->N): scheduled tasks fold by schedule_id (only the latest run per
 	// schedule shows); manual tasks (schedule_id IS NULL) each form their own group.
@@ -525,11 +525,62 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	countSQL := "SELECT COUNT(*) FROM (" + innerSQL + ") sub WHERE sub.rn = 1"
 	h.db.Raw(countSQL, args...).Scan(&total)
 
-	pageSQL := "SELECT * FROM (" + innerSQL + ") sub WHERE sub.rn = 1 ORDER BY " + orderClause + " LIMIT ? OFFSET ?"
-	pageArgs := append(append([]interface{}{}, args...), pageSize, (page-1)*pageSize)
+	// Attention is caller-specific. Compute it only after schedule folding, then
+	// sort before pagination. A pending invitation outranks unread content; team
+	// and personal cursors are compared independently because their ids belong to
+	// different tables.
+	attentionJoins := `
+ LEFT JOIN summary_user_read sur ON sur.task_id = sub.id AND sur.user_id = ?
+ LEFT JOIN summary_result cr ON cr.id = sub.current_result_id AND cr.task_id = sub.id
+ LEFT JOIN summary_personal_result pr ON pr.task_id = sub.id AND pr.user_id = ?
+ LEFT JOIN summary_personal_result_version pv ON pv.id = pr.current_version_id AND pv.task_id = sub.id AND pv.user_id = ?
+ LEFT JOIN summary_participant me ON me.task_id = sub.id AND me.user_id = ?`
+	schedulePendingExpr := "0"
+	if h.db.Dialector.Name() == "mysql" {
+		// Schedule-level confirmation lives in participant_config rather than
+		// summary_participant. Expand the V5 roster so these invitations share the
+		// same attention/red-dot semantics as ordinary task invitations.
+		schedulePendingExpr = `EXISTS (SELECT 1 FROM summary_schedule ss
+ JOIN JSON_TABLE(JSON_EXTRACT(ss.participant_config, '$.participants'), '$[*]'
+ COLUMNS(user_id VARCHAR(64) PATH '$.user_id', confirmed BOOL PATH '$.confirmed' DEFAULT 'false' ON EMPTY)) sc
+ WHERE ss.id=sub.schedule_id AND ss.deleted_at IS NULL AND ss.is_active=1
+ AND ss.confirm_policy=1 AND sc.user_id=? AND sc.confirmed=false)`
+	}
+	attentionSelect := `,
+ CASE WHEN me.status = ? OR ` + schedulePendingExpr + ` THEN 1 ELSE 0 END AS has_pending_invitation,
+ CASE WHEN (sub.current_result_id IS NOT NULL AND (sur.last_read_team_result_id IS NULL OR sur.last_read_team_result_id <> sub.current_result_id))
+        OR (pr.current_version_id IS NOT NULL AND (sur.last_read_personal_version_id IS NULL OR sur.last_read_personal_version_id <> pr.current_version_id))
+      THEN 1 ELSE 0 END AS is_unread,
+ sub.current_result_id AS list_current_result_id,
+ pr.current_version_id AS current_personal_version_id,
+	 CASE WHEN cr.generated_at IS NOT NULL AND pv.generated_at IS NOT NULL
+	      THEN CASE WHEN cr.generated_at >= pv.generated_at THEN cr.generated_at ELSE pv.generated_at END
+	      ELSE COALESCE(cr.generated_at, pv.generated_at, sub.created_at) END AS activity_at`
+	pageSQL := "SELECT sub.*" + attentionSelect + " FROM (" + innerSQL + ") sub" + attentionJoins +
+		" WHERE sub.rn = 1 ORDER BY has_pending_invitation DESC, is_unread DESC, activity_at DESC, sub.id DESC, " + orderClause + " LIMIT ? OFFSET ?"
+	pageArgs := []interface{}{model.ParticipantPending}
+	if h.db.Dialector.Name() == "mysql" {
+		pageArgs = append(pageArgs, userID)
+	}
+	pageArgs = append(pageArgs, args...)
+	pageArgs = append(pageArgs, userID, userID, userID, userID, pageSize, (page-1)*pageSize)
 
-	var tasks []model.SummaryTask
-	h.db.Raw(pageSQL, pageArgs...).Scan(&tasks)
+	type listTaskRow struct {
+		model.SummaryTask        `gorm:"embedded"`
+		HasPendingInvitation     bool   `gorm:"column:has_pending_invitation"`
+		IsUnread                 bool   `gorm:"column:is_unread"`
+		ListCurrentResultID      *int64 `gorm:"column:list_current_result_id"`
+		CurrentPersonalVersionID *int64 `gorm:"column:current_personal_version_id"`
+		ActivityAt               string `gorm:"column:activity_at"`
+	}
+	var taskRows []listTaskRow
+	h.db.Raw(pageSQL, pageArgs...).Scan(&taskRows)
+	tasks := make([]model.SummaryTask, 0, len(taskRows))
+	rowByTask := make(map[int64]listTaskRow, len(taskRows))
+	for _, row := range taskRows {
+		tasks = append(tasks, row.SummaryTask)
+		rowByTask[row.ID] = row
+	}
 
 	// FIX2: batch-load participants for ALL listed tasks in ONE query (avoid N+1),
 	// grouped by task_id. The frontend SummaryCard needs task.participants to decide
@@ -559,6 +610,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 
 	items := make([]gin.H, 0, len(tasks))
 	for _, t := range tasks {
+		attention := rowByTask[t.ID]
 		var sources []model.SummarySource
 		h.db.Where("task_id = ?", t.ID).Find(&sources)
 
@@ -613,30 +665,129 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 		}
 
 		items = append(items, gin.H{
-			"task_id":             t.ID,
-			"task_no":             t.TaskNo,
-			"title":               t.Title,
-			"summary_mode":        t.SummaryMode,
-			"status":              t.Status,
-			"trigger_type":        t.TriggerType,
-			"schedule_id":         scheduleIDOut,
-			"creator_id":          t.CreatorID,
-			"participants":        parts,
-			"time_range_start":    t.TimeRangeStart.Format(time.RFC3339),
-			"time_range_end":      t.TimeRangeEnd.Format(time.RFC3339),
-			"sources":             srcList,
-			"total_msg_count":     totalMsgCount,
-			"creator_name":        creatorName,
-			"origin_channel_id":   t.OriginChannelID,
-			"origin_channel_type": t.OriginChannelType,
-			"created_at":          t.CreatedAt.Format(time.RFC3339),
-			"completed_at":        completedAt,
-			"result_is_edited":    resultIsEdited,
-			"result_edited_at":    resultEditedAt,
+			"task_id":                     t.ID,
+			"task_no":                     t.TaskNo,
+			"title":                       t.Title,
+			"summary_mode":                t.SummaryMode,
+			"status":                      t.Status,
+			"trigger_type":                t.TriggerType,
+			"schedule_id":                 scheduleIDOut,
+			"creator_id":                  t.CreatorID,
+			"participants":                parts,
+			"time_range_start":            t.TimeRangeStart.Format(time.RFC3339),
+			"time_range_end":              t.TimeRangeEnd.Format(time.RFC3339),
+			"sources":                     srcList,
+			"total_msg_count":             totalMsgCount,
+			"creator_name":                creatorName,
+			"origin_channel_id":           t.OriginChannelID,
+			"origin_channel_type":         t.OriginChannelType,
+			"created_at":                  t.CreatedAt.Format(time.RFC3339),
+			"completed_at":                completedAt,
+			"result_is_edited":            resultIsEdited,
+			"result_edited_at":            resultEditedAt,
+			"is_unread":                   attention.IsUnread,
+			"has_pending_invitation":      attention.HasPendingInvitation,
+			"needs_attention":             attention.IsUnread || attention.HasPendingInvitation,
+			"current_result_id":           attention.ListCurrentResultID,
+			"current_personal_version_id": attention.CurrentPersonalVersionID,
+			"activity_at":                 attention.ActivityAt,
 		})
 	}
 
-	ok(c, gin.H{"total": total, "items": items})
+	// Counts deliberately ignore the current list filters: the navigation badge
+	// represents all cards that require this user's attention in the space.
+	countInner := "SELECT *, ROW_NUMBER() OVER (PARTITION BY (CASE WHEN schedule_id IS NULL THEN CONCAT('t', id) ELSE CONCAT('s', schedule_id) END) ORDER BY id DESC) AS rn FROM summary_task WHERE space_id = ? AND deleted_at IS NULL AND (creator_id = ? OR id IN (SELECT task_id FROM summary_participant WHERE user_id = ?))"
+	attentionCountSQL := "SELECT COALESCE(SUM(has_invite),0) pending_invitation_count, COALESCE(SUM(unread),0) unread_count, COALESCE(SUM(CASE WHEN has_invite=1 OR unread=1 THEN 1 ELSE 0 END),0) attention_count FROM (SELECT CASE WHEN me.status=? OR " + schedulePendingExpr + " THEN 1 ELSE 0 END has_invite, CASE WHEN (sub.current_result_id IS NOT NULL AND (sur.last_read_team_result_id IS NULL OR sur.last_read_team_result_id<>sub.current_result_id)) OR (pr.current_version_id IS NOT NULL AND (sur.last_read_personal_version_id IS NULL OR sur.last_read_personal_version_id<>pr.current_version_id)) THEN 1 ELSE 0 END unread FROM (" + countInner + ") sub" + attentionJoins + " WHERE sub.rn=1) attention"
+	var counts struct {
+		AttentionCount         int64 `gorm:"column:attention_count"`
+		UnreadCount            int64 `gorm:"column:unread_count"`
+		PendingInvitationCount int64 `gorm:"column:pending_invitation_count"`
+	}
+	countArgs := []interface{}{model.ParticipantPending}
+	if h.db.Dialector.Name() == "mysql" {
+		countArgs = append(countArgs, userID)
+	}
+	countArgs = append(countArgs, spaceID, userID, userID, userID, userID, userID, userID)
+	h.db.Raw(attentionCountSQL, countArgs...).Scan(&counts)
+	ok(c, gin.H{"total": total, "items": items, "attention_count": counts.AttentionCount, "unread_count": counts.UnreadCount, "pending_invitation_count": counts.PendingInvitationCount})
+}
+
+type markSummaryReadRequest struct {
+	TeamResultID      *int64 `json:"team_result_id"`
+	PersonalVersionID *int64 `json:"personal_version_id"`
+}
+
+// MarkSummaryRead records exactly the versions rendered by the caller. It does
+// not blindly mark the latest version, so a result completed concurrently with
+// an older detail request remains unread.
+func (h *TaskHandler) MarkSummaryRead(c *gin.Context) {
+	taskID, resolved := h.resolveSummaryTaskParam(c)
+	if !resolved {
+		return
+	}
+	if _, authorized := h.authorizeTaskAccess(c, taskID); !authorized {
+		return
+	}
+	var req markSummaryReadRequest
+	if err := c.ShouldBindJSON(&req); err != nil || (req.TeamResultID == nil && req.PersonalVersionID == nil) {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "team_result_id or personal_version_id is required"})
+		return
+	}
+	userID := middleware.GetUserID(c)
+	if req.TeamResultID != nil {
+		var count int64
+		h.db.Model(&model.SummaryResult{}).Where("id = ? AND task_id = ?", *req.TeamResultID, taskID).Count(&count)
+		if count == 0 {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "result does not belong to task"})
+			return
+		}
+	}
+	if req.PersonalVersionID != nil {
+		var count int64
+		h.db.Model(&model.PersonalResultVersion{}).Where("id = ? AND task_id = ? AND user_id = ?", *req.PersonalVersionID, taskID, userID).Count(&count)
+		if count == 0 {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "personal version is not visible to caller"})
+			return
+		}
+	}
+	now := timezone.Now()
+	row := model.SummaryUserRead{TaskID: taskID, UserID: userID, LastReadTeamResultID: req.TeamResultID, LastReadPersonalVersionID: req.PersonalVersionID, ReadAt: &now, CreatedAt: now, UpdatedAt: now}
+	assignments := map[string]interface{}{"read_at": now, "updated_at": now}
+	if req.TeamResultID != nil {
+		assignments["last_read_team_result_id"] = *req.TeamResultID
+	}
+	if req.PersonalVersionID != nil {
+		assignments["last_read_personal_version_id"] = *req.PersonalVersionID
+	}
+	if err := h.db.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "task_id"}, {Name: "user_id"}}, DoUpdates: clause.Assignments(assignments)}).Create(&row).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
+		return
+	}
+	var state struct {
+		CurrentTeamID     *int64 `gorm:"column:current_team_id"`
+		CurrentPersonalID *int64 `gorm:"column:current_personal_id"`
+		ReadTeamID        *int64 `gorm:"column:read_team_id"`
+		ReadPersonalID    *int64 `gorm:"column:read_personal_id"`
+		PendingInvitation bool   `gorm:"column:pending_invitation"`
+	}
+	h.db.Raw(`SELECT t.current_result_id AS current_team_id,
+ pr.current_version_id AS current_personal_id,
+ sur.last_read_team_result_id AS read_team_id,
+ sur.last_read_personal_version_id AS read_personal_id,
+ CASE WHEN p.status = ? THEN 1 ELSE 0 END AS pending_invitation
+ FROM summary_task t
+ LEFT JOIN summary_personal_result pr ON pr.task_id=t.id AND pr.user_id=?
+ LEFT JOIN summary_user_read sur ON sur.task_id=t.id AND sur.user_id=?
+ LEFT JOIN summary_participant p ON p.task_id=t.id AND p.user_id=?
+ WHERE t.id=?`, model.ParticipantPending, userID, userID, userID, taskID).Scan(&state)
+	teamUnread := state.CurrentTeamID != nil && (state.ReadTeamID == nil || *state.CurrentTeamID != *state.ReadTeamID)
+	personalUnread := state.CurrentPersonalID != nil && (state.ReadPersonalID == nil || *state.CurrentPersonalID != *state.ReadPersonalID)
+	isUnread := teamUnread || personalUnread
+	ok(c, gin.H{
+		"task_id": taskID, "team_result_id": req.TeamResultID, "personal_version_id": req.PersonalVersionID,
+		"is_unread": isUnread, "has_pending_invitation": state.PendingInvitation,
+		"needs_attention": isUnread || state.PendingInvitation,
+	})
 }
 
 // GetSummary handles GET /api/v1/summaries/:id

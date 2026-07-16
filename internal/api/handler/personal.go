@@ -452,15 +452,16 @@ func (h *PersonalHandler) GetPersonal(c *gin.Context) {
 	}
 
 	result := gin.H{
-		"id":             pr.ID,
-		"version":        version,
-		"worker_status":  pr.WorkerStatus,
-		"workflow_stage": pr.WorkflowStage,
-		"content":        pr.Content,
-		"citations":      pr.GetCitations(),
-		"submitted_at":   nil,
-		"generated_at":   nil,
-		"msg_count":      pr.MsgCount,
+		"id":                 pr.ID,
+		"version":            version,
+		"worker_status":      pr.WorkerStatus,
+		"workflow_stage":     pr.WorkflowStage,
+		"content":            pr.Content,
+		"citations":          pr.GetCitations(),
+		"submitted_at":       nil,
+		"generated_at":       nil,
+		"msg_count":          pr.MsgCount,
+		"current_version_id": pr.CurrentVersionID,
 	}
 	if pr.SubmittedAt != nil {
 		result["submitted_at"] = pr.SubmittedAt.Format(time.RFC3339)

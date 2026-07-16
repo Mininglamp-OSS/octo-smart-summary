@@ -361,7 +361,11 @@ func setupListTestDBs(t *testing.T) (db *gorm.DB, imDB *gorm.DB) {
 	if err != nil {
 		t.Fatalf("open summary db: %v", err)
 	}
-	db.AutoMigrate(&model.SummaryTask{}, &model.SummarySource{}, &model.SummaryParticipant{}, &model.SummaryResult{})
+	db.AutoMigrate(
+		&model.SummaryTask{}, &model.SummarySource{}, &model.SummaryParticipant{},
+		&model.SummaryResult{}, &model.PersonalResult{}, &model.PersonalResultVersion{},
+		&model.SummaryUserRead{},
+	)
 
 	imDB, err = gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	if err != nil {

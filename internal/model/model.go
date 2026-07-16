@@ -345,6 +345,22 @@ type SummaryEvent struct {
 
 func (SummaryEvent) TableName() string { return "summary_event" }
 
+// SummaryUserRead stores the last team and personal result actually rendered by
+// one user. Team and personal result ids live in different tables, so they must
+// never share a single cursor column.
+type SummaryUserRead struct {
+	ID                        int64      `gorm:"primaryKey;autoIncrement" json:"id"`
+	TaskID                    int64      `gorm:"column:task_id;not null;uniqueIndex:uk_summary_user_read_task_user" json:"task_id"`
+	UserID                    string     `gorm:"column:user_id;type:varchar(64);not null;uniqueIndex:uk_summary_user_read_task_user" json:"user_id"`
+	LastReadTeamResultID      *int64     `gorm:"column:last_read_team_result_id" json:"last_read_team_result_id"`
+	LastReadPersonalVersionID *int64     `gorm:"column:last_read_personal_version_id" json:"last_read_personal_version_id"`
+	ReadAt                    *time.Time `gorm:"column:read_at" json:"read_at"`
+	CreatedAt                 time.Time  `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt                 time.Time  `gorm:"column:updated_at;not null" json:"updated_at"`
+}
+
+func (SummaryUserRead) TableName() string { return "summary_user_read" }
+
 // TaskEvent is the payload for Worker → API HTTP callback.
 type TaskEvent struct {
 	TaskID       int64  `json:"task_id"`
