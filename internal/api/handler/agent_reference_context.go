@@ -200,6 +200,38 @@ func appOriginToStorageChannelType(origin int) int {
 	}
 }
 
+// storageChannelTypeToAppOrigin is the reverse mapping of
+// appOriginToStorageChannelType — WuKongIM storage-layer channel_type back
+// to application-layer OriginChannelType, used when we resolve a session's
+// tool-argument channel_type back into the value we persist in
+// SummaryTask.OriginChannelType (SUM-158 blocker 4).
+//
+// Storage layer → Application layer:
+//
+//	ChannelTypeDM     (1) → OriginChannelDM     (3)
+//	ChannelTypeGroup  (2) → OriginChannelGroup  (1)
+//	ChannelTypeThread (5) → OriginChannelThread (2)
+//
+// Returns (0, false) for unrecognized storage-layer values so callers can
+// distinguish "not-recognized" from a legitimate OriginChannelGlobal (0).
+// Historical bug (SUM-158): CreateAgentSummary used to store the raw tool
+// channel_type (1/2/5) directly as origin_channel_type, so DM sessions were
+// mis-stored as Group and Thread sessions fell outside the 1..3 validation
+// window entirely. Callers must translate through this function before
+// writing to the SummaryTask row.
+func storageChannelTypeToAppOrigin(storage int) (int, bool) {
+	switch storage {
+	case model.ChannelTypeDM:
+		return model.OriginChannelDM, true
+	case model.ChannelTypeGroup:
+		return model.OriginChannelGroup, true
+	case model.ChannelTypeThread:
+		return model.OriginChannelThread, true
+	default:
+		return 0, false
+	}
+}
+
 // serializeReferencedTaskIDs converts a slice of task IDs to a JSON string
 // suitable for storing in SummaryTask.ReferencedTaskIDs. Returns nil (not
 // empty string) when the list is empty so the DB column stays NULL.

@@ -160,7 +160,20 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			}
 		} else {
 			finalChannelID = resolvedID
-			finalChannelType = resolvedType
+			// SUM-158 blocker 4: resolveOriginChannelFromSession returns the
+			// STORAGE-layer channel_type (1=DM, 2=Group, 5=Thread) recovered
+			// from the tool call args. But SummaryTask.OriginChannelType stores
+			// the APPLICATION-layer value (1=Group, 2=Thread, 3=DM). Without
+			// this translation DM sessions get written as Group, and Thread
+			// (5) falls outside the 1..3 validation window entirely.
+			appOrigin, ok := storageChannelTypeToAppOrigin(resolvedType)
+			if !ok {
+				log.Printf("[handler] CreateAgentSummary: resolveOriginChannelFromSession returned unrecognized storage channel_type=%d session=%s (channel_id=%s)",
+					resolvedType, req.SessionID, resolvedID)
+				c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "无法识别 session 中 fetch_channel 的 channel_type,请重新触发 agent 或显式传 origin_channel_type"})
+				return
+			}
+			finalChannelType = appOrigin
 		}
 	} else {
 		// Provided (even if empty string) → validate as before

@@ -161,14 +161,19 @@ func TestCreateAgentSummary_NotProvidedResolveSuccess(t *testing.T) {
 		t.Errorf("expected code=0, got %v", resp["code"])
 	}
 
-	// Verify DB used the resolved values
+	// Verify DB used the resolved values.
+	// Seed tool call uses storage-layer channel_type=2 (Group). After the
+	// SUM-158 blocker 4 fix the handler must translate this to the
+	// application-layer OriginChannelGroup=1 before persisting (previously
+	// the raw storage value was stored, mis-labeling Groups as Threads).
 	var task model.SummaryTask
 	db.First(&task)
 	if task.OriginChannelID != "CH-RESOLVED" {
 		t.Errorf("expected resolved origin_channel_id=CH-RESOLVED, got %s", task.OriginChannelID)
 	}
-	if task.OriginChannelType != 2 {
-		t.Errorf("expected resolved origin_channel_type=2, got %d", task.OriginChannelType)
+	if task.OriginChannelType != model.OriginChannelGroup {
+		t.Errorf("expected resolved origin_channel_type=%d (OriginChannelGroup, from storage=2), got %d",
+			model.OriginChannelGroup, task.OriginChannelType)
 	}
 }
 
