@@ -477,8 +477,15 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	// Build the shared filter fragment (applied identically to the folded COUNT and
 	// the folded page query). All business filters live INSIDE the window subquery
 	// so "latest per schedule" is computed over the already-filtered set.
-	whereSQL := "space_id = ? AND deleted_at IS NULL AND (creator_id = ? OR id IN (SELECT task_id FROM summary_participant WHERE user_id = ?))"
+	// Under schedule-level CONFIRM, an unconfirmed roster member is intentionally
+	// not materialized in summary_participant. Admit that config-only invitee here;
+	// otherwise the later attention expression never gets a row to mark pending.
+	scheduleVisibilityExpr := h.schedulePendingInvitationExpr("summary_task")
+	whereSQL := "space_id = ? AND deleted_at IS NULL AND (creator_id = ? OR id IN (SELECT task_id FROM summary_participant WHERE user_id = ?) OR " + scheduleVisibilityExpr + ")"
 	args := []interface{}{spaceID, userID, userID}
+	if h.db.Dialector.Name() == "mysql" {
+		args = append(args, userID)
+	}
 
 	if s := c.Query("status"); s != "" {
 		if v, err := strconv.Atoi(s); err == nil {
@@ -568,7 +575,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	      THEN CASE WHEN cr.generated_at >= pv.generated_at THEN cr.generated_at ELSE pv.generated_at END
 	      ELSE COALESCE(cr.generated_at, pv.generated_at, sub.created_at) END AS activity_at`
 	pageSQL := "SELECT sub.*" + attentionSelect + " FROM (" + innerSQL + ") sub" + attentionJoins +
-		" WHERE sub.rn = 1 ORDER BY has_pending_invitation DESC, is_unread DESC, activity_at DESC, sub.id DESC, " + orderClause + " LIMIT ? OFFSET ?"
+		" WHERE sub.rn = 1 ORDER BY has_pending_invitation DESC, is_unread DESC, activity_at DESC, " + orderClause + ", sub.id DESC LIMIT ? OFFSET ?"
 	pageArgs := []interface{}{model.ParticipantPending}
 	if h.db.Dialector.Name() == "mysql" {
 		pageArgs = append(pageArgs, userID)
@@ -711,7 +718,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 
 	// Counts deliberately ignore the current list filters: the navigation badge
 	// represents all cards that require this user's attention in the space.
-	countInner := "SELECT *, ROW_NUMBER() OVER (PARTITION BY (CASE WHEN schedule_id IS NULL THEN CONCAT('t', id) ELSE CONCAT('s', schedule_id) END) ORDER BY id DESC) AS rn FROM summary_task WHERE space_id = ? AND deleted_at IS NULL AND (creator_id = ? OR id IN (SELECT task_id FROM summary_participant WHERE user_id = ?))"
+	countInner := "SELECT *, ROW_NUMBER() OVER (PARTITION BY (CASE WHEN schedule_id IS NULL THEN CONCAT('t', id) ELSE CONCAT('s', schedule_id) END) ORDER BY id DESC) AS rn FROM summary_task WHERE space_id = ? AND deleted_at IS NULL AND (creator_id = ? OR id IN (SELECT task_id FROM summary_participant WHERE user_id = ?) OR " + scheduleVisibilityExpr + ")"
 	attentionCountSQL := "SELECT COALESCE(SUM(has_invite),0) pending_invitation_count, COALESCE(SUM(unread),0) unread_count, COALESCE(SUM(CASE WHEN has_invite=1 OR unread=1 THEN 1 ELSE 0 END),0) attention_count FROM (SELECT CASE WHEN me.status=? OR " + schedulePendingExpr + " THEN 1 ELSE 0 END has_invite, CASE WHEN (sub.current_result_id IS NOT NULL AND (sur.last_read_team_result_id IS NULL OR sur.last_read_team_result_id<>sub.current_result_id)) OR (pr.current_version_id IS NOT NULL AND (sur.last_read_personal_version_id IS NULL OR sur.last_read_personal_version_id<>pr.current_version_id)) THEN 1 ELSE 0 END unread FROM (" + countInner + ") sub" + attentionJoins + " WHERE sub.rn=1) attention"
 	var counts struct {
 		AttentionCount         int64 `gorm:"column:attention_count"`
@@ -722,7 +729,11 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	if h.db.Dialector.Name() == "mysql" {
 		countArgs = append(countArgs, userID)
 	}
-	countArgs = append(countArgs, spaceID, userID, userID, userID, userID, userID, userID)
+	countArgs = append(countArgs, spaceID, userID, userID)
+	if h.db.Dialector.Name() == "mysql" {
+		countArgs = append(countArgs, userID)
+	}
+	countArgs = append(countArgs, userID, userID, userID, userID)
 	if err := h.db.Raw(attentionCountSQL, countArgs...).Scan(&counts).Error; err != nil {
 		log.Printf("list summaries attention count query failed: %v", err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "failed to list summaries"})
