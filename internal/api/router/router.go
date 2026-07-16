@@ -58,6 +58,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		v1.GET("/summaries", taskH.ListSummaries)
 		v1.GET("/summaries/:id", taskH.GetSummary)
 		v1.GET("/summaries/:id/stream", streamH.StreamSummary)
+		v1.POST("/summaries/:id/read", taskH.MarkSummaryRead)
 		v1.GET("/summaries/:id/result", taskH.GetResult)
 		v1.POST("/summaries/:id/regenerate", taskH.Regenerate)
 		v1.POST("/summaries/:id/refine", editH.RefineSummary)

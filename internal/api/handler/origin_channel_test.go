@@ -29,7 +29,9 @@ func setupOriginTestDB(t *testing.T) (db *gorm.DB, imDB *gorm.DB) {
 		&model.SummarySource{},
 		&model.SummaryParticipant{},
 		&model.PersonalResult{},
+		&model.PersonalResultVersion{},
 		&model.SummaryResult{},
+		&model.SummaryUserRead{},
 	)
 	imDB, err = gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	if err != nil {
