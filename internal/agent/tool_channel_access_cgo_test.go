@@ -102,6 +102,7 @@ func TestFetchChannelTool_AccessControl(t *testing.T) {
 		// Request channel-B (not in user-1's accessible channels)
 		reqJSON := []byte(`{
 			"channel_id": "channel-B",
+			"channel_type": 2,
 			"time_start": "2024-01-01T00:00:00Z",
 			"time_end": "2024-01-02T00:00:00Z"
 		}`)
@@ -128,6 +129,7 @@ func TestFetchChannelTool_AccessControl(t *testing.T) {
 		// Request channel-A (in user-1's accessible channels)
 		reqJSON := []byte(`{
 			"channel_id": "channel-A",
+			"channel_type": 2,
 			"time_start": "2024-01-01T00:00:00Z",
 			"time_end": "2024-01-02T00:00:00Z"
 		}`)
@@ -193,6 +195,7 @@ func TestPeekChannelTool_AccessControl(t *testing.T) {
 		// Request channel-Y (not in user-2's accessible channels)
 		reqJSON := []byte(`{
 			"channel_id": "channel-Y",
+			"channel_type": 2,
 			"time_start": "2024-01-01T00:00:00Z",
 			"time_end": "2024-01-02T00:00:00Z",
 			"limit": 30
@@ -220,6 +223,7 @@ func TestPeekChannelTool_AccessControl(t *testing.T) {
 		// Request channel-X (in user-2's accessible channels)
 		reqJSON := []byte(`{
 			"channel_id": "channel-X",
+			"channel_type": 2,
 			"time_start": "2024-01-01T00:00:00Z",
 			"time_end": "2024-01-02T00:00:00Z",
 			"limit": 30

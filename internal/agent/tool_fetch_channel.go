@@ -41,7 +41,7 @@ func FetchChannelTool() (Tool, Handler) {
 						"description": "每频道最大消息数，<=0 使用配置默认值",
 					},
 				},
-				"required": []string{"channel_id", "time_start", "time_end"},
+				"required": []string{"channel_id", "channel_type", "time_start", "time_end"},
 			},
 		},
 	}

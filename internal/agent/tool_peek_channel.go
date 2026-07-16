@@ -41,7 +41,7 @@ func PeekChannelTool() (Tool, Handler) {
 						"description": "结束时间 RFC3339，留空则用当前时间",
 					},
 				},
-				"required": []string{"channel_id"},
+				"required": []string{"channel_id", "channel_type"},
 			},
 		},
 	}
