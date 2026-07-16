@@ -174,7 +174,7 @@ func TestChatStreamContextTimeout(t *testing.T) {
 		t.Errorf("expected NO 'event: done' on timeout, got: %s", body)
 	}
 	// AppendMessages 不应被调
-	history, _ := store.LoadHistory(context.Background(), "sess-timeout")
+	history, _ := store.LoadHistory(context.Background(), "sess-timeout", testAgentChatUID)
 	if len(history) != 0 {
 		t.Errorf("expected no persistence on timeout, but got %d msgs", len(history))
 	}
@@ -220,7 +220,7 @@ func TestChatStreamClientDisconnect(t *testing.T) {
 	}
 
 	// 断言:不落库(因为 runner 返回 err)
-	history, _ := store.LoadHistory(context.Background(), "sess-abort")
+	history, _ := store.LoadHistory(context.Background(), "sess-abort", testAgentChatUID)
 	if len(history) != 0 {
 		t.Errorf("expected no persistence after client abort, got %d msgs", len(history))
 	}
@@ -249,7 +249,7 @@ func TestChatStreamPersistenceEquivalent(t *testing.T) {
 	if wChat.Code != http.StatusOK {
 		t.Fatalf("chat: expected 200, got %d body=%s", wChat.Code, wChat.Body.String())
 	}
-	histChat, _ := storeChat.LoadHistory(context.Background(), "sess-eq-chat")
+	histChat, _ := storeChat.LoadHistory(context.Background(), "sess-eq-chat", testAgentChatUID)
 
 	// 场景 5b:ChatStream 落库(独立 store,同 message,同 reply)
 	hStream := newTestAgentChatHandler(reply)
@@ -260,7 +260,7 @@ func TestChatStreamPersistenceEquivalent(t *testing.T) {
 	if wStream.Code != http.StatusOK {
 		t.Fatalf("stream: expected 200, got %d body=%s", wStream.Code, wStream.Body.String())
 	}
-	histStream, _ := storeStream.LoadHistory(context.Background(), "sess-eq-stream")
+	histStream, _ := storeStream.LoadHistory(context.Background(), "sess-eq-stream", testAgentChatUID)
 
 	// 断言 1:两侧都落了 user + assistant 两条(不多不少)
 	if len(histChat) != 2 || len(histStream) != 2 {

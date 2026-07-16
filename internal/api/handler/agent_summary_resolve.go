@@ -30,17 +30,20 @@ type fetchChannelArgs struct {
 // messages for the first fetch_channel tool call and returns its channel_id
 // and channel_type.
 //
+// owner-scoped：必须传 userID，避免从他人 session 反推 channel 信息
+// （SUM-158 blocker 1）。
+//
 // Returns ("", 0, nil) when no fetch_channel call is found — this is NOT an
 // error, just means the session has no tool trace to backfill from.
 // Only returns a non-nil error for real DB failures.
 func (h *AgentSummaryHandler) resolveOriginChannelFromSession(
-	ctx context.Context, sessionID string,
+	ctx context.Context, sessionID, userID string,
 ) (channelID string, channelType int, err error) {
 	// Query all assistant messages with tool_calls (non-NULL), ordered by id ASC
 	// to find the chronologically earliest tool invocations.
 	var assistantMessages []model.AgentMessage
 	err = h.db.WithContext(ctx).
-		Where("session_id = ? AND role = ? AND tool_calls IS NOT NULL", sessionID, "assistant").
+		Where("user_id = ? AND session_id = ? AND role = ? AND tool_calls IS NOT NULL", userID, sessionID, "assistant").
 		Order("id ASC").
 		Find(&assistantMessages).Error
 	if err != nil {

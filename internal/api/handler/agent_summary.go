@@ -127,7 +127,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 
 	if req.OriginChannelID == nil {
 		// Not provided → resolve from session tool traces
-		resolvedID, resolvedType, err := h.resolveOriginChannelFromSession(c.Request.Context(), req.SessionID)
+		resolvedID, resolvedType, err := h.resolveOriginChannelFromSession(c.Request.Context(), req.SessionID, userID)
 		if err != nil {
 			// DB error or other real failure → 500
 			log.Printf("[handler] resolveOriginChannelFromSession failed session=%s: %v", req.SessionID, err)
@@ -187,7 +187,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	// deliverable. Empty content ⇒ 40004 (must block, no empty summary allowed).
 	// We only look at messages with tool_calls IS NULL to skip the intermediate
 	// "call this tool" assistant messages; the final answer never has tool_calls.
-	content, err := loadLatestAssistantContent(h.db, req.SessionID)
+	content, err := loadLatestAssistantContent(h.db, req.SessionID, userID)
 	if err != nil {
 		if errors.Is(err, errNoAgentOutput) {
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40004, Message: "session 无有效产出,请先在对话中生成总结再保存"})
@@ -335,7 +335,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		}
 		creatorPR.SetCitations(cits)
 		// Build v1 snapshot for agent-generated summary
-		snapshot := h.buildSnapshotV1(tx, req.SessionID, &task, req.Sources)
+		snapshot := h.buildSnapshotV1(tx, req.SessionID, userID, &task, req.Sources)
 		creatorPR.SetSnapshot(snapshot)
 		if err := tx.Create(&creatorPR).Error; err != nil {
 			return fmt.Errorf("create creator personal_result: %w", err)
@@ -372,7 +372,8 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		// let the whole transaction commit (the summary was saved fine, we
 		// just leave orphan message rows for a cleanup cron). A failure
 		// here should NOT block the user from seeing their saved summary.
-		if err := tx.Where("session_id = ?", req.SessionID).Delete(&model.AgentMessage{}).Error; err != nil {
+		// owner-scoped：只删本 uid 的记录，防止 session_id 撞车时误删他人（SUM-158 blocker 1）。
+		if err := tx.Where("user_id = ? AND session_id = ?", userID, req.SessionID).Delete(&model.AgentMessage{}).Error; err != nil {
 			log.Printf("[handler] CreateAgentSummary: session cleanup DELETE failed session=%s: %v (summary was saved OK, orphan rows will remain)", req.SessionID, err)
 			// Intentionally do NOT return err — the summary is safely saved.
 		}
@@ -409,9 +410,12 @@ var errNoAgentOutput = errors.New("no assistant output on session")
 // loadLatestAssistantContent returns the latest non-empty assistant message
 // text on the given session (skipping intermediate "call this tool" messages,
 // which are recognisable because they carry a tool_calls payload).
-func loadLatestAssistantContent(db *gorm.DB, sessionID string) (string, error) {
+//
+// owner-scoped：必须传 userID，跨用户匹配返回 errNoAgentOutput（与真实空会话
+// 在响应上不可区分，不泄漏 session 存在）(SUM-158 blocker 1)。
+func loadLatestAssistantContent(db *gorm.DB, sessionID, userID string) (string, error) {
 	var msg model.AgentMessage
-	err := db.Where("session_id = ? AND role = ? AND tool_calls IS NULL AND content <> ''", sessionID, "assistant").
+	err := db.Where("user_id = ? AND session_id = ? AND role = ? AND tool_calls IS NULL AND content <> ''", userID, sessionID, "assistant").
 		Order("id DESC").
 		Limit(1).
 		Take(&msg).Error
@@ -427,15 +431,18 @@ func loadLatestAssistantContent(db *gorm.DB, sessionID string) (string, error) {
 // buildSnapshotV1 constructs the v1 snapshot for an agent-generated summary.
 // This is the initial snapshot (parent_snapshot_version=null, user_instruction=null).
 // Tool summary is built by counting role='tool' messages in agent_message.
+//
+// owner-scoped：必须传 userID，避免 tool 统计跨用户聚合别人 session 的行数
+// （SUM-158 blocker 1）。
 func (h *AgentSummaryHandler) buildSnapshotV1(
 	db *gorm.DB,
-	sessionID string,
+	sessionID, userID string,
 	task *model.SummaryTask,
 	sources []sourceReq,
 ) *model.Snapshot {
 	// Build tool_summary: count tool invocations by name
 	var toolMessages []model.AgentMessage
-	if err := db.Where("session_id = ? AND role = ?", sessionID, "tool").
+	if err := db.Where("user_id = ? AND session_id = ? AND role = ?", userID, sessionID, "tool").
 		Find(&toolMessages).Error; err != nil {
 		log.Printf("[handler] buildSnapshotV1: failed to query tool messages: %v", err)
 		// fallback to empty array on error

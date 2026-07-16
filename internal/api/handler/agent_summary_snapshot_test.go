@@ -24,9 +24,9 @@ func TestBuildSnapshotV1(t *testing.T) {
 
 	// Insert some tool messages
 	toolMessages := []model.AgentMessage{
-		{SessionID: sessionID, Role: "tool", Name: "fetch_channel", Content: "result1", CreatedAt: time.Now()},
-		{SessionID: sessionID, Role: "tool", Name: "search_messages", Content: "result2", CreatedAt: time.Now()},
-		{SessionID: sessionID, Role: "tool", Name: "fetch_channel", Content: "result3", CreatedAt: time.Now()},
+		{UserID: "test-user", SessionID: sessionID, Role: "tool", Name: "fetch_channel", Content: "result1", CreatedAt: time.Now()},
+		{UserID: "test-user", SessionID: sessionID, Role: "tool", Name: "search_messages", Content: "result2", CreatedAt: time.Now()},
+		{UserID: "test-user", SessionID: sessionID, Role: "tool", Name: "fetch_channel", Content: "result3", CreatedAt: time.Now()},
 	}
 	for _, msg := range toolMessages {
 		if err := db.Create(&msg).Error; err != nil {
@@ -46,7 +46,7 @@ func TestBuildSnapshotV1(t *testing.T) {
 		{SourceID: "ch2", SourceType: 1},
 	}
 
-	snap := h.buildSnapshotV1(db, sessionID, task, sources)
+	snap := h.buildSnapshotV1(db, sessionID, "test-user", task, sources)
 
 	if snap == nil {
 		t.Fatal("expected non-nil snapshot")
@@ -124,6 +124,7 @@ func TestCreateAgentSummary_SnapshotPersisted(t *testing.T) {
 
 	// Seed agent_message with an assistant reply
 	assistantMsg := model.AgentMessage{
+		UserID:    "test-user",
 		SessionID: sessionID,
 		Role:      "assistant",
 		Content:   "This is the agent-produced summary content.",
@@ -135,8 +136,8 @@ func TestCreateAgentSummary_SnapshotPersisted(t *testing.T) {
 
 	// Seed some tool messages
 	toolMessages := []model.AgentMessage{
-		{SessionID: sessionID, Role: "tool", Name: "fetch_channel", Content: "tool result", CreatedAt: time.Now()},
-		{SessionID: sessionID, Role: "tool", Name: "search_messages", Content: "tool result 2", CreatedAt: time.Now()},
+		{UserID: "test-user", SessionID: sessionID, Role: "tool", Name: "fetch_channel", Content: "tool result", CreatedAt: time.Now()},
+		{UserID: "test-user", SessionID: sessionID, Role: "tool", Name: "search_messages", Content: "tool result 2", CreatedAt: time.Now()},
 	}
 	for _, msg := range toolMessages {
 		if err := db.Create(&msg).Error; err != nil {
@@ -176,7 +177,7 @@ func TestCreateAgentSummary_SnapshotPersisted(t *testing.T) {
 	// Build the snapshot manually (mimicking what the handler does)
 	h := &AgentSummaryHandler{db: db}
 	sources := []sourceReq{{SourceID: "channel1", SourceType: 1}}
-	snapshot := h.buildSnapshotV1(db, sessionID, &task, sources)
+	snapshot := h.buildSnapshotV1(db, sessionID, "test-user", &task, sources)
 
 	// Create the PersonalResult with snapshot
 	now := time.Now()

@@ -35,7 +35,7 @@ func (h *AgentSummaryHandler) buildCitationsForSession(
 	// 1. 从 agent_message 拿本 session 所有 role='tool' 的返回值
 	var toolMessages []model.AgentMessage
 	err := h.db.WithContext(ctx).
-		Where("session_id = ? AND role = ?", sessionID, "tool").
+		Where("user_id = ? AND session_id = ? AND role = ?", uid, sessionID, "tool").
 		Order("id ASC").
 		Find(&toolMessages).Error
 	if err != nil {

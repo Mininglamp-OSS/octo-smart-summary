@@ -55,10 +55,21 @@ func newTestAgentChatHandlerErr(err error) *AgentChatHandler {
 	return newAgentChatHandlerWithRunner(runner, "test-system-prompt", newFakeHistoryStore(), 10)
 }
 
+// testAgentChatUID 是 test router 默认注入的 uid，模拟 middleware.StrictAuth 已完成鉴权。
+// 与 SUM-158 blocker 1 修复对齐：handler 必须能从 gin.Context 拿到非空 user_id 才能查/写 owner-scoped 记录。
+const testAgentChatUID = "test-uid"
+
 func setupAgentChatRouter(h *AgentChatHandler) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
+	// 注入固定 uid，模拟已通过鉴权中间件。生产走 StrictAuthMiddleware → middleware.GetUserID。
+	r.Use(func(c *gin.Context) {
+		c.Set("user_id", testAgentChatUID)
+		c.Next()
+	})
 	r.POST("/api/v1/agent/chat", h.Chat)
+	r.POST("/api/v1/agent/chat/stream", h.ChatStream)
+	r.GET("/api/v1/agent/chat/history", h.History)
 	return r
 }
 
@@ -137,21 +148,28 @@ func TestAgentChatRunnerErrorNotLeaked(t *testing.T) {
 	}
 }
 
-// fakeHistoryStore 是内存版 agentHistoryStore：无需真 DB，模拟按 session 累积历史。
+// fakeHistoryStore 是内存版 agentHistoryStore：无需真 DB，模拟按 (user_id, session) 累积历史。
+// 与 SUM-158 blocker 1 修复对齐：owner-scoped 键 = user_id + session_id。
 type fakeHistoryStore struct {
-	byID map[string][]agent.Message
+	byKey map[string][]agent.Message
 }
 
 func newFakeHistoryStore() *fakeHistoryStore {
-	return &fakeHistoryStore{byID: map[string][]agent.Message{}}
+	return &fakeHistoryStore{byKey: map[string][]agent.Message{}}
 }
 
-func (s *fakeHistoryStore) LoadHistory(ctx context.Context, sessionID string) ([]agent.Message, error) {
-	return append([]agent.Message(nil), s.byID[sessionID]...), nil
+// key 组合 user_id + session_id，模拟 DB WHERE user_id=? AND session_id=? 的 owner-scoped 语义。
+func fakeHistoryKey(sessionID, userID string) string {
+	return userID + "|" + sessionID
 }
 
-func (s *fakeHistoryStore) AppendMessages(ctx context.Context, sessionID string, msgs []agent.Message) error {
-	s.byID[sessionID] = append(s.byID[sessionID], msgs...)
+func (s *fakeHistoryStore) LoadHistory(ctx context.Context, sessionID, userID string) ([]agent.Message, error) {
+	return append([]agent.Message(nil), s.byKey[fakeHistoryKey(sessionID, userID)]...), nil
+}
+
+func (s *fakeHistoryStore) AppendMessages(ctx context.Context, sessionID, userID string, msgs []agent.Message) error {
+	k := fakeHistoryKey(sessionID, userID)
+	s.byKey[k] = append(s.byKey[k], msgs...)
 	return nil
 }
 
@@ -260,7 +278,7 @@ func TestAgentChatMultiTurnHistory(t *testing.T) {
 		t.Fatalf("turn1 ctx len = %d, want 2: %+v", len(chatter.lastMsgs), chatter.lastMsgs)
 	}
 	// 落库后该 session 应有 user+assistant 两条。
-	if got := store.byID[sess]; len(got) != 2 {
+	if got := store.byKey[fakeHistoryKey(sess, testAgentChatUID)]; len(got) != 2 {
 		t.Fatalf("after turn1 store has %d msgs, want 2: %+v", len(got), got)
 	}
 
@@ -286,7 +304,7 @@ func TestAgentChatMultiTurnHistory(t *testing.T) {
 		t.Fatalf("turn2 current user wrong: %+v", m[3])
 	}
 	// 两轮后 store 应累积 4 条。
-	if got := store.byID[sess]; len(got) != 4 {
+	if got := store.byKey[fakeHistoryKey(sess, testAgentChatUID)]; len(got) != 4 {
 		t.Fatalf("after turn2 store has %d msgs, want 4: %+v", len(got), got)
 	}
 }
@@ -341,9 +359,14 @@ func TestRowsDescToMessagesAscEmpty(t *testing.T) {
 }
 
 // setupAgentHistoryRouter 挂 GET /api/v1/agent/chat/history 路由，供 History handler 测试。
+// 与 setupAgentChatRouter 保持一致：注入固定 uid 模拟已通过鉴权中间件（SUM-158 blocker 1）。
 func setupAgentHistoryRouter(h *AgentChatHandler) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("user_id", testAgentChatUID)
+		c.Next()
+	})
 	r.GET("/api/v1/agent/chat/history", h.History)
 	return r
 }
@@ -361,7 +384,7 @@ func doHistory(t *testing.T, r *gin.Engine, sessionID string) *httptest.Response
 func TestAgentChatHistoryOK(t *testing.T) {
 	store := newFakeHistoryStore()
 	const sess = "sess-hist"
-	store.byID[sess] = []agent.Message{
+	store.byKey[fakeHistoryKey(sess, testAgentChatUID)] = []agent.Message{
 		{Role: "user", Content: "你好"},
 		{Role: "assistant", Content: "", ToolCalls: []agent.ToolCall{{ID: "call_1", Type: "function"}}},
 		{Role: "tool", Content: "tool-result", ToolCallID: "call_1", Name: "foo"},
@@ -500,7 +523,7 @@ func TestChatStreamSuccess(t *testing.T) {
 	}
 
 	// Assert AppendMessages was called once (messages were persisted)
-	history, _ := store.LoadHistory(context.Background(), "sess-stream")
+	history, _ := store.LoadHistory(context.Background(), "sess-stream", testAgentChatUID)
 	if len(history) == 0 {
 		t.Fatal("expected AppendMessages to persist messages, but history is empty")
 	}
@@ -533,7 +556,7 @@ func TestChatStreamRunnerError(t *testing.T) {
 	}
 
 	// Assert AppendMessages was NOT called (no persistence on error)
-	history, _ := store.LoadHistory(context.Background(), "sess-err")
+	history, _ := store.LoadHistory(context.Background(), "sess-err", testAgentChatUID)
 	if len(history) != 0 {
 		t.Errorf("expected no AppendMessages on error, but history has %d messages", len(history))
 	}

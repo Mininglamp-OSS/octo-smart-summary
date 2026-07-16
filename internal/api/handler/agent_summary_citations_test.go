@@ -53,7 +53,7 @@ func TestBuildCitationsForSession_WithMarkersAndMessages(t *testing.T) {
 	}
 	content, _ := json.Marshal(toolReturn)
 	msg := model.AgentMessage{
-		SessionID: "session-1",
+		UserID: "test-user", SessionID: "session-1",
 		Role:      "tool",
 		Content:   string(content),
 		Name:      "fetch_channel",
@@ -118,7 +118,7 @@ func TestBuildCitationsForSession_NoMarkers(t *testing.T) {
 	}
 	content, _ := json.Marshal(toolReturn)
 	msg := model.AgentMessage{
-		SessionID: "session-1",
+		UserID: "test-user", SessionID: "session-1",
 		Role:      "tool",
 		Content:   string(content),
 		Name:      "fetch_channel",
@@ -155,7 +155,7 @@ func TestBuildCitationsForSession_EmptyToolTrace(t *testing.T) {
 	}
 	content, _ := json.Marshal(toolReturn)
 	msg := model.AgentMessage{
-		SessionID: "session-1",
+		UserID: "test-user", SessionID: "session-1",
 		Role:      "tool",
 		Content:   string(content),
 		Name:      "fetch_channel",
@@ -269,7 +269,7 @@ func TestBuildCitationsForSession_PeekChannelMultipleMessages(t *testing.T) {
 	}
 	content, _ := json.Marshal(toolReturn)
 	msg := model.AgentMessage{
-		SessionID: "session-1",
+		UserID: "test-user", SessionID: "session-1",
 		Role:      "tool",
 		Content:   string(content),
 		Name:      "peek_channel",
@@ -318,7 +318,10 @@ func TestBuildCitationsForSession_PeekChannelMultipleMessages(t *testing.T) {
 // Test helpers
 
 func setupTestDB(t *testing.T) (*gorm.DB, bool) {
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	// 使用 ":memory:"(不加 file:: / ?cache=shared)确保每个测试独立 DB 不串。
+	// SUM-158 P1-B5 修复：共享缓存曾导致 owner-scoped 查询跨 test 污染。
+	// skill cgo-test-recipe.md 项目公约：新测试都必须用私有 DB。
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	if err != nil {
 		t.Skipf("CGO required for sqlite: %v", err)
 		return nil, true

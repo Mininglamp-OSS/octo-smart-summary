@@ -19,7 +19,12 @@ import (
 // setupAgentSummaryTestDB creates an in-memory test DB with all required tables
 func setupAgentSummaryTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	// 使用 ":memory:"(不加 file:: / ?cache=shared)确保每个测试独立 DB 不串。
+	// SUM-158 P1-B5 修复：原 "file::memory:?cache=shared" 会让本包所有 test 共享同一进程内
+	// 全局 SQLite，跨 test 数据污染导致 owner-scoped 查询命中他测残留（TaskID=1 常年被抢占，
+	// UNIQUE(task_no) 撞车，`db.First(&task)` 拿到他测种子）。skill cgo-test-recipe.md 已把此规则
+	// 写入项目公约。若未来需要跨 test 共享 fixture，请显式做 fixture builder，不要走共享缓存。
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("failed to open test db: %v", err)
 	}
@@ -62,6 +67,7 @@ func TestCreateAgentSummary_ProvidedOriginChannelDirectPass(t *testing.T) {
 	sessionID := "session-valid-001"
 	content := "This is the agent-generated summary."
 	db.Create(&model.AgentMessage{
+		UserID:    "test-user",
 		SessionID: sessionID,
 		Role:      "assistant",
 		Content:   content,
@@ -119,11 +125,13 @@ func TestCreateAgentSummary_NotProvidedResolveSuccess(t *testing.T) {
 	toolCallsJSON := `[{"id":"call_fetch","type":"function","function":{"name":"fetch_channel","arguments":"{\"channel_id\":\"CH-RESOLVED\",\"channel_type\":2}"}}]`
 
 	db.Create(&model.AgentMessage{
+		UserID:    "test-user",
 		SessionID: sessionID,
 		Role:      "assistant",
 		ToolCalls: &toolCallsJSON,
 	})
 	db.Create(&model.AgentMessage{
+		UserID:    "test-user",
 		SessionID: sessionID,
 		Role:      "assistant",
 		Content:   content,
@@ -176,6 +184,7 @@ func TestCreateAgentSummary_NotProvidedResolveFailure(t *testing.T) {
 	sessionID := "session-no-fetch"
 	content := "Summary without origin channel."
 	db.Create(&model.AgentMessage{
+		UserID:    "test-user",
 		SessionID: sessionID,
 		Role:      "assistant",
 		Content:   content,
@@ -204,7 +213,7 @@ func TestCreateAgentSummary_NotProvidedResolveFailure(t *testing.T) {
 		t.Errorf("expected code=40001, got %v", resp["code"])
 	}
 
-	expectedMsg := "origin_channel_id 未传且无法从 session 反查(session 无 fetch_channel 调用)"
+	expectedMsg := "origin_channel_id 未传且无法从 session 反查(session 无 fetch_channel 调用),也无引用总结可继承 origin"
 	if resp["message"].(string) != expectedMsg {
 		t.Errorf("expected new message, got: %s", resp["message"])
 	}
@@ -221,6 +230,7 @@ func TestCreateAgentSummary_ExplicitlyEmptyString(t *testing.T) {
 	sessionID := "session-empty-string"
 	content := "Summary content."
 	db.Create(&model.AgentMessage{
+		UserID:    "test-user",
 		SessionID: sessionID,
 		Role:      "assistant",
 		Content:   content,
@@ -267,6 +277,7 @@ func TestCreateAgentSummary_InvalidChannelType(t *testing.T) {
 	sessionID := "session-invalid-type"
 	content := "Summary content."
 	db.Create(&model.AgentMessage{
+		UserID:    "test-user",
 		SessionID: sessionID,
 		Role:      "assistant",
 		Content:   content,

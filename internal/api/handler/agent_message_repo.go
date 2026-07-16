@@ -16,9 +16,13 @@ import (
 const maxHistoryRows = 200
 
 // agentHistoryStore 抽象多轮记忆的读写，便于 handler 单测注入 mock（无需真 DB）。
+//
+// 权限模型（SUM-158 blocker 1 修复）：所有查询必须携带 userID，服务端从鉴权
+// 中间件（middleware.GetUserID）注入。跨用户命中返回空历史（LoadHistory）或
+// 不落库（AppendMessages 侧不该出现——handler 层保证 userID 一致后才调）。
 type agentHistoryStore interface {
-	LoadHistory(ctx context.Context, sessionID string) ([]agent.Message, error)
-	AppendMessages(ctx context.Context, sessionID string, msgs []agent.Message) error
+	LoadHistory(ctx context.Context, sessionID, userID string) ([]agent.Message, error)
+	AppendMessages(ctx context.Context, sessionID, userID string, msgs []agent.Message) error
 }
 
 // agentMessageRepo 是 agentHistoryStore 的 gorm 实现，落在 agent_message 表。
@@ -30,13 +34,17 @@ func newAgentMessageRepo(db *gorm.DB) *agentMessageRepo {
 	return &agentMessageRepo{db: db}
 }
 
-// LoadHistory 取该 session 最近 maxHistoryRows 条（DB 层 id DESC + Limit 粗筛），
-// 在 Go 里反转回 id 升序（即对话时序）后返回，维持 LoadHistory 升序返回的既有契约。
-func (r *agentMessageRepo) LoadHistory(ctx context.Context, sessionID string) ([]agent.Message, error) {
+// LoadHistory 取该 (user_id, session_id) 最近 maxHistoryRows 条（DB 层 id DESC + Limit
+// 粗筛），在 Go 里反转回 id 升序（即对话时序）后返回，维持 LoadHistory 升序返回的既有契约。
+//
+// 权限：强制 user_id 过滤——即使跨用户猜到相同 session_id 字面值，也只会看到自己那部分
+// 记录（各自表现为一个不存在的会话，返回空历史）。
+func (r *agentMessageRepo) LoadHistory(ctx context.Context, sessionID, userID string) ([]agent.Message, error) {
 	var rows []model.AgentMessage
-	// id DESC + Limit 命中 idx_session_created(session_id, id) 只扫最近后缀，避免全表拉取。
+	// id DESC + Limit 命中 idx_user_session_created(user_id, session_id, id) 只扫最近后缀，
+	// 避免全表拉取。
 	if err := r.db.WithContext(ctx).
-		Where("session_id = ?", sessionID).
+		Where("user_id = ? AND session_id = ?", userID, sessionID).
 		Order("id DESC").
 		Limit(maxHistoryRows).
 		Find(&rows).Error; err != nil {
@@ -72,7 +80,10 @@ func rowsDescToMessagesAsc(rows []model.AgentMessage) ([]agent.Message, error) {
 }
 
 // AppendMessages 批量落本回合新增消息；tool_calls 序列化成 JSON 存列。
-func (r *agentMessageRepo) AppendMessages(ctx context.Context, sessionID string, msgs []agent.Message) error {
+//
+// 权限：user_id 由 handler 从鉴权中间件注入，与 LoadHistory 走同一属主，确保写入
+// 时属主一致，杜绝跨用户污染。
+func (r *agentMessageRepo) AppendMessages(ctx context.Context, sessionID, userID string, msgs []agent.Message) error {
 	if len(msgs) == 0 {
 		return nil
 	}
@@ -81,6 +92,7 @@ func (r *agentMessageRepo) AppendMessages(ctx context.Context, sessionID string,
 	for i := range msgs {
 		row := model.AgentMessage{
 			SessionID:  sessionID,
+			UserID:     userID,
 			Role:       msgs[i].Role,
 			Content:    msgs[i].Content,
 			ToolCallID: msgs[i].ToolCallID,

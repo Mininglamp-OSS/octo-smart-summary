@@ -12,7 +12,8 @@ import (
 // setupResolveTestDB creates an in-memory SQLite DB for testing
 // Returns (db, skip=true) when CGO is not available
 func setupResolveTestDB(t *testing.T) (*gorm.DB, bool) {
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	// 使用 ":memory:" 独立 DB(SUM-158 P1-B5)。
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	if err != nil {
 		t.Skipf("CGO required for sqlite: %v", err)
 		return nil, true
@@ -38,7 +39,7 @@ func TestResolveOriginChannelFromSession_ValidFetchChannel(t *testing.T) {
 	toolCallsJSON := `[{"id":"call_abc","type":"function","function":{"name":"fetch_channel","arguments":"{\"channel_id\":\"CH123\",\"channel_type\":2,\"time_start\":\"2024-01-01T00:00:00Z\",\"time_end\":\"2024-01-02T00:00:00Z\"}"}}]`
 
 	msg := model.AgentMessage{
-		SessionID: sessionID,
+		UserID: "test-user", SessionID: sessionID,
 		Role:      "assistant",
 		Content:   "",
 		ToolCalls: &toolCallsJSON,
@@ -47,7 +48,7 @@ func TestResolveOriginChannelFromSession_ValidFetchChannel(t *testing.T) {
 		t.Fatalf("failed to insert test message: %v", err)
 	}
 
-	channelID, channelType, err := handler.resolveOriginChannelFromSession(context.Background(), sessionID)
+	channelID, channelType, err := handler.resolveOriginChannelFromSession(context.Background(), sessionID, "test-user")
 
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
@@ -74,7 +75,7 @@ func TestResolveOriginChannelFromSession_DefaultChannelType(t *testing.T) {
 	toolCallsJSON := `[{"id":"call_xyz","type":"function","function":{"name":"fetch_channel","arguments":"{\"channel_id\":\"CH456\",\"channel_type\":0}"}}]`
 
 	msg := model.AgentMessage{
-		SessionID: sessionID,
+		UserID: "test-user", SessionID: sessionID,
 		Role:      "assistant",
 		ToolCalls: &toolCallsJSON,
 	}
@@ -82,7 +83,7 @@ func TestResolveOriginChannelFromSession_DefaultChannelType(t *testing.T) {
 		t.Fatalf("failed to insert test message: %v", err)
 	}
 
-	channelID, channelType, err := handler.resolveOriginChannelFromSession(context.Background(), sessionID)
+	channelID, channelType, err := handler.resolveOriginChannelFromSession(context.Background(), sessionID, "test-user")
 
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
@@ -109,7 +110,7 @@ func TestResolveOriginChannelFromSession_NoFetchChannel(t *testing.T) {
 	toolCallsJSON := `[{"id":"call_time","type":"function","function":{"name":"get_current_time","arguments":"{}"}}]`
 
 	msg := model.AgentMessage{
-		SessionID: sessionID,
+		UserID: "test-user", SessionID: sessionID,
 		Role:      "assistant",
 		ToolCalls: &toolCallsJSON,
 	}
@@ -117,7 +118,7 @@ func TestResolveOriginChannelFromSession_NoFetchChannel(t *testing.T) {
 		t.Fatalf("failed to insert test message: %v", err)
 	}
 
-	channelID, channelType, err := handler.resolveOriginChannelFromSession(context.Background(), sessionID)
+	channelID, channelType, err := handler.resolveOriginChannelFromSession(context.Background(), sessionID, "test-user")
 
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
@@ -139,7 +140,7 @@ func TestResolveOriginChannelFromSession_EmptySession(t *testing.T) {
 	}
 	handler := &AgentSummaryHandler{db: db}
 
-	channelID, channelType, err := handler.resolveOriginChannelFromSession(context.Background(), "no-such-session")
+	channelID, channelType, err := handler.resolveOriginChannelFromSession(context.Background(), "no-such-session", "test-user")
 
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
@@ -166,7 +167,7 @@ func TestResolveOriginChannelFromSession_FirstCall(t *testing.T) {
 	// First message with fetch_channel for CH-FIRST
 	toolCalls1 := `[{"id":"call_1","type":"function","function":{"name":"fetch_channel","arguments":"{\"channel_id\":\"CH-FIRST\",\"channel_type\":1}"}}]`
 	msg1 := model.AgentMessage{
-		SessionID: sessionID,
+		UserID: "test-user", SessionID: sessionID,
 		Role:      "assistant",
 		ToolCalls: &toolCalls1,
 	}
@@ -177,7 +178,7 @@ func TestResolveOriginChannelFromSession_FirstCall(t *testing.T) {
 	// Second message with fetch_channel for CH-SECOND
 	toolCalls2 := `[{"id":"call_2","type":"function","function":{"name":"fetch_channel","arguments":"{\"channel_id\":\"CH-SECOND\",\"channel_type\":3}"}}]`
 	msg2 := model.AgentMessage{
-		SessionID: sessionID,
+		UserID: "test-user", SessionID: sessionID,
 		Role:      "assistant",
 		ToolCalls: &toolCalls2,
 	}
@@ -185,7 +186,7 @@ func TestResolveOriginChannelFromSession_FirstCall(t *testing.T) {
 		t.Fatalf("failed to insert test message 2: %v", err)
 	}
 
-	channelID, channelType, err := handler.resolveOriginChannelFromSession(context.Background(), sessionID)
+	channelID, channelType, err := handler.resolveOriginChannelFromSession(context.Background(), sessionID, "test-user")
 
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
@@ -212,7 +213,7 @@ func TestResolveOriginChannelFromSession_SkipsMalformedJSON(t *testing.T) {
 	// First message with malformed JSON
 	malformed := "not valid json"
 	msg1 := model.AgentMessage{
-		SessionID: sessionID,
+		UserID: "test-user", SessionID: sessionID,
 		Role:      "assistant",
 		ToolCalls: &malformed,
 	}
@@ -223,7 +224,7 @@ func TestResolveOriginChannelFromSession_SkipsMalformedJSON(t *testing.T) {
 	// Second message with valid fetch_channel
 	validToolCalls := `[{"id":"call_ok","type":"function","function":{"name":"fetch_channel","arguments":"{\"channel_id\":\"CH-VALID\",\"channel_type\":2}"}}]`
 	msg2 := model.AgentMessage{
-		SessionID: sessionID,
+		UserID: "test-user", SessionID: sessionID,
 		Role:      "assistant",
 		ToolCalls: &validToolCalls,
 	}
@@ -231,7 +232,7 @@ func TestResolveOriginChannelFromSession_SkipsMalformedJSON(t *testing.T) {
 		t.Fatalf("failed to insert test message 2: %v", err)
 	}
 
-	channelID, channelType, err := handler.resolveOriginChannelFromSession(context.Background(), sessionID)
+	channelID, channelType, err := handler.resolveOriginChannelFromSession(context.Background(), sessionID, "test-user")
 
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
@@ -259,7 +260,7 @@ func TestResolveOriginChannelFromSession_DBError(t *testing.T) {
 	
 	handler := &AgentSummaryHandler{db: db}
 
-	channelID, channelType, err := handler.resolveOriginChannelFromSession(context.Background(), "any-session")
+	channelID, channelType, err := handler.resolveOriginChannelFromSession(context.Background(), "any-session", "test-user")
 
 	// Should return an error (not nil), and empty values
 	if err == nil {

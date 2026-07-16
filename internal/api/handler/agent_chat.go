@@ -218,8 +218,9 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		}
 	}
 
-	// 读多轮历史并滑窗截断。
-	history, err := h.store.LoadHistory(ctx, req.SessionID)
+	// 读多轮历史并滑窗截断。owner-scoped：只加载当前 uid 归属的记录，
+	// 跨用户猜到相同 session_id 也只会得到空历史（SUM-158 blocker 1）。
+	history, err := h.store.LoadHistory(ctx, req.SessionID, uid)
 	if err != nil {
 		log.Printf("[agent] load history error: %v", err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "agent chat failed"})
@@ -254,7 +255,8 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 	}
 
 	// 成功回复后才落库；落库失败不阻断本次回复（宁可丢本回合历史，也不只落 user 造脏历史）。
-	if err := h.store.AppendMessages(ctx, req.SessionID, newMsgs); err != nil {
+	// user_id 与 LoadHistory 保持一致，杜绝跨用户污染（SUM-158 blocker 1）。
+	if err := h.store.AppendMessages(ctx, req.SessionID, uid, newMsgs); err != nil {
 		log.Printf("[agent] append messages error: %v", err)
 	}
 
@@ -290,8 +292,16 @@ func (h *AgentChatHandler) History(c *gin.Context) {
 		return
 	}
 
+	// 拿鉴权 uid：owner-scoped 加载，跨用户猜到相同 session_id 只会返回空历史，
+	// 与真实空会话在响应上不可区分（不泄漏 session 存在）(SUM-158 blocker 1)。
+	uid := middleware.GetUserID(c)
+	if uid == "" {
+		c.JSON(http.StatusUnauthorized, apiResponse{Code: 40100, Message: "missing auth context"})
+		return
+	}
+
 	ctx := c.Request.Context()
-	history, err := h.store.LoadHistory(ctx, sessionID)
+	history, err := h.store.LoadHistory(ctx, sessionID, uid)
 	if err != nil {
 		log.Printf("[agent] load history error: %v", err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "agent chat history failed"})
@@ -423,8 +433,8 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		}
 	}
 
-	// Load and truncate history (same as Chat)
-	history, err := h.store.LoadHistory(ctx, req.SessionID)
+	// Load and truncate history (same as Chat). owner-scoped by uid（SUM-158 blocker 1）。
+	history, err := h.store.LoadHistory(ctx, req.SessionID, uid)
 	if err != nil {
 		log.Printf("[agent] load history error: %v", err)
 		h.writeSSEErrorViaSink(sink, 50000, "agent chat failed")
@@ -455,8 +465,8 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		return
 	}
 
-	// Persist messages on success (same as Chat)
-	if err := h.store.AppendMessages(ctx, req.SessionID, newMsgs); err != nil {
+	// Persist messages on success (same as Chat). owner-scoped by uid（SUM-158 blocker 1）。
+	if err := h.store.AppendMessages(ctx, req.SessionID, uid, newMsgs); err != nil {
 		log.Printf("[agent] append messages error: %v", err)
 	}
 
