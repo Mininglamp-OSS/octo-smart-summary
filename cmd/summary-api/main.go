@@ -9,6 +9,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/handler"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/router"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/ws"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/auth"
@@ -74,6 +76,16 @@ func main() {
 	hub := ws.NewHub(summaryDB)
 	streamHub := streaming.NewHub(60 * time.Second)
 
+	// Init OctoSearch client for summary tools
+	var octoClient *service.OctoSearchBatchClient
+	if cfg.OctoSearchURL != "" && cfg.OctoSearchToken != "" {
+		octoClient = service.NewOctoSearchBatchClient(cfg.OctoSearchURL, cfg.OctoSearchToken)
+		log.Printf("[api] OctoSearch client initialized: %s", cfg.OctoSearchURL)
+	}
+
+	// Inject summary dependencies for agent tools
+	agent.SetSummaryDeps(imDB, octoClient, *cfg)
+
 	// Inject IM DB resolvers
 	if imDB != nil {
 		service.SetSourceNameResolver(func(sourceID string) string {
@@ -103,7 +115,9 @@ func main() {
 	if cfg.LLMApiURL != "" && cfg.LLMApiKey != "" && cfg.LLMModel != "" {
 		refineLLM = service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, cfg.ToolCallTimeout)
 	}
-	publicRouter := router.SetupPublic(summaryDB, imDB, hub, authResolver, cfg.WorkerTriggerURL, cfg.CandidateQueryLimit, cfg.FeatureTeamSchedule, cfg.SummaryCustomTemplateLimit, streamHub, refineLLM)
+	// 合并上游后统一签名：上游 streamHub(SSE)+ 上游模板参数 + agent handler 所需的原始 LLM 配置
+	// + 变参 refineLLM(上游 refine/personal 用)。
+	publicRouter := router.SetupPublic(summaryDB, imDB, hub, authResolver, cfg.WorkerTriggerURL, cfg.CandidateQueryLimit, cfg.FeatureTeamSchedule, cfg.SummaryCustomTemplateLimit, streamHub, cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, refineLLM)
 	publicSrv := &http.Server{
 		Addr:    ":" + cfg.APIPort,
 		Handler: publicRouter,
@@ -130,6 +144,13 @@ func main() {
 			log.Fatalf("[api] internal server: %v", err)
 		}
 	}()
+
+	// Start agent_message 24h cleanup (每 24h 清一次超过 24h 未活动的 session)。
+	// 见 internal/api/handler/agent_session_cleanup.go 顶部注释 + 主人 2026-07-15
+	// 决策 D1..D5。用 shutdownCtx 保证 SIGTERM 时干净退出 goroutine。
+	shutdownCtx, cancelShutdown := context.WithCancel(context.Background())
+	defer cancelShutdown()
+	handler.StartAgentSessionCleanup(shutdownCtx, summaryDB)
 
 	// Graceful shutdown
 	quit := make(chan os.Signal, 1)

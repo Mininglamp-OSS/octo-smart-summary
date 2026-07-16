@@ -30,10 +30,15 @@ func extractCitationIndexes(text string) []int {
 	return indexes
 }
 
+
+// BuildCitations is the exported wrapper of buildCitations.
+// Exposed so out-of-package callers can reuse the citation logic.
+func BuildCitations(text string, messages []pipeline.Message, allMessages []pipeline.Message, nameMap map[string]string) []model.Citation {
+	return buildCitations(text, messages, allMessages, nameMap)
+}
 // buildCitations builds a citation list from the summary text and original messages.
 // Only messages actually referenced in the text are included.
-// allMessages is the full message set (all channels) used for context lookup.
-// nameMap maps sender UIDs to display names; if nil or a UID is missing, the UID is used as-is.
+
 func buildCitations(text string, messages []pipeline.Message, allMessages []pipeline.Message, nameMap map[string]string) []model.Citation {
 	indexes := extractCitationIndexes(text)
 	if len(indexes) == 0 {

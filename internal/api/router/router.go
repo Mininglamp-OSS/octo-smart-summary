@@ -13,7 +13,10 @@ import (
 )
 
 // SetupPublic configures the public API router on :8080.
-func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middleware.TokenResolver, workerTriggerURL string, candidateQueryLimit int, featureTeamSchedule bool, customTemplateLimit int, streamHub *streaming.Hub, llm ...*service.LLMClient) *gin.Engine {
+// 合并上游后统一签名：customTemplateLimit(上游模板) + streamHub(上游 SSE) + agent 原始 LLM 配置
+// (agent chat/summary handler 用) + 变参 llm(上游 refine/personal 用的 *service.LLMClient，
+// 可选，须置于末尾)。
+func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middleware.TokenResolver, workerTriggerURL string, candidateQueryLimit int, featureTeamSchedule bool, customTemplateLimit int, streamHub *streaming.Hub, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int, llm ...*service.LLMClient) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
 
@@ -54,6 +57,10 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	v1.Use(middleware.StrictAuthMiddleware(authResolver), middleware.StrictSpaceMiddleware())
 	{
 		v1.POST("/summaries", taskH.CreateSummary)
+		// POST /summaries/agent — persist an agent-generated deliverable.
+		// Isomorphic response shape with /summaries; born status=Completed +
+		// trigger_type=Agent, content pulled from agent_message on the given
+		// session_id. See handler/agent_summary.go.
 		v1.POST("/summaries/batch-status", taskH.BatchStatus)
 		v1.GET("/summaries", taskH.ListSummaries)
 		v1.GET("/summaries/:id", taskH.GetSummary)
@@ -124,6 +131,24 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		// POST .../members (AddMembers); the HTTP method disambiguates.
 		p2.DELETE("/summaries/:id/members", personalH.RemoveMember)
 	}
+
+	// Agent chat: requires auth. creator_uid is derived from the auth middleware
+	// (not from LLM params); the summary profile injects it into tool handlers for
+	// channel/message-level permission isolation. db backs multi-turn history.
+	agentChatH := handler.NewAgentChatHandler(db, llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
+	agentGroup := r.Group("/api/v1/agent")
+	agentGroup.Use(middleware.StrictAuthMiddleware(authResolver), middleware.StrictSpaceMiddleware())
+	{
+		agentGroup.POST("/chat", agentChatH.Chat)
+		agentGroup.POST("/chat/stream", agentChatH.ChatStream)
+		agentGroup.GET("/chat/history", agentChatH.History)
+	}
+
+	// Agent summary: persists agent-generated summaries.
+	// (The old /summaries/:id/refine route was removed in favor of the
+	// reference-based chat flow — see CHAT-REFERENCE-BASED-DESIGN-v1.)
+	agentSummaryH := handler.NewAgentSummaryHandler(db, llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
+	v1.POST("/summaries/agent", agentSummaryH.CreateAgentSummary)
 
 	return r
 }
