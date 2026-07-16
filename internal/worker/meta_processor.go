@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/streaming"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timing"
 	"gorm.io/gorm"
@@ -149,6 +150,28 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 			return
 		}
 
+		runID := newSummaryRunID(taskID, "team")
+		teamStream := newSummaryStreamSender(ctx, m.proc.cfg, taskID, "", streaming.ScopeTeam, runID)
+		teamStreamFinalized := false
+		finishTeamDone := func() {
+			if teamStream != nil && !teamStreamFinalized {
+				teamStream.Done(model.StatusCompleted)
+				teamStreamFinalized = true
+			}
+		}
+		finishTeamError := func(message string) {
+			if teamStream != nil && !teamStreamFinalized {
+				teamStream.Error(message)
+				teamStreamFinalized = true
+			}
+		}
+		closeTeamStream := func() {
+			if teamStream != nil {
+				teamStream.Close()
+			}
+		}
+		teamStream.Stage(model.WorkflowStageGenerateSummary)
+
 		var finalContent string
 		var totalTokens int
 		var teamCitations []model.TeamCitation
@@ -157,6 +180,7 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 			// Single submission: copy content directly, no LLM call
 			finalContent = submitted[0].Content
 			totalTokens = 0
+			_ = teamStream.Delta(finalContent)
 
 			var participant model.SummaryParticipant
 			m.proc.db.First(&participant, submitted[0].ParticipantRefID)
@@ -176,6 +200,8 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 			var task model.SummaryTask
 			if err := m.proc.db.First(&task, taskID).Error; err != nil {
 				log.Printf("[meta-worker] task %d not found: %v", taskID, err)
+				finishTeamError("team summary task not found")
+				closeTeamStream()
 				return
 			}
 
@@ -202,12 +228,14 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 
 			generationTopic := m.proc.generationTopic(task)
 			reduceStart := time.Now()
-			content, tokens, err := m.proc.llm.CallReduceByPerson(ctx, participantSummaries, startTime, endTime, generationTopic)
+			content, tokens, err := m.proc.llm.CallReduceByPersonStream(ctx, participantSummaries, startTime, endTime, generationTopic, teamStream.Delta)
 			reportKey := "team#" + strconv.FormatInt(taskID, 10)
 			timing.RecordLLMSince(reportKey, "团队汇总: 合并各成员总结", reduceStart, tokens)
 			timing.FlushReport(reportKey, time.Since(reduceStart).Milliseconds(), nil)
 			if err != nil {
 				log.Printf("[meta-worker] reduce error task=%d: %v", taskID, err)
+				finishTeamError("team summary generation failed")
+				closeTeamStream()
 				return
 			}
 			finalContent = content
@@ -255,6 +283,8 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 		var taskCheck model.SummaryTask
 		if err := m.proc.db.Select("status").First(&taskCheck, taskID).Error; err != nil || taskCheck.Status != model.StatusProcessing {
 			log.Printf("[meta-worker] task %d no longer processing before result write, aborting", taskID)
+			finishTeamError("team summary task stopped before persistence")
+			closeTeamStream()
 			return
 		}
 
@@ -274,20 +304,29 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 		if err := saveLatestResultAndCompleteTask(m.proc.db, taskID, &result, isScheduled, snapshotContributorIDs); err != nil {
 			if errors.Is(err, errTaskNoLongerProcessing) {
 				log.Printf("[meta-worker] task %d status changed during processing (likely cancelled), skipping completion", taskID)
+				finishTeamError("team summary task stopped during persistence")
+				closeTeamStream()
 				return
 			}
 			if errors.Is(err, errRosterChangedDuringMerge) {
 				rosterRetries++
 				if rosterRetries > maxRosterRetries {
 					log.Printf("[meta-worker] task %d: exceeded roster-recompute retries (%d), aborting to avoid livelock", taskID, maxRosterRetries)
+					finishTeamError("team summary roster changed too often")
+					closeTeamStream()
 					return
 				}
 				log.Printf("[meta-worker] task %d: contributor roster changed during merge (member left/removed); recomputing with the updated roster (attempt %d)", taskID, rosterRetries)
+				closeTeamStream()
 				continue // re-read submitted snapshot at loop top and re-aggregate with the new roster
 			}
 			log.Printf("[meta-worker] save result error task=%d: %v", taskID, err)
+			finishTeamError("team summary persistence failed")
+			closeTeamStream()
 			return
 		}
+		finishTeamDone()
+		closeTeamStream()
 
 		// Send WS notification (META_SUMMARY_UPDATED, broadcast to all)
 		m.proc.sendCallback(model.TaskEvent{

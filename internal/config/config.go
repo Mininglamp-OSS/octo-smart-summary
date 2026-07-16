@@ -58,6 +58,10 @@ type Config struct {
 	// volume. <=0 disables the cap.
 	ScheduleMaxWindowDays int
 	WorkerCallbackURL     string
+	// SummaryStreamInternalToken optionally authenticates worker -> API
+	// POST /internal/summary-stream via X-Internal-Token. Empty preserves the
+	// existing internal-network trust model used by other internal endpoints.
+	SummaryStreamInternalToken string
 
 	// Message table count
 	MsgTableCount int
@@ -157,13 +161,14 @@ func Load() *Config {
 		WorkerInternalPort:        envStr("WORKER_INTERNAL_PORT", "8082"),
 		WorkerListenAllInterfaces: envStr("WORKER_LISTEN_ADDR", "0.0.0.0"),
 
-		WorkerMaxConcurrent:   envInt("WORKER_MAX_CONCURRENT_TASKS", 20),
-		WorkerMapConcurrency:  envInt("WORKER_MAP_CONCURRENCY", 5),
-		WorkerPollInterval:    envInt("WORKER_POLL_INTERVAL_SECONDS", 2),
-		WorkerLeaseMinutes:    envInt("WORKER_TASK_LEASE_MINUTES", 20),
-		WorkerMaxRetry:        envInt("WORKER_MAX_RETRY", 3),
-		ScheduleMaxWindowDays: envInt("SCHEDULE_MAX_WINDOW_DAYS", 30),
-		WorkerCallbackURL:     envStr("WORKER_API_CALLBACK_URL", ""),
+		WorkerMaxConcurrent:        envInt("WORKER_MAX_CONCURRENT_TASKS", 20),
+		WorkerMapConcurrency:       envInt("WORKER_MAP_CONCURRENCY", 5),
+		WorkerPollInterval:         envInt("WORKER_POLL_INTERVAL_SECONDS", 2),
+		WorkerLeaseMinutes:         envInt("WORKER_TASK_LEASE_MINUTES", 20),
+		WorkerMaxRetry:             envInt("WORKER_MAX_RETRY", 3),
+		ScheduleMaxWindowDays:      envInt("SCHEDULE_MAX_WINDOW_DAYS", 30),
+		WorkerCallbackURL:          envStr("WORKER_API_CALLBACK_URL", ""),
+		SummaryStreamInternalToken: envStr("SUMMARY_STREAM_INTERNAL_TOKEN", ""),
 
 		MsgTableCount: envInt("MSG_TABLE_COUNT", 5),
 

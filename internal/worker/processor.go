@@ -388,6 +388,46 @@ func (p *Processor) processTask(task model.SummaryTask) {
 	}
 
 	if participantCount <= 1 {
+		var participants []model.SummaryParticipant
+		p.db.Where("task_id = ?", task.ID).Find(&participants)
+
+		// Scheduled single-person tasks must not depend on the best-effort
+		// processing_deadline refresh. The multi-person scheduled path already
+		// dispatches before refreshing the deadline for the same reason: a racing
+		// stuck-scan/claim can make the CAS miss even though this run is still
+		// valid. If we return on that miss, the task stays visually stuck at the
+		// first workflow step because no personal worker is ever dispatched.
+		if task.TriggerType == model.TriggerScheduled {
+			for _, pt := range participants {
+				p.db.Model(&model.SummaryParticipant{}).Where("id = ?", pt.ID).
+					Update("status", model.ParticipantAccepted)
+				ptID := pt.ID
+				p.dispatchPersonal(task.ID, ptID)
+			}
+
+			casResult := p.db.Model(&model.SummaryTask{}).
+				Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
+				Updates(map[string]interface{}{
+					"processing_deadline": timezone.Now().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute),
+				})
+			if casResult.Error != nil {
+				log.Printf("[processor] task %d scheduled single deadline refresh failed (dispatch already done): %v", task.ID, casResult.Error)
+			} else if casResult.RowsAffected == 0 {
+				var cur model.SummaryTask
+				if err := p.db.Select("status").First(&cur, task.ID).Error; err == nil {
+					log.Printf("[processor] task %d scheduled single deadline refresh missed (status=%d); dispatch already issued for %d participant(s)", task.ID, cur.Status, len(participants))
+				}
+			}
+			p.sendCallback(model.TaskEvent{
+				TaskID:   task.ID,
+				Status:   model.StatusProcessing,
+				Progress: 50,
+				Message:  "单人模式，自动处理中",
+			})
+			log.Printf("[processor] task %d scheduled single participant, dispatched %d participant(s)", task.ID, len(participants))
+			return
+		}
+
 		casResult := p.db.Model(&model.SummaryTask{}).
 			Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
 			Updates(map[string]interface{}{
@@ -398,11 +438,16 @@ func (p *Processor) processTask(task model.SummaryTask) {
 			return
 		}
 		if casResult.RowsAffected == 0 {
-			log.Printf("[processor] task %d status changed (likely cancelled), skipping dispatch", task.ID)
-			return
+			var cur model.SummaryTask
+			if err := p.db.Select("status").First(&cur, task.ID).Error; err != nil {
+				log.Printf("[processor] task %d status reload failed after CAS miss: %v", task.ID, err)
+				return
+			}
+			if cur.Status != model.StatusProcessing {
+				log.Printf("[processor] task %d no longer Processing (status=%d), skipping single dispatch", task.ID, cur.Status)
+				return
+			}
 		}
-		var participants []model.SummaryParticipant
-		p.db.Where("task_id = ?", task.ID).Find(&participants)
 		for _, pt := range participants {
 			p.db.Model(&model.SummaryParticipant{}).Where("id = ?", pt.ID).
 				Update("status", model.ParticipantAccepted)
