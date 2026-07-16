@@ -3,6 +3,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -382,6 +383,129 @@ func setupListRouter(h *TaskHandler) *gin.Engine {
 	r.Use(middleware.AuthMiddleware(&mockTokenResolver{}), middleware.SpaceMiddleware())
 	r.GET("/api/v1/summaries", h.ListSummaries)
 	return r
+}
+
+func setupReadRouter(h *TaskHandler) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(middleware.AuthMiddleware(&mockTokenResolver{}), middleware.SpaceMiddleware())
+	r.POST("/api/v1/summaries/:id/read", h.MarkSummaryRead)
+	return r
+}
+
+func markReadRequest(r *gin.Engine, taskID int64, userID string, body string) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/v1/summaries/%d/read", taskID), bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Token", userID)
+	req.Header.Set("X-Space-Id", "space1")
+	r.ServeHTTP(w, req)
+	return w
+}
+
+type markReadResponse struct {
+	Code int `json:"code"`
+	Data struct {
+		IsUnread             bool `json:"is_unread"`
+		HasPendingInvitation bool `json:"has_pending_invitation"`
+		NeedsAttention       bool `json:"needs_attention"`
+	} `json:"data"`
+}
+
+func parseMarkReadResponse(t *testing.T, w *httptest.ResponseRecorder) markReadResponse {
+	t.Helper()
+	var resp markReadResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal mark-read response: %v; body=%s", err, w.Body.String())
+	}
+	return resp
+}
+
+func TestMarkSummaryRead_RecordsRenderedVersionsAndKeepsPendingInvitation(t *testing.T) {
+	db, imDB := setupListTestDBs(t)
+	taskID := seedTask(t, db, imDB)
+	var task model.SummaryTask
+	db.First(&task, taskID)
+
+	oldResult := model.SummaryResult{TaskID: taskID, Content: "old", GeneratedAt: timezone.Now(), CreatedAt: timezone.Now(), UpdatedAt: timezone.Now()}
+	newResult := model.SummaryResult{TaskID: taskID, Content: "new", GeneratedAt: timezone.Now(), CreatedAt: timezone.Now(), UpdatedAt: timezone.Now()}
+	db.Create(&oldResult)
+	db.Create(&newResult)
+	db.Model(&task).Update("current_result_id", newResult.ID)
+	db.Model(&model.SummaryParticipant{}).Where("task_id = ? AND user_id = ?", taskID, "participant1").Update("status", model.ParticipantPending)
+
+	r := setupReadRouter(NewTaskHandler(db, imDB, ""))
+	w := markReadRequest(r, taskID, "participant1", fmt.Sprintf(`{"team_result_id":%d}`, oldResult.ID))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	resp := parseMarkReadResponse(t, w)
+	if !resp.Data.IsUnread || !resp.Data.HasPendingInvitation || !resp.Data.NeedsAttention {
+		t.Fatalf("expected stale result and pending invitation to keep attention, got %+v", resp.Data)
+	}
+
+	w = markReadRequest(r, taskID, "participant1", fmt.Sprintf(`{"team_result_id":%d}`, newResult.ID))
+	resp = parseMarkReadResponse(t, w)
+	if resp.Data.IsUnread || !resp.Data.HasPendingInvitation || !resp.Data.NeedsAttention {
+		t.Fatalf("expected result read but pending invitation to keep attention, got %+v", resp.Data)
+	}
+}
+
+func TestMarkSummaryRead_UpdatesTeamAndPersonalCursorsIndependently(t *testing.T) {
+	db, imDB := setupListTestDBs(t)
+	taskID := seedTask(t, db, imDB)
+	db.Model(&model.SummaryParticipant{}).Where("task_id = ? AND user_id = ?", taskID, "participant1").Update("status", model.ParticipantAccepted)
+	now := timezone.Now()
+	team := model.SummaryResult{TaskID: taskID, Content: "team", GeneratedAt: now, CreatedAt: now, UpdatedAt: now}
+	personalVersion := model.PersonalResultVersion{TaskID: taskID, UserID: "participant1", Content: "personal", Version: 1, GeneratedAt: now, CreatedAt: now, UpdatedAt: now}
+	db.Create(&team)
+	db.Create(&personalVersion)
+	db.Model(&model.SummaryTask{}).Where("id = ?", taskID).Update("current_result_id", team.ID)
+	db.Create(&model.PersonalResult{TaskID: taskID, UserID: "participant1", Content: "personal", CurrentVersionID: &personalVersion.ID, CreatedAt: now, UpdatedAt: now})
+
+	r := setupReadRouter(NewTaskHandler(db, imDB, ""))
+	w := markReadRequest(r, taskID, "participant1", fmt.Sprintf(`{"team_result_id":%d,"personal_version_id":%d}`, team.ID, personalVersion.ID))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	resp := parseMarkReadResponse(t, w)
+	if resp.Data.IsUnread || resp.Data.NeedsAttention {
+		t.Fatalf("expected both current versions read, got %+v", resp.Data)
+	}
+	var read model.SummaryUserRead
+	if err := db.Where("task_id = ? AND user_id = ?", taskID, "participant1").First(&read).Error; err != nil {
+		t.Fatalf("read cursor not persisted: %v", err)
+	}
+	if read.LastReadTeamResultID == nil || *read.LastReadTeamResultID != team.ID || read.LastReadPersonalVersionID == nil || *read.LastReadPersonalVersionID != personalVersion.ID {
+		t.Fatalf("unexpected persisted cursors: %+v", read)
+	}
+}
+
+func TestMarkSummaryRead_RejectsForeignAndUnauthorizedVersions(t *testing.T) {
+	db, imDB := setupListTestDBs(t)
+	taskID := seedTask(t, db, imDB)
+	otherTask := model.SummaryTask{TaskNo: "TST-OTHER", SpaceID: "space1", CreatorID: "other", SummaryMode: model.ModeByPerson, Status: model.StatusCompleted}
+	db.Create(&otherTask)
+	now := timezone.Now()
+	foreignResult := model.SummaryResult{TaskID: otherTask.ID, Content: "foreign", GeneratedAt: now, CreatedAt: now, UpdatedAt: now}
+	foreignPersonal := model.PersonalResultVersion{TaskID: taskID, UserID: "someone-else", Content: "foreign", Version: 1, GeneratedAt: now, CreatedAt: now, UpdatedAt: now}
+	db.Create(&foreignResult)
+	db.Create(&foreignPersonal)
+	r := setupReadRouter(NewTaskHandler(db, imDB, ""))
+
+	for _, body := range []string{
+		fmt.Sprintf(`{"team_result_id":%d}`, foreignResult.ID),
+		fmt.Sprintf(`{"personal_version_id":%d}`, foreignPersonal.ID),
+	} {
+		w := markReadRequest(r, taskID, "participant1", body)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for foreign version, got %d: %s", w.Code, w.Body.String())
+		}
+	}
+	w := markReadRequest(r, taskID, "stranger", fmt.Sprintf(`{"team_result_id":%d}`, foreignResult.ID))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for unauthorized caller, got %d: %s", w.Code, w.Body.String())
+	}
 }
 
 type listResponse struct {

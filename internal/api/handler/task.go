@@ -58,6 +58,20 @@ func (h *TaskHandler) getCustomTemplateLimit() int {
 	return h.customTemplateLimit
 }
 
+// schedulePendingInvitationExpr returns the schedule-level pending-confirmation
+// predicate for the given summary_task alias. SQLite does not support
+// JSON_TABLE, so its unit-test path deliberately has no schedule-config branch.
+func (h *TaskHandler) schedulePendingInvitationExpr(taskAlias string) string {
+	if h.db.Dialector.Name() != "mysql" {
+		return "0"
+	}
+	return `EXISTS (SELECT 1 FROM summary_schedule ss
+ JOIN JSON_TABLE(JSON_EXTRACT(ss.participant_config, '$.participants'), '$[*]'
+ COLUMNS(user_id VARCHAR(64) PATH '$.user_id', confirmed BOOL PATH '$.confirmed' DEFAULT 'false' ON EMPTY)) sc
+ WHERE ss.id=` + taskAlias + `.schedule_id AND ss.deleted_at IS NULL AND ss.is_active=1
+ AND ss.confirm_policy=1 AND sc.user_id=? AND sc.confirmed=false)`
+}
+
 // canAccessTask reports whether userID may read the task: creator or explicit
 // participant. This is the single source of truth shared by the detail path
 // (authorizeTaskAccess) and conceptually the batch path (batchAuthorize) and the
@@ -523,7 +537,11 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 
 	var total int64
 	countSQL := "SELECT COUNT(*) FROM (" + innerSQL + ") sub WHERE sub.rn = 1"
-	h.db.Raw(countSQL, args...).Scan(&total)
+	if err := h.db.Raw(countSQL, args...).Scan(&total).Error; err != nil {
+		log.Printf("list summaries count query failed: %v", err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "failed to list summaries"})
+		return
+	}
 
 	// Attention is caller-specific. Compute it only after schedule folding, then
 	// sort before pagination. A pending invitation outranks unread content; team
@@ -535,17 +553,10 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
  LEFT JOIN summary_personal_result pr ON pr.task_id = sub.id AND pr.user_id = ?
  LEFT JOIN summary_personal_result_version pv ON pv.id = pr.current_version_id AND pv.task_id = sub.id AND pv.user_id = ?
  LEFT JOIN summary_participant me ON me.task_id = sub.id AND me.user_id = ?`
-	schedulePendingExpr := "0"
-	if h.db.Dialector.Name() == "mysql" {
-		// Schedule-level confirmation lives in participant_config rather than
-		// summary_participant. Expand the V5 roster so these invitations share the
-		// same attention/red-dot semantics as ordinary task invitations.
-		schedulePendingExpr = `EXISTS (SELECT 1 FROM summary_schedule ss
- JOIN JSON_TABLE(JSON_EXTRACT(ss.participant_config, '$.participants'), '$[*]'
- COLUMNS(user_id VARCHAR(64) PATH '$.user_id', confirmed BOOL PATH '$.confirmed' DEFAULT 'false' ON EMPTY)) sc
- WHERE ss.id=sub.schedule_id AND ss.deleted_at IS NULL AND ss.is_active=1
- AND ss.confirm_policy=1 AND sc.user_id=? AND sc.confirmed=false)`
-	}
+	// Schedule-level confirmation lives in participant_config rather than
+	// summary_participant. Expand the V5 roster so these invitations share the
+	// same attention/red-dot semantics as ordinary task invitations.
+	schedulePendingExpr := h.schedulePendingInvitationExpr("sub")
 	attentionSelect := `,
  CASE WHEN me.status = ? OR ` + schedulePendingExpr + ` THEN 1 ELSE 0 END AS has_pending_invitation,
  CASE WHEN (sub.current_result_id IS NOT NULL AND (sur.last_read_team_result_id IS NULL OR sur.last_read_team_result_id <> sub.current_result_id))
@@ -574,7 +585,11 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 		ActivityAt               string `gorm:"column:activity_at"`
 	}
 	var taskRows []listTaskRow
-	h.db.Raw(pageSQL, pageArgs...).Scan(&taskRows)
+	if err := h.db.Raw(pageSQL, pageArgs...).Scan(&taskRows).Error; err != nil {
+		log.Printf("list summaries page query failed: %v", err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "failed to list summaries"})
+		return
+	}
 	tasks := make([]model.SummaryTask, 0, len(taskRows))
 	rowByTask := make(map[int64]listTaskRow, len(taskRows))
 	for _, row := range taskRows {
@@ -708,7 +723,11 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 		countArgs = append(countArgs, userID)
 	}
 	countArgs = append(countArgs, spaceID, userID, userID, userID, userID, userID, userID)
-	h.db.Raw(attentionCountSQL, countArgs...).Scan(&counts)
+	if err := h.db.Raw(attentionCountSQL, countArgs...).Scan(&counts).Error; err != nil {
+		log.Printf("list summaries attention count query failed: %v", err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "failed to list summaries"})
+		return
+	}
 	ok(c, gin.H{"total": total, "items": items, "attention_count": counts.AttentionCount, "unread_count": counts.UnreadCount, "pending_invitation_count": counts.PendingInvitationCount})
 }
 
@@ -770,16 +789,27 @@ func (h *TaskHandler) MarkSummaryRead(c *gin.Context) {
 		ReadPersonalID    *int64 `gorm:"column:read_personal_id"`
 		PendingInvitation bool   `gorm:"column:pending_invitation"`
 	}
-	h.db.Raw(`SELECT t.current_result_id AS current_team_id,
+	schedulePendingExpr := h.schedulePendingInvitationExpr("t")
+	stateSQL := `SELECT t.current_result_id AS current_team_id,
  pr.current_version_id AS current_personal_id,
  sur.last_read_team_result_id AS read_team_id,
  sur.last_read_personal_version_id AS read_personal_id,
- CASE WHEN p.status = ? THEN 1 ELSE 0 END AS pending_invitation
+ CASE WHEN p.status = ? OR ` + schedulePendingExpr + ` THEN 1 ELSE 0 END AS pending_invitation
  FROM summary_task t
  LEFT JOIN summary_personal_result pr ON pr.task_id=t.id AND pr.user_id=?
  LEFT JOIN summary_user_read sur ON sur.task_id=t.id AND sur.user_id=?
  LEFT JOIN summary_participant p ON p.task_id=t.id AND p.user_id=?
- WHERE t.id=?`, model.ParticipantPending, userID, userID, userID, taskID).Scan(&state)
+ WHERE t.id=?`
+	stateArgs := []interface{}{model.ParticipantPending}
+	if h.db.Dialector.Name() == "mysql" {
+		stateArgs = append(stateArgs, userID)
+	}
+	stateArgs = append(stateArgs, userID, userID, userID, taskID)
+	if err := h.db.Raw(stateSQL, stateArgs...).Scan(&state).Error; err != nil {
+		log.Printf("mark summary read state query failed: %v", err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "failed to load summary attention state"})
+		return
+	}
 	teamUnread := state.CurrentTeamID != nil && (state.ReadTeamID == nil || *state.CurrentTeamID != *state.ReadTeamID)
 	personalUnread := state.CurrentPersonalID != nil && (state.ReadPersonalID == nil || *state.CurrentPersonalID != *state.ReadPersonalID)
 	isUnread := teamUnread || personalUnread
