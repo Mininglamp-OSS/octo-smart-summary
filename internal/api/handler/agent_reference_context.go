@@ -20,9 +20,11 @@ import (
 //   - Only invoked on the FIRST turn of a session (when LoadHistory returns
 //     empty). Later turns rely on the injected system message being cached
 //     in the LLM context.
-//   - Space boundary enforced: tasks not belonging to the caller's space
-//     are silently dropped (not an error — logged so the caller can decide
-//     whether to surface an "some references unavailable" hint).
+//   - Access enforcement (SUM-158 blocker 2): tasks are filtered through the
+//     shared canAccessTaskDB rule (creator or explicit participant) — same
+//     rule used by GetSummary / detail path — so agent cannot pull material
+//     from tasks the caller can't otherwise read. Rejected tasks are silently
+//     dropped and logged.
 //   - Reference material is APPENDED to the profile's system prompt (not
 //     prepended), so agent's baseline behavior (from profile.md) still
 //     takes precedence.
@@ -43,7 +45,9 @@ func buildReferencedSummariesContext(
 		return "", nil, nil
 	}
 
-	// Fetch tasks in one query, then filter to caller's space
+	// Fetch tasks in one query (space-scoped), then further filter each via
+	// canAccessTaskDB (creator or participant) so agent references cannot
+	// bypass the normal read authorization (SUM-158 blocker 2).
 	var tasks []model.SummaryTask
 	if err := db.WithContext(ctx).
 		Where("id IN ? AND space_id = ?", taskIDs, spaceID).
@@ -53,6 +57,16 @@ func buildReferencedSummariesContext(
 	if len(tasks) == 0 {
 		return "", nil, nil
 	}
+	authorizedTasks := make([]model.SummaryTask, 0, len(tasks))
+	for _, t := range tasks {
+		if canAccessTaskDB(db.WithContext(ctx), userID, t.ID, t.CreatorID) {
+			authorizedTasks = append(authorizedTasks, t)
+		}
+	}
+	if len(authorizedTasks) == 0 {
+		return "", nil, nil
+	}
+	tasks = authorizedTasks
 
 	loaded := make([]int64, 0, len(tasks))
 	var sb strings.Builder
@@ -66,21 +80,18 @@ func buildReferencedSummariesContext(
 	sb.WriteString("═══════════════════════════════════════════════════\n\n")
 
 	for _, task := range tasks {
-		// Fetch the latest (per creator) PersonalResult for this task.
+		// Fetch caller's own PersonalResult for this task.
+		// No cross-user fallback (SUM-158 blocker 2): if caller has no PR,
+		// they see the reference as "not yet generated" rather than any other
+		// user's PR text.
 		var pr model.PersonalResult
 		err := db.WithContext(ctx).
 			Where("task_id = ? AND user_id = ?", task.ID, userID).
 			Order("id DESC").
 			First(&pr).Error
 		if err != nil {
-			// Fall back to any PR for this task
-			if err2 := db.WithContext(ctx).
-				Where("task_id = ?", task.ID).
-				Order("id DESC").
-				First(&pr).Error; err2 != nil {
-				sb.WriteString(fmt.Sprintf("【引用总结 · task_id=%d · %s】(产物尚未生成,跳过)\n\n", task.ID, task.Title))
-				continue
-			}
+			sb.WriteString(fmt.Sprintf("【引用总结 · task_id=%d · %s】(产物尚未生成,跳过)\n\n", task.ID, task.Title))
+			continue
 		}
 
 		loaded = append(loaded, task.ID)
@@ -220,29 +231,28 @@ func (h *AgentSummaryHandler) borrowCitationsFromReference(
 	spaceID string,
 	userID string,
 ) []model.Citation {
-	// Space-scoped lookup: refuse to leak citations across spaces.
+	// Space-scoped + canAccessTask: agent references cannot pull citations
+	// from tasks the caller can't read (SUM-158 blocker 2).
 	var task model.SummaryTask
 	if err := h.db.WithContext(ctx).
-		Select("id, space_id").
+		Select("id, space_id, creator_id").
 		Where("id = ? AND space_id = ?", refTaskID, spaceID).
 		First(&task).Error; err != nil {
 		return []model.Citation{}
 	}
+	if !canAccessTaskDB(h.db.WithContext(ctx), userID, task.ID, task.CreatorID) {
+		return []model.Citation{}
+	}
 
-	// Prefer caller's own PR (per-creator citation set); fall back to any PR
-	// for this task if not found.
+	// Caller's own PersonalResult only. No cross-user fallback: if caller has
+	// no PR yet, borrow nothing rather than lifting someone else's citation
+	// set (SUM-158 blocker 2 — same defense as buildReferencedSummariesContext).
 	var pr model.PersonalResult
-	err := h.db.WithContext(ctx).
+	if err := h.db.WithContext(ctx).
 		Where("task_id = ? AND user_id = ?", refTaskID, userID).
 		Order("id DESC").
-		First(&pr).Error
-	if err != nil {
-		if err2 := h.db.WithContext(ctx).
-			Where("task_id = ?", refTaskID).
-			Order("id DESC").
-			First(&pr).Error; err2 != nil {
-			return []model.Citation{}
-		}
+		First(&pr).Error; err != nil {
+		return []model.Citation{}
 	}
 
 	cits := pr.GetCitations()

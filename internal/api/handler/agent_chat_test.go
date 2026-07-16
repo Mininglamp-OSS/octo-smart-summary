@@ -477,6 +477,11 @@ func TestAgentChatHistoryInvalidSessionID(t *testing.T) {
 func setupAgentChatStreamRouter(h *AgentChatHandler) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
+	// 注入固定 uid，模拟已通过鉴权中间件（与 setupAgentChatRouter 对齐，SUM-158 blocker 1）。
+	r.Use(func(c *gin.Context) {
+		c.Set("user_id", testAgentChatUID)
+		c.Next()
+	})
 	r.POST("/api/v1/agent/chat/stream", h.ChatStream)
 	return r
 }
