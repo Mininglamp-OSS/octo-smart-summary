@@ -45,6 +45,7 @@ func getSessionMessagePool(sessionID, uid string) ([]pipeline.Message, error) {
 	// is only written by AppendMessages after RunWithHistory returns).
 	var evidenceRows []model.AgentMessageEvidence
 	if err := summaryDB.Where("user_id = ? AND session_id = ?", uid, sessionID).
+		Order("created_at ASC, handle ASC").
 		Find(&evidenceRows).Error; err != nil {
 		return nil, fmt.Errorf("query evidence rows: %w", err)
 	}

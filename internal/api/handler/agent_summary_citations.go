@@ -18,96 +18,95 @@ import (
 // 若 content 里没有任何 [n] 标记,返回 []Citation{} (等价于 SetCitations(nil))。
 //
 // 实现策略:
-// 1. 从 agent_message 提取本 session 所有 role='tool' 的 Content
-// 2. 解析 JSON,提取 messages_handle (工具返回里的缓存句柄)
-// 3. 尝试从 agent.messageCache 恢复 messages (30分钟 TTL)
-// 5. 合并去重 → 得到 allMessages 池
-// 6. 为每条 message 分配 CitationIndex(1-indexed, 全局唯一, 时间升序)
-// 7. 收集 nameMap: sender_uid -> sender_name
-// 8. 调 worker.BuildCitations(content, allMessages, allMessages, nameMap)
-// 9. 返回结果; 出错走 log + 返回空数组不阻塞落库(citations 是锦上添花不是必要)
+// 1. 从 agent_message_evidence 提取本 (user_id, session_id) 的所有 handle
+// 2. 每个 handle 优先走 agent.messageCache 恢复 messages (30分钟 TTL),
+//    cache miss 时 fallback 到 evidence.Evidence 的 JSON snapshot
+// 3. 合并去重 → 得到 allMessages 池
+// 4. 为每条 message 分配 CitationIndex(1-indexed, 全局唯一, 时间升序)
+// 5. 收集 nameMap: sender_uid -> sender_name
+// 6. 调 worker.BuildCitations(content, allMessages, allMessages, nameMap)
+// 7. 返回结果; 出错走 log + 返回空数组不阻塞落库(citations 是锦上添花不是必要)
+//
+// Discovery-source symmetry (#161 P1-A · yujiawei):
+// Must discover handles from agent_message_evidence — byte-identical to
+// getSessionMessagePool (internal/agent/tool_summarize_chunk.go). Previously
+// this function discovered from agent_message WHERE role='tool' while
+// getSessionMessagePool discovered from agent_message_evidence, so an
+// orphan-evidence scenario (chat step fails before AppendMessages persists
+// tool rows, but PersistEvidence already wrote its evidence row) produced
+// a pool asymmetry: mid-run pool saw orphan rows, save-time pool did not,
+// CitationIndex 1..N drifted between the two, [n] markers no longer lined
+// up with saved Citation rows. Aligning both sites on evidence discovery
+// closes that reachable failure path.
 func (h *AgentSummaryHandler) buildCitationsForSession(
 	ctx context.Context,
 	sessionID string,
 	content string,
 	uid string,
 ) ([]model.Citation, error) {
-	// 1. 从 agent_message 拿本 session 所有 role='tool' 的返回值
-	var toolMessages []model.AgentMessage
+	// 1. Discover handles from agent_message_evidence — must stay symmetric
+	// with getSessionMessagePool in tool_summarize_chunk.go. Rows are written
+	// synchronously by PersistEvidence inside every data-fetching tool
+	// (fetch_channel, peek_channel, search_messages, filter_relevant) before
+	// the tool returns, so this discovery source is populated for every
+	// handle the LLM could cite — regardless of whether the subsequent
+	// AppendMessages persisted the corresponding agent_message tool row.
+	var evidenceRows []model.AgentMessageEvidence
 	err := h.db.WithContext(ctx).
-		Where("user_id = ? AND session_id = ? AND role = ?", uid, sessionID, "tool").
-		Order("id ASC").
-		Find(&toolMessages).Error
+		Where("user_id = ? AND session_id = ?", uid, sessionID).
+		Order("created_at ASC, handle ASC").
+		Find(&evidenceRows).Error
 	if err != nil {
-		log.Printf("[citations] query tool messages failed session=%s: %v", sessionID, err)
+		log.Printf("[citations] query evidence rows failed session=%s: %v", sessionID, err)
 		return nil, err
 	}
 
-	if len(toolMessages) == 0 {
+	if len(evidenceRows) == 0 {
 		// No tool calls = no messages to cite
 		return []model.Citation{}, nil
 	}
 
-	// 2. 提取所有 messages,尝试从 cache 或直接从 content
+	// 2. Resolve each handle to its messages: cache preferred (hot path),
+	// evidence JSON snapshot as fallback (cold cache / restart).
 	var allMessages []pipeline.Message
 	seenKey := make(map[string]bool) // de-dup by channel_id+message_seq
 
 	cache := agent.GetMessageCache()
 
-	for _, tm := range toolMessages {
-		if tm.Content == "" {
+	for _, ev := range evidenceRows {
+		if ev.Handle == "" {
 			continue
 		}
 
-		// Parse tool return JSON
-		var toolReturn map[string]interface{}
-		if err := json.Unmarshal([]byte(tm.Content), &toolReturn); err != nil {
-			log.Printf("[citations] parse tool return failed session=%s tool=%s: %v", sessionID, tm.Name, err)
-			continue
-		}
-
-		// Try to get messages from cache via handle
-		if handleRaw, ok := toolReturn["messages_handle"]; ok {
-			if handle, ok := handleRaw.(string); ok && handle != "" {
-				cached := cache.Retrieve(handle, uid)
-				if cached != nil {
-					for _, msg := range cached {
-						key := fmt.Sprintf("%s:%d", msg.ChannelID, msg.MessageSeq)
-						if !seenKey[key] {
-							allMessages = append(allMessages, msg)
-							seenKey[key] = true
-						}
-					}
-					log.Printf("[citations] retrieved %d messages from cache handle=%s", len(cached), handle)
-				} else {
-					// Cache miss: fallback to evidence table (Stage 3 Blocker C fix)
-					log.Printf("[citations] cache miss for handle=%s session=%s, falling back to DB", handle, sessionID)
-					var evidence model.AgentMessageEvidence
-					err := h.db.WithContext(ctx).
-						Where("user_id = ? AND session_id = ? AND handle = ?", uid, sessionID, handle).
-						First(&evidence).Error
-					if err == nil {
-						// Deserialize evidence
-						var evidenceMessages []pipeline.Message
-						if err := json.Unmarshal([]byte(evidence.Evidence), &evidenceMessages); err == nil {
-							for _, msg := range evidenceMessages {
-								key := fmt.Sprintf("%s:%d", msg.ChannelID, msg.MessageSeq)
-								if !seenKey[key] {
-									allMessages = append(allMessages, msg)
-									seenKey[key] = true
-								}
-							}
-							log.Printf("[citations] retrieved %d messages from evidence table handle=%s", len(evidenceMessages), handle)
-						} else {
-							log.Printf("[citations] evidence unmarshal failed handle=%s: %v", handle, err)
-						}
-					} else {
-						log.Printf("[citations] evidence table miss handle=%s session=%s: %v", handle, sessionID, err)
-					}
+		// Prefer cache (avoids JSON unmarshal on the hot path)
+		if cached := cache.Retrieve(ev.Handle, uid); cached != nil {
+			for _, msg := range cached {
+				key := fmt.Sprintf("%s:%d", msg.ChannelID, msg.MessageSeq)
+				if !seenKey[key] {
+					allMessages = append(allMessages, msg)
+					seenKey[key] = true
 				}
 			}
+			log.Printf("[citations] retrieved %d messages from cache handle=%s", len(cached), ev.Handle)
+			continue
 		}
 
+		// Cache miss: fallback to evidence JSON snapshot. Log both success
+		// and unmarshal failure for parity with observability elsewhere.
+		log.Printf("[citations] cache miss for handle=%s session=%s, falling back to evidence JSON", ev.Handle, sessionID)
+		var evidenceMessages []pipeline.Message
+		if err := json.Unmarshal([]byte(ev.Evidence), &evidenceMessages); err != nil {
+			log.Printf("[citations] evidence unmarshal failed handle=%s: %v", ev.Handle, err)
+			continue
+		}
+		for _, msg := range evidenceMessages {
+			key := fmt.Sprintf("%s:%d", msg.ChannelID, msg.MessageSeq)
+			if !seenKey[key] {
+				allMessages = append(allMessages, msg)
+				seenKey[key] = true
+			}
+		}
+		log.Printf("[citations] retrieved %d messages from evidence table handle=%s", len(evidenceMessages), ev.Handle)
 	}
 
 	if len(allMessages) == 0 {
