@@ -16,71 +16,73 @@ import (
 // sorts them globally by timestamp, and assigns CitationIndex.
 // This ensures the same global ordering that buildCitationsForSession will use.
 //
-// Cache/DB recovery (SUM-47 v3 / PR #158 Octo-Q P1): the pool is reconstructed
-// from the message cache (GetMessageCache, 30-min TTL) and, on cache miss
-// (expiry, eviction, process restart), falls back to the agent_message_evidence
-// table — byte-for-byte the same recovery buildCitationsForSession performs.
-// Keeping the two symmetric guarantees the pre-assigned CitationIndex here
-// matches the post-assignment there even for long-running or paused agent
-// sessions (>30 min between tool calls and summarize_chunk), so [n] citations
-// in the summary body always line up with the final Citation rows.
+// Handle discovery (post-#158 regression fix, 4-reviewer P1):
+// Previously handles were discovered by querying agent_message WHERE
+// role='tool'. That table is populated only by AppendMessages, which runs
+// AFTER RunWithHistory returns. During the run itself — including when
+// summarize_chunk executes inside the agent loop — there are zero tool rows
+// for the current turn, so the pool was empty, CitationIndex stayed at the
+// Go zero value 0, the LLM emitted `[0]` markers, and worker.BuildCitations
+// (idx >= 1 && idx <= maxIdx) discarded every marker at save time. First-
+// turn agent summaries produced broken/empty citations on the dominant path.
+//
+// The fix sources handles from agent_message_evidence instead. Evidence rows
+// are written synchronously by PersistEvidence inside fetch_channel /
+// peek_channel tool handlers (BEFORE the tool returns), so by the time
+// summarize_chunk runs in a later step, the evidence table already contains
+// every handle produced this turn. The messages themselves come from the
+// in-memory cache when warm, and fall back to the evidence row's JSON
+// snapshot when cold — byte-for-byte the same recovery
+// buildCitationsForSession performs. Keeping the two symmetric guarantees
+// the pre-assigned CitationIndex here matches the post-assignment there
+// for both first-turn and long-running/paused sessions.
 func getSessionMessagePool(sessionID, uid string) ([]pipeline.Message, error) {
 	summaryDB, _, _, _ := GetSummaryDeps()
 
-	// Query all tool messages for this session
-	var toolMessages []model.AgentMessage
-	if err := summaryDB.Where("user_id = ? AND session_id = ? AND role = ?", uid, sessionID, "tool").
-		Find(&toolMessages).Error; err != nil {
-		return nil, fmt.Errorf("query tool messages: %w", err)
+	// Discover handles from evidence table — populated synchronously by
+	// PersistEvidence inside fetch_channel / peek_channel before the tool
+	// returns, so it is populated during the run (unlike agent_message which
+	// is only written by AppendMessages after RunWithHistory returns).
+	var evidenceRows []model.AgentMessageEvidence
+	if err := summaryDB.Where("user_id = ? AND session_id = ?", uid, sessionID).
+		Find(&evidenceRows).Error; err != nil {
+		return nil, fmt.Errorf("query evidence rows: %w", err)
 	}
 
-	// Collect all messages from all handles
+	// Collect all messages from all handles (cache-hot preferred, evidence
+	// JSON snapshot as fallback for cold cache / restart)
 	var allMessages []pipeline.Message
 	seenKey := make(map[string]bool) // de-dup by channel_id+message_seq
 
 	cache := GetMessageCache()
-	for _, tm := range toolMessages {
-		if tm.Content == "" {
+	for _, ev := range evidenceRows {
+		if ev.Handle == "" {
 			continue
 		}
 
-		var toolReturn map[string]interface{}
-		if err := json.Unmarshal([]byte(tm.Content), &toolReturn); err != nil {
-			continue
-		}
-
-		if handleRaw, ok := toolReturn["messages_handle"]; ok {
-			if handle, ok := handleRaw.(string); ok && handle != "" {
-				cached := cache.Retrieve(handle, uid)
-				if cached != nil {
-					for _, msg := range cached {
-						key := fmt.Sprintf("%s:%d", msg.ChannelID, msg.MessageSeq)
-						if !seenKey[key] {
-							allMessages = append(allMessages, msg)
-							seenKey[key] = true
-						}
-					}
-				} else {
-					// Cache miss: fall back to the evidence table so this pool stays
-					// symmetric with buildCitationsForSession's recovery. Keeping the
-					// two identical is what prevents the pre-assigned CitationIndex
-					// from drifting when the cache is cold (SUM-47 v3 / PR #158 Octo-Q P1).
-					var evidence model.AgentMessageEvidence
-					if err := summaryDB.
-						Where("user_id = ? AND session_id = ? AND handle = ?", uid, sessionID, handle).
-						First(&evidence).Error; err == nil {
-						var evidenceMessages []pipeline.Message
-						if err := json.Unmarshal([]byte(evidence.Evidence), &evidenceMessages); err == nil {
-							for _, msg := range evidenceMessages {
-								key := fmt.Sprintf("%s:%d", msg.ChannelID, msg.MessageSeq)
-								if !seenKey[key] {
-									allMessages = append(allMessages, msg)
-									seenKey[key] = true
-								}
-							}
-						}
-					}
+		// Prefer cache (avoids JSON unmarshal on the hot path)
+		if cached := cache.Retrieve(ev.Handle, uid); cached != nil {
+			for _, msg := range cached {
+				key := fmt.Sprintf("%s:%d", msg.ChannelID, msg.MessageSeq)
+				if !seenKey[key] {
+					allMessages = append(allMessages, msg)
+					seenKey[key] = true
 				}
+			}
+			continue
+		}
+
+		// Cache miss: unmarshal the evidence JSON snapshot. Same recovery
+		// path as buildCitationsForSession — see agent_summary_citations.go.
+		var evidenceMessages []pipeline.Message
+		if err := json.Unmarshal([]byte(ev.Evidence), &evidenceMessages); err != nil {
+			continue
+		}
+		for _, msg := range evidenceMessages {
+			key := fmt.Sprintf("%s:%d", msg.ChannelID, msg.MessageSeq)
+			if !seenKey[key] {
+				allMessages = append(allMessages, msg)
+				seenKey[key] = true
 			}
 		}
 	}
