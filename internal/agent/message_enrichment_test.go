@@ -27,7 +27,7 @@ import (
 func TestEnrichMessagesWithMetadata_PopulatesAllFields(t *testing.T) {
 	// Setup: in-memory SQLite with user table
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
-		Logger: logger.Default.LogLevel(logger.Silent),
+		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	if err != nil {
 		t.Fatalf("failed to open in-memory db: %v", err)
@@ -148,7 +148,7 @@ func TestEnrichMessagesWithMetadata_PopulatesAllFields(t *testing.T) {
 func TestEnrichMessagesWithMetadata_BatchResolveNoPlusOne(t *testing.T) {
 	// This test uses query logging to verify batch behavior
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
-		Logger: logger.Default.LogLevel(logger.Info),
+		Logger: logger.Default.LogMode(logger.Info),
 	})
 	if err != nil {
 		t.Fatalf("failed to open in-memory db: %v", err)
@@ -195,14 +195,21 @@ func TestEnrichMessagesWithMetadata_BatchResolveNoPlusOne(t *testing.T) {
 	// Wrap db to count queries
 	queryCount := 0
 	db = db.Session(&gorm.Session{
-		Logger: logger.Default.LogLevel(logger.Info),
+		Logger: logger.Default.LogMode(logger.Info),
 	})
 
-	// Track SELECT queries on user table
-	db.Callback().Query().Before("gorm:query").Register("count_queries", func(db *gorm.DB) {
-		if db.Statement != nil && db.Statement.SQL.String() != "" {
+	// Track SELECT queries. enrichMessagesWithMetadata builds the user-name
+	// lookup with `.Raw(...).Scan(...)`, which fires gorm's Row callback
+	// (not Query). Additionally the Before-phase runs before Statement.SQL
+	// is rendered, so it's always empty there — we must attach After. The
+	// prior Before("gorm:query") registration matched neither the callback
+	// class nor the phase, so the counter never incremented and the
+	// assertion silently measured 0 for both the batch and hypothetical
+	// N+1 case.
+	db.Callback().Row().After("gorm:row").Register("count_queries", func(db *gorm.DB) {
+		if db.Statement != nil {
 			sql := db.Statement.SQL.String()
-			if len(sql) > 0 && sql[0:6] == "SELECT" {
+			if len(sql) >= 6 && sql[0:6] == "SELECT" {
 				queryCount++
 			}
 		}
@@ -222,7 +229,7 @@ func TestEnrichMessagesWithMetadata_BatchResolveNoPlusOne(t *testing.T) {
 // don't cause failures — SenderName stays empty but enrichment continues.
 func TestEnrichMessagesWithMetadata_MissingUserGraceful(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
-		Logger: logger.Default.LogLevel(logger.Silent),
+		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	if err != nil {
 		t.Fatalf("failed to open in-memory db: %v", err)
