@@ -80,7 +80,30 @@ func (h *AgentSummaryHandler) buildCitationsForSession(
 					}
 					log.Printf("[citations] retrieved %d messages from cache handle=%s", len(cached), handle)
 				} else {
-					log.Printf("[citations] cache miss or expired for handle=%s session=%s", handle, sessionID)
+					// Cache miss: fallback to evidence table (Stage 3 Blocker C fix)
+					log.Printf("[citations] cache miss for handle=%s session=%s, falling back to DB", handle, sessionID)
+					var evidence model.AgentMessageEvidence
+					err := h.db.WithContext(ctx).
+						Where("user_id = ? AND session_id = ? AND handle = ?", uid, sessionID, handle).
+						First(&evidence).Error
+					if err == nil {
+						// Deserialize evidence
+						var evidenceMessages []pipeline.Message
+						if err := json.Unmarshal([]byte(evidence.Evidence), &evidenceMessages); err == nil {
+							for _, msg := range evidenceMessages {
+								key := fmt.Sprintf("%s:%d", msg.ChannelID, msg.MessageSeq)
+								if !seenKey[key] {
+									allMessages = append(allMessages, msg)
+									seenKey[key] = true
+								}
+							}
+							log.Printf("[citations] retrieved %d messages from evidence table handle=%s", len(evidenceMessages), handle)
+						} else {
+							log.Printf("[citations] evidence unmarshal failed handle=%s: %v", handle, err)
+						}
+					} else {
+						log.Printf("[citations] evidence table miss handle=%s session=%s: %v", handle, sessionID, err)
+					}
 				}
 			}
 		}

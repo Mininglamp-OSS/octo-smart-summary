@@ -43,7 +43,7 @@ func NarrowChannelsByTopicTool() (Tool, Handler) {
 			return "", fmt.Errorf("parse args: %w", err)
 		}
 
-		_, _, cfg := GetSummaryDeps()
+		_, _, _, cfg := GetSummaryDeps()
 
 		var candidates []pipeline.ChannelInfo
 		for _, id := range req.ChannelIDs {

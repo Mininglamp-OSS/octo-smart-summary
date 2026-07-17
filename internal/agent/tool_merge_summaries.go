@@ -67,7 +67,7 @@ func MergeSummariesTool() (Tool, Handler) {
 
 // mergeSummariesWithLLM uses LLM to merge and structure multiple summaries.
 func mergeSummariesWithLLM(ctx context.Context, combined string) (string, error) {
-	_, _, cfg := GetSummaryDeps()
+	_, _, _, cfg := GetSummaryDeps()
 	client := service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, 30)
 
 	systemPrompt := `你是专业的工作内容整理助手。请将多个局部总结合并为一个结构化摘要：

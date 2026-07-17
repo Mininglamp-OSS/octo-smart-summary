@@ -196,7 +196,8 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		profileName = agentChatProfile // default profile
 	}
 
-	ctx := c.Request.Context()
+	// Inject session_id into context for tool handlers (evidence persistence, Stage 3 Blocker C).
+	ctx := context.WithValue(c.Request.Context(), agent.ContextKeySessionID, req.SessionID)
 
 	// Extract uid from middleware (authenticated identity).
 	// 鉴权中间件已保证到此处 uid 非空；summary profile 的工具据此做权限隔离。
@@ -394,7 +395,9 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	c.Writer.Flush()
 
 	// 300s context timeout for long-running map-reduce tasks
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 300*time.Second)
+	// Inject session_id into base context for tool handlers (evidence persistence, Stage 3 Blocker C).
+	baseCtx := context.WithValue(c.Request.Context(), agent.ContextKeySessionID, req.SessionID)
+	ctx, cancel := context.WithTimeout(baseCtx, 300*time.Second)
 	defer cancel()
 
 	uid := middleware.GetUserID(c)

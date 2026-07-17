@@ -84,7 +84,7 @@ func main() {
 	}
 
 	// Inject summary dependencies for agent tools
-	agent.SetSummaryDeps(imDB, octoClient, *cfg)
+	agent.SetSummaryDeps(summaryDB, imDB, octoClient, *cfg)
 
 	// Inject IM DB resolvers
 	if imDB != nil {

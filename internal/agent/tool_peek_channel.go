@@ -89,7 +89,7 @@ func PeekChannelTool() (Tool, Handler) {
 			}
 		}
 
-		imDB, _, cfg := GetSummaryDeps()
+		summaryDB, imDB, _, cfg := GetSummaryDeps()
 
 		// Security: validate channel accessibility for system-injected uid
 		accessibleChannels, err := pipeline.GetUserChannels(ctx, uid, imDB)
@@ -121,6 +121,9 @@ func PeekChannelTool() (Tool, Handler) {
 		enrichMessagesWithMetadata(ctx, messages, req.ChannelID, accessibleChannels, imDB)
 
 		handle := messageCache.Store(messages, uid)
+		// Persist evidence to DB for citation fallback on cache miss (Stage 3 Blocker C).
+		// Write failures are logged but do not block the tool return.
+		PersistEvidence(summaryDB, ctx, handle, messages)
 
 		const sampleSize = 5
 		var sampled []map[string]interface{}

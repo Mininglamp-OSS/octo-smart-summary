@@ -45,3 +45,9 @@ type contextKeyUID struct{}
 
 // ContextKeyUID is exported for use by handler to inject uid into context.
 var ContextKeyUID = contextKeyUID{}
+
+// ContextKeySessionID is the context key for storing session ID in request context.
+type contextKeySessionID struct{}
+
+// ContextKeySessionID is exported for use by handler to inject session_id into context.
+var ContextKeySessionID = contextKeySessionID{}

@@ -44,7 +44,7 @@ func FindSharedChannelsTool() (Tool, Handler) {
 			return "", fmt.Errorf("missing user identity in context")
 		}
 
-		imDB, _, _ := GetSummaryDeps()
+		_, imDB, _, _ := GetSummaryDeps()
 
 		creatorChannels, err := pipeline.GetUserChannels(ctx, uid, imDB)
 		if err != nil {

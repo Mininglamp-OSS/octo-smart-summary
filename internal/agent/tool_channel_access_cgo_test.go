@@ -83,10 +83,10 @@ func TestFetchChannelTool_AccessControl(t *testing.T) {
 	}
 
 	// Inject dependencies
-	SetSummaryDeps(db, nil, cfg)
+	SetSummaryDeps(nil, db, nil, cfg)
 	defer func() {
 		// Clean up
-		SetSummaryDeps(nil, nil, config.Config{})
+		SetSummaryDeps(nil, nil, nil, config.Config{})
 	}()
 
 	// Get the real tool handler
@@ -177,9 +177,9 @@ func TestPeekChannelTool_AccessControl(t *testing.T) {
 	}
 
 	// Inject dependencies
-	SetSummaryDeps(db, nil, cfg)
+	SetSummaryDeps(nil, db, nil, cfg)
 	defer func() {
-		SetSummaryDeps(nil, nil, config.Config{})
+		SetSummaryDeps(nil, nil, nil, config.Config{})
 	}()
 
 	// Get the real tool handler
