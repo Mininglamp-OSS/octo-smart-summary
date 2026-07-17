@@ -116,6 +116,10 @@ func PeekChannelTool() (Tool, Handler) {
 			return "", fmt.Errorf("fetch messages: %w", err)
 		}
 
+		// Enrich messages with SenderName, SourceName, ChannelType before caching.
+		// See tool_fetch_channel.go for detailed rationale (SUM-46 Blocker A fix).
+		enrichMessagesWithMetadata(ctx, messages, req.ChannelID, accessibleChannels, imDB)
+
 		handle := messageCache.Store(messages, uid)
 
 		const sampleSize = 5
@@ -149,3 +153,4 @@ func PeekChannelTool() (Tool, Handler) {
 
 	return schema, handler
 }
+

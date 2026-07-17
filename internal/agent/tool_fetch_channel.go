@@ -116,6 +116,16 @@ func FetchChannelTool() (Tool, Handler) {
 			return "", fmt.Errorf("fetch messages: %w", err)
 		}
 
+		// Enrich messages with SenderName, SourceName, ChannelType before caching.
+		// This fixes citation metadata loss (SUM-46 Blocker A).
+		// Rationale: pipeline.FetchMessagesFromChannel only fills 5 fields (SenderUID,
+		// ChannelID, Timestamp, SendTime, Content). Citations need SenderName/SourceName/
+		// ChannelType. We enrich here (tool layer) rather than in pipeline because:
+		// (1) tool layer already has accessibleChannels with ChannelName/ChannelType
+		// (2) keeps pipeline focused on message fetching, not metadata resolution
+		// (3) no circular dependency risk
+		enrichMessagesWithMetadata(ctx, messages, req.ChannelID, accessibleChannels, imDB)
+
 		handle := messageCache.Store(messages, uid)
 
 		result := map[string]interface{}{
