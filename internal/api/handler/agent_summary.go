@@ -141,16 +141,29 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			// referenced existing summaries, borrow the FIRST referenced task's
 			// origin as the new summary's origin. This keeps the chat/list
 			// grouping sensible without asking the user to re-select the channel.
+			//
+			// SUM-158 blocker 5 (follow-up to blocker 2): this is the third
+			// consumption site of ReferencedTaskIDs; buildReferencedSummariesContext
+			// and borrowCitationsFromReference already gate through canAccessTaskDB,
+			// this fallback was missed. Space-scope alone lets a caller inherit any
+			// same-space task's origin_channel_id/type (an in-space authz bypass on
+			// metadata) — enforce the same creator/participant rule as the two
+			// sibling paths here.
 			if len(req.ReferencedTaskIDs) > 0 {
 				var refTask model.SummaryTask
 				if err := h.db.WithContext(c.Request.Context()).
-					Select("id, origin_channel_id, origin_channel_type").
+					Select("id, creator_id, origin_channel_id, origin_channel_type").
 					Where("id = ? AND space_id = ? AND origin_channel_id != ''", req.ReferencedTaskIDs[0], spaceID).
 					First(&refTask).Error; err == nil {
-					finalChannelID = refTask.OriginChannelID
-					finalChannelType = refTask.OriginChannelType
-					log.Printf("[handler] CreateAgentSummary borrowed origin from referenced task_id=%d channel=%s/%d session=%s",
-						refTask.ID, finalChannelID, finalChannelType, req.SessionID)
+					if canAccessTaskDB(h.db.WithContext(c.Request.Context()), userID, refTask.ID, refTask.CreatorID) {
+						finalChannelID = refTask.OriginChannelID
+						finalChannelType = refTask.OriginChannelType
+						log.Printf("[handler] CreateAgentSummary borrowed origin from referenced task_id=%d channel=%s/%d session=%s",
+							refTask.ID, finalChannelID, finalChannelType, req.SessionID)
+					} else {
+						log.Printf("[handler] CreateAgentSummary refused to borrow origin from referenced task_id=%d (user=%s lacks read access) session=%s",
+							refTask.ID, userID, req.SessionID)
+					}
 				}
 			}
 			if finalChannelID == "" {

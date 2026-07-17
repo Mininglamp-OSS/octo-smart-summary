@@ -64,24 +64,31 @@ func StartAgentSessionCleanup(ctx context.Context, db *gorm.DB) {
 }
 
 // runOnce 执行一次清理。分成小函数便于单测直接调用不依赖 ticker。
+//
+// 权限模型对齐(SUM-158 blocker 6):agent_message 的所有权键是
+// (user_id, session_id)——按 blocker 1 的设计,两个不同用户允许偶然共用同一
+// session_id 字面值。因此清理粒度也必须是 (user_id, session_id) 而不是裸
+// session_id,否则:
+//   1. 一个 (user, session) tuple 的活跃会保护另一个 (other_user, same_session)
+//      的老 tuple 过期不掉——过度保留。
+//   2. 当两个 tuple 都空闲后,`WHERE session_id IN (...)` 会一次删掉整段,
+//      连带把最后活动比另一 tuple 更晚的行也误删——跨用户误删。
+// 用 (user_id, session_id) 复合筛选,精确到属主。
 func runOnce(db *gorm.DB) {
 	cutoff := time.Now().Add(-cleanupAge)
 	start := time.Now()
 
-	// 用子查询定位:哪些 session_id 的最大 created_at 都 <= cutoff.
-	// 这批就是全 session 都超过 24h 未动的老 session,整段清掉。
+	// 按 (user_id, session_id) 聚合 MAX(created_at),定位两键都过期的 tuple.
+	// 组合 IN 子查询在 MySQL 和 SQLite 3.7+ 都支持 (`WHERE (a, b) IN (SELECT a, b ...)`).
 	//
 	// 单条 SQL 不用事务(DELETE 天然是原子写),避免长事务锁。
-	// 用 sub-select 精确匹配"最后活动时间"而不是"某条消息很老"—— 后者会
-	// 误伤当前活跃 session 里偶然被删过消息的场景(虽然现在没有软删,但
-	// 保留正确语义)。
 	result := db.Exec(`
 		DELETE FROM agent_message
-		WHERE session_id IN (
-			SELECT session_id FROM (
-				SELECT session_id, MAX(created_at) AS last_at
+		WHERE (user_id, session_id) IN (
+			SELECT user_id, session_id FROM (
+				SELECT user_id, session_id, MAX(created_at) AS last_at
 				FROM agent_message
-				GROUP BY session_id
+				GROUP BY user_id, session_id
 				HAVING last_at <= ?
 			) AS expired
 		)

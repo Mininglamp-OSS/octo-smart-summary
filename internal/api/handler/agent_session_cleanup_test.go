@@ -28,10 +28,11 @@ func newCleanupTestDB(t *testing.T) (*gorm.DB, bool) {
 	return db, false
 }
 
-func seedMsg(t *testing.T, db *gorm.DB, sessionID string, role string, createdAt time.Time) {
+func seedMsg(t *testing.T, db *gorm.DB, sessionID, userID, role string, createdAt time.Time) {
 	t.Helper()
 	if err := db.Create(&model.AgentMessage{
 		SessionID: sessionID,
+		UserID:    userID,
 		Role:      role,
 		Content:   "test",
 		CreatedAt: createdAt,
@@ -49,12 +50,24 @@ func countMsgs(t *testing.T, db *gorm.DB, sessionID string) int64 {
 	return n
 }
 
+// countMsgsFor 数指定 (user_id, session_id) 的行数，用于验证清理精确到属主。
+func countMsgsFor(t *testing.T, db *gorm.DB, userID, sessionID string) int64 {
+	t.Helper()
+	var n int64
+	if err := db.Model(&model.AgentMessage{}).
+		Where("user_id = ? AND session_id = ?", userID, sessionID).
+		Count(&n).Error; err != nil {
+		t.Fatalf("count for (user=%s session=%s): %v", userID, sessionID, err)
+	}
+	return n
+}
+
 func TestRunOnce_expiredSessionCleaned(t *testing.T) {
 	db, skip := newCleanupTestDB(t)
 	if skip { return }
 	// session A: 最后一条 25h 前 → 过期,该清
-	seedMsg(t, db, "session-A", "user", time.Now().Add(-30*time.Hour))
-	seedMsg(t, db, "session-A", "assistant", time.Now().Add(-25*time.Hour))
+	seedMsg(t, db, "session-A", "user-1", "user", time.Now().Add(-30*time.Hour))
+	seedMsg(t, db, "session-A", "user-1", "assistant", time.Now().Add(-25*time.Hour))
 
 	runOnce(db)
 
@@ -67,8 +80,8 @@ func TestRunOnce_freshSessionUntouched(t *testing.T) {
 	db, skip := newCleanupTestDB(t)
 	if skip { return }
 	// session B: 最后一条 1h 前 → 活跃,不动
-	seedMsg(t, db, "session-B", "user", time.Now().Add(-2*time.Hour))
-	seedMsg(t, db, "session-B", "assistant", time.Now().Add(-1*time.Hour))
+	seedMsg(t, db, "session-B", "user-1", "user", time.Now().Add(-2*time.Hour))
+	seedMsg(t, db, "session-B", "user-1", "assistant", time.Now().Add(-1*time.Hour))
 
 	runOnce(db)
 
@@ -81,7 +94,7 @@ func TestRunOnce_borderline23_9hUntouched(t *testing.T) {
 	db, skip := newCleanupTestDB(t)
 	if skip { return }
 	// session C: 最后一条 23h55min 前 → 还没到 24h,不动
-	seedMsg(t, db, "session-C", "user", time.Now().Add(-23*time.Hour-55*time.Minute))
+	seedMsg(t, db, "session-C", "user-1", "user", time.Now().Add(-23*time.Hour-55*time.Minute))
 
 	runOnce(db)
 
@@ -97,8 +110,8 @@ func TestRunOnce_mixedFreshAndOldSessionPartiallyPreserved(t *testing.T) {
 	db, skip := newCleanupTestDB(t)
 	if skip { return }
 	// session D: 有老消息 (30h 前) 也有新消息 (1h 前) → 整段 session 应保留
-	seedMsg(t, db, "session-D", "user", time.Now().Add(-30*time.Hour))
-	seedMsg(t, db, "session-D", "assistant", time.Now().Add(-1*time.Hour))
+	seedMsg(t, db, "session-D", "user-1", "user", time.Now().Add(-30*time.Hour))
+	seedMsg(t, db, "session-D", "user-1", "assistant", time.Now().Add(-1*time.Hour))
 
 	runOnce(db)
 
@@ -110,10 +123,10 @@ func TestRunOnce_mixedFreshAndOldSessionPartiallyPreserved(t *testing.T) {
 func TestRunOnce_multipleSessionsIsolated(t *testing.T) {
 	db, skip := newCleanupTestDB(t)
 	if skip { return }
-	seedMsg(t, db, "session-old", "user", time.Now().Add(-48*time.Hour))
-	seedMsg(t, db, "session-old", "assistant", time.Now().Add(-40*time.Hour))
-	seedMsg(t, db, "session-new", "user", time.Now().Add(-30*time.Minute))
-	seedMsg(t, db, "session-new", "assistant", time.Now().Add(-10*time.Minute))
+	seedMsg(t, db, "session-old", "user-1", "user", time.Now().Add(-48*time.Hour))
+	seedMsg(t, db, "session-old", "user-1", "assistant", time.Now().Add(-40*time.Hour))
+	seedMsg(t, db, "session-new", "user-1", "user", time.Now().Add(-30*time.Minute))
+	seedMsg(t, db, "session-new", "user-1", "assistant", time.Now().Add(-10*time.Minute))
 
 	runOnce(db)
 
@@ -135,5 +148,61 @@ func TestRunOnce_emptyTable(t *testing.T) {
 	db.Model(&model.AgentMessage{}).Count(&total)
 	if total != 0 {
 		t.Errorf("empty table stays empty, got %d", total)
+	}
+}
+
+// TestRunOnce_sameSessionIDDifferentUsers_scopedByOwner covers SUM-158 blocker 6:
+// two different users happen to reuse the same session_id literal (allowed by
+// the ownership model — (user_id, session_id) is the effective key). Both
+// sessions have been idle > 24h so both must be cleaned, but the aggregation
+// key had to switch from bare session_id to (user_id, session_id) or the
+// bulk DELETE would either over-retain (any active tuple keeps the other's
+// old tuple alive) or cross-user delete (`WHERE session_id IN (...)` sweeps
+// both users' rows). Verify BOTH users' rows disappear when BOTH are expired.
+func TestRunOnce_sameSessionIDDifferentUsers_scopedByOwner(t *testing.T) {
+	db, skip := newCleanupTestDB(t)
+	if skip { return }
+
+	// Two users share the same session_id literal, both idle > 24h.
+	seedMsg(t, db, "sess-shared", "user-alice", "user", time.Now().Add(-30*time.Hour))
+	seedMsg(t, db, "sess-shared", "user-alice", "assistant", time.Now().Add(-25*time.Hour))
+	seedMsg(t, db, "sess-shared", "user-bob", "user", time.Now().Add(-40*time.Hour))
+	seedMsg(t, db, "sess-shared", "user-bob", "assistant", time.Now().Add(-26*time.Hour))
+
+	runOnce(db)
+
+	if got := countMsgsFor(t, db, "user-alice", "sess-shared"); got != 0 {
+		t.Errorf("(alice, sess-shared) expired, expected 0 rows, got %d", got)
+	}
+	if got := countMsgsFor(t, db, "user-bob", "sess-shared"); got != 0 {
+		t.Errorf("(bob, sess-shared) expired, expected 0 rows, got %d", got)
+	}
+}
+
+// TestRunOnce_sameSessionIDDifferentUsers_activeTuplePreserved covers the
+// dangerous inverse case: two users share a session_id literal, one is idle
+// (should be cleaned), the other is active (must not be touched). Before
+// blocker 6's (user_id, session_id) aggregation, either the active tuple
+// would protect the stale one (over-retention) OR the bulk delete would
+// sweep both (cross-user data loss). The correct behavior is precise:
+// stale tuple gone, active tuple preserved.
+func TestRunOnce_sameSessionIDDifferentUsers_activeTuplePreserved(t *testing.T) {
+	db, skip := newCleanupTestDB(t)
+	if skip { return }
+
+	// Alice: idle > 24h → must be cleaned.
+	seedMsg(t, db, "sess-shared", "user-alice", "user", time.Now().Add(-30*time.Hour))
+	seedMsg(t, db, "sess-shared", "user-alice", "assistant", time.Now().Add(-25*time.Hour))
+	// Bob: last message 1h ago → must be untouched.
+	seedMsg(t, db, "sess-shared", "user-bob", "user", time.Now().Add(-2*time.Hour))
+	seedMsg(t, db, "sess-shared", "user-bob", "assistant", time.Now().Add(-1*time.Hour))
+
+	runOnce(db)
+
+	if got := countMsgsFor(t, db, "user-alice", "sess-shared"); got != 0 {
+		t.Errorf("(alice, sess-shared) idle > 24h, expected 0 rows, got %d", got)
+	}
+	if got := countMsgsFor(t, db, "user-bob", "sess-shared"); got != 2 {
+		t.Errorf("(bob, sess-shared) still active, expected 2 rows preserved, got %d", got)
 	}
 }
