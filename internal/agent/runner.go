@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
+	"strings"
 	"sync"
 	"time"
 )
@@ -85,7 +87,32 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 		}
 		totalTokens += turn.Tokens
 
-		// 无工具调用 = 模型给出最终答案，正常出口：把 assistant 终答并入 newMsgs 落库。
+		// SUM-158 blocker follow-up: 无工具调用 且 有 content = 模型给出最终答案，正常出口。
+		// 但如果 tool_calls 空 且 content 也空/空白，不能视为正常终止：
+		//   1. reasoning-style 模型(kimi-k2.6 / glm / qwen)在 fan-out 多步 tool_call 后
+		//      偶尔会返回 content="" tool_calls=[]，通常表示模型"卡住"而非"想通了"。
+		//   2. 走静默终止路径会：(a) SSE stream 关闭时不 emit `done` 事件 → 前端表现
+		//      为 "stream closed without done"；(b) 落一条 empty assistant 到
+		//      agent_message 表，下次 LoadHistory 加载 session 时带毒；(c) 上层 caller
+		//      看到 (content="", nil) 无从区分真·空答案 vs bug。
+		// 修法：识别 empty response → log 警告 + 注入一条 nudge user message 强制模型
+		// 重新给答，只有在最后一步仍空才 return error。有 content 的正常终止路径未变。
+		if len(turn.ToolCalls) == 0 && strings.TrimSpace(turn.Content) == "" {
+			log.Printf("[agent] step %d/%d: LLM returned empty content and no tool_calls; nudging model to produce a final answer",
+				step+1, r.policy.MaxSteps)
+			if step >= r.policy.MaxSteps-1 {
+				return "", nil, errors.New("LLM returned empty response with no tool_calls at final step")
+			}
+			// Nudge lives only on the in-memory msgs slice (not newMsgs) so the
+			// poison assistant + nudge don't get persisted into session history.
+			msgs = append(msgs, Message{Role: "assistant", Content: ""})
+			msgs = append(msgs, Message{
+				Role:    "user",
+				Content: "请基于以上工具返回结果给出最终答案。",
+			})
+			continue
+		}
+
 		if len(turn.ToolCalls) == 0 {
 			stepElapsed := time.Since(stepStart).Milliseconds()
 			if r.OnEvent != nil {

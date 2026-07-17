@@ -490,3 +490,94 @@ func TestRunner_OnEvent_EmitsEvents(t *testing.T) {
 		}
 	}
 }
+
+// TestRunner_EmptyResponseNudge verifies the SUM-158 blocker follow-up:
+// when the LLM returns content="" and tool_calls=[] mid-session, the runner
+// nudges the model with a user message instead of silently returning empty
+// success. Reproduces the "stream closed without done" symptom observed with
+// kimi-k2.6 in production and locks in the recovery path.
+func TestRunner_EmptyResponseNudge(t *testing.T) {
+	fc := &fakeClient{turns: []AssistantTurn{
+		// Step 1: a normal tool call so we're not on step 0
+		{ToolCalls: []ToolCall{mkToolCall("id1", "alpha", "{}")}},
+		// Step 2: EMPTY response — this used to terminate the runner silently
+		{Content: "", ToolCalls: nil},
+		// Step 3: after the nudge, model recovers and gives a real final answer
+		{Content: "recovered answer", ToolCalls: nil},
+	}}
+	reg := regWithEcho("alpha")
+	r := newTestRunner(fc, reg, Policy{MaxSteps: 5, MaxTokens: 10000, StepTimeout: 5 * time.Second})
+
+	out, newMsgs, err := r.RunWithHistory(context.Background(), "system", nil, "hi")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if out != "recovered answer" {
+		t.Errorf("out = %q, want %q", out, "recovered answer")
+	}
+	if fc.calls != 3 {
+		t.Errorf("calls = %d, want 3 (tool call + empty + recovery)", fc.calls)
+	}
+	// The empty assistant + nudge must NOT be persisted to newMsgs (which is
+	// what the caller writes to agent_message).
+	for _, m := range newMsgs {
+		if m.Role == "assistant" && m.Content == "" && len(m.ToolCalls) == 0 {
+			t.Errorf("empty assistant should NOT be persisted to newMsgs; got %+v", m)
+		}
+		if m.Role == "user" && strings.Contains(m.Content, "请基于以上工具返回结果给出最终答案") {
+			t.Errorf("nudge user message should NOT be persisted to newMsgs; got %+v", m)
+		}
+	}
+	// But the nudge MUST reach the model on the next call — check via lastMsgs.
+	foundNudge := false
+	for _, m := range fc.lastMsgs {
+		if m.Role == "user" && strings.Contains(m.Content, "请基于以上工具返回结果给出最终答案") {
+			foundNudge = true
+		}
+	}
+	if !foundNudge {
+		t.Errorf("nudge user message should be in lastMsgs sent to LLM")
+	}
+}
+
+// TestRunner_EmptyResponseAtFinalStepErrors verifies the guardrail: if the
+// empty response happens at the very last step, we cannot nudge again — the
+// runner must return a diagnostic error instead of a silent empty success.
+func TestRunner_EmptyResponseAtFinalStepErrors(t *testing.T) {
+	fc := &fakeClient{turns: []AssistantTurn{
+		{Content: "", ToolCalls: nil}, // Step 1 = final (MaxSteps=1) and empty
+	}}
+	reg := NewRegistry()
+	r := newTestRunner(fc, reg, Policy{MaxSteps: 1, MaxTokens: 10000, StepTimeout: 5 * time.Second})
+
+	_, _, err := r.RunWithHistory(context.Background(), "system", nil, "hi")
+	if err == nil {
+		t.Fatal("expected error on empty final-step response, got nil")
+	}
+	if !strings.Contains(err.Error(), "empty response") {
+		t.Errorf("error should mention 'empty response'; got %v", err)
+	}
+}
+
+// TestRunner_WhitespaceOnlyContentTreatedAsEmpty verifies that a whitespace-only
+// content (e.g. "   \n\n") is treated the same as empty and triggers the nudge
+// path, not a bogus "final answer".
+func TestRunner_WhitespaceOnlyContentTreatedAsEmpty(t *testing.T) {
+	fc := &fakeClient{turns: []AssistantTurn{
+		{Content: "   \n\t\n  ", ToolCalls: nil}, // whitespace only
+		{Content: "real answer", ToolCalls: nil}, // recovery
+	}}
+	reg := NewRegistry()
+	r := newTestRunner(fc, reg, Policy{MaxSteps: 5, MaxTokens: 10000, StepTimeout: 5 * time.Second})
+
+	out, _, err := r.RunWithHistory(context.Background(), "system", nil, "hi")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if out != "real answer" {
+		t.Errorf("out = %q, want %q (whitespace-only should have triggered nudge)", out, "real answer")
+	}
+	if fc.calls != 2 {
+		t.Errorf("calls = %d, want 2 (empty + recovery)", fc.calls)
+	}
+}
