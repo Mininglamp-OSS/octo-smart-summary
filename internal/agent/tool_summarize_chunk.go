@@ -56,9 +56,18 @@ func getSessionMessagePool(sessionID, uid string) ([]pipeline.Message, error) {
 		}
 	}
 
-	// Sort by timestamp ascending (same as agent_summary_citations.go:97-99)
+	// Sort by timestamp ascending, with (ChannelID, MessageSeq) as deterministic
+	// tiebreaker. Must stay byte-identical to the sort in
+	// agent_summary_citations.go:120-122 so that the pre-assigned CitationIndex
+	// here matches the post-assignment there — see SUM-47 v3 rationale.
 	sort.Slice(allMessages, func(i, j int) bool {
-		return allMessages[i].Timestamp < allMessages[j].Timestamp
+		if allMessages[i].Timestamp != allMessages[j].Timestamp {
+			return allMessages[i].Timestamp < allMessages[j].Timestamp
+		}
+		if allMessages[i].ChannelID != allMessages[j].ChannelID {
+			return allMessages[i].ChannelID < allMessages[j].ChannelID
+		}
+		return allMessages[i].MessageSeq < allMessages[j].MessageSeq
 	})
 
 	// Assign global CitationIndex (same as agent_summary_citations.go:102-103)

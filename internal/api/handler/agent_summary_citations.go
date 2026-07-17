@@ -116,9 +116,19 @@ func (h *AgentSummaryHandler) buildCitationsForSession(
 		return []model.Citation{}, nil
 	}
 
-	// 3. Sort by time ascending
+	// 3. Sort by timestamp ascending, with (ChannelID, MessageSeq) as deterministic
+	// tiebreaker. Must stay byte-identical to the sort in
+	// internal/agent/tool_summarize_chunk.go:60-70 so that the pre-assigned
+	// CitationIndex from the tool layer matches the post-assignment here —
+	// see SUM-47 v3 rationale.
 	sort.Slice(allMessages, func(i, j int) bool {
-		return allMessages[i].Timestamp < allMessages[j].Timestamp
+		if allMessages[i].Timestamp != allMessages[j].Timestamp {
+			return allMessages[i].Timestamp < allMessages[j].Timestamp
+		}
+		if allMessages[i].ChannelID != allMessages[j].ChannelID {
+			return allMessages[i].ChannelID < allMessages[j].ChannelID
+		}
+		return allMessages[i].MessageSeq < allMessages[j].MessageSeq
 	})
 
 	// 4. Assign CitationIndex (1-indexed, global sequential)
