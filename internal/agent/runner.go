@@ -79,15 +79,24 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 			})
 		}
 
-		// stepCtx bounds BOTH the LLM call and the subsequent tool executions
-		// for this step, so a hung tool cannot outlast the intended per-step
-		// budget (post-#158 Octo-Q P2, 4-reviewer follow-up). Previously
-		// runTools received the outer request ctx, letting a hung tool block
-		// until the 300s ChatStream backstop instead of the 60s StepTimeout.
+		// stepCtx bounds ONLY the planning LLM call (r.client.Chat below).
+		// Tool execution must NOT share this budget: LLM-backed tools such
+		// as summarize_chunk and merge_summaries run their own sequential
+		// per-chunk LLM calls, each with its own LLMTimeout (default 180s,
+		// see config.go). Wrapping runTools in stepCtx (default 60s) — as
+		// briefly attempted in commit 4f614cc — clamps every large map-reduce
+		// summary to 60s and breaks the feature's primary path (byte-verified
+		// by yujiawei / lml2468 / Jerry-Xin in PR #161).
+		//
+		// The outer ctx passed to runTools is the request-scoped ChatStream
+		// context (300s backstop, see agent_chat.go), which is the correct
+		// wall-clock ceiling for tool execution. If a per-tool budget is
+		// ever needed, wrap it inside the tool handler itself — do NOT
+		// re-widen stepCtx here.
 		stepCtx, cancel := context.WithTimeout(ctx, r.policy.StepTimeout)
 		turn, err := r.client.Chat(stepCtx, msgs, r.reg.Schemas())
+		cancel()
 		if err != nil {
-			cancel()
 			return "", nil, err
 		}
 		totalTokens += turn.Tokens
@@ -106,7 +115,6 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 			log.Printf("[agent] step %d/%d: LLM returned empty content and no tool_calls; nudging model to produce a final answer",
 				step+1, r.policy.MaxSteps)
 			if step >= r.policy.MaxSteps-1 {
-				cancel()
 				return "", nil, errors.New("LLM returned empty response with no tool_calls at final step")
 			}
 			// Nudge lives only on the in-memory msgs slice (not newMsgs) so the
@@ -116,7 +124,6 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 				Role:    "user",
 				Content: "请基于以上工具返回结果给出最终答案。",
 			})
-			cancel()
 			continue
 		}
 
@@ -132,7 +139,6 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 				})
 			}
 			newMsgs = append(newMsgs, Message{Role: "assistant", Content: turn.Content})
-			cancel()
 			return turn.Content, newMsgs, nil
 		}
 
@@ -146,10 +152,11 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 		newMsgs = append(newMsgs, assistantMsg)
 
 		// 单跳内多工具并发执行；结果按原索引回填以保证顺序稳定、无数据竞争。
-		// Pass stepCtx (not the outer ctx) so a hung tool is bounded by the
-		// step timeout — see the stepCtx setup comment above.
-		results := r.runTools(stepCtx, turn.ToolCalls, step+1, r.policy.MaxSteps)
-		cancel()
+		// Use the outer request ctx (300s ChatStream backstop) — NOT stepCtx.
+		// See the stepCtx setup comment above for why: LLM-backed tools like
+		// summarize_chunk run their own sequential LLM calls that legitimately
+		// exceed the 60s per-step planning budget.
+		results := r.runTools(ctx, turn.ToolCalls, step+1, r.policy.MaxSteps)
 		for i, tc := range turn.ToolCalls {
 			toolMsg := Message{
 				Role:       "tool",
