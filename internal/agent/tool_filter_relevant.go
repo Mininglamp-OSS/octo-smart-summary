@@ -69,6 +69,14 @@ func FilterRelevantTool() (Tool, Handler) {
 
 		newHandle := messageCache.Store(filtered, uid)
 
+		// Also persist to evidence table so citation recovery survives the
+		// 30-min in-memory TTL. fetch_channel / peek_channel already do this;
+		// search/filter previously did not, creating a citation-recovery gap
+		// for sessions that summarize a filter-derived handle after cache
+		// expiry (post-#158 Octo-Q P2, 4-reviewer follow-up).
+		summaryDB, _, _, _ := GetSummaryDeps()
+		PersistEvidence(summaryDB, ctx, newHandle, filtered)
+
 		result := map[string]interface{}{
 			"original_count":  len(messages),
 			"filtered_count":  len(filtered),
