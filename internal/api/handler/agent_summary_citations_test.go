@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -11,6 +12,28 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
+
+// seedEvidenceRow writes an agent_message_evidence row directly via GORM, mirroring
+// what PersistEvidence does in production. Used by buildCitationsForSession tests
+// after the #161 P1-A fix aligned discovery on the evidence table.
+func seedEvidenceRow(t *testing.T, db *gorm.DB, uid, sessionID, handle string, messages []pipeline.Message) {
+	t.Helper()
+	blob, err := json.Marshal(messages)
+	if err != nil {
+		t.Fatalf("marshal evidence: %v", err)
+	}
+	now := time.Now()
+	if err := db.Create(&model.AgentMessageEvidence{
+		UserID:    uid,
+		SessionID: sessionID,
+		Handle:    handle,
+		Evidence:  string(blob),
+		CreatedAt: now,
+		UpdatedAt: now,
+	}).Error; err != nil {
+		t.Fatalf("seed evidence: %v", err)
+	}
+}
 
 // Test 1: 有 [n] 标记 + 有完整 tool 轨迹 → citations 非空、结构正确
 func TestBuildCitationsForSession_WithMarkersAndMessages(t *testing.T) {
@@ -59,6 +82,9 @@ func TestBuildCitationsForSession_WithMarkersAndMessages(t *testing.T) {
 		Name:      "fetch_channel",
 	}
 	db.Create(&msg)
+	// #161 P1-A (yujiawei): buildCitationsForSession now discovers handles
+	// from agent_message_evidence, so tests must seed the evidence row too.
+	seedEvidenceRow(t, db, "test-user", "session-1", handle, messages)
 
 	h := &AgentSummaryHandler{db: db}
 
@@ -124,6 +150,8 @@ func TestBuildCitationsForSession_NoMarkers(t *testing.T) {
 		Name:      "fetch_channel",
 	}
 	db.Create(&msg)
+	// #161 P1-A: seed evidence for the new discovery source.
+	seedEvidenceRow(t, db, "test-user", "session-1", handle, messages)
 
 	h := &AgentSummaryHandler{db: db}
 
@@ -275,6 +303,8 @@ func TestBuildCitationsForSession_PeekChannelMultipleMessages(t *testing.T) {
 		Name:      "peek_channel",
 	}
 	db.Create(&msg)
+	// #161 P1-A: seed evidence for the new discovery source.
+	seedEvidenceRow(t, db, "test-user", "session-1", handle, messages)
 
 	h := &AgentSummaryHandler{db: db}
 
@@ -327,7 +357,7 @@ func setupTestDB(t *testing.T) (*gorm.DB, bool) {
 		return nil, true
 	}
 
-	if err := db.AutoMigrate(&model.AgentMessage{}); err != nil {
+	if err := db.AutoMigrate(&model.AgentMessage{}, &model.AgentMessageEvidence{}); err != nil {
 		t.Fatalf("failed to migrate: %v", err)
 	}
 

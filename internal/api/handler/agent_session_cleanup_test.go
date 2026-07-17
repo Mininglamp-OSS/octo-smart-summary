@@ -22,7 +22,7 @@ func newCleanupTestDB(t *testing.T) (*gorm.DB, bool) {
 		t.Skipf("CGO required for sqlite: %v", err)
 		return nil, true
 	}
-	if err := db.AutoMigrate(&model.AgentMessage{}); err != nil {
+	if err := db.AutoMigrate(&model.AgentMessage{}, &model.AgentMessageEvidence{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	return db, false
@@ -204,5 +204,94 @@ func TestRunOnce_sameSessionIDDifferentUsers_activeTuplePreserved(t *testing.T) 
 	}
 	if got := countMsgsFor(t, db, "user-bob", "sess-shared"); got != 2 {
 		t.Errorf("(bob, sess-shared) still active, expected 2 rows preserved, got %d", got)
+	}
+}
+
+// seedEvidence writes an agent_message_evidence row, mirroring what
+// PersistEvidence does in production. Used by the #161 P2 (yujiawei)
+// symmetric-cleanup regression tests below.
+func seedEvidence(t *testing.T, db *gorm.DB, userID, sessionID, handle string, createdAt time.Time) {
+	t.Helper()
+	if err := db.Create(&model.AgentMessageEvidence{
+		UserID:    userID,
+		SessionID: sessionID,
+		Handle:    handle,
+		Evidence:  "[]", // JSON-empty; content shape is irrelevant to cleanup
+		CreatedAt: createdAt,
+		UpdatedAt: createdAt,
+	}).Error; err != nil {
+		t.Fatalf("seed evidence (user=%s session=%s handle=%s): %v", userID, sessionID, handle, err)
+	}
+}
+
+func countEvidence(t *testing.T, db *gorm.DB, userID, sessionID string) int64 {
+	t.Helper()
+	var n int64
+	if err := db.Model(&model.AgentMessageEvidence{}).
+		Where("user_id = ? AND session_id = ?", userID, sessionID).
+		Count(&n).Error; err != nil {
+		t.Fatalf("count evidence for (user=%s session=%s): %v", userID, sessionID, err)
+	}
+	return n
+}
+
+// TestRunOnce_expiredEvidenceCleaned is the #161 P2 (yujiawei) regression:
+// agent_message_evidence must be cleaned symmetrically with agent_message so
+// stale evidence rows don't accumulate indefinitely and inflate the citation
+// pool of every subsequent summarize_chunk. Without symmetric cleanup,
+// evidence rows written 30+ days ago for a reused session_id would still be
+// pulled into today's pool by getSessionMessagePool / buildCitationsForSession.
+func TestRunOnce_expiredEvidenceCleaned(t *testing.T) {
+	db, skip := newCleanupTestDB(t)
+	if skip {
+		return
+	}
+	// evidence-A: 30h old → expired → should be cleaned
+	seedEvidence(t, db, "user-1", "session-A", "msg_u1_1", time.Now().Add(-30*time.Hour))
+
+	runOnce(db)
+
+	if got := countEvidence(t, db, "user-1", "session-A"); got != 0 {
+		t.Errorf("expired evidence-A should be cleaned, got %d rows", got)
+	}
+}
+
+// TestRunOnce_freshEvidenceUntouched asserts the cutoff is honored — recent
+// evidence (< 24h) must NOT be cleaned even if the message table for the
+// same session has already been expired.
+func TestRunOnce_freshEvidenceUntouched(t *testing.T) {
+	db, skip := newCleanupTestDB(t)
+	if skip {
+		return
+	}
+	// evidence-B: 1h old → fresh → keep
+	seedEvidence(t, db, "user-1", "session-B", "msg_u1_2", time.Now().Add(-1*time.Hour))
+
+	runOnce(db)
+
+	if got := countEvidence(t, db, "user-1", "session-B"); got != 1 {
+		t.Errorf("fresh evidence-B should NOT be cleaned, got %d rows", got)
+	}
+}
+
+// TestRunOnce_evidenceOwnerScoped verifies the (user_id, session_id) predicate
+// is honored on evidence cleanup too — two different users sharing the same
+// literal session_id string must be cleaned independently.
+func TestRunOnce_evidenceOwnerScoped(t *testing.T) {
+	db, skip := newCleanupTestDB(t)
+	if skip {
+		return
+	}
+	// user-1's evidence expired, user-2's still fresh; same session_id literal
+	seedEvidence(t, db, "user-1", "shared-session", "msg_u1_3", time.Now().Add(-30*time.Hour))
+	seedEvidence(t, db, "user-2", "shared-session", "msg_u2_1", time.Now().Add(-1*time.Hour))
+
+	runOnce(db)
+
+	if got := countEvidence(t, db, "user-1", "shared-session"); got != 0 {
+		t.Errorf("user-1's expired evidence should be cleaned, got %d rows", got)
+	}
+	if got := countEvidence(t, db, "user-2", "shared-session"); got != 1 {
+		t.Errorf("user-2's fresh evidence must survive, got %d rows (cross-user clobber?)", got)
 	}
 }

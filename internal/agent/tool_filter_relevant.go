@@ -69,6 +69,16 @@ func FilterRelevantTool() (Tool, Handler) {
 
 		newHandle := messageCache.Store(filtered, uid)
 
+		// Also persist to evidence table so citation recovery survives the
+		// 30-min in-memory TTL. #161 P1-B (yujiawei): evidence is the sole
+		// discovery source for citation building, so a write failure would
+		// make this handle uncitable for the entire session — escalate as
+		// a tool-level error.
+		summaryDB, _, _, _ := GetSummaryDeps()
+		if err := PersistEvidence(summaryDB, ctx, newHandle, filtered); err != nil {
+			return "", fmt.Errorf("persist evidence: %w", err)
+		}
+
 		result := map[string]interface{}{
 			"original_count":  len(messages),
 			"filtered_count":  len(filtered),

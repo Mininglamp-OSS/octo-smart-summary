@@ -74,6 +74,15 @@ func StartAgentSessionCleanup(ctx context.Context, db *gorm.DB) {
 //   2. 当两个 tuple 都空闲后,`WHERE session_id IN (...)` 会一次删掉整段,
 //      连带把最后活动比另一 tuple 更晚的行也误删——跨用户误删。
 // 用 (user_id, session_id) 复合筛选,精确到属主。
+//
+// #161 P2 (yujiawei): agent_message_evidence must be cleaned symmetrically.
+// After PR #161 evidence is the sole citation-handle discovery source for
+// both getSessionMessagePool (mid-run) and buildCitationsForSession
+// (save-time). Without cleanup, evidence rows accumulate indefinitely for
+// any reused session_id and inflate the citation pool of every subsequent
+// summarize_chunk. The evidence table has no created_at index on its own
+// key columns — the age predicate reuses agent_message's last-activity
+// timestamp so both tables retire together per (user_id, session_id).
 func runOnce(db *gorm.DB) {
 	cutoff := time.Now().Add(-cleanupAge)
 	start := time.Now()
@@ -112,7 +121,40 @@ func runOnce(db *gorm.DB) {
 		log.Printf("[agent-cleanup] SLOW delete took %s (rows=%d, cutoff=%s) — consider indexing agent_message(session_id, created_at)",
 			elapsed, result.RowsAffected, cutoff.Format(time.RFC3339))
 	}
+
+	// #161 P2 (yujiawei): symmetric evidence cleanup. Delete evidence rows
+	// for (user_id, session_id) tuples whose evidence itself is older than
+	// cleanupAge. Keying off evidence.created_at (not agent_message) is
+	// simpler and self-contained — evidence is written synchronously by
+	// PersistEvidence at fetch/peek/search/filter time, so its timestamps
+	// reflect real user activity independent of AppendMessages ordering.
+	evStart := time.Now()
+	evResult := db.Exec(`
+		DELETE FROM agent_message_evidence
+		WHERE (user_id, session_id) IN (
+			SELECT user_id, session_id FROM (
+				SELECT user_id, session_id, MAX(created_at) AS last_at
+				FROM agent_message_evidence
+				GROUP BY user_id, session_id
+				HAVING last_at <= ?
+			) AS expired
+		)
+	`, cutoff)
+	evElapsed := time.Since(evStart)
+	if evResult.Error != nil {
+		log.Printf("[agent-cleanup] ERROR evidence delete failed after %s: %v", evElapsed, evResult.Error)
+		return
+	}
+	if evResult.RowsAffected > 0 {
+		log.Printf("[agent-cleanup] cleaned %d evidence rows in %s (cutoff=%s)",
+			evResult.RowsAffected, evElapsed, cutoff.Format(time.RFC3339))
+	}
+	if evElapsed > cleanupSlowThreshold {
+		log.Printf("[agent-cleanup] SLOW evidence delete took %s (rows=%d, cutoff=%s) — consider indexing agent_message_evidence(session_id, created_at)",
+			evElapsed, evResult.RowsAffected, cutoff.Format(time.RFC3339))
+	}
 }
 
 // 兜底类型检查:确保 AgentMessage 表名不变时这段代码还生效
 var _ = model.AgentMessage{}
+var _ = model.AgentMessageEvidence{}

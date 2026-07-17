@@ -122,8 +122,12 @@ func PeekChannelTool() (Tool, Handler) {
 
 		handle := messageCache.Store(messages, uid)
 		// Persist evidence to DB for citation fallback on cache miss (Stage 3 Blocker C).
-		// Write failures are logged but do not block the tool return.
-		PersistEvidence(summaryDB, ctx, handle, messages)
+		// #161 P1-B (yujiawei): evidence is the sole discovery source for
+		// citation building — surface write failures as tool errors, see
+		// tool_fetch_channel.go for the full rationale.
+		if err := PersistEvidence(summaryDB, ctx, handle, messages); err != nil {
+			return "", fmt.Errorf("persist evidence: %w", err)
+		}
 
 		const sampleSize = 5
 		var sampled []map[string]interface{}

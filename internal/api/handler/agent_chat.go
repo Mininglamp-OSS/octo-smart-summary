@@ -407,6 +407,17 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	defer cancel()
 
 	uid := middleware.GetUserID(c)
+	if uid == "" {
+		// Defense-in-depth (post-#158 Octo-Q P2, 4-reviewer): Chat() and
+		// History() explicitly reject empty uid; ChatStream() previously
+		// relied only on StrictAuthMiddleware. Symmetric guard closes the
+		// asymmetry so a future route misconfiguration cannot silently
+		// degrade only this endpoint's authz. Errors are emitted via the
+		// SSE sink because response headers are already sent by this point.
+		sink := &sseSink{w: c.Writer}
+		h.writeSSEErrorViaSink(sink, 40100, "missing auth context")
+		return
+	}
 
 	// Build runner with OnEvent callback for SSE progress
 	var runner *agent.Runner

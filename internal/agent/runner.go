@@ -79,6 +79,20 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 			})
 		}
 
+		// stepCtx bounds ONLY the planning LLM call (r.client.Chat below).
+		// Tool execution must NOT share this budget: LLM-backed tools such
+		// as summarize_chunk and merge_summaries run their own sequential
+		// per-chunk LLM calls, each with its own LLMTimeout (default 180s,
+		// see config.go). Wrapping runTools in stepCtx (default 60s) — as
+		// briefly attempted in commit 4f614cc — clamps every large map-reduce
+		// summary to 60s and breaks the feature's primary path (byte-verified
+		// by yujiawei / lml2468 / Jerry-Xin in PR #161).
+		//
+		// The outer ctx passed to runTools is the request-scoped ChatStream
+		// context (300s backstop, see agent_chat.go), which is the correct
+		// wall-clock ceiling for tool execution. If a per-tool budget is
+		// ever needed, wrap it inside the tool handler itself — do NOT
+		// re-widen stepCtx here.
 		stepCtx, cancel := context.WithTimeout(ctx, r.policy.StepTimeout)
 		turn, err := r.client.Chat(stepCtx, msgs, r.reg.Schemas())
 		cancel()
@@ -138,6 +152,10 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 		newMsgs = append(newMsgs, assistantMsg)
 
 		// 单跳内多工具并发执行；结果按原索引回填以保证顺序稳定、无数据竞争。
+		// Use the outer request ctx (300s ChatStream backstop) — NOT stepCtx.
+		// See the stepCtx setup comment above for why: LLM-backed tools like
+		// summarize_chunk run their own sequential LLM calls that legitimately
+		// exceed the 60s per-step planning budget.
 		results := r.runTools(ctx, turn.ToolCalls, step+1, r.policy.MaxSteps)
 		for i, tc := range turn.ToolCalls {
 			toolMsg := Message{
