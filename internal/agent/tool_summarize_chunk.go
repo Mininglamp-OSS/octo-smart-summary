@@ -15,6 +15,18 @@ import (
 // getSessionMessagePool retrieves all messages from all tool calls in the session,
 // sorts them globally by timestamp, and assigns CitationIndex.
 // This ensures the same global ordering that buildCitationsForSession will use.
+//
+// TTL dependency (SUM-47 v3 caveat): this function reconstructs the pool from
+// the message cache (GetMessageCache, 30-min TTL). On cache miss (expiry,
+// eviction, process restart) the pool silently shrinks and the pre-assigned
+// CitationIndex can drift from the DB-evidence fallback in
+// buildCitationsForSession, which sources from agent_message_evidence when the
+// cache is cold. Long-running or paused agent sessions (>30 min between tool
+// calls and summarize_chunk) may therefore see mis-numbered [n] citations in
+// the summary body relative to the final Citation rows. This is bounded by
+// the current cache-first / DB-fallback split and is documented as accepted
+// scope for SUM-47 v3; a full fix would source the pool from
+// agent_message_evidence here too. See PR #158 CR discussion (Jerry-Xin).
 func getSessionMessagePool(sessionID, uid string) ([]pipeline.Message, error) {
 	summaryDB, _, _, _ := GetSummaryDeps()
 
