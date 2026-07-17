@@ -39,6 +39,7 @@ type PersonalResult struct {
 	UserID           string     `gorm:"column:user_id;type:varchar(64);not null" json:"user_id"`
 	Content          string     `gorm:"column:content;type:mediumtext;not null" json:"content"`
 	CitationsJSON    string     `gorm:"column:citations_json;type:mediumtext" json:"-"`
+	SnapshotJSON     *string    `gorm:"column:snapshot_json;type:mediumtext" json:"-"`
 	MsgCount         int        `gorm:"column:msg_count;not null;default:0" json:"msg_count"`
 	TotalTokenUsed   int        `gorm:"column:total_token_used;not null;default:0" json:"total_token_used"`
 	ModelVersion     string     `gorm:"column:model_version;type:varchar(50);not null;default:''" json:"model_version"`
@@ -157,4 +158,31 @@ func ParticipantStatusLabel(status int) string {
 	default:
 		return "unknown"
 	}
+}
+
+// GetSnapshot deserializes SnapshotJSON into a Snapshot.
+func (r *PersonalResult) GetSnapshot() *Snapshot {
+	if r.SnapshotJSON == nil || *r.SnapshotJSON == "" {
+		return nil
+	}
+	var snap Snapshot
+	if err := json.Unmarshal([]byte(*r.SnapshotJSON), &snap); err != nil {
+		return nil
+	}
+	return &snap
+}
+
+// SetSnapshot serializes a Snapshot into SnapshotJSON.
+func (r *PersonalResult) SetSnapshot(snap *Snapshot) {
+	if snap == nil {
+		r.SnapshotJSON = nil
+		return
+	}
+	data, err := json.Marshal(snap)
+	if err != nil {
+		r.SnapshotJSON = nil
+		return
+	}
+	str := string(data)
+	r.SnapshotJSON = &str
 }

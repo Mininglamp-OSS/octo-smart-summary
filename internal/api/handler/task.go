@@ -72,19 +72,30 @@ func (h *TaskHandler) schedulePendingInvitationExpr(taskAlias string) string {
  AND ss.confirm_policy=1 AND sc.user_id=? AND sc.confirmed=false)`
 }
 
+// canAccessTaskDB reports whether userID may read the task: creator or
+// explicit participant. Source-group membership alone does NOT grant access.
+//
+// This is the package-level version so non-TaskHandler handlers (agent chat /
+// summary) can reuse the exact same rule (SUM-158 blocker 2). TaskHandler
+// still exposes canAccessTask as a thin wrapper for backwards compatibility
+// with the existing detail / list paths.
+func canAccessTaskDB(db *gorm.DB, userID string, taskID int64, creatorID string) bool {
+	if creatorID == userID {
+		return true
+	}
+	var cnt int64
+	db.Model(&model.SummaryParticipant{}).
+		Where("task_id = ? AND user_id = ?", taskID, userID).
+		Count(&cnt)
+	return cnt > 0
+}
+
 // canAccessTask reports whether userID may read the task: creator or explicit
 // participant. This is the single source of truth shared by the detail path
 // (authorizeTaskAccess) and conceptually the batch path (batchAuthorize) and the
 // list query (ListSummaries). Source-group membership alone does NOT grant access.
 func (h *TaskHandler) canAccessTask(userID string, taskID int64, creatorID string) bool {
-	if creatorID == userID {
-		return true
-	}
-	var cnt int64
-	h.db.Model(&model.SummaryParticipant{}).
-		Where("task_id = ? AND user_id = ?", taskID, userID).
-		Count(&cnt)
-	return cnt > 0
+	return canAccessTaskDB(h.db, userID, taskID, creatorID)
 }
 
 // authorizeTaskAccess loads a task by ID and checks that the current user is

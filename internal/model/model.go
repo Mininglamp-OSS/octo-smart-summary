@@ -65,9 +65,15 @@ const (
 )
 
 // Trigger type constants.
+// Trigger types for summary_task.trigger_type
 const (
 	TriggerManual    = 1
 	TriggerScheduled = 2
+	// TriggerAgent marks a summary created via the agent conversational entry
+	// (POST /api/v1/summaries/agent). The task is born with status=Completed
+	// and content is filled synchronously from the agent's produced deliverable;
+	// no worker dispatch is triggered.
+	TriggerAgent = 3
 )
 
 // Scheduled multi-participant confirm policy constants (summary_schedule.confirm_policy).
@@ -105,9 +111,13 @@ const (
 )
 
 // Channel type constants (aligned with the IM server protocol).
+// These are the values stored in the WuKongIM message table's channel_type
+// column. Different from OriginChannel* above (which is the application-layer
+// "user-facing origin" enum) — see appToStorageChannelType() for mapping.
 const (
-	ChannelTypeDM    = 1
-	ChannelTypeGroup = 2
+	ChannelTypeDM     = 1
+	ChannelTypeGroup  = 2
+	ChannelTypeThread = 5 // WuKongIM reserves 3/4 so thread jumps to 5
 )
 
 // SummaryTask represents a summary generation task.
@@ -134,6 +144,12 @@ type SummaryTask struct {
 	CreatedAt          time.Time  `gorm:"column:created_at;not null" json:"created_at"`
 	UpdatedAt          time.Time  `gorm:"column:updated_at;not null" json:"updated_at"`
 	DeletedAt          *time.Time `gorm:"column:deleted_at;index" json:"deleted_at,omitempty"`
+	// ReferencedTaskIDs is a JSON-encoded array of task_ids that this agent
+	// summary was generated with reference to. NULL when the summary was
+	// generated from scratch (no reference). Only populated for
+	// trigger_type=agent summaries where the user picked one or more existing
+	// summaries as reference material via the chat UI.
+	ReferencedTaskIDs *string `gorm:"column:referenced_task_ids;type:text" json:"-"`
 }
 
 func (SummaryTask) TableName() string { return "summary_task" }
