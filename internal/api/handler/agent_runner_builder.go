@@ -11,7 +11,7 @@ import (
 // buildRunner constructs a runner for the given profile name with LLM configuration.
 // If uid is non-empty and profile is "summary" or "summary_refine", it will be injected into tool handlers.
 // This is a shared helper used by both AgentChatHandler and AgentSummaryHandler.
-func buildRunner(profileName, uid, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int) (*agent.Runner, string, error) {
+func buildRunner(profileName, uid, sessionID, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int) (*agent.Runner, string, error) {
 	profile, err := agent.GetProfile(profileName)
 	if err != nil {
 		return nil, "", fmt.Errorf("load profile %q: %w", profileName, err)
@@ -23,7 +23,7 @@ func buildRunner(profileName, uid, llmApiURL, llmApiKey, llmModel string, llmTim
 
 	var reg *agent.Registry
 	if (profileName == "summary" || profileName == "summary_refine") && uid != "" {
-		reg, err = buildSummaryRegistryWithUID(uid)
+		reg, err = buildSummaryRegistryWithUID(uid, sessionID)
 	} else {
 		reg, err = agent.BuildRegistry(profile.Tools)
 	}
@@ -37,8 +37,8 @@ func buildRunner(profileName, uid, llmApiURL, llmApiKey, llmModel string, llmTim
 	return runner, system, nil
 }
 
-// buildSummaryRegistryWithUID builds a summary registry with uid injected into tool handlers.
-func buildSummaryRegistryWithUID(uid string) (*agent.Registry, error) {
+// buildSummaryRegistryWithUID builds a summary registry with uid and sessionID injected into tool handlers.
+func buildSummaryRegistryWithUID(uid, sessionID string) (*agent.Registry, error) {
 	reg := agent.NewRegistry()
 
 	// Non-summary tools (no uid injection needed)
@@ -51,7 +51,7 @@ func buildSummaryRegistryWithUID(uid string) (*agent.Registry, error) {
 		reg.Register(schema, handler)
 	}
 
-	// Summary tools: wrap handlers to inject uid via context
+	// Summary tools: wrap handlers to inject uid and sessionID via context
 	summaryTools := []string{
 		"list_channels", "narrow_channels_by_topic", "find_shared_channels",
 		"peek_channel", "fetch_channel", "search_messages",
@@ -64,9 +64,10 @@ func buildSummaryRegistryWithUID(uid string) (*agent.Registry, error) {
 		}
 		schema, origHandler := factory()
 
-		// Wrap handler to inject uid into context
+		// Wrap handler to inject uid and sessionID into context
 		wrappedHandler := func(ctx context.Context, args json.RawMessage) (string, error) {
 			ctx = context.WithValue(ctx, agent.ContextKeyUID, uid)
+			ctx = context.WithValue(ctx, agent.ContextKeySessionID, sessionID)
 			return origHandler(ctx, args)
 		}
 		reg.Register(schema, wrappedHandler)

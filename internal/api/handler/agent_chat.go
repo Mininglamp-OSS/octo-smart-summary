@@ -81,7 +81,7 @@ func NewAgentChatHandler(db *gorm.DB, llmApiURL, llmApiKey, llmModel string, llm
 
 // buildRunnerForProfile constructs a runner for the given profile name.
 // If uid is non-empty and profile is "summary", it will be injected into tool handlers.
-func (h *AgentChatHandler) buildRunnerForProfile(profileName, uid string) (*agent.Runner, string, error) {
+func (h *AgentChatHandler) buildRunnerForProfile(profileName, uid, sessionID string) (*agent.Runner, string, error) {
 	profile, err := agent.GetProfile(profileName)
 	if err != nil {
 		return nil, "", fmt.Errorf("load profile %q: %w", profileName, err)
@@ -93,7 +93,7 @@ func (h *AgentChatHandler) buildRunnerForProfile(profileName, uid string) (*agen
 
 	var reg *agent.Registry
 	if (profileName == "summary" || profileName == "summary_refine") && uid != "" {
-		reg, err = h.buildSummaryRegistryWithUID(uid)
+		reg, err = h.buildSummaryRegistryWithUID(uid, sessionID)
 	} else {
 		reg, err = agent.BuildRegistry(profile.Tools)
 	}
@@ -108,7 +108,7 @@ func (h *AgentChatHandler) buildRunnerForProfile(profileName, uid string) (*agen
 }
 
 // buildSummaryRegistryWithUID builds a summary registry with uid injected into tool handlers.
-func (h *AgentChatHandler) buildSummaryRegistryWithUID(uid string) (*agent.Registry, error) {
+func (h *AgentChatHandler) buildSummaryRegistryWithUID(uid, sessionID string) (*agent.Registry, error) {
 	reg := agent.NewRegistry()
 
 	// Non-summary tools (no uid injection needed)
@@ -134,9 +134,10 @@ func (h *AgentChatHandler) buildSummaryRegistryWithUID(uid string) (*agent.Regis
 		}
 		schema, origHandler := factory()
 
-		// Wrap handler to inject uid into context
+		// Wrap handler to inject uid and sessionID into context
 		wrappedHandler := func(ctx context.Context, args json.RawMessage) (string, error) {
 			ctx = context.WithValue(ctx, agent.ContextKeyUID, uid)
+			ctx = context.WithValue(ctx, agent.ContextKeySessionID, sessionID)
 			return origHandler(ctx, args)
 		}
 		reg.Register(schema, wrappedHandler)
@@ -211,7 +212,7 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		runner = h.testRunner
 		system = h.testSystem
 	} else {
-		runner, system, err = h.buildRunnerForProfile(profileName, uid)
+		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID)
 		if err != nil {
 			log.Printf("[agent] build runner for profile %q: %v", profileName, err)
 			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "failed to initialize agent"})
@@ -410,7 +411,7 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		runner = h.testRunner
 		system = h.testSystem
 	} else {
-		runner, system, err = h.buildRunnerForProfile(profileName, uid)
+		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID)
 		if err != nil {
 			log.Printf("[agent] build runner for profile %q: %v", profileName, err)
 			sink := &sseSink{w: c.Writer}
