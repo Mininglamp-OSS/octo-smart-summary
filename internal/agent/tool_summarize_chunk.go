@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
@@ -58,14 +59,24 @@ func SummarizeChunkTool() (Tool, Handler) {
 			return "{\"summary\":\"无可总结内容\",\"chunk_count\":0}", nil
 		}
 
+		// Pre-assign CitationIndex before chunking (sort by timestamp, assign 1-indexed sequential IDs)
+		// This ensures LLM sees the same indexes that agent_summary_citations.go will assign later
+		sort.Slice(messages, func(i, j int) bool {
+			return messages[i].Timestamp < messages[j].Timestamp
+		})
+		for i := range messages {
+			messages[i].CitationIndex = i + 1
+		}
+
 		// Convert to map format for SplitIntoChunks
 		msgMaps := make([]map[string]interface{}, len(messages))
 		for i, msg := range messages {
 			msgMaps[i] = map[string]interface{}{
-				"sender_name": msg.SenderName,
-				"content":     msg.Content,
-				"timestamp":   msg.SendTime,
-				"channel_id":  msg.ChannelID,
+				"sender_name":    msg.SenderName,
+				"content":        msg.Content,
+				"timestamp":      msg.SendTime,
+				"channel_id":     msg.ChannelID,
+				"citation_index": msg.CitationIndex,
 			}
 		}
 
@@ -79,14 +90,12 @@ func SummarizeChunkTool() (Tool, Handler) {
 		// For simplicity, generate a unified summary for all chunks
 		// In production, each chunk would be summarized separately and merged
 		var summaries []string
-		cumulativeOffset := 0
 		for _, chunk := range chunks {
-			summary, err := summarizeMessagesChunk(ctx, chunk, cumulativeOffset)
+			summary, err := summarizeMessagesChunk(ctx, chunk)
 			if err != nil {
 				return "", fmt.Errorf("summarize chunk: %w", err)
 			}
 			summaries = append(summaries, summary)
-			cumulativeOffset += len(chunk)
 		}
 
 		combinedSummary := strings.Join(summaries, "\n\n---\n\n")
@@ -107,12 +116,12 @@ func SummarizeChunkTool() (Tool, Handler) {
 }
 
 // summarizeMessagesChunk generates a summary for a single chunk using LLM.
-// startIndex is the global offset to start numbering messages from (0-indexed).
-func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{}, startIndex int) (string, error) {
+// Messages must have pre-assigned citation_index in each map.
+func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{}) (string, error) {
 	_, _, cfg := GetSummaryDeps()
 	client := service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, 30)
 
-	// Format messages for LLM with global indexing
+	// Format messages for LLM using pre-assigned CitationIndex
 	var formatted strings.Builder
 	for i, msg := range chunk {
 		if i >= 200 { // safety limit per chunk
@@ -120,7 +129,8 @@ func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{},
 		}
 		sender, _ := msg["sender_name"].(string)
 		content, _ := msg["content"].(string)
-		formatted.WriteString(fmt.Sprintf("[%d] %s: %s\n", startIndex+i+1, sender, content))
+		citationIdx, _ := msg["citation_index"].(int)
+		formatted.WriteString(fmt.Sprintf("[%d] %s: %s\n", citationIdx, sender, content))
 	}
 
 	systemPrompt := `你是专业的工作内容整理助手。请从聊天记录中提炼关键信息：
