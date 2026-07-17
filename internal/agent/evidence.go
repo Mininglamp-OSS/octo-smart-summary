@@ -14,14 +14,28 @@ import (
 // PersistEvidence writes citation evidence to DB for long-term recovery.
 // Fixes SUM-158 Blocker C: buildCitationsForSession failing after 30-minute cache expiry.
 //
-// Called by fetch_channel and peek_channel tools after successful message fetch.
-// Write failures are logged but do not block tool return (evidence is best-effort).
+// Called by every data-fetching tool (fetch_channel, peek_channel,
+// search_messages, filter_relevant) after successful message fetch.
+//
+// Returns error on DB write failure so callers can propagate the failure
+// out of the tool handler. Since #161 (4-reviewer P1), evidence is the sole
+// discovery source for CitationIndex assignment in both getSessionMessagePool
+// (mid-run) and buildCitationsForSession (save-time): a silently-dropped write
+// would make the handle's messages invisible to citation building in the
+// whole session. Callers must NOT swallow this error — see the tool
+// handlers for the required propagation pattern (return the error out of
+// the handler so the runner surfaces it in tool_call output).
+//
+// Missing context values (uid/sessionID/handle empty) and a nil db are
+// treated as legitimate skip conditions (return nil) — the former can occur
+// in test paths that don't wire the full context chain, the latter in unit
+// tests.
 //
 // Upsert semantics (ON DUPLICATE KEY UPDATE) allow idempotent tool re-execution.
-func PersistEvidence(db *gorm.DB, ctx context.Context, handle string, messages []pipeline.Message) {
+func PersistEvidence(db *gorm.DB, ctx context.Context, handle string, messages []pipeline.Message) error {
 	if db == nil {
 		log.Printf("[evidence] skipping persistence: db is nil (likely test mode)")
-		return
+		return nil
 	}
 
 	// Extract uid and session_id from context
@@ -30,14 +44,14 @@ func PersistEvidence(db *gorm.DB, ctx context.Context, handle string, messages [
 
 	if uid == "" || sessionID == "" || handle == "" {
 		log.Printf("[evidence] skip: missing uid=%q session=%q handle=%q", uid, sessionID, handle)
-		return
+		return nil
 	}
 
 	// Serialize messages to JSON
 	evidenceJSON, err := json.Marshal(messages)
 	if err != nil {
 		log.Printf("[evidence] marshal failed handle=%s: %v", handle, err)
-		return
+		return err
 	}
 
 	now := time.Now()
@@ -59,7 +73,8 @@ func PersistEvidence(db *gorm.DB, ctx context.Context, handle string, messages [
 
 	if err != nil {
 		log.Printf("[evidence] upsert failed handle=%s session=%s: %v", handle, sessionID, err)
-	} else {
-		log.Printf("[evidence] persisted %d messages handle=%s session=%s", len(messages), handle, sessionID)
+		return err
 	}
+	log.Printf("[evidence] persisted %d messages handle=%s session=%s", len(messages), handle, sessionID)
+	return nil
 }

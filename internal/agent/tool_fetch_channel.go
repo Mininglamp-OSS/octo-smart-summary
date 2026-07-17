@@ -128,8 +128,14 @@ func FetchChannelTool() (Tool, Handler) {
 
 		handle := messageCache.Store(messages, uid)
 		// Persist evidence to DB for citation fallback on cache miss (Stage 3 Blocker C).
-		// Write failures are logged but do not block the tool return.
-		PersistEvidence(summaryDB, ctx, handle, messages)
+		// #161 P1-B (yujiawei): evidence is now the sole discovery source
+		// for CitationIndex in both getSessionMessagePool and
+		// buildCitationsForSession. A silently-dropped write would make this
+		// handle's messages invisible to citation building for the entire
+		// session, so a write failure is escalated as a tool-level error.
+		if err := PersistEvidence(summaryDB, ctx, handle, messages); err != nil {
+			return "", fmt.Errorf("persist evidence: %w", err)
+		}
 
 		result := map[string]interface{}{
 			"total":           len(messages),

@@ -77,12 +77,14 @@ func SearchMessagesTool() (Tool, Handler) {
 		newHandle := messageCache.Store(matched, uid)
 
 		// Also persist to evidence table so citation recovery survives the
-		// 30-min in-memory TTL. fetch_channel / peek_channel already do this;
-		// search/filter previously did not, creating a citation-recovery gap
-		// for sessions that summarize a search-derived handle after cache
-		// expiry (post-#158 Octo-Q P2, 4-reviewer follow-up).
+		// 30-min in-memory TTL. #161 P1-B (yujiawei): evidence is the sole
+		// discovery source for citation building, so a write failure would
+		// make this handle uncitable for the entire session — escalate as
+		// a tool-level error.
 		summaryDB, _, _, _ := GetSummaryDeps()
-		PersistEvidence(summaryDB, ctx, newHandle, matched)
+		if err := PersistEvidence(summaryDB, ctx, newHandle, matched); err != nil {
+			return "", fmt.Errorf("persist evidence: %w", err)
+		}
 
 		result := map[string]interface{}{
 			"total":           len(matched),
