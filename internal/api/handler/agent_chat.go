@@ -201,8 +201,13 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 	ctx := context.WithValue(c.Request.Context(), agent.ContextKeySessionID, req.SessionID)
 
 	// Extract uid from middleware (authenticated identity).
-	// 鉴权中间件已保证到此处 uid 非空；summary profile 的工具据此做权限隔离。
+	// 鉴权中间件已保证到此处 uid 非空；此处再做一次显式守卫，与 ChatStream()/History()
+	// 对称，避免将来路由若误配为非严格鉴权时在本入口静默降级（PR #158 Octo-Q P2）。
 	uid := middleware.GetUserID(c)
+	if uid == "" {
+		c.JSON(http.StatusUnauthorized, apiResponse{Code: 40100, Message: "missing auth context"})
+		return
+	}
 
 	// 按 profile 组装 runner（summary 场景注入 uid 工具）；测试可注入现成 runner。
 	var runner *agent.Runner

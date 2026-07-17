@@ -16,17 +16,14 @@ import (
 // sorts them globally by timestamp, and assigns CitationIndex.
 // This ensures the same global ordering that buildCitationsForSession will use.
 //
-// TTL dependency (SUM-47 v3 caveat): this function reconstructs the pool from
-// the message cache (GetMessageCache, 30-min TTL). On cache miss (expiry,
-// eviction, process restart) the pool silently shrinks and the pre-assigned
-// CitationIndex can drift from the DB-evidence fallback in
-// buildCitationsForSession, which sources from agent_message_evidence when the
-// cache is cold. Long-running or paused agent sessions (>30 min between tool
-// calls and summarize_chunk) may therefore see mis-numbered [n] citations in
-// the summary body relative to the final Citation rows. This is bounded by
-// the current cache-first / DB-fallback split and is documented as accepted
-// scope for SUM-47 v3; a full fix would source the pool from
-// agent_message_evidence here too. See PR #158 CR discussion (Jerry-Xin).
+// Cache/DB recovery (SUM-47 v3 / PR #158 Octo-Q P1): the pool is reconstructed
+// from the message cache (GetMessageCache, 30-min TTL) and, on cache miss
+// (expiry, eviction, process restart), falls back to the agent_message_evidence
+// table — byte-for-byte the same recovery buildCitationsForSession performs.
+// Keeping the two symmetric guarantees the pre-assigned CitationIndex here
+// matches the post-assignment there even for long-running or paused agent
+// sessions (>30 min between tool calls and summarize_chunk), so [n] citations
+// in the summary body always line up with the final Citation rows.
 func getSessionMessagePool(sessionID, uid string) ([]pipeline.Message, error) {
 	summaryDB, _, _, _ := GetSummaryDeps()
 
@@ -61,6 +58,26 @@ func getSessionMessagePool(sessionID, uid string) ([]pipeline.Message, error) {
 						if !seenKey[key] {
 							allMessages = append(allMessages, msg)
 							seenKey[key] = true
+						}
+					}
+				} else {
+					// Cache miss: fall back to the evidence table so this pool stays
+					// symmetric with buildCitationsForSession's recovery. Keeping the
+					// two identical is what prevents the pre-assigned CitationIndex
+					// from drifting when the cache is cold (SUM-47 v3 / PR #158 Octo-Q P1).
+					var evidence model.AgentMessageEvidence
+					if err := summaryDB.
+						Where("user_id = ? AND session_id = ? AND handle = ?", uid, sessionID, handle).
+						First(&evidence).Error; err == nil {
+						var evidenceMessages []pipeline.Message
+						if err := json.Unmarshal([]byte(evidence.Evidence), &evidenceMessages); err == nil {
+							for _, msg := range evidenceMessages {
+								key := fmt.Sprintf("%s:%d", msg.ChannelID, msg.MessageSeq)
+								if !seenKey[key] {
+									allMessages = append(allMessages, msg)
+									seenKey[key] = true
+								}
+							}
 						}
 					}
 				}
