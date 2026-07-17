@@ -581,3 +581,72 @@ func TestRunner_WhitespaceOnlyContentTreatedAsEmpty(t *testing.T) {
 		t.Errorf("calls = %d, want 2 (empty + recovery)", fc.calls)
 	}
 }
+
+// TestRunner_ToolExecutionExceedsStepTimeout is the regression test for the
+// #161 3-reviewer P1 (yujiawei / lml2468 / Jerry-Xin): tool execution must NOT
+// share stepCtx with the planning Chat() call, because LLM-backed tools like
+// summarize_chunk / merge_summaries run their own sequential LLM calls that
+// legitimately exceed the per-step planning budget (default 60s).
+//
+// This test simulates:
+//   step 1: planning Chat returns a tool_call
+//   tool  : sleeps 200ms (well over StepTimeout=50ms)
+//   step 2: planning Chat returns final answer
+//
+// If tool execution were bound by stepCtx (as it briefly was in 4f614cc),
+// the tool would be cancelled at 50ms and return a context.DeadlineExceeded
+// error. With the fixed behaviour (tool uses the outer ctx, no bound below
+// the 300s ChatStream backstop), the tool completes in its natural time
+// and the run succeeds.
+//
+// A test that seeds a tool sleeping longer than StepTimeout, asserting the
+// tool still completes, is exactly what the 3 reviewers said would have
+// caught the regression pre-merge.
+func TestRunner_ToolExecutionExceedsStepTimeout(t *testing.T) {
+	// Tool that sleeps 200ms — much longer than the 50ms StepTimeout below.
+	// Must observe ctx cancellation to differentiate "cancelled by stepCtx
+	// (bug)" from "completed naturally (fixed)".
+	slowTool := func(ctx context.Context, args json.RawMessage) (string, error) {
+		select {
+		case <-time.After(200 * time.Millisecond):
+			return "R:slow-completed", nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+
+	reg := NewRegistry()
+	reg.Register(Tool{Type: "function", Function: ToolFunction{Name: "slow"}}, slowTool)
+
+	fc := &fakeClient{turns: []AssistantTurn{
+		{Content: "", ToolCalls: []ToolCall{mkToolCall("call-1", "slow", "{}")}},
+		{Content: "final answer", ToolCalls: nil},
+	}}
+
+	// Deliberately tight StepTimeout — 50ms — much less than the tool's 200ms.
+	// If tool execution shares stepCtx (the regression), the tool's ctx.Done()
+	// fires at 50ms and the tool returns context.DeadlineExceeded, poisoning
+	// the tool_call result and the LLM's next input.
+	r := newTestRunner(fc, reg, Policy{
+		MaxSteps: 5, MaxTokens: 10000, StepTimeout: 50 * time.Millisecond,
+	})
+
+	start := time.Now()
+	out, _, err := r.RunWithHistory(context.Background(), "system", nil, "hi")
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Run error: %v (tool likely cancelled by stepCtx — bug is back)", err)
+	}
+	if out != "final answer" {
+		t.Errorf("out = %q, want %q — the slow tool result likely leaked into the final content (via cancellation error), which means stepCtx clamped tool execution", out, "final answer")
+	}
+	// Sanity: elapsed must be >= tool sleep (200ms) but well under any
+	// hypothetical outer wall-clock (test isn't real ChatStream).
+	if elapsed < 200*time.Millisecond {
+		t.Errorf("elapsed = %v, want >= 200ms (the tool must have run to completion, not been cancelled early)", elapsed)
+	}
+	if fc.calls != 2 {
+		t.Errorf("calls = %d, want 2 (planning + final answer)", fc.calls)
+	}
+}
