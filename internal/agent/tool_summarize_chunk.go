@@ -36,6 +36,19 @@ import (
 // buildCitationsForSession performs. Keeping the two symmetric guarantees
 // the pre-assigned CitationIndex here matches the post-assignment there
 // for both first-turn and long-running/paused sessions.
+//
+// Two-phase pool invariant (#161 P2, yujiawei):
+// The pre-assigned CitationIndex here (mid-run) and the rebuilt index in
+// buildCitationsForSession (save-time) are only guaranteed to match if the
+// evidence row set does not change between the two phases. In practice this
+// is upheld by the profile ordering `fetch/search/filter → summarize_chunk →
+// merge_summaries → answer`: any handle-producing tool runs BEFORE
+// summarize_chunk in the same or an earlier step, so no evidence row is
+// added after summarize_chunk's pool snapshot. If a future profile ever
+// interleaves a data-fetching tool after summarize_chunk in the same turn,
+// the newly-persisted evidence would appear only at save time, shifting
+// CitationIndex and breaking the [n]-marker alignment. Enforce this
+// invariant at profile design time — the runner does not check it.
 func getSessionMessagePool(sessionID, uid string) ([]pipeline.Message, error) {
 	summaryDB, _, _, _ := GetSummaryDeps()
 
