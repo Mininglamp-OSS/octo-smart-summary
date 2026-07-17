@@ -79,12 +79,14 @@ func SummarizeChunkTool() (Tool, Handler) {
 		// For simplicity, generate a unified summary for all chunks
 		// In production, each chunk would be summarized separately and merged
 		var summaries []string
+		cumulativeOffset := 0
 		for _, chunk := range chunks {
-			summary, err := summarizeMessagesChunk(ctx, chunk)
+			summary, err := summarizeMessagesChunk(ctx, chunk, cumulativeOffset)
 			if err != nil {
 				return "", fmt.Errorf("summarize chunk: %w", err)
 			}
 			summaries = append(summaries, summary)
+			cumulativeOffset += len(chunk)
 		}
 
 		combinedSummary := strings.Join(summaries, "\n\n---\n\n")
@@ -105,11 +107,12 @@ func SummarizeChunkTool() (Tool, Handler) {
 }
 
 // summarizeMessagesChunk generates a summary for a single chunk using LLM.
-func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{}) (string, error) {
+// startIndex is the global offset to start numbering messages from (0-indexed).
+func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{}, startIndex int) (string, error) {
 	_, _, cfg := GetSummaryDeps()
 	client := service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, 30)
 
-	// Format messages for LLM
+	// Format messages for LLM with global indexing
 	var formatted strings.Builder
 	for i, msg := range chunk {
 		if i >= 200 { // safety limit per chunk
@@ -117,7 +120,7 @@ func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{})
 		}
 		sender, _ := msg["sender_name"].(string)
 		content, _ := msg["content"].(string)
-		formatted.WriteString(fmt.Sprintf("[%d] %s: %s\n", i+1, sender, content))
+		formatted.WriteString(fmt.Sprintf("[%d] %s: %s\n", startIndex+i+1, sender, content))
 	}
 
 	systemPrompt := `你是专业的工作内容整理助手。请从聊天记录中提炼关键信息：
