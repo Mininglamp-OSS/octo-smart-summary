@@ -14,7 +14,7 @@ func FindSharedChannelsTool() (Tool, Handler) {
 		Type: "function",
 		Function: ToolFunction{
 			Name:        "find_shared_channels",
-			Description: "找出创建者与指定参与者共同所在的频道。用于聚焦多人对话场景。",
+			Description: "找出创建者与指定参与者共同所在的频道。用于聚焦多人对话场景。默认不含已归档子区。",
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -22,6 +22,10 @@ func FindSharedChannelsTool() (Tool, Handler) {
 						"type":        "array",
 						"items":       map[string]interface{}{"type": "string"},
 						"description": "参与者 UID 列表",
+					},
+					"include_archived": map[string]interface{}{
+						"type":        "boolean",
+						"description": "是否把已归档子区（thread status=2）纳入共同频道计算。默认 false。仅当用户明确要含已归档/历史子区时置 true。",
 					},
 				},
 				"required": []string{"participant_uids"},
@@ -32,6 +36,7 @@ func FindSharedChannelsTool() (Tool, Handler) {
 	handler := func(ctx context.Context, args json.RawMessage) (string, error) {
 		var req struct {
 			ParticipantUIDs []string `json:"participant_uids"`
+			IncludeArchived bool     `json:"include_archived,omitempty"`
 		}
 		if err := json.Unmarshal(args, &req); err != nil {
 			return "", fmt.Errorf("parse args: %w", err)
@@ -46,12 +51,12 @@ func FindSharedChannelsTool() (Tool, Handler) {
 
 		_, imDB, _, _ := GetSummaryDeps()
 
-		creatorChannels, err := pipeline.GetUserChannels(ctx, uid, imDB)
+		creatorChannels, err := pipeline.GetUserChannels(ctx, uid, imDB, pipeline.WithIncludeArchived(req.IncludeArchived))
 		if err != nil {
 			return "", fmt.Errorf("get creator channels: %w", err)
 		}
 
-		shared, err := pipeline.IntersectParticipantChannels(ctx, creatorChannels, req.ParticipantUIDs, imDB)
+		shared, err := pipeline.IntersectParticipantChannels(ctx, creatorChannels, req.ParticipantUIDs, imDB, pipeline.WithIncludeArchived(req.IncludeArchived))
 		if err != nil {
 			return "", fmt.Errorf("intersect participant channels: %w", err)
 		}

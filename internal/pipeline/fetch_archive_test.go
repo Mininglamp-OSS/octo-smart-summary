@@ -169,7 +169,7 @@ func TestGetUserChannels_SelectedArchivedRetained(t *testing.T) {
 	db := setupPipelineImDB(t)
 	seedPipelineThreads(db, time.Now().Unix())
 
-	channels, err := GetUserChannels(context.Background(), "user1", db, "grp1____thB")
+	channels, err := GetUserChannels(context.Background(), "user1", db, WithSelectedThreads([]string{"grp1____thB"}))
 	if err != nil {
 		t.Fatalf("GetUserChannels: %v", err)
 	}
@@ -192,13 +192,45 @@ func TestGetUserChannels_SelectedDeletedNeverRetained(t *testing.T) {
 
 	// Even if a deleted thread id is passed as selected, it must not appear:
 	// the relaxation only admits status=2.
-	channels, err := GetUserChannels(context.Background(), "user1", db, "grp1____thC")
+	channels, err := GetUserChannels(context.Background(), "user1", db, WithSelectedThreads([]string{"grp1____thC"}))
 	if err != nil {
 		t.Fatalf("GetUserChannels: %v", err)
 	}
 	threads := threadIDSet(channels)
 	if threads["grp1____thC"] {
 		t.Errorf("deleted thread must never be discovered, got %v", threads)
+	}
+}
+
+func TestGetUserChannels_IncludeArchived_DiscoversAllArchivedNotDeleted(t *testing.T) {
+	db := setupPipelineImDB(t)
+	seedPipelineThreads(db, time.Now().Unix())
+
+	channels, err := GetUserChannels(context.Background(), "user1", db, WithIncludeArchived(true))
+	if err != nil {
+		t.Fatalf("GetUserChannels: %v", err)
+	}
+	threads := threadIDSet(channels)
+	if !threads["grp1____thA"] {
+		t.Errorf("active thread should be discovered, got %v", threads)
+	}
+	if !threads["grp1____thB"] {
+		t.Errorf("include_archived=true must discover archived thread without explicit selection, got %v", threads)
+	}
+	if threads["grp1____thC"] {
+		t.Errorf("deleted thread must never be discovered even with include_archived, got %v", threads)
+	}
+
+	// IsArchived flag must be set only on the archived thread.
+	byID := map[string]ChannelInfo{}
+	for _, ch := range channels {
+		byID[ch.ChannelID] = ch
+	}
+	if byID["grp1____thB"].IsArchived != true {
+		t.Errorf("archived thread thB should have IsArchived=true, got %+v", byID["grp1____thB"])
+	}
+	if byID["grp1____thA"].IsArchived != false {
+		t.Errorf("active thread thA should have IsArchived=false, got %+v", byID["grp1____thA"])
 	}
 }
 
@@ -402,7 +434,7 @@ func TestIntersectParticipantChannels_EmptySelection_NoArchived(t *testing.T) {
 	// Creator can see the archived thread (it was explicitly selected for them),
 	// but with no selection threaded into the participant lookup, the intersect
 	// drops it because user2's status=1-only discovery never includes it.
-	creatorChannels, err := GetUserChannels(context.Background(), "user1", db, "grp1____thB")
+	creatorChannels, err := GetUserChannels(context.Background(), "user1", db, WithSelectedThreads([]string{"grp1____thB"}))
 	if err != nil {
 		t.Fatalf("GetUserChannels: %v", err)
 	}

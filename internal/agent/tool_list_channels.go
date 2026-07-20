@@ -14,15 +14,26 @@ func ListChannelsTool() (Tool, Handler) {
 		Type: "function",
 		Function: ToolFunction{
 			Name:        "list_channels",
-			Description: "列出指定用户可见的所有频道（群组 + 私聊）。用于探索阶段了解可用频道范围。",
+			Description: "列出指定用户可见的所有频道（群组 + 私聊 + 子区）。用于探索阶段了解可用频道范围。默认不含已归档子区。",
 			Parameters: map[string]interface{}{
-				"type":       "object",
-				"properties": map[string]interface{}{},
+				"type": "object",
+				"properties": map[string]interface{}{
+					"include_archived": map[string]interface{}{
+						"type":        "boolean",
+						"description": "是否包含已归档的子区（thread）。默认 false（只列活跃频道）。仅当用户明确要「已归档/历史/已关闭的子区」时才置 true。返回结果中归档子区带 is_archived=true 标记。",
+					},
+				},
 			},
 		},
 	}
 
 	handler := func(ctx context.Context, args json.RawMessage) (string, error) {
+		var req struct {
+			IncludeArchived bool `json:"include_archived,omitempty"`
+		}
+		// args 可能为空对象；解析失败不致命，按默认（不含归档）处理。
+		_ = json.Unmarshal(args, &req)
+
 		// Extract uid from context (injected by handler middleware)
 		uidVal := ctx.Value(ContextKeyUID)
 		uid, ok := uidVal.(string)
@@ -32,7 +43,7 @@ func ListChannelsTool() (Tool, Handler) {
 
 		_, imDB, _, _ := GetSummaryDeps()
 
-		channels, err := pipeline.GetUserChannels(ctx, uid, imDB)
+		channels, err := pipeline.GetUserChannels(ctx, uid, imDB, pipeline.WithIncludeArchived(req.IncludeArchived))
 		if err != nil {
 			return "", fmt.Errorf("get user channels: %w", err)
 		}

@@ -38,6 +38,11 @@ type ChannelInfo struct {
 	ChannelName string `json:"channel_name"`
 	SpaceID     string `json:"space_id,omitempty"`
 	PeerUID     string `json:"peer_uid,omitempty"`
+	// IsArchived is true only for Archived threads (thread status=2). Groups
+	// and DMs are always false. Exposed so callers/agents can tell an archived
+	// 子区 apart from an active one; the raw status enum is deliberately not
+	// surfaced (a bare int invites the same mis-read that bit channel_type).
+	IsArchived bool `json:"is_archived,omitempty"`
 }
 
 // Message represents a fetched chat message.
@@ -58,17 +63,49 @@ type Message struct {
 // LLMCallFn is the type for the LLM topic-narrowing function.
 type LLMCallFn func(ctx context.Context, prompt string) (string, error)
 
-// GetUserChannels discovers all channels (group + DM) for a user. (Layer 1)
+// channelQuery holds the resolved discovery options for GetUserChannels.
+type channelQuery struct {
+	selectedThreadIDs []string
+	includeArchived   bool
+}
+
+// ChannelQueryOption configures GetUserChannels discovery.
+type ChannelQueryOption func(*channelQuery)
+
+// WithSelectedThreads relaxes the archived-thread filter for the given thread
+// channel ids (group_no____short_id): a thread listed here survives discovery
+// even when its status is Archived (2). Scopes the relaxation to exactly the
+// threads the caller explicitly picked.
+func WithSelectedThreads(ids []string) ChannelQueryOption {
+	return func(q *channelQuery) { q.selectedThreadIDs = ids }
+}
+
+// WithIncludeArchived, when true, discovers ALL Archived threads (status=2)
+// the user belongs to — not just explicitly-selected ones. Deleted threads
+// (status=3) are still never returned. Default (unset) keeps discovery to
+// Active threads only, so auto/background summaries stay archived-free.
+func WithIncludeArchived(v bool) ChannelQueryOption {
+	return func(q *channelQuery) { q.includeArchived = v }
+}
+
+// GetUserChannels discovers all channels (group + DM + thread) for a user. (Layer 1)
 //
-// selectedThreadIDs scopes the archived-thread relaxation: only threads whose
-// channel id (group_no____short_id) appears here are allowed when their status
-// is Archived (2). When the slice is empty, only Active (status=1) threads are
-// discovered. Deleted threads (status=3) are never returned. This keeps
-// auto/background summaries (no explicit sources) free of archived threads
-// while letting an explicitly-selected archived thread survive discovery.
-func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB, selectedThreadIDs ...string) ([]ChannelInfo, error) {
+// Thread (子区) discovery follows this precedence:
+//   - WithIncludeArchived(true): Active + all Archived threads (status IN 1,2).
+//   - else WithSelectedThreads(ids): Active + the listed Archived threads only.
+//   - else: Active threads only (status=1).
+//
+// Deleted threads (status=3) are never returned. This keeps auto/background
+// summaries (no options) archived-free while letting the caller opt in either
+// per-thread (selection) or wholesale (include-archived).
+func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB, opts ...ChannelQueryOption) ([]ChannelInfo, error) {
 	if imDB == nil {
 		return nil, fmt.Errorf("IM database not available")
+	}
+
+	var q channelQuery
+	for _, opt := range opts {
+		opt(&q)
 	}
 
 	var channels []ChannelInfo
@@ -138,23 +175,28 @@ func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB, selectedThr
 		ChannelType int    `gorm:"column:channel_type"`
 		ChannelName string `gorm:"column:channel_name"`
 		SpaceID     string `gorm:"column:space_id"`
+		Status      int    `gorm:"column:status"`
 	}
 	var threadChannels []threadRow
 	// Active threads (status=1) are always discovered. Archived threads
-	// (status=2) are only discovered when explicitly selected by the caller,
-	// scoped via selectedThreadIDs. Deleted threads (status=3) are never
-	// returned (always excluded by enumerating allowed statuses).
+	// (status=2) surface either wholesale (WithIncludeArchived) or per-thread
+	// (WithSelectedThreads). Deleted threads (status=3) are never returned
+	// (enumerating allowed statuses always excludes it).
 	threadStatusCond := "t.status = 1"
 	threadArgs := []interface{}{uid}
-	if len(selectedThreadIDs) > 0 {
+	switch {
+	case q.includeArchived:
+		threadStatusCond = "t.status IN (1, 2)"
+	case len(q.selectedThreadIDs) > 0:
 		threadStatusCond = "(t.status = 1 OR (t.status = 2 AND CONCAT(t.group_no, '____', t.short_id) IN ?))"
-		threadArgs = append(threadArgs, selectedThreadIDs)
+		threadArgs = append(threadArgs, q.selectedThreadIDs)
 	}
 	threadQuery := `
 		SELECT CONCAT(t.group_no, '____', t.short_id) AS channel_id,
 		       5 AS channel_type,
 		       CONCAT(t.name, ' · ', g.name) AS channel_name,
-		       COALESCE(g.space_id, '') AS space_id
+		       COALESCE(g.space_id, '') AS space_id,
+		       t.status AS status
 		FROM thread t
 		INNER JOIN ` + "`group`" + ` g ON g.group_no COLLATE utf8mb4_unicode_ci = t.group_no
 		INNER JOIN thread_member tm ON tm.thread_id = t.id
@@ -173,6 +215,7 @@ func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB, selectedThr
 			ChannelType: 5,
 			ChannelName: tc.ChannelName,
 			SpaceID:     tc.SpaceID,
+			IsArchived:  tc.Status == 2,
 		})
 	}
 
@@ -499,7 +542,7 @@ func fetchViaMySQL(ctx context.Context, candidates []ChannelInfo, creatorUID str
 // the same scope as Layer 1, so an explicitly-selected archived thread that the
 // creator can see is not dropped just because the participant lookup defaulted to
 // status=1-only discovery.
-func IntersectParticipantChannels(ctx context.Context, creatorChannels []ChannelInfo, participantUIDs []string, imDB *gorm.DB, selectedThreadIDs ...string) ([]ChannelInfo, error) {
+func IntersectParticipantChannels(ctx context.Context, creatorChannels []ChannelInfo, participantUIDs []string, imDB *gorm.DB, opts ...ChannelQueryOption) ([]ChannelInfo, error) {
 	if len(participantUIDs) == 0 {
 		return creatorChannels, nil
 	}
@@ -510,9 +553,12 @@ func IntersectParticipantChannels(ctx context.Context, creatorChannels []Channel
 		intersection[ch.ChannelID] = true
 	}
 
-	// For each participant, get their channels and intersect
+	// For each participant, get their channels and intersect. The same
+	// discovery options (selected threads / include-archived) are forwarded so
+	// an archived thread the creator surfaced is not dropped by a status=1-only
+	// participant lookup.
 	for _, uid := range participantUIDs {
-		pChannels, err := GetUserChannels(ctx, uid, imDB, selectedThreadIDs...)
+		pChannels, err := GetUserChannels(ctx, uid, imDB, opts...)
 		if err != nil {
 			return nil, fmt.Errorf("get channels for participant %s: %w", uid, err)
 		}
@@ -725,7 +771,7 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 	// Layer 1: channel discovery (needed before intent recognition for memberMap)
 	l1Start := time.Now()
 	selectedThreads := selectedThreadChannelIDs(specifiedSources)
-	userChannels, err := GetUserChannels(ctx, creatorUID, imDB, selectedThreads...)
+	userChannels, err := GetUserChannels(ctx, creatorUID, imDB, WithSelectedThreads(selectedThreads))
 	if err != nil {
 		return nil, nil, fmt.Errorf("channel discovery: %w", err)
 	}
@@ -734,7 +780,7 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 
 	// Layer 1.5: intersect with participant channels
 	l15Start := time.Now()
-	userChannels, err = IntersectParticipantChannels(ctx, userChannels, participantUIDs, imDB, selectedThreads...)
+	userChannels, err = IntersectParticipantChannels(ctx, userChannels, participantUIDs, imDB, WithSelectedThreads(selectedThreads))
 	if err != nil {
 		return nil, nil, fmt.Errorf("intersect participant channels: %w", err)
 	}

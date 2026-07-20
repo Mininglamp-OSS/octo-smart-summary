@@ -40,6 +40,10 @@ func FetchChannelTool() (Tool, Handler) {
 						"type":        "integer",
 						"description": "每频道最大消息数，<=0 使用配置默认值",
 					},
+					"include_archived": map[string]interface{}{
+						"type":        "boolean",
+						"description": "当目标是已归档子区（thread status=2）时置 true，否则归档频道会被判为不可达而拒绝。默认 false。",
+					},
 				},
 				"required": []string{"channel_id", "channel_type", "time_start", "time_end"},
 			},
@@ -48,11 +52,12 @@ func FetchChannelTool() (Tool, Handler) {
 
 	handler := func(ctx context.Context, args json.RawMessage) (string, error) {
 		var req struct {
-			ChannelID   string `json:"channel_id"`
-			ChannelType int    `json:"channel_type,omitempty"`
-			TimeStart   string `json:"time_start"`
-			TimeEnd     string `json:"time_end"`
-			MaxMessages int    `json:"max_messages,omitempty"`
+			ChannelID       string `json:"channel_id"`
+			ChannelType     int    `json:"channel_type,omitempty"`
+			TimeStart       string `json:"time_start"`
+			TimeEnd         string `json:"time_end"`
+			MaxMessages     int    `json:"max_messages,omitempty"`
+			IncludeArchived bool   `json:"include_archived,omitempty"`
 		}
 		if err := json.Unmarshal(args, &req); err != nil {
 			return "", fmt.Errorf("parse args: %w", err)
@@ -86,7 +91,7 @@ func FetchChannelTool() (Tool, Handler) {
 		summaryDB, imDB, _, cfg := GetSummaryDeps()
 
 		// Security: validate channel accessibility for system-injected uid
-		accessibleChannels, err := pipeline.GetUserChannels(ctx, uid, imDB)
+		accessibleChannels, err := pipeline.GetUserChannels(ctx, uid, imDB, pipeline.WithIncludeArchived(req.IncludeArchived))
 		if err != nil {
 			return "", fmt.Errorf("get user channels: %w", err)
 		}
