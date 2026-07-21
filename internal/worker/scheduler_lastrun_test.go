@@ -143,6 +143,34 @@ func TestClaim_RequeueAdvancesLastRunAt(t *testing.T) {
 	}
 }
 
+func TestClaim_RequeueRefreshesTopicFromScheduleTitle(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	sched := seedDueSchedule(t, db, &old)
+	if err := db.Model(&model.SummarySchedule{}).Where("id = ?", sched.ID).
+		Update("title", "最新定时总结要求").Error; err != nil {
+		t.Fatalf("update schedule title: %v", err)
+	}
+	sched = reloadSchedule(t, db, sched.ID)
+	prior := seedBoundTask(t, db, sched.ID, model.StatusCompleted, 1)
+	if err := db.Model(&model.SummaryTask{}).Where("id = ?", prior.ID).
+		Updates(map[string]interface{}{"title": "旧标题", "topic": "旧总结要求"}).Error; err != nil {
+		t.Fatalf("seed stale task topic: %v", err)
+	}
+
+	taskID, claimed, err := claimAndCreateScheduledTask(db, nil, sched, time.Now().UTC(), 30, false)
+	if err != nil || !claimed {
+		t.Fatalf("claim: claimed=%v err=%v", claimed, err)
+	}
+	var task model.SummaryTask
+	if err := db.First(&task, taskID).Error; err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	if task.Title != sched.Title || task.Topic != sched.Title {
+		t.Fatalf("requeued title/topic must follow schedule: title=%q topic=%q want=%q", task.Title, task.Topic, sched.Title)
+	}
+}
+
 func TestClaim_RequeueClearsPriorNotifications(t *testing.T) {
 	db := newSchedulerTestDB(t)
 	old := time.Now().UTC().Add(-48 * time.Hour)

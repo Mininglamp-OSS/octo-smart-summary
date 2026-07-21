@@ -26,25 +26,25 @@ func TestPreRetrievalNarrow_TopicTruncation(t *testing.T) {
 		return `{"has_time_expr": false}`, nil
 	}
 
-	t.Run("topic<=1000 is not truncated", func(t *testing.T) {
+	t.Run("topic<=2300 is not truncated", func(t *testing.T) {
 		captured = ""
-		topic := strings.Repeat("あ", 1000)
+		topic := strings.Repeat("あ", 2300)
 		PreRetrievalNarrow(context.Background(), topic, start, end, stubFn)
 		if !strings.Contains(captured, topic) {
-			t.Errorf("expected full topic (1000 runes) to be preserved in prompt")
+			t.Errorf("expected full topic (2300 runes) to be preserved in prompt")
 		}
 	})
 
-	t.Run("topic>1000 is truncated to 1000", func(t *testing.T) {
+	t.Run("topic>2300 is truncated to 2300", func(t *testing.T) {
 		captured = ""
-		topic := strings.Repeat("あ", 1500)
+		topic := strings.Repeat("あ", 2500)
 		PreRetrievalNarrow(context.Background(), topic, start, end, stubFn)
-		// The truncated topic should have exactly 1000 runes of 'あ'
-		truncated := strings.Repeat("あ", 1000)
+		// The truncated topic should have exactly 2300 runes of 'あ'
+		truncated := strings.Repeat("あ", 2300)
 		if !strings.Contains(captured, truncated) {
-			t.Errorf("expected truncated topic (1000 runes) in prompt")
+			t.Errorf("expected truncated topic (2300 runes) in prompt")
 		}
-		// Should NOT contain the full 1500-rune topic
+		// Should NOT contain the full 2500-rune topic
 		if strings.Contains(captured, topic) {
 			t.Errorf("expected topic to be truncated, but full topic found in prompt")
 		}
@@ -60,8 +60,8 @@ func TestPreRetrievalNarrow_TopicTruncation(t *testing.T) {
 			t.Fatalf("could not find closing quote for topic")
 		}
 		extracted := after[:endIdx]
-		if got := utf8.RuneCountInString(extracted); got != 1000 {
-			t.Errorf("expected extracted topic to have 1000 runes, got %d", got)
+		if got := utf8.RuneCountInString(extracted); got != 2300 {
+			t.Errorf("expected extracted topic to have 2300 runes, got %d", got)
 		}
 	})
 }

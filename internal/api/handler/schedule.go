@@ -495,8 +495,8 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		return
 	}
 
-	if utf8.RuneCountInString(req.Title) > 1000 {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 1000 字符"})
+	if utf8.RuneCountInString(req.Title) > maxSummaryTopicRunes {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 2300 字符"})
 		return
 	}
 	generationInstruction, err := normalizeScheduleGenerationInstruction(req.GenerationInstruction)
@@ -1009,8 +1009,8 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		return
 	}
 
-	if req.Title != nil && utf8.RuneCountInString(*req.Title) > 1000 {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 1000 字符"})
+	if req.Title != nil && utf8.RuneCountInString(*req.Title) > maxSummaryTopicRunes {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 2300 字符"})
 		return
 	}
 	if req.GenerationInstruction != nil {

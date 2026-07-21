@@ -800,7 +800,7 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 
 	fetchStart := time.Now()
 	messages, _, err = pipeline.ResolveAndFetchMessagesForPersonal(
-		ctx, task.CreatorID, participantUIDs, participantNames, specifiedSources, task.Title,
+		ctx, task.CreatorID, participantUIDs, participantNames, specifiedSources, task.EffectiveTopic(),
 		task.TimeRangeStart, task.TimeRangeEnd,
 		p.imDB, p.octoClient, p.cfg.MessageFetchBackend, toolCallFn, llmFn, p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency, p.cfg.OctoSearchPollSec,
 		channelScopeOpts, nil,

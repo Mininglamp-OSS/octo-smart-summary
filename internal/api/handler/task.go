@@ -31,6 +31,11 @@ const maxSourceCount = 30
 
 const defaultCustomTemplateLimit = 30
 
+const maxTemplateDescriptionRunes = 2000
+
+// A template topic includes the 2000-rune description plus its name and framing labels.
+const maxSummaryTopicRunes = 2300
+
 // TaskHandler handles summary task endpoints.
 type TaskHandler struct {
 	db                  *gorm.DB
@@ -271,12 +276,12 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 	}
 
 	// Validate
-	if utf8.RuneCountInString(req.Title) > 1000 {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 1000 字符"})
+	if utf8.RuneCountInString(req.Title) > maxSummaryTopicRunes {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 2300 字符"})
 		return
 	}
-	if utf8.RuneCountInString(req.Topic) > 1000 {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "topic 不能超过 1000 字符"})
+	if utf8.RuneCountInString(req.Topic) > maxSummaryTopicRunes {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "topic 不能超过 2300 字符"})
 		return
 	}
 	if req.OriginChannelID != "" && (req.OriginChannelType < model.OriginChannelGroup || req.OriginChannelType > model.OriginChannelDM) {
@@ -351,6 +356,7 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		SpaceID:           spaceID,
 		CreatorID:         effectiveUID,
 		Title:             title,
+		Topic:             req.Topic,
 		SummaryMode:       summaryMode,
 		TimeRangeStart:    timeStart,
 		TimeRangeEnd:      timeEnd,
@@ -1157,13 +1163,15 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 		return
 	}
 	topic := strings.TrimSpace(req.Topic)
-	if utf8.RuneCountInString(topic) > 1000 {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "topic 不能超过 1000 字符"})
+	if utf8.RuneCountInString(topic) > maxSummaryTopicRunes {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "topic 不能超过 2300 字符"})
 		return
 	}
 	newTitle := task.Title
-	if topic != "" && topic != task.Title {
+	newTopic := task.EffectiveTopic()
+	if topic != "" {
 		newTitle = topic
+		newTopic = topic
 	}
 
 	nextVer, _ := service.GetNextVersion(h.db, taskID)
@@ -1183,6 +1191,7 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 				"error_message":       nil,
 				"processing_deadline": nil,
 				"title":               newTitle,
+				"topic":               newTopic,
 			})
 		if res.Error != nil {
 			return res.Error
@@ -1452,8 +1461,8 @@ type customTemplateReq struct {
 
 func validateTemplatePattern(c *gin.Context, pattern string) (string, bool) {
 	pattern = strings.TrimSpace(pattern)
-	if utf8.RuneCountInString(pattern) > 1000 {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "pattern 不能超过 1000 字符"})
+	if utf8.RuneCountInString(pattern) > maxTemplateDescriptionRunes {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "模板规则不能超过 2000 字符"})
 		return "", false
 	}
 	return pattern, true
@@ -1463,6 +1472,22 @@ func validateCustomTemplateReq(c *gin.Context, req customTemplateReq) (customTem
 	req.Label = strings.TrimSpace(req.Label)
 	req.Description = strings.TrimSpace(req.Description)
 	req.Pattern = strings.TrimSpace(req.Pattern)
+	if req.Label == "" {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "模板名称不能为空"})
+		return req, false
+	}
+	if req.Description == "" {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "总结内容不能为空"})
+		return req, false
+	}
+	if utf8.RuneCountInString(req.Label) > 100 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "模板名称不能超过 100 字符"})
+		return req, false
+	}
+	if utf8.RuneCountInString(req.Description) > maxTemplateDescriptionRunes {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "总结内容不能超过 2000 字符"})
+		return req, false
+	}
 	if req.Pattern == "" {
 		req.Pattern = req.Description
 	}
@@ -1471,22 +1496,6 @@ func validateCustomTemplateReq(c *gin.Context, req customTemplateReq) (customTem
 		return req, false
 	}
 	req.Pattern = pattern
-	if req.Label == "" {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "label 不能为空"})
-		return req, false
-	}
-	if req.Description == "" {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "description 不能为空"})
-		return req, false
-	}
-	if utf8.RuneCountInString(req.Label) > 100 {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "label 不能超过 100 字符"})
-		return req, false
-	}
-	if utf8.RuneCountInString(req.Description) > 200 {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "description 不能超过 200 字符"})
-		return req, false
-	}
 	return req, true
 }
 

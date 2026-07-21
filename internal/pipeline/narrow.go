@@ -66,15 +66,17 @@ func sanitizeTopic(s string) string {
 // LLMToolCallFn is the callback type for function-call based LLM invocations.
 type LLMToolCallFn func(ctx context.Context, messages []service.ChatMessage, tools []service.Tool, forceFn string) (string, error)
 
+const maxPipelineTopicRunes = 2300
+
 // PreRetrievalNarrow uses LLM Function Call to extract time expressions from topic
 // and narrow the query window. Falls back to original range on any failure.
 func PreRetrievalNarrow(ctx context.Context, topic string, originalStart, originalEnd time.Time, toolCallFn LLMToolCallFn) (time.Time, time.Time) {
 	if topic == "" || toolCallFn == nil {
 		return originalStart, originalEnd
 	}
-	if utf8.RuneCountInString(topic) > 1000 {
+	if utf8.RuneCountInString(topic) > maxPipelineTopicRunes {
 		runes := []rune(topic)
-		topic = string(runes[:1000])
+		topic = string(runes[:maxPipelineTopicRunes])
 	}
 	topic = sanitizeTopic(topic)
 

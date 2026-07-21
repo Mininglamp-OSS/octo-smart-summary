@@ -21,14 +21,15 @@ func (p *Processor) scheduleGenerationInstruction(task model.SummaryTask) string
 }
 
 func (p *Processor) generationTopic(task model.SummaryTask) string {
+	topic := task.EffectiveTopic()
 	instruction := p.scheduleGenerationInstruction(task)
 	if instruction == "" {
-		return task.Title
+		return topic
 	}
-	if strings.TrimSpace(task.Title) == "" {
+	if strings.TrimSpace(topic) == "" {
 		return instruction
 	}
-	return fmt.Sprintf("%s\n\n定时生成要求：\n%s", task.Title, instruction)
+	return fmt.Sprintf("%s\n\n定时生成要求：\n%s", topic, instruction)
 }
 
 func (p *Processor) scheduledOperationNote(task model.SummaryTask) string {
