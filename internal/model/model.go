@@ -4,6 +4,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -126,7 +127,8 @@ type SummaryTask struct {
 	TaskNo             string     `gorm:"column:task_no;type:varchar(32);uniqueIndex:uk_task_no;not null" json:"task_no"`
 	SpaceID            string     `gorm:"column:space_id;type:varchar(64);not null;default:''" json:"space_id"`
 	CreatorID          string     `gorm:"column:creator_id;type:varchar(64);not null" json:"creator_id"`
-	Title              string     `gorm:"column:title;type:varchar(1000);not null;default:''" json:"title"`
+	Title              string     `gorm:"column:title;type:varchar(2300);not null;default:''" json:"title"`
+	Topic              string     `gorm:"column:topic;type:varchar(2300);not null;default:''" json:"topic"`
 	SummaryMode        int        `gorm:"column:summary_mode;type:tinyint;not null" json:"summary_mode"`
 	TimeRangeStart     time.Time  `gorm:"column:time_range_start;not null" json:"time_range_start"`
 	TimeRangeEnd       time.Time  `gorm:"column:time_range_end;not null" json:"time_range_end"`
@@ -150,6 +152,15 @@ type SummaryTask struct {
 	// trigger_type=agent summaries where the user picked one or more existing
 	// summaries as reference material via the chat UI.
 	ReferencedTaskIDs *string `gorm:"column:referenced_task_ids;type:text" json:"-"`
+}
+
+// EffectiveTopic keeps existing tasks compatible while new tasks persist the
+// complete summary instruction separately from the display title.
+func (t SummaryTask) EffectiveTopic() string {
+	if strings.TrimSpace(t.Topic) != "" {
+		return t.Topic
+	}
+	return t.Title
 }
 
 func (SummaryTask) TableName() string { return "summary_task" }
@@ -320,7 +331,7 @@ type SummarySchedule struct {
 	ID                    int64  `gorm:"primaryKey;autoIncrement" json:"id"`
 	SpaceID               string `gorm:"column:space_id;type:varchar(64);not null;default:''" json:"space_id"`
 	CreatorID             string `gorm:"column:creator_id;type:varchar(64);not null" json:"creator_id"`
-	Title                 string `gorm:"column:title;type:varchar(1000);not null;default:''" json:"title"`
+	Title                 string `gorm:"column:title;type:varchar(2300);not null;default:''" json:"title"`
 	GenerationInstruction string `gorm:"column:generation_instruction;type:text" json:"generation_instruction"`
 	SummaryMode           int    `gorm:"column:summary_mode;type:tinyint;not null" json:"summary_mode"`
 	CronExpr              string `gorm:"column:cron_expr;type:varchar(50);not null" json:"cron_expr"`

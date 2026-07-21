@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/gin-gonic/gin"
 )
 
@@ -103,5 +106,37 @@ func TestCreateSummary_SourceCountExceedsLimit(t *testing.T) {
 	}
 	if code := respCode(t, w); code != 40003 {
 		t.Errorf("expected code 40003 for exceeding source limit, got %d: %s", code, w.Body.String())
+	}
+}
+
+func TestCreateSummary_TopicLimit(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupCreateRouter(h)
+
+	fullTopic := strings.Repeat("总", maxSummaryTopicRunes)
+	w := doCreateSummary(r, map[string]interface{}{
+		"title":   "topic-limit-test",
+		"topic":   fullTopic,
+		"sources": makeSources(1),
+	}, "creator1")
+	if w.Code == http.StatusBadRequest && respCode(t, w) == 40001 {
+		t.Fatalf("expected %d-rune topic to pass validation: %s", maxSummaryTopicRunes, w.Body.String())
+	}
+	var task model.SummaryTask
+	if err := db.Order("id DESC").First(&task).Error; err != nil {
+		t.Fatalf("load created task: %v", err)
+	}
+	if task.Title != "topic-limit-test" || task.Topic != fullTopic {
+		t.Fatalf("title/topic persistence mismatch: title=%q topicRunes=%d", task.Title, utf8.RuneCountInString(task.Topic))
+	}
+
+	w = doCreateSummary(r, map[string]interface{}{
+		"title":   "topic-limit-test",
+		"topic":   strings.Repeat("总", maxSummaryTopicRunes+1),
+		"sources": makeSources(1),
+	}, "creator1")
+	if w.Code != http.StatusBadRequest || respCode(t, w) != 40001 || !strings.Contains(w.Body.String(), "topic 不能超过 2300 字符") {
+		t.Fatalf("expected %d-rune topic to be rejected: status=%d body=%s", maxSummaryTopicRunes+1, w.Code, w.Body.String())
 	}
 }

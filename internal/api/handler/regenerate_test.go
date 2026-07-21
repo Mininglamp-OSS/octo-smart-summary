@@ -634,7 +634,7 @@ func TestRegenerate_TopicTooLong(t *testing.T) {
 	h := NewTaskHandler(db, imDB, "")
 	r := setupRegenerateRouter(h)
 
-	longTopic := strings.Repeat("a", 1001)
+	longTopic := strings.Repeat("a", 2301)
 	w := httptest.NewRecorder()
 	body := bytes.NewBufferString(fmt.Sprintf(`{"topic":%q}`, longTopic))
 	req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/summaries/%d/regenerate", taskID), body)

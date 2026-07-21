@@ -726,8 +726,8 @@ func (h *PersonalHandler) RegeneratePersonalSummary(c *gin.Context) {
 		return
 	}
 	topic := strings.TrimSpace(req.Topic)
-	if utf8.RuneCountInString(topic) > 1000 {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "topic 不能超过 1000 字符"})
+	if utf8.RuneCountInString(topic) > maxSummaryTopicRunes {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "topic 不能超过 2300 字符"})
 		return
 	}
 	err := h.db.Transaction(func(tx *gorm.DB) error {

@@ -154,6 +154,26 @@ func TestMyTemplateOverrideAndReset(t *testing.T) {
 	}
 }
 
+func TestMyTemplateDescriptionLimit(t *testing.T) {
+	r := setupTemplateRouter(t)
+
+	w := doTemplateReq(r, http.MethodPut, "/api/v1/summary-templates/project_progress/my", map[string]string{
+		"label":       "项目进展复盘",
+		"description": strings.Repeat("总", 2000),
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("2000-rune description status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	w = doTemplateReq(r, http.MethodPut, "/api/v1/summary-templates/project_progress/my", map[string]string{
+		"label":       "项目进展复盘",
+		"description": strings.Repeat("总", 2001),
+	})
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "总结内容不能超过 2000 字符") {
+		t.Fatalf("2001-rune description status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestCustomTemplateCRUD(t *testing.T) {
 	r := setupTemplateRouter(t)
 
@@ -205,6 +225,26 @@ func TestCustomTemplateCRUD(t *testing.T) {
 	templates = decodeTemplateMap(t, w)
 	if _, ok := templates[id]; ok {
 		t.Fatalf("deleted custom template still returned: %#v", templates[id])
+	}
+}
+
+func TestCustomTemplateDescriptionLimit(t *testing.T) {
+	r := setupTemplateRouter(t)
+
+	w := doTemplateReq(r, http.MethodPost, "/api/v1/summary-templates/my", map[string]string{
+		"label":       "长内容模板",
+		"description": strings.Repeat("总", 2000),
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("2000-rune description status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	w = doTemplateReq(r, http.MethodPost, "/api/v1/summary-templates/my", map[string]string{
+		"label":       "超长内容模板",
+		"description": strings.Repeat("总", 2001),
+	})
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "总结内容不能超过 2000 字符") {
+		t.Fatalf("2001-rune description status=%d body=%s", w.Code, w.Body.String())
 	}
 }
 

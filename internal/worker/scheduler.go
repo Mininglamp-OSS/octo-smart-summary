@@ -154,6 +154,7 @@ func claimAndRequeueScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.Summar
 					SpaceID:        lockedSched.SpaceID,
 					CreatorID:      lockedSched.CreatorID,
 					Title:          lockedSched.Title,
+					Topic:          lockedSched.Title,
 					SummaryMode:    lockedSched.SummaryMode,
 					TimeRangeStart: start,
 					TimeRangeEnd:   end,
@@ -206,6 +207,7 @@ func claimAndRequeueScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.Summar
 
 		updates := map[string]interface{}{
 			"title":               lockedSched.Title,
+			"topic":               lockedSched.Title,
 			"summary_mode":        lockedSched.SummaryMode,
 			"time_range_start":    start,
 			"time_range_end":      end,

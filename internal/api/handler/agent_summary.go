@@ -203,8 +203,8 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		}
 	}
 
-	if utf8.RuneCountInString(req.Title) > 1000 {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 1000 字符"})
+	if utf8.RuneCountInString(req.Title) > maxSummaryTopicRunes {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 2300 字符"})
 		return
 	}
 
@@ -271,6 +271,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		SpaceID:           spaceID,
 		CreatorID:         userID,
 		Title:             title,
+		Topic:             title,
 		SummaryMode:       model.ModeByPerson,
 		TimeRangeStart:    now,
 		TimeRangeEnd:      now,

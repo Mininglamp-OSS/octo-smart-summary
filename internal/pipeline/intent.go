@@ -114,8 +114,8 @@ var recognizeIntentTool = service.Tool{
 					"description": "主题中提到的频道对应的 channel_id。只能从候选频道列表中选取，不得编造。无频道约束时为空数组",
 				},
 				"channel_type": map[string]interface{}{
-					"type":  "array",
-					"items": map[string]interface{}{"type": "string", "enum": []string{"group", "dm", "thread"}},
+					"type":        "array",
+					"items":       map[string]interface{}{"type": "string", "enum": []string{"group", "dm", "thread"}},
 					"description": "限定频道类型。'私聊'/'DM'→[\"dm\"]；'群'/'群组'→[\"group\"]；'子区'/'thread'→[\"thread\"]；无限定时为空数组",
 				},
 				"channel_persons": map[string]interface{}{
@@ -190,9 +190,9 @@ func RecognizeIntent(
 	}
 
 	// Truncate topic if too long
-	if utf8.RuneCountInString(topic) > 1000 {
+	if utf8.RuneCountInString(topic) > maxPipelineTopicRunes {
 		runes := []rune(topic)
-		topic = string(runes[:1000])
+		topic = string(runes[:maxPipelineTopicRunes])
 	}
 	topic = sanitizeTopic(topic)
 

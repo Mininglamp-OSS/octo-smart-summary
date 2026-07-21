@@ -11,7 +11,7 @@ type SummaryUserTemplate struct {
 	UserID      string     `gorm:"column:user_id;type:varchar(64);not null;uniqueIndex:uk_summary_user_template" json:"user_id"`
 	TemplateID  string     `gorm:"column:template_id;type:varchar(64);not null;uniqueIndex:uk_summary_user_template" json:"template_id"`
 	Label       string     `gorm:"column:label;type:varchar(100);not null;default:''" json:"label"`
-	Description string     `gorm:"column:description;type:varchar(200);not null;default:''" json:"description"`
+	Description string     `gorm:"column:description;type:varchar(2000);not null;default:''" json:"description"`
 	IsCustom    bool       `gorm:"column:is_custom;type:tinyint;not null;default:0" json:"is_custom"`
 	Pattern     string     `gorm:"column:pattern;type:text;not null" json:"pattern"`
 	SortOrder   int        `gorm:"column:sort_order;type:int;not null;default:0" json:"sort_order"`

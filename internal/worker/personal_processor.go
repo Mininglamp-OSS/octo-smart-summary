@@ -707,7 +707,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 
 	fetchStart := time.Now()
 	messages, intentResult, err := pipeline.ResolveAndFetchMessagesForPersonal(
-		ctx, userID, nil, nil, specifiedSources, task.Title,
+		ctx, userID, nil, nil, specifiedSources, task.EffectiveTopic(),
 		task.TimeRangeStart, task.TimeRangeEnd,
 		p.imDB, p.octoClient, p.cfg.MessageFetchBackend, toolCallFn, llmFn,
 		p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency, p.cfg.OctoSearchPollSec,
@@ -774,8 +774,8 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	// summary would over-widen to ALL messages. So re-resolve against the actual
 	// post-fetch senders (nameMap, untruncated) whenever we have no target and the
 	// topic is not purely generic (pure_generic_topic by definition names no one).
-	if len(targetUIDs) == 0 && intentResult.SkipReason != "pure_generic_topic" && task.Title != "" {
-		if fallback := pipeline.ResolveTopicTarget(ctx, task.Title, nameMap, userID, toolCallFn); len(fallback) > 0 {
+	if topic := task.EffectiveTopic(); len(targetUIDs) == 0 && intentResult.SkipReason != "pure_generic_topic" && topic != "" {
+		if fallback := pipeline.ResolveTopicTarget(ctx, topic, nameMap, userID, toolCallFn); len(fallback) > 0 {
 			targetUIDs = fallback
 			log.Printf("[personal-worker] target resolved via post-fetch fallback: %v (creator=%s)", targetUIDs, userID)
 		}

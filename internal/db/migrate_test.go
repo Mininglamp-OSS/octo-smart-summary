@@ -193,6 +193,30 @@ SELECT 1;
 -- +migrate Down
 SELECT 1;
 `)},
+	"20260720-01-summary-user-template-description-1000.sql": &fstest.MapFile{Data: []byte(`-- +migrate Up
+SELECT 1;
+
+-- +migrate Down
+SELECT 1;
+`)},
+	"20260720-02-summary-title-varchar-1300.sql": &fstest.MapFile{Data: []byte(`-- +migrate Up
+SELECT 1;
+
+-- +migrate Down
+SELECT 1;
+`)},
+	"20260720-03-summary-task-topic.sql": &fstest.MapFile{Data: []byte(`-- +migrate Up
+SELECT 1;
+
+-- +migrate Down
+SELECT 1;
+`)},
+	"20260721-01-summary-content-limits-2000.sql": &fstest.MapFile{Data: []byte(`-- +migrate Up
+SELECT 1;
+
+-- +migrate Down
+SELECT 1;
+`)},
 }
 
 func testSource() migrate.MigrationSource {
@@ -218,8 +242,8 @@ func TestRunMigrations_NewDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runMigrationsCore: %v", err)
 	}
-	if n != 6 {
-		t.Fatalf("expected 6 migrations applied, got %d", n)
+	if n != 10 {
+		t.Fatalf("expected 10 migrations applied, got %d", n)
 	}
 
 	tables := []string{
@@ -294,8 +318,8 @@ func TestRunMigrations_ExistingDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runMigrationsCore: %v", err)
 	}
-	if n != 5 {
-		t.Fatalf("expected 5 migrations applied (006+007+workflow_stage+user_template+template_compat), got %d", n)
+	if n != 9 {
+		t.Fatalf("expected 9 migrations applied (006+007+workflow_stage+user_template+template_compat+description_1000+title_1300+task_topic+content_2000), got %d", n)
 	}
 }
 
@@ -320,8 +344,8 @@ func TestRunMigrations_Idempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first run: %v", err)
 	}
-	if n1 != 6 {
-		t.Fatalf("first run: expected 6, got %d", n1)
+	if n1 != 10 {
+		t.Fatalf("first run: expected 10, got %d", n1)
 	}
 
 	n2, err := runMigrationsCore(db, "sqlite3", testSource())
