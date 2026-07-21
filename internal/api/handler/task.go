@@ -506,8 +506,20 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 
 	if s := c.Query("status"); s != "" {
 		if v, err := strconv.Atoi(s); err == nil {
-			whereSQL += " AND status = ?"
-			args = append(args, v)
+			if v == model.StatusPending {
+				// Waiting is a caller-specific aggregate state that includes tasks not
+				// yet started, pending task invitations, and pending schedule invitations.
+				// Apply it before pagination to keep totals and pages accurate.
+				statusPendingExpr := h.schedulePendingInvitationExpr("summary_task")
+				whereSQL += " AND (status = ? OR id IN (SELECT task_id FROM summary_participant WHERE user_id = ? AND status = ?) OR EXISTS (SELECT 1 FROM summary_personal_result wait_pr WHERE wait_pr.task_id = summary_task.id AND wait_pr.user_id = ? AND wait_pr.worker_status = ? AND wait_pr.submitted_at IS NULL AND (SELECT COUNT(*) FROM summary_participant wait_sp WHERE wait_sp.task_id = summary_task.id) > 1) OR " + statusPendingExpr + ")"
+				args = append(args, v, userID, model.ParticipantPending, userID, model.PersonalStatusCompleted)
+				if h.db.Dialector.Name() == "mysql" {
+					args = append(args, userID)
+				}
+			} else {
+				whereSQL += " AND status = ?"
+				args = append(args, v)
+			}
 		}
 	}
 	if s := c.Query("trigger_type"); s != "" {
@@ -583,6 +595,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	schedulePendingExpr := h.schedulePendingInvitationExpr("sub")
 	attentionSelect := `,
  CASE WHEN me.status = ? OR ` + schedulePendingExpr + ` THEN 1 ELSE 0 END AS has_pending_invitation,
+ CASE WHEN pr.worker_status = ? AND pr.submitted_at IS NULL AND (SELECT COUNT(*) FROM summary_participant wait_sp WHERE wait_sp.task_id = sub.id) > 1 THEN 1 ELSE 0 END AS has_pending_submission,
  CASE WHEN (sub.current_result_id IS NOT NULL AND (sur.last_read_team_result_id IS NULL OR sur.last_read_team_result_id <> sub.current_result_id))
         OR (pr.current_version_id IS NOT NULL AND (sur.last_read_personal_version_id IS NULL OR sur.last_read_personal_version_id <> pr.current_version_id))
       THEN 1 ELSE 0 END AS is_unread,
@@ -597,12 +610,14 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	if h.db.Dialector.Name() == "mysql" {
 		pageArgs = append(pageArgs, userID)
 	}
+	pageArgs = append(pageArgs, model.PersonalStatusCompleted)
 	pageArgs = append(pageArgs, args...)
 	pageArgs = append(pageArgs, userID, userID, userID, userID, pageSize, (page-1)*pageSize)
 
 	type listTaskRow struct {
 		model.SummaryTask        `gorm:"embedded"`
 		HasPendingInvitation     bool   `gorm:"column:has_pending_invitation"`
+		HasPendingSubmission     bool   `gorm:"column:has_pending_submission"`
 		IsUnread                 bool   `gorm:"column:is_unread"`
 		ListCurrentResultID      *int64 `gorm:"column:list_current_result_id"`
 		CurrentPersonalVersionID *int64 `gorm:"column:current_personal_version_id"`
@@ -707,6 +722,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			"task_id":                     t.ID,
 			"task_no":                     t.TaskNo,
 			"title":                       t.Title,
+			"topic":                       t.EffectiveTopic(),
 			"summary_mode":                t.SummaryMode,
 			"status":                      t.Status,
 			"trigger_type":                t.TriggerType,
@@ -726,6 +742,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			"result_edited_at":            resultEditedAt,
 			"is_unread":                   attention.IsUnread,
 			"has_pending_invitation":      attention.HasPendingInvitation,
+			"has_pending_submission":      attention.HasPendingSubmission,
 			"needs_attention":             attention.IsUnread || attention.HasPendingInvitation,
 			"current_result_id":           attention.ListCurrentResultID,
 			"current_personal_version_id": attention.CurrentPersonalVersionID,
@@ -925,6 +942,7 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		"task_id":             task.ID,
 		"task_no":             task.TaskNo,
 		"title":               task.Title,
+		"topic":               task.EffectiveTopic(),
 		"summary_mode":        task.SummaryMode,
 		"status":              task.Status,
 		"creator_id":          task.CreatorID,
