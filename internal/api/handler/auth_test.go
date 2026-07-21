@@ -1069,3 +1069,78 @@ func TestGetResult_SingleConfirmLeak_ProducerSeesOwn(t *testing.T) {
 		t.Errorf("producer memberA must KEEP their own plain citations via GetResult; got none. body=%s", w.Body.String())
 	}
 }
+
+func TestListSummaries_WaitingFilterExcludesSinglePersonCompletedResult(t *testing.T) {
+	db, imDB := setupListTestDBs(t)
+	task := model.SummaryTask{
+		TaskNo: "TST-SINGLE-COMPLETED", SpaceID: "space1", CreatorID: "creator1",
+		SummaryMode: model.ModeByPerson, Status: model.StatusCompleted,
+	}
+	db.Create(&task)
+	db.Create(&model.SummaryParticipant{
+		TaskID: task.ID, UserID: "creator1", Status: model.ParticipantCompleted,
+	})
+	db.Create(&model.PersonalResult{
+		TaskID: task.ID, UserID: "creator1", WorkerStatus: model.PersonalStatusCompleted,
+	})
+
+	r := setupListRouter(NewTaskHandler(db, imDB, ""))
+	w := doRequest(r, "GET", "/api/v1/summaries?status=0", "creator1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	resp := parseListResponse(t, w)
+	if resp.Data.Total != 0 || len(resp.Data.Items) != 0 {
+		t.Fatalf("single-person completed result must not be treated as waiting for submission, got total=%d items=%d", resp.Data.Total, len(resp.Data.Items))
+	}
+}
+
+func TestListSummaries_WaitingFilterIncludesMyPendingInvitation(t *testing.T) {
+	db, imDB := setupListTestDBs(t)
+	task := model.SummaryTask{
+		TaskNo:      "TST-WAITING-INVITE",
+		SpaceID:     "space1",
+		CreatorID:   "creator1",
+		SummaryMode: model.ModeByPerson,
+		Status:      model.StatusProcessing,
+	}
+	db.Create(&task)
+	db.Create(&model.SummaryParticipant{
+		TaskID: task.ID, UserID: "creator1", UserName: "Creator", Status: model.ParticipantAccepted,
+	})
+	db.Create(&model.SummaryParticipant{
+		TaskID: task.ID, UserID: "participant1", UserName: "P1", Status: model.ParticipantPending,
+	})
+
+	r := setupListRouter(NewTaskHandler(db, imDB, ""))
+	w := doRequest(r, "GET", "/api/v1/summaries?status=0", "participant1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	resp := parseListResponse(t, w)
+	if resp.Data.Total != 1 || len(resp.Data.Items) != 1 {
+		t.Fatalf("waiting filter must include my pending invitation on a processing task, got total=%d items=%d", resp.Data.Total, len(resp.Data.Items))
+	}
+
+	db.Model(&model.SummaryParticipant{}).
+		Where("task_id = ? AND user_id = ?", task.ID, "participant1").
+		Update("status", model.ParticipantAccepted)
+	db.Create(&model.PersonalResult{
+		TaskID: task.ID, UserID: "participant1", WorkerStatus: model.PersonalStatusCompleted,
+	})
+	w = doRequest(r, "GET", "/api/v1/summaries?status=0", "participant1")
+	resp = parseListResponse(t, w)
+	if resp.Data.Total != 1 || len(resp.Data.Items) != 1 {
+		t.Fatalf("waiting filter must include my completed but unsubmitted personal summary, got total=%d items=%d", resp.Data.Total, len(resp.Data.Items))
+	}
+
+	now := timezone.Now()
+	db.Model(&model.PersonalResult{}).
+		Where("task_id = ? AND user_id = ?", task.ID, "participant1").
+		Update("submitted_at", now)
+	w = doRequest(r, "GET", "/api/v1/summaries?status=0", "participant1")
+	resp = parseListResponse(t, w)
+	if resp.Data.Total != 0 || len(resp.Data.Items) != 0 {
+		t.Fatalf("waiting filter must exclude a processing task after personal summary submission, got total=%d items=%d", resp.Data.Total, len(resp.Data.Items))
+	}
+}
