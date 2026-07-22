@@ -215,6 +215,14 @@ func TestGetUserChannels_DeletedOrMissingParentMembershipCannotSeeThreads(t *tes
 	if threads := threadIDSet(channels); len(threads) != 0 {
 		t.Fatalf("deleted parent-group member must not discover threads, got %v", threads)
 	}
+
+	channels, err = GetUserChannels(context.Background(), "user-without-group-membership", db, WithIncludeArchived(true))
+	if err != nil {
+		t.Fatalf("GetUserChannels without parent membership: %v", err)
+	}
+	if threads := threadIDSet(channels); len(threads) != 0 {
+		t.Fatalf("user without parent-group membership must not discover threads, got %v", threads)
+	}
 }
 
 func TestGetUserChannels_SelectedDeletedNeverRetained(t *testing.T) {
