@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sort"
 	"strconv"
@@ -108,9 +109,12 @@ func (h *ShareHandler) canUseTarget(spaceID, uid string, target shareTarget) boo
 	}
 	switch target.ChannelType {
 	case model.ChannelTypeGroup:
+		if !h.activeSpaceMember(spaceID, uid) {
+			return false
+		}
 		var count int64
 		err := h.imDB.Raw(
-			"SELECT COUNT(*) FROM `group` g INNER JOIN space s ON s.space_id = g.space_id AND s.status = 1 INNER JOIN group_member gm ON gm.group_no = g.group_no WHERE g.group_no = ? AND g.space_id = ? AND g.status = 1 AND gm.uid = ? AND gm.is_deleted = 0",
+			"SELECT COUNT(*) FROM `group` g INNER JOIN space s ON s.space_id = g.space_id AND s.status = 1 INNER JOIN group_member gm ON gm.group_no = g.group_no WHERE g.group_no = ? AND g.space_id = ? AND g.status = 1 AND gm.uid = ? AND gm.status = 1 AND gm.is_deleted = 0",
 			target.ChannelID, spaceID, uid,
 		).Scan(&count).Error
 		return err == nil && count > 0
@@ -211,6 +215,59 @@ func (h *ShareHandler) response(snapshot model.SummaryShareSnapshot, grants []mo
 	return gin.H{"snapshot": snapshot, "grants": items}
 }
 
+func isShareDuplicateKey(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, gorm.ErrDuplicatedKey) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "duplicate entry") ||
+		strings.Contains(message, "error 1062") ||
+		strings.Contains(message, "unique constraint failed") ||
+		strings.Contains(message, "constraint failed: unique")
+}
+
+func (h *ShareHandler) existingShare(spaceID, userID, idempotencyKey, hash string) (model.SummaryShareSnapshot, []model.SummaryShareGrant, bool, bool, error) {
+	var snapshot model.SummaryShareSnapshot
+	err := h.db.Where(
+		"space_id = ? AND creator_id = ? AND idempotency_key = ?",
+		spaceID, userID, idempotencyKey,
+	).First(&snapshot).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return snapshot, nil, false, false, nil
+	}
+	if err != nil {
+		return snapshot, nil, false, false, err
+	}
+	if snapshot.RequestHash != hash {
+		return snapshot, nil, true, true, nil
+	}
+	var grants []model.SummaryShareGrant
+	if err := h.db.Where("snapshot_id = ? AND status = ?", snapshot.ID, model.ShareGrantActive).Find(&grants).Error; err != nil {
+		return snapshot, nil, true, false, err
+	}
+	return snapshot, grants, true, false, nil
+}
+
+func (h *ShareHandler) respondWithExistingShare(c *gin.Context, spaceID, userID, idempotencyKey, hash string) bool {
+	snapshot, grants, found, conflict, err := h.existingShare(spaceID, userID, idempotencyKey, hash)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "读取分享请求失败"})
+		return true
+	}
+	if conflict {
+		c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "幂等键已用于其他分享请求"})
+		return true
+	}
+	if found {
+		ok(c, h.response(snapshot, grants))
+		return true
+	}
+	return false
+}
+
 func (h *ShareHandler) Create(c *gin.Context) {
 	spaceID, userID := middleware.GetSpaceID(c), middleware.GetUserID(c)
 	var req createSharesRequest
@@ -243,15 +300,7 @@ func (h *ShareHandler) Create(c *gin.Context) {
 		}
 	}
 	hash := requestHash(task.ID, targets)
-	var existing model.SummaryShareSnapshot
-	if err := h.db.Where("space_id = ? AND creator_id = ? AND idempotency_key = ?", spaceID, userID, req.IdempotencyKey).First(&existing).Error; err == nil {
-		if existing.RequestHash != hash {
-			c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "幂等键已用于其他分享请求"})
-			return
-		}
-		var grants []model.SummaryShareGrant
-		h.db.Where("snapshot_id = ? AND status = ?", existing.ID, model.ShareGrantActive).Find(&grants)
-		ok(c, h.response(existing, grants))
+	if h.respondWithExistingShare(c, spaceID, userID, req.IdempotencyKey, hash) {
 		return
 	}
 
@@ -266,7 +315,10 @@ func (h *ShareHandler) Create(c *gin.Context) {
 		return
 	}
 	var sources []model.SummarySource
-	h.db.Where("task_id = ?", task.ID).Find(&sources)
+	if err := h.db.Where("task_id = ?", task.ID).Find(&sources).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "读取总结来源失败"})
+		return
+	}
 	names := make([]string, 0, len(sources))
 	for _, source := range sources {
 		if strings.TrimSpace(source.SourceName) != "" {
@@ -274,7 +326,10 @@ func (h *ShareHandler) Create(c *gin.Context) {
 		}
 	}
 	var participantCount int64
-	h.db.Model(&model.SummaryParticipant{}).Where("task_id = ? AND status <> ?", task.ID, model.ParticipantDeclined).Count(&participantCount)
+	if err := h.db.Model(&model.SummaryParticipant{}).Where("task_id = ? AND status <> ?", task.ID, model.ParticipantDeclined).Count(&participantCount).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "读取总结参与者失败"})
+		return
+	}
 	now := time.Now()
 	snapshot := model.SummaryShareSnapshot{
 		TaskID: task.ID, TaskNo: task.TaskNo, SpaceID: spaceID, CreatorID: userID,
@@ -303,6 +358,9 @@ func (h *ShareHandler) Create(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
+		if isShareDuplicateKey(err) && h.respondWithExistingShare(c, spaceID, userID, req.IdempotencyKey, hash) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "创建分享失败"})
 		return
 	}
@@ -361,6 +419,10 @@ func (h *ShareHandler) Revoke(c *gin.Context) {
 		return
 	}
 	now := time.Now()
-	h.db.Model(&grant).Updates(map[string]any{"status": model.ShareGrantRevoked, "revoked_at": now, "updated_at": now})
+	result := h.db.Model(&grant).Updates(map[string]any{"status": model.ShareGrantRevoked, "revoked_at": now, "updated_at": now})
+	if result.Error != nil || result.RowsAffected != 1 {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "撤销分享失败"})
+		return
+	}
 	ok(c, gin.H{"share_id": grant.ShareID, "revoked": true})
 }
