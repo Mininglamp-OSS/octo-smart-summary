@@ -192,16 +192,20 @@ func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB, opts ...Cha
 		threadArgs = append(threadArgs, q.selectedThreadIDs)
 	}
 	threadQuery := `
-		SELECT DISTINCT CONCAT(t.group_no, '____', t.short_id) AS channel_id,
+		SELECT CONCAT(t.group_no, '____', t.short_id) AS channel_id,
 		       5 AS channel_type,
 		       CONCAT(t.name, ' · ', g.name) AS channel_name,
 		       COALESCE(g.space_id, '') AS space_id,
 		       t.status AS status
 		FROM thread t
 		INNER JOIN ` + "`group`" + ` g ON g.group_no COLLATE utf8mb4_unicode_ci = t.group_no
-		INNER JOIN group_member gm ON gm.group_no COLLATE utf8mb4_unicode_ci = t.group_no
-		WHERE gm.uid = ?
-		  AND gm.is_deleted = 0
+		WHERE EXISTS (
+			SELECT 1
+			FROM group_member gm
+			WHERE gm.group_no COLLATE utf8mb4_unicode_ci = t.group_no
+			  AND gm.uid = ?
+			  AND gm.is_deleted = 0
+		)
 		  AND ` + threadStatusCond + `
 		  AND g.status = 1
 		ORDER BY t.updated_at DESC
