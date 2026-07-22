@@ -51,12 +51,16 @@ func FindSharedChannelsTool() (Tool, Handler) {
 
 		_, imDB, _, _ := GetSummaryDeps()
 
-		creatorChannels, err := pipeline.GetUserChannels(ctx, uid, imDB, pipeline.WithIncludeArchived(req.IncludeArchived))
+		options := []pipeline.ChannelQueryOption{pipeline.WithIncludeArchived(req.IncludeArchived)}
+		if !req.IncludeArchived {
+			options = append(options, pipeline.WithSelectedThreads(SelectedArchivedChannelIDs(ctx)))
+		}
+		creatorChannels, err := pipeline.GetUserChannels(ctx, uid, imDB, options...)
 		if err != nil {
 			return "", fmt.Errorf("get creator channels: %w", err)
 		}
 
-		shared, err := pipeline.IntersectParticipantChannels(ctx, creatorChannels, req.ParticipantUIDs, imDB, pipeline.WithIncludeArchived(req.IncludeArchived))
+		shared, err := pipeline.IntersectParticipantChannels(ctx, creatorChannels, req.ParticipantUIDs, imDB, options...)
 		if err != nil {
 			return "", fmt.Errorf("intersect participant channels: %w", err)
 		}

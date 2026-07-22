@@ -43,7 +43,11 @@ func ListChannelsTool() (Tool, Handler) {
 
 		_, imDB, _, _ := GetSummaryDeps()
 
-		channels, err := pipeline.GetUserChannels(ctx, uid, imDB, pipeline.WithIncludeArchived(req.IncludeArchived))
+		options := []pipeline.ChannelQueryOption{pipeline.WithIncludeArchived(req.IncludeArchived)}
+		if !req.IncludeArchived {
+			options = append(options, pipeline.WithSelectedThreads(SelectedArchivedChannelIDs(ctx)))
+		}
+		channels, err := pipeline.GetUserChannels(ctx, uid, imDB, options...)
 		if err != nil {
 			return "", fmt.Errorf("get user channels: %w", err)
 		}

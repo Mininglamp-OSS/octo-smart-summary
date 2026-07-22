@@ -91,7 +91,11 @@ func FetchChannelTool() (Tool, Handler) {
 		summaryDB, imDB, _, cfg := GetSummaryDeps()
 
 		// Security: validate channel accessibility for system-injected uid
-		accessibleChannels, err := pipeline.GetUserChannels(ctx, uid, imDB, pipeline.WithIncludeArchived(req.IncludeArchived))
+		options := []pipeline.ChannelQueryOption{pipeline.WithIncludeArchived(req.IncludeArchived)}
+		if !req.IncludeArchived {
+			options = append(options, pipeline.WithSelectedThreads(SelectedArchivedChannelIDs(ctx)))
+		}
+		accessibleChannels, err := pipeline.GetUserChannels(ctx, uid, imDB, options...)
 		if err != nil {
 			return "", fmt.Errorf("get user channels: %w", err)
 		}
