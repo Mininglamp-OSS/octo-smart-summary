@@ -189,8 +189,12 @@ func applySelectedChannelContext(ctx context.Context, system string, selected []
 		seen[ch.ChannelID] = true
 		ch.Name = truncateRunes(strings.TrimSpace(ch.Name), 200)
 		ch.ChannelType = strings.ToLower(strings.TrimSpace(ch.ChannelType))
+		// Drop entries whose type we don't recognize instead of coercing them
+		// into an "unknown" placeholder that would surface as
+		// tool_channel_type=0 in the system prompt (and cause downstream
+		// fetch/peek to miss). yujiawei review PR#164: normalize by dropping.
 		if ch.ChannelType != "group" && ch.ChannelType != "direct" && ch.ChannelType != "thread" {
-			ch.ChannelType = "unknown"
+			continue
 		}
 		normalized = append(normalized, ch)
 		// Do not trust the client-provided is_archived bit for access decisions.

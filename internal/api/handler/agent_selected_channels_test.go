@@ -40,6 +40,34 @@ func TestApplySelectedChannelContext_AddsPromptAndArchivedAllowlist(t *testing.T
 	}
 }
 
+func TestApplySelectedChannelContext_DropsUnknownChannelTypes(t *testing.T) {
+	// yujiawei review PR#164 (P2#3): entries with an unrecognized chat_type
+	// used to be coerced into "unknown" and still emitted into the system
+	// prompt as tool_channel_type=0, which then failed fetch/peek downstream.
+	// The fix drops them at normalization time so the LLM never sees a
+	// broken descriptor. Valid entries in the same batch must still surface.
+	ctx, system := applySelectedChannelContext(context.Background(), "base", []selectedChannel{
+		{ChannelID: "bad-1", ChannelType: "chatroom", Name: "非法类型-A"},
+		{ChannelID: "bad-2", ChannelType: "", Name: "空类型"},
+		{ChannelID: "group-1", ChannelType: "group", Name: "正常群"},
+	})
+
+	if strings.Contains(system, "非法类型-A") || strings.Contains(system, "空类型") {
+		t.Errorf("unknown-type entries leaked into system prompt: %s", system)
+	}
+	if strings.Contains(system, "tool_channel_type=0") {
+		t.Errorf("system prompt still emits tool_channel_type=0: %s", system)
+	}
+	if !strings.Contains(system, "正常群") || !strings.Contains(system, "tool_channel_type=2") {
+		t.Errorf("valid entry missing from system prompt: %s", system)
+	}
+	// Unknown entries were never threads, so no archived allowlist should exist.
+	ids := agent.SelectedArchivedChannelIDs(ctx)
+	if len(ids) != 0 {
+		t.Fatalf("unexpected archived allowlist entries: %v", ids)
+	}
+}
+
 func TestAgentChat_SelectedChannelsReachSystemPrompt(t *testing.T) {
 	reg := agent.NewRegistry()
 	pool := agent.NewPool(1)
