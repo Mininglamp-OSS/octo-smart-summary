@@ -12,8 +12,8 @@ import (
 //   - 设 env > 0 → override 生效,3 个 profile 都受影响
 //   - 设 env=0 或非法 → 保持 default(不 override)
 func TestGetProfile_StepTimeoutOverride(t *testing.T) {
-	// 2 个 profile 都要跑一次 · summary / summary_refine(仓库里只有这两个)
-	profileNames := []string{"summary", "summary_refine"}
+	// 所有 profile 都要覆盖，保证统一 override 语义不会漏掉 chat 场景。
+	profileNames := []string{"chat", "summary", "summary_refine"}
 
 	// case 1: 未设 env · 保持 240s 静态 default
 	t.Run("no_env_keeps_static_default", func(t *testing.T) {

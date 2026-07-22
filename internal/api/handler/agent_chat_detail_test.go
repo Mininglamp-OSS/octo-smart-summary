@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -23,7 +24,7 @@ func TestSafeErrorDetail(t *testing.T) {
 		},
 		{
 			"wrapped context deadline exceeded is whitelisted",
-			errors.New("runner step: context deadline exceeded"),
+			fmt.Errorf("runner step: %w", context.DeadlineExceeded),
 			"context deadline exceeded",
 		},
 		{

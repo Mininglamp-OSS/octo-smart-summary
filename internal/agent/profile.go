@@ -54,12 +54,12 @@ var profiles = map[string]Profile{
 	"chat": {
 		PromptFile: "chat",
 		Tools:      []string{"get_current_time", "extract_time_range"},
-		Policy:     Policy{MaxSteps: 8, MaxTokens: 8000, StepTimeout: 240e9},
+		Policy:     Policy{MaxSteps: 8, MaxTokens: 8000, StepTimeout: 240 * time.Second},
 	},
 	"summary": {
 		PromptFile: "summary",
 		Tools:      []string{"get_current_time", "extract_time_range", "list_channels", "narrow_channels_by_topic", "find_shared_channels", "peek_channel", "fetch_channel", "search_messages", "filter_relevant", "summarize_chunk", "merge_summaries"},
-		Policy:     Policy{MaxSteps: 20, MaxTokens: 60000, StepTimeout: 240e9},
+		Policy:     Policy{MaxSteps: 20, MaxTokens: 60000, StepTimeout: 240 * time.Second},
 	},
 	"summary_refine": {
 		PromptFile: "summary_refine",
@@ -76,7 +76,7 @@ var profiles = map[string]Profile{
 		// the old 60s tripped stepCtx before the LLM finished streaming and
 		// surfaced as `[agent] chat runner error: context deadline exceeded`.
 		// AGENT_STEP_TIMEOUT env still overrides at GetProfile time (see below).
-		Policy: Policy{MaxSteps: 15, MaxTokens: 120000, StepTimeout: 240e9},
+		Policy: Policy{MaxSteps: 15, MaxTokens: 120000, StepTimeout: 240 * time.Second},
 	},
 }
 
@@ -137,7 +137,7 @@ func BuildRegistry(toolNames []string) (*Registry, error) {
 // especially refine flows injecting ~21K tokens of referenced summary per
 // turn — can push a single LLM planning call well past 60s on slower
 // models (kimi / sonnet with large context). AGENT_STEP_TIMEOUT env
-// overrides the static default; default 240s (see config.go). Setting
+// overrides the static 240s default. Setting
 // to 0 disables the override and keeps the code default.
 func GetProfile(name string) (Profile, error) {
 	p, ok := profiles[name]
@@ -159,9 +159,9 @@ func GetToolFactory(name string) (ToolFactory, bool) {
 // agentStepTimeoutOverride returns the AGENT_STEP_TIMEOUT env value as a
 // duration if it parses to a positive integer, else 0 (meaning: keep the
 // profile's static StepTimeout). Read directly from os.Getenv rather than
-// via config.Config so profile lookup does not require SetSummaryDeps —
-// this matters for unit tests that build a runner without initializing
-// the whole deps container.
+// via config.Config so this remains the single source of truth and profile
+// lookup does not require SetSummaryDeps. This matters for unit tests that
+// build a runner without initializing the whole deps container.
 func agentStepTimeoutOverride() time.Duration {
 	v := strings.TrimSpace(os.Getenv("AGENT_STEP_TIMEOUT"))
 	if v == "" {

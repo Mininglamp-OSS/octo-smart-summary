@@ -17,6 +17,7 @@ All configuration is done via environment variables.
 | `LLM_API_KEY` | API key for the LLM gateway | Yes (Worker) | — |
 | `LLM_MODEL` | Model identifier to use for summarization | Yes | — |
 | `LLM_TIMEOUT` | LLM request timeout in seconds | No | `180` |
+| `AGENT_STEP_TIMEOUT` | Maximum duration in seconds for one agent planning step; streaming requests remain capped by the 300-second request deadline | No | `240` |
 | `LLM_MAX_TOKENS` | Maximum tokens for LLM response | No | `4096` |
 | `LLM_TEMPERATURE` | Sampling temperature for LLM | No | `0.3` |
 | `LLM_ENABLE_THINKING` | Enable extended thinking mode | No | `false` |

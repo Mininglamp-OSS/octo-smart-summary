@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestGetProfile_SummaryRefine 验证 summary_refine profile 能正确装配
@@ -49,8 +50,8 @@ func TestGetProfile_SummaryRefine(t *testing.T) {
 	if profile.Policy.MaxTokens != 120000 {
 		t.Errorf("Policy.MaxTokens = %d, want 120000", profile.Policy.MaxTokens)
 	}
-	if profile.Policy.StepTimeout != 240e9 {
-		t.Errorf("Policy.StepTimeout = %d, want 240e9", profile.Policy.StepTimeout)
+	if profile.Policy.StepTimeout != 240*time.Second {
+		t.Errorf("Policy.StepTimeout = %v, want 240s", profile.Policy.StepTimeout)
 	}
 }
 

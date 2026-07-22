@@ -5,6 +5,7 @@ import "sync"
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -500,8 +501,10 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 
 // writeSSEProgressViaSink writes a progress SSE event via the provided sink.
 // Contract (stable with frontend): only abstract, non-leaking fields are emitted —
-//   phase (safe enum: understand|retrieve|filter|distill|compose|reply),
-//   step / ofSteps / elapsed_ms, and an optional integer count (omitted when 0).
+//
+//	phase (safe enum: understand|retrieve|filter|distill|compose|reply),
+//	step / ofSteps / elapsed_ms, and an optional integer count (omitted when 0).
+//
 // It intentionally does NOT emit the raw tool name, an internal label, or free-text detail.
 func (h *AgentChatHandler) writeSSEProgressViaSink(sink *sseSink, phase string, step, ofSteps, count int, elapsedMs int64) {
 	data := map[string]interface{}{
@@ -579,22 +582,21 @@ func safeErrorDetail(err error) string {
 	if err == nil {
 		return ""
 	}
-	msg := err.Error()
 	switch {
-	case strings.Contains(msg, "context deadline exceeded"):
+	case errors.Is(err, context.DeadlineExceeded):
 		// runner.go stepCtx timeout (single LLM planning call). Tune via
-		// AGENT_STEP_TIMEOUT env; see config.go / profile.go.
+		// AGENT_STEP_TIMEOUT env; see profile.go / CONFIGURATION.md.
 		return "context deadline exceeded"
-	case strings.Contains(msg, "context canceled"):
+	case errors.Is(err, context.Canceled):
 		// upstream cancellation (client disconnect or outer ctx timeout).
 		return "context canceled"
-	case strings.Contains(msg, "max steps exceeded"):
+	case strings.Contains(err.Error(), "max steps exceeded"):
 		// runner.go MaxSteps loop guard. Model failed to converge.
 		return "max steps exceeded"
-	case strings.Contains(msg, "LLM returned empty response with no tool_calls"):
+	case strings.Contains(err.Error(), "LLM returned empty response with no tool_calls"):
 		// runner.go final-step empty content guard (SUM-158 blocker follow-up).
 		return "LLM returned empty response with no tool_calls at final step"
-	case strings.Contains(msg, "unknown agent profile"):
+	case strings.Contains(err.Error(), "unknown agent profile"):
 		// profile.go GetProfile lookup miss.
 		return "unknown agent profile"
 	}
