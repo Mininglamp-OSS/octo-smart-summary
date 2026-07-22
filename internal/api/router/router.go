@@ -52,6 +52,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	editH := handler.NewEditHandler(db, refineLLM)
 	personalH.SetLLM(refineLLM)
 	streamH := handler.NewStreamHandler(db, streamHub)
+	shareH := handler.NewShareHandler(db, imDB)
 
 	v1 := r.Group("/api/v1")
 	v1.Use(middleware.StrictAuthMiddleware(authResolver), middleware.StrictSpaceMiddleware())
@@ -64,6 +65,9 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		v1.POST("/summaries/batch-status", taskH.BatchStatus)
 		v1.GET("/summaries", taskH.ListSummaries)
 		v1.GET("/summaries/:id", taskH.GetSummary)
+		v1.POST("/summaries/:id/shares", shareH.Create)
+		v1.GET("/summary-shares/:share_id", shareH.Get)
+		v1.DELETE("/summary-shares/:share_id", shareH.Revoke)
 		v1.GET("/summaries/:id/stream", streamH.StreamSummary)
 		v1.POST("/summaries/:id/read", taskH.MarkSummaryRead)
 		v1.GET("/summaries/:id/result", taskH.GetResult)
