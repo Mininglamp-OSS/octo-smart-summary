@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -23,6 +24,7 @@ func ListChannelsTool() (Tool, Handler) {
 						"description": "是否包含已归档的子区（thread）。默认 false（只列活跃频道）。仅当用户明确要「已归档/历史/已关闭的子区」时才置 true。返回结果中归档子区带 is_archived=true 标记。",
 					},
 				},
+				"required": []string{},
 			},
 		},
 	}
@@ -31,8 +33,14 @@ func ListChannelsTool() (Tool, Handler) {
 		var req struct {
 			IncludeArchived bool `json:"include_archived,omitempty"`
 		}
-		// args 可能为空对象；解析失败不致命，按默认（不含归档）处理。
-		_ = json.Unmarshal(args, &req)
+		// An omitted argument payload is equivalent to {}; malformed JSON is
+		// surfaced so the model can self-correct instead of silently changing
+		// the request to include_archived=false.
+		if len(bytes.TrimSpace(args)) > 0 {
+			if err := json.Unmarshal(args, &req); err != nil {
+				return "", fmt.Errorf("parse args: %w", err)
+			}
+		}
 
 		// Extract uid from context (injected by handler middleware)
 		uidVal := ctx.Value(ContextKeyUID)

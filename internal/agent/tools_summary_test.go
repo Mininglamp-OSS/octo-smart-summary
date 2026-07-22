@@ -1,6 +1,9 @@
 package agent
 
 import (
+	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -55,6 +58,13 @@ func TestListChannelsToolSchema(t *testing.T) {
 	}
 
 	checkRequiredFields(t, params)
+}
+
+func TestListChannelsToolRejectsMalformedArguments(t *testing.T) {
+	_, handler := ListChannelsTool()
+	if _, err := handler(context.Background(), json.RawMessage(`{"include_archived":`)); err == nil || !strings.Contains(err.Error(), "parse args") {
+		t.Fatalf("malformed arguments should return parse error, got %v", err)
+	}
 }
 
 func TestNarrowChannelsByTopicToolSchema(t *testing.T) {

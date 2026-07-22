@@ -186,6 +186,37 @@ func TestGetUserChannels_SelectedArchivedRetained(t *testing.T) {
 	}
 }
 
+func TestGetUserChannels_ParentGroupMemberSeesThreadWithoutThreadMemberRow(t *testing.T) {
+	db := setupPipelineImDB(t)
+	seedPipelineThreads(db, time.Now().Unix())
+	// Candidate/UI visibility is based on non-deleted parent-group membership;
+	// posting in a thread (and thus having thread_member) is not required.
+	db.Exec(`DELETE FROM thread_member WHERE uid = 'user1'`)
+
+	channels, err := GetUserChannels(context.Background(), "user1", db, WithSelectedThreads([]string{"grp1____thB"}))
+	if err != nil {
+		t.Fatalf("GetUserChannels: %v", err)
+	}
+	threads := threadIDSet(channels)
+	if !threads["grp1____thA"] || !threads["grp1____thB"] {
+		t.Fatalf("parent-group member should see active and selected archived threads without thread_member rows, got %v", threads)
+	}
+}
+
+func TestGetUserChannels_DeletedOrMissingParentMembershipCannotSeeThreads(t *testing.T) {
+	db := setupPipelineImDB(t)
+	seedPipelineThreads(db, time.Now().Unix())
+	db.Exec(`UPDATE group_member SET is_deleted = 1 WHERE group_no = 'grp1' AND uid = 'user1'`)
+
+	channels, err := GetUserChannels(context.Background(), "user1", db, WithIncludeArchived(true))
+	if err != nil {
+		t.Fatalf("GetUserChannels: %v", err)
+	}
+	if threads := threadIDSet(channels); len(threads) != 0 {
+		t.Fatalf("deleted parent-group member must not discover threads, got %v", threads)
+	}
+}
+
 func TestGetUserChannels_SelectedDeletedNeverRetained(t *testing.T) {
 	db := setupPipelineImDB(t)
 	seedPipelineThreads(db, time.Now().Unix())
