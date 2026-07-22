@@ -38,6 +38,17 @@ type Config struct {
 	LLMTemperature    float64
 	LLMEnableThinking bool
 
+	// AgentStepTimeout bounds a single LLM planning call inside the agent runner
+	// (see agent/runner.go stepCtx). Distinct from LLMTimeout, which is the
+	// http-layer per-request timeout used by LLM-backed tools such as
+	// summarize_chunk / merge_summaries. Refine flows inject ~21K tokens of
+	// referenced summary content per turn (see profile.go summary_refine
+	// comment) — the accumulated context can push single-turn planning
+	// duration past 60s on slower models (kimi / sonnet with large context).
+	// Default 240s covers observed p99 while the outer 300s ChatStream ctx
+	// backstop (agent_chat.go:406) remains the wall-clock ceiling.
+	AgentStepTimeout int
+
 	// API
 	APIPort         string
 	APIInternalPort string
@@ -154,6 +165,7 @@ func Load() *Config {
 		LLMMaxToken:       envInt("LLM_MAX_TOKENS", 4096),
 		LLMTemperature:    getEnvFloat("LLM_TEMPERATURE", 0.3),
 		LLMEnableThinking: envBool("LLM_ENABLE_THINKING", false),
+		AgentStepTimeout:  envInt("AGENT_STEP_TIMEOUT", 240),
 
 		APIPort:         envStr("API_PORT", "8080"),
 		APIInternalPort: envStr("API_INTERNAL_PORT", "8081"),

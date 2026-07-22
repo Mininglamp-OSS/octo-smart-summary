@@ -49,8 +49,8 @@ func TestGetProfile_SummaryRefine(t *testing.T) {
 	if profile.Policy.MaxTokens != 120000 {
 		t.Errorf("Policy.MaxTokens = %d, want 120000", profile.Policy.MaxTokens)
 	}
-	if profile.Policy.StepTimeout != 60e9 {
-		t.Errorf("Policy.StepTimeout = %d, want 60e9", profile.Policy.StepTimeout)
+	if profile.Policy.StepTimeout != 240e9 {
+		t.Errorf("Policy.StepTimeout = %d, want 240e9", profile.Policy.StepTimeout)
 	}
 }
 

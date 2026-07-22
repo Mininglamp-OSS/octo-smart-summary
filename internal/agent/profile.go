@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // 提示词与工具的可配置机制：
@@ -52,12 +54,12 @@ var profiles = map[string]Profile{
 	"chat": {
 		PromptFile: "chat",
 		Tools:      []string{"get_current_time", "extract_time_range"},
-		Policy:     Policy{MaxSteps: 8, MaxTokens: 8000, StepTimeout: 60e9},
+		Policy:     Policy{MaxSteps: 8, MaxTokens: 8000, StepTimeout: 240e9},
 	},
 	"summary": {
 		PromptFile: "summary",
 		Tools:      []string{"get_current_time", "extract_time_range", "list_channels", "narrow_channels_by_topic", "find_shared_channels", "peek_channel", "fetch_channel", "search_messages", "filter_relevant", "summarize_chunk", "merge_summaries"},
-		Policy:     Policy{MaxSteps: 20, MaxTokens: 60000, StepTimeout: 60e9},
+		Policy:     Policy{MaxSteps: 20, MaxTokens: 60000, StepTimeout: 240e9},
 	},
 	"summary_refine": {
 		PromptFile: "summary_refine",
@@ -68,7 +70,13 @@ var profiles = map[string]Profile{
 		// refine (get_time + fetch + answer) blew through 40K by step 2 and
 		// triggered "已达 token 预算" mid-flow. 120K gives room for 4-5 tool
 		// steps at ~25K each. See CHAT-REFERENCE-BASED-DESIGN-v1 diagnostic.
-		Policy: Policy{MaxSteps: 15, MaxTokens: 120000, StepTimeout: 60e9},
+		//
+		// StepTimeout 240s (was 60s): a single LLM planning call on
+		// sonnet/kimi with 20-40K tokens of context routinely takes 60-100s;
+		// the old 60s tripped stepCtx before the LLM finished streaming and
+		// surfaced as `[agent] chat runner error: context deadline exceeded`.
+		// AGENT_STEP_TIMEOUT env still overrides at GetProfile time (see below).
+		Policy: Policy{MaxSteps: 15, MaxTokens: 120000, StepTimeout: 240e9},
 	},
 }
 
@@ -123,10 +131,21 @@ func BuildRegistry(toolNames []string) (*Registry, error) {
 }
 
 // GetProfile 取一个场景定义。未知场景报错。
+//
+// StepTimeout override: the static profile values above are code defaults
+// (60s) that historically fit the pipeline flow. Interactive agent chat —
+// especially refine flows injecting ~21K tokens of referenced summary per
+// turn — can push a single LLM planning call well past 60s on slower
+// models (kimi / sonnet with large context). AGENT_STEP_TIMEOUT env
+// overrides the static default; default 240s (see config.go). Setting
+// to 0 disables the override and keeps the code default.
 func GetProfile(name string) (Profile, error) {
 	p, ok := profiles[name]
 	if !ok {
 		return Profile{}, fmt.Errorf("unknown agent profile %q", name)
+	}
+	if override := agentStepTimeoutOverride(); override > 0 {
+		p.Policy.StepTimeout = override
 	}
 	return p, nil
 }
@@ -135,4 +154,22 @@ func GetProfile(name string) (Profile, error) {
 func GetToolFactory(name string) (ToolFactory, bool) {
 	f, ok := toolFactories[name]
 	return f, ok
+}
+
+// agentStepTimeoutOverride returns the AGENT_STEP_TIMEOUT env value as a
+// duration if it parses to a positive integer, else 0 (meaning: keep the
+// profile's static StepTimeout). Read directly from os.Getenv rather than
+// via config.Config so profile lookup does not require SetSummaryDeps —
+// this matters for unit tests that build a runner without initializing
+// the whole deps container.
+func agentStepTimeoutOverride() time.Duration {
+	v := strings.TrimSpace(os.Getenv("AGENT_STEP_TIMEOUT"))
+	if v == "" {
+		return 0
+	}
+	secs, err := strconv.Atoi(v)
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
 }
