@@ -154,9 +154,8 @@ func Load() *Config {
 		LLMMaxToken:       envInt("LLM_MAX_TOKENS", 4096),
 		LLMTemperature:    getEnvFloat("LLM_TEMPERATURE", 0.3),
 		LLMEnableThinking: envBool("LLM_ENABLE_THINKING", false),
-
-		APIPort:         envStr("API_PORT", "8080"),
-		APIInternalPort: envStr("API_INTERNAL_PORT", "8081"),
+		APIPort:           envStr("API_PORT", "8080"),
+		APIInternalPort:   envStr("API_INTERNAL_PORT", "8081"),
 
 		WorkerInternalPort:        envStr("WORKER_INTERNAL_PORT", "8082"),
 		WorkerListenAllInterfaces: envStr("WORKER_LISTEN_ADDR", "0.0.0.0"),

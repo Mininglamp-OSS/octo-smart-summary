@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // 提示词与工具的可配置机制：
@@ -52,12 +54,12 @@ var profiles = map[string]Profile{
 	"chat": {
 		PromptFile: "chat",
 		Tools:      []string{"get_current_time", "extract_time_range"},
-		Policy:     Policy{MaxSteps: 8, MaxTokens: 8000, StepTimeout: 60e9},
+		Policy:     Policy{MaxSteps: 8, MaxTokens: 8000, StepTimeout: 240 * time.Second},
 	},
 	"summary": {
 		PromptFile: "summary",
 		Tools:      []string{"get_current_time", "extract_time_range", "list_channels", "narrow_channels_by_topic", "find_shared_channels", "peek_channel", "fetch_channel", "search_messages", "filter_relevant", "summarize_chunk", "merge_summaries"},
-		Policy:     Policy{MaxSteps: 20, MaxTokens: 60000, StepTimeout: 60e9},
+		Policy:     Policy{MaxSteps: 20, MaxTokens: 60000, StepTimeout: 240 * time.Second},
 	},
 	"summary_refine": {
 		PromptFile: "summary_refine",
@@ -68,7 +70,13 @@ var profiles = map[string]Profile{
 		// refine (get_time + fetch + answer) blew through 40K by step 2 and
 		// triggered "已达 token 预算" mid-flow. 120K gives room for 4-5 tool
 		// steps at ~25K each. See CHAT-REFERENCE-BASED-DESIGN-v1 diagnostic.
-		Policy: Policy{MaxSteps: 15, MaxTokens: 120000, StepTimeout: 60e9},
+		//
+		// StepTimeout 240s (was 60s): a single LLM planning call on
+		// sonnet/kimi with 20-40K tokens of context routinely takes 60-100s;
+		// the old 60s tripped stepCtx before the LLM finished streaming and
+		// surfaced as `[agent] chat runner error: context deadline exceeded`.
+		// AGENT_STEP_TIMEOUT env still overrides at GetProfile time (see below).
+		Policy: Policy{MaxSteps: 15, MaxTokens: 120000, StepTimeout: 240 * time.Second},
 	},
 }
 
@@ -123,10 +131,19 @@ func BuildRegistry(toolNames []string) (*Registry, error) {
 }
 
 // GetProfile 取一个场景定义。未知场景报错。
+//
+// StepTimeout: the static profile values above are the code default (240s —
+// raised from a historical 60s that tripped stepCtx on large-context refine
+// turns). AGENT_STEP_TIMEOUT env overrides it per-deploy; an unset / 0 /
+// invalid value keeps the 240s static default. The runner reads
+// Policy.StepTimeout from here — nothing reads config for it.
 func GetProfile(name string) (Profile, error) {
 	p, ok := profiles[name]
 	if !ok {
 		return Profile{}, fmt.Errorf("unknown agent profile %q", name)
+	}
+	if override := agentStepTimeoutOverride(); override > 0 {
+		p.Policy.StepTimeout = override
 	}
 	return p, nil
 }
@@ -135,4 +152,22 @@ func GetProfile(name string) (Profile, error) {
 func GetToolFactory(name string) (ToolFactory, bool) {
 	f, ok := toolFactories[name]
 	return f, ok
+}
+
+// agentStepTimeoutOverride returns the AGENT_STEP_TIMEOUT env value as a
+// duration if it parses to a positive integer, else 0 (meaning: keep the
+// profile's static StepTimeout). Read directly from os.Getenv rather than
+// via config.Config so this remains the single source of truth and profile
+// lookup does not require SetSummaryDeps. This matters for unit tests that
+// build a runner without initializing the whole deps container.
+func agentStepTimeoutOverride() time.Duration {
+	v := strings.TrimSpace(os.Getenv("AGENT_STEP_TIMEOUT"))
+	if v == "" {
+		return 0
+	}
+	secs, err := strconv.Atoi(v)
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
 }

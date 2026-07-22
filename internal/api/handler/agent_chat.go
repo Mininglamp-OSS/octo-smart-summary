@@ -5,10 +5,12 @@ import "sync"
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
@@ -220,7 +222,7 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID)
 		if err != nil {
 			log.Printf("[agent] build runner for profile %q: %v", profileName, err)
-			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "failed to initialize agent"})
+			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "failed to initialize agent", Detail: safeErrorDetail(err)})
 			return
 		}
 	}
@@ -230,7 +232,7 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 	history, err := h.store.LoadHistory(ctx, req.SessionID, uid)
 	if err != nil {
 		log.Printf("[agent] load history error: %v", err)
-		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "agent chat failed"})
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "agent chat failed", Detail: safeErrorDetail(err)})
 		return
 	}
 
@@ -256,8 +258,11 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 	reply, newMsgs, err := runner.RunWithHistory(ctx, system, history, req.Message)
 	if err != nil {
 		// 真实错误只记服务端日志，避免向调用方泄漏上游 LLM 地址/网络/内部细节。
+		// Detail 走白名单：仅 context deadline / max steps / empty response 等
+		// 明确不含内部地址/IP/token 的 error 会被透传给客户端，其它一律为
+		// "internal error"（safeErrorDetail 保证），前端可据此区分超时 vs 未知错。
 		log.Printf("[agent] chat runner error: %v", err)
-		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "agent chat failed"})
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "agent chat failed", Detail: safeErrorDetail(err)})
 		return
 	}
 
@@ -311,7 +316,7 @@ func (h *AgentChatHandler) History(c *gin.Context) {
 	history, err := h.store.LoadHistory(ctx, sessionID, uid)
 	if err != nil {
 		log.Printf("[agent] load history error: %v", err)
-		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "agent chat history failed"})
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "agent chat history failed", Detail: safeErrorDetail(err)})
 		return
 	}
 
@@ -431,7 +436,7 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		if err != nil {
 			log.Printf("[agent] build runner for profile %q: %v", profileName, err)
 			sink := &sseSink{w: c.Writer}
-			h.writeSSEErrorViaSink(sink, 50000, "failed to initialize agent")
+			h.writeSSEErrorViaSinkWithDetail(sink, 50000, "failed to initialize agent", safeErrorDetail(err))
 			return
 		}
 	}
@@ -457,7 +462,7 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	history, err := h.store.LoadHistory(ctx, req.SessionID, uid)
 	if err != nil {
 		log.Printf("[agent] load history error: %v", err)
-		h.writeSSEErrorViaSink(sink, 50000, "agent chat failed")
+		h.writeSSEErrorViaSinkWithDetail(sink, 50000, "agent chat failed", safeErrorDetail(err))
 		return
 	}
 
@@ -481,7 +486,7 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	reply, newMsgs, err := runner.RunWithHistory(ctx, system, history, req.Message)
 	if err != nil {
 		log.Printf("[agent] chat runner error: %v", err)
-		h.writeSSEErrorViaSink(sink, 50000, "agent chat failed")
+		h.writeSSEErrorViaSinkWithDetail(sink, 50000, "agent chat failed", safeErrorDetail(err))
 		return
 	}
 
@@ -496,8 +501,10 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 
 // writeSSEProgressViaSink writes a progress SSE event via the provided sink.
 // Contract (stable with frontend): only abstract, non-leaking fields are emitted —
-//   phase (safe enum: understand|retrieve|filter|distill|compose|reply),
-//   step / ofSteps / elapsed_ms, and an optional integer count (omitted when 0).
+//
+//	phase (safe enum: understand|retrieve|filter|distill|compose|reply),
+//	step / ofSteps / elapsed_ms, and an optional integer count (omitted when 0).
+//
 // It intentionally does NOT emit the raw tool name, an internal label, or free-text detail.
 func (h *AgentChatHandler) writeSSEProgressViaSink(sink *sseSink, phase string, step, ofSteps, count int, elapsedMs int64) {
 	data := map[string]interface{}{
@@ -536,9 +543,19 @@ func (h *AgentChatHandler) writeSSEDoneViaSink(sink *sseSink, reply, sessionID s
 
 // writeSSEErrorViaSink writes an error SSE event via the provided sink.
 func (h *AgentChatHandler) writeSSEErrorViaSink(sink *sseSink, code int, message string) {
+	h.writeSSEErrorViaSinkWithDetail(sink, code, message, "")
+}
+
+// writeSSEErrorViaSinkWithDetail is the detail-aware variant. Emits the
+// standard SSE error frame plus a safe-to-expose detail string when
+// non-empty. See safeErrorDetail below for the whitelist policy.
+func (h *AgentChatHandler) writeSSEErrorViaSinkWithDetail(sink *sseSink, code int, message string, detail string) {
 	data := map[string]interface{}{
 		"code":    code,
 		"message": message,
+	}
+	if detail != "" {
+		data["detail"] = detail
 	}
 	jsonData, err := json.Marshal(data)
 	if err != nil {
@@ -547,4 +564,41 @@ func (h *AgentChatHandler) writeSSEErrorViaSink(sink *sseSink, code int, message
 	}
 
 	sink.write("error", jsonData)
+}
+
+// safeErrorDetail returns a compact, safe-to-expose string derived from err
+// for inclusion in JSON/SSE error responses. Whitelist-only: we return the
+// raw err.Error() only for a small set of well-known agent runner failure
+// modes whose text is known not to embed URLs, IPs, tokens, or stack
+// fragments. Everything else collapses to "internal error", which lets the
+// client distinguish "your request timed out" (actionable) from "something
+// broke server-side" (open an issue / poll the ops channel) without
+// leaking backend geometry.
+//
+// Grow this whitelist deliberately: each new pattern must be traceable to
+// a specific errors.New / fmt.Errorf site in the runner or handler code
+// path whose format string contains no operator-supplied data.
+func safeErrorDetail(err error) string {
+	if err == nil {
+		return ""
+	}
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		// runner.go stepCtx timeout (single LLM planning call). Tune via
+		// AGENT_STEP_TIMEOUT env; see profile.go / CONFIGURATION.md.
+		return "context deadline exceeded"
+	case errors.Is(err, context.Canceled):
+		// upstream cancellation (client disconnect or outer ctx timeout).
+		return "context canceled"
+	case strings.Contains(err.Error(), "max steps exceeded"):
+		// runner.go MaxSteps loop guard. Model failed to converge.
+		return "max steps exceeded"
+	case strings.Contains(err.Error(), "LLM returned empty response with no tool_calls"):
+		// runner.go final-step empty content guard (SUM-158 blocker follow-up).
+		return "LLM returned empty response with no tool_calls at final step"
+	case strings.Contains(err.Error(), "unknown agent profile"):
+		// profile.go GetProfile lookup miss.
+		return "unknown agent profile"
+	}
+	return "internal error"
 }
