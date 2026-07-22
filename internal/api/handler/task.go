@@ -216,6 +216,15 @@ func callerPlainCitationsVisible(db *gorm.DB, task *model.SummaryTask, callerID 
 type apiResponse struct {
 	Code    int         `json:"code"`
 	Message string      `json:"message"`
+	// Detail carries a compact, safe-to-expose error signature so clients
+	// (F12 devtools, ops) can distinguish sub-causes of a generic Message
+	// without pulling backend logs. Populated only on error responses;
+	// omitted (via omitempty) on success. Caller must ensure the value
+	// is safe to send to end users — do NOT put raw sensitive info here
+	// (DB paths, tokens, stack fragments). Passthrough of err.Error() from
+	// well-known agent runner failures (context deadline exceeded, max
+	// steps exceeded, LLM returned empty response) is safe by construction.
+	Detail  string      `json:"detail,omitempty"`
 	Data    interface{} `json:"data,omitempty"`
 }
 
