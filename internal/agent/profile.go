@@ -132,13 +132,11 @@ func BuildRegistry(toolNames []string) (*Registry, error) {
 
 // GetProfile 取一个场景定义。未知场景报错。
 //
-// StepTimeout override: the static profile values above are code defaults
-// (60s) that historically fit the pipeline flow. Interactive agent chat —
-// especially refine flows injecting ~21K tokens of referenced summary per
-// turn — can push a single LLM planning call well past 60s on slower
-// models (kimi / sonnet with large context). AGENT_STEP_TIMEOUT env
-// overrides the static 240s default. Setting
-// to 0 disables the override and keeps the code default.
+// StepTimeout: the static profile values above are the code default (240s —
+// raised from a historical 60s that tripped stepCtx on large-context refine
+// turns). AGENT_STEP_TIMEOUT env overrides it per-deploy; an unset / 0 /
+// invalid value keeps the 240s static default. The runner reads
+// Policy.StepTimeout from here — nothing reads config for it.
 func GetProfile(name string) (Profile, error) {
 	p, ok := profiles[name]
 	if !ok {
