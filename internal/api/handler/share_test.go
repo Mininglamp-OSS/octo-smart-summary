@@ -315,3 +315,51 @@ func TestSummaryShare_RevokeDoesNotReportSuccessWhenUpdateFails(t *testing.T) {
 		t.Fatalf("failed revoke changed status to %d", grant.Status)
 	}
 }
+
+// TestSummaryShare_AgentPersonalResultFallback covers the TriggerAgent path:
+// an agent summary's deliverable is the creator's PersonalResult and NO
+// SummaryResult row is ever written (see agent_summary.go). Create-share must
+// fall back to that PersonalResult instead of failing with "no shareable
+// content", and the snapshot content must come from it.
+func TestSummaryShare_AgentPersonalResultFallback(t *testing.T) {
+	db, _, r, _ := setupShareTest(t)
+	now := time.Now()
+
+	agent := model.SummaryTask{
+		TaskNo: "ST-share-agent", SpaceID: "space1", CreatorID: "creator",
+		Title: "Agent summary", SummaryMode: model.ModeByPerson, TriggerType: model.TriggerAgent,
+		Status: model.StatusCompleted, TimeRangeStart: now.Add(-time.Hour), TimeRangeEnd: now,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := db.Create(&agent).Error; err != nil {
+		t.Fatal(err)
+	}
+	db.Create(&model.SummarySource{TaskID: agent.ID, SourceType: model.SourceGroup, SourceID: "source", SourceName: "Agent source", CreatedAt: now})
+	db.Create(&model.SummaryParticipant{TaskID: agent.ID, UserID: "creator", UserName: "Creator", Status: model.ParticipantAccepted, CreatedAt: now, UpdatedAt: now})
+
+	const agentContent = "## Agent deliverable\nShipped the release [1]."
+	if err := db.Create(&model.PersonalResult{TaskID: agent.ID, UserID: "creator", Content: agentContent, MsgCount: 12, CreatedAt: now, UpdatedAt: now}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	// Guard the premise: the agent task has no SummaryResult row.
+	var srCount int64
+	db.Model(&model.SummaryResult{}).Where("task_id = ?", agent.ID).Count(&srCount)
+	if srCount != 0 {
+		t.Fatalf("agent task must have no summary_result, got %d", srCount)
+	}
+
+	body := gin.H{"idempotency_key": "share-agent-1", "targets": []gin.H{{"channel_id": "group1", "channel_type": model.ChannelTypeGroup}}}
+	w := shareRequest(t, r, http.MethodPost, "/api/v1/summaries/ST-share-agent/shares", "creator", "space1", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("agent create-share should succeed via PersonalResult fallback: %d %s", w.Code, w.Body.String())
+	}
+
+	var snap model.SummaryShareSnapshot
+	if err := db.Where("task_id = ?", agent.ID).First(&snap).Error; err != nil {
+		t.Fatalf("snapshot not created for agent task: %v", err)
+	}
+	if snap.Content != agentContent {
+		t.Fatalf("snapshot content = %q, want PersonalResult content %q", snap.Content, agentContent)
+	}
+}
