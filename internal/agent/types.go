@@ -1,5 +1,7 @@
 package agent
 
+import "context"
+
 // 自定义线格式类型：贴 OpenAI chat/completions，刻意不复用 internal/service，
 // 以保证 internal/agent 零侵入、零本项目依赖。
 
@@ -51,3 +53,24 @@ type contextKeySessionID struct{}
 
 // ContextKeySessionID is exported for use by handler to inject session_id into context.
 var ContextKeySessionID = contextKeySessionID{}
+
+// ContextKeyAllowedArchivedChannels carries the archived thread IDs explicitly
+// selected by the user for this request. Tool handlers still resolve channel
+// membership through GetUserChannels; this value only scopes which archived
+// threads may pass the otherwise-active-only discovery filter.
+type contextKeyAllowedArchivedChannels struct{}
+
+var ContextKeyAllowedArchivedChannels = contextKeyAllowedArchivedChannels{}
+
+// SelectedArchivedChannelIDs returns the request-scoped archived thread IDs.
+// A copy is returned so tool handlers cannot mutate the context value.
+func SelectedArchivedChannelIDs(ctx context.Context) []string {
+	allowed, _ := ctx.Value(ContextKeyAllowedArchivedChannels).(map[string]bool)
+	ids := make([]string, 0, len(allowed))
+	for id, ok := range allowed {
+		if ok && id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}

@@ -40,6 +40,10 @@ func PeekChannelTool() (Tool, Handler) {
 						"type":        "string",
 						"description": "结束时间 RFC3339，留空则用当前时间",
 					},
+					"include_archived": map[string]interface{}{
+						"type":        "boolean",
+						"description": "当目标是已归档子区（thread status=2）时置 true，否则归档频道会被判为不可达而拒绝。默认 false。",
+					},
 				},
 				"required": []string{"channel_id", "channel_type"},
 			},
@@ -48,11 +52,12 @@ func PeekChannelTool() (Tool, Handler) {
 
 	handler := func(ctx context.Context, args json.RawMessage) (string, error) {
 		var req struct {
-			ChannelID   string `json:"channel_id"`
-			ChannelType int    `json:"channel_type,omitempty"`
-			Limit       int    `json:"limit,omitempty"`
-			TimeStart   string `json:"time_start,omitempty"`
-			TimeEnd     string `json:"time_end,omitempty"`
+			ChannelID       string `json:"channel_id"`
+			ChannelType     int    `json:"channel_type,omitempty"`
+			Limit           int    `json:"limit,omitempty"`
+			TimeStart       string `json:"time_start,omitempty"`
+			TimeEnd         string `json:"time_end,omitempty"`
+			IncludeArchived bool   `json:"include_archived,omitempty"`
 		}
 		if err := json.Unmarshal(args, &req); err != nil {
 			return "", fmt.Errorf("parse args: %w", err)
@@ -92,7 +97,11 @@ func PeekChannelTool() (Tool, Handler) {
 		summaryDB, imDB, _, cfg := GetSummaryDeps()
 
 		// Security: validate channel accessibility for system-injected uid
-		accessibleChannels, err := pipeline.GetUserChannels(ctx, uid, imDB)
+		options := []pipeline.ChannelQueryOption{pipeline.WithIncludeArchived(req.IncludeArchived)}
+		if !req.IncludeArchived {
+			options = append(options, pipeline.WithSelectedThreads(SelectedArchivedChannelIDs(ctx)))
+		}
+		accessibleChannels, err := pipeline.GetUserChannels(ctx, uid, imDB, options...)
 		if err != nil {
 			return "", fmt.Errorf("get user channels: %w", err)
 		}
@@ -160,4 +169,3 @@ func PeekChannelTool() (Tool, Handler) {
 
 	return schema, handler
 }
-

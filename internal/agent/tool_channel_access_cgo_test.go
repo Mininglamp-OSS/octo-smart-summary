@@ -253,3 +253,67 @@ func TestPeekChannelTool_AccessControl(t *testing.T) {
 		}
 	})
 }
+
+// TestSelectedArchivedChannelsBridge locks the UI-selection bridge across all
+// four channel tools. The selected archived thread is visible without the LLM
+// setting include_archived; a selected ID the user does not belong to remains
+// inaccessible, so the bridge cannot be used as an authz bypass.
+func TestSelectedArchivedChannelsBridge(t *testing.T) {
+	db := setupAgentImDB(t)
+	db.Exec(`INSERT INTO "group" (group_no, name, space_id, status, creator) VALUES ('grp1', 'Group 1', 'space', 1, 'user-1'), ('grp2', 'Group 2', 'space', 1, 'user-2')`)
+	db.Exec(`INSERT INTO group_member (group_no, uid, is_deleted, role) VALUES ('grp1', 'user-1', 0, 0)`)
+	db.Exec(`INSERT INTO thread (id, short_id, name, group_no, status, creator_uid) VALUES (1, 'arch', 'Archived', 'grp1', 2, 'user-1')`)
+	db.Exec(`INSERT INTO thread (id, short_id, name, group_no, status, creator_uid) VALUES (2, 'secret', 'Secret', 'grp2', 2, 'user-2')`)
+	db.Exec(`INSERT INTO thread_member (thread_id, uid) VALUES (2, 'user-2')`)
+	db.Exec(`INSERT INTO group_member (group_no, uid, is_deleted, role) VALUES ('grp2', 'user-2', 0, 0)`)
+
+	SetSummaryDeps(nil, db, nil, config.Config{MsgTableCount: 1, MaxMessagesPerChannel: 10})
+	defer SetSummaryDeps(nil, nil, nil, config.Config{})
+
+	ctx := context.WithValue(context.Background(), ContextKeyUID, "user-1")
+	ctx = context.WithValue(ctx, ContextKeyAllowedArchivedChannels, map[string]bool{
+		"grp1____arch":   true,
+		"grp2____secret": true,
+	})
+
+	_, list := ListChannelsTool()
+	listed, err := list(ctx, json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("list_channels: %v", err)
+	}
+	if !strings.Contains(listed, "grp1____arch") {
+		t.Fatalf("selected archived thread missing from list: %s", listed)
+	}
+	if strings.Contains(listed, "grp2____secret") {
+		t.Fatalf("non-member archived thread leaked into list: %s", listed)
+	}
+
+	_, shared := FindSharedChannelsTool()
+	sharedResult, err := shared(ctx, json.RawMessage(`{"participant_uids":[]}`))
+	if err != nil || !strings.Contains(sharedResult, "grp1____arch") || strings.Contains(sharedResult, "grp2____secret") {
+		t.Fatalf("find_shared_channels bridge mismatch: result=%s err=%v", sharedResult, err)
+	}
+
+	requests := []struct {
+		name    string
+		handler Handler
+		args    string
+	}{
+		{"fetch_channel", func() Handler { _, h := FetchChannelTool(); return h }(), `{"channel_id":"grp1____arch","channel_type":5,"time_start":"2024-01-01T00:00:00Z","time_end":"2024-01-02T00:00:00Z"}`},
+		{"peek_channel", func() Handler { _, h := PeekChannelTool(); return h }(), `{"channel_id":"grp1____arch","channel_type":5}`},
+	}
+	for _, tc := range requests {
+		t.Run(tc.name+" selected member passes access", func(t *testing.T) {
+			result, err := tc.handler(ctx, json.RawMessage(tc.args))
+			if err != nil && (strings.Contains(err.Error(), "not accessible") || strings.Contains(result, "channel not accessible")) {
+				t.Fatalf("selected archived member was denied: result=%s err=%v", result, err)
+			}
+		})
+	}
+
+	_, fetch := FetchChannelTool()
+	secretResult, secretErr := fetch(ctx, json.RawMessage(`{"channel_id":"grp2____secret","channel_type":5,"time_start":"2024-01-01T00:00:00Z","time_end":"2024-01-02T00:00:00Z"}`))
+	if secretErr == nil || !strings.Contains(secretResult, "channel not accessible") {
+		t.Fatalf("non-member selected ID bypassed access: result=%s err=%v", secretResult, secretErr)
+	}
+}

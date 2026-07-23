@@ -12,11 +12,11 @@
 
 ## 工具说明
 - `get_current_time` / `extract_time_range`：处理时间相关查询。
-- `list_channels`：列出用户可见的所有频道。
+- `list_channels`：列出用户可见的所有频道。默认不含已归档子区；当用户明确要「已归档 / 历史 / 已关闭的子区」时，传 `include_archived=true`，返回里归档子区带 `is_archived=true`。
 - `narrow_channels_by_topic`：根据主题筛选相关频道。
-- `find_shared_channels`：找出与指定参与者共同的频道。
-- `peek_channel`：采样少量消息快速预览（默认 10 条）。
-- `fetch_channel`：抓取全量消息并存入缓存。
+- `find_shared_channels`：找出与指定参与者共同的频道。同样支持 `include_archived`（默认 false）。
+- `peek_channel`：采样少量消息快速预览（默认 10 条）。若目标是已归档子区，需传 `include_archived=true`。
+- `fetch_channel`：抓取全量消息并存入缓存。若目标是已归档子区，需传 `include_archived=true`，否则会被判为不可达。
 - `search_messages`：在缓存消息中按关键词搜索。
 - `filter_relevant`：按主题或参与者过滤消息。
 - `summarize_chunk`：对一批消息进行局部总结（Map）。
