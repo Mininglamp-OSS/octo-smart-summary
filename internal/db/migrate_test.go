@@ -217,6 +217,49 @@ SELECT 1;
 -- +migrate Down
 SELECT 1;
 `)},
+	"20260721-02-summary-share-snapshot.sql": &fstest.MapFile{Data: []byte(`-- +migrate Up
+CREATE TABLE summary_share_snapshot (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL,
+  task_no TEXT NOT NULL,
+  space_id TEXT NOT NULL,
+  creator_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  source_name TEXT NOT NULL DEFAULT '',
+  source_count INTEGER NOT NULL DEFAULT 0,
+  participant_count INTEGER NOT NULL DEFAULT 0,
+  message_count INTEGER NOT NULL DEFAULT 0,
+  time_range_start TEXT NOT NULL,
+  time_range_end TEXT NOT NULL,
+  summary_mode INTEGER NOT NULL,
+  result_version INTEGER NOT NULL DEFAULT 1,
+  preview TEXT NOT NULL,
+  content TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX uk_summary_share_idempotency ON summary_share_snapshot (space_id, creator_id, idempotency_key);
+CREATE INDEX idx_summary_share_task ON summary_share_snapshot (task_id);
+CREATE TABLE summary_share_grant (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  snapshot_id INTEGER NOT NULL,
+  share_id TEXT NOT NULL,
+  channel_id TEXT NOT NULL,
+  channel_type INTEGER NOT NULL,
+  status INTEGER NOT NULL DEFAULT 1,
+  revoked_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX uk_summary_share_id ON summary_share_grant (share_id);
+CREATE UNIQUE INDEX uk_summary_share_target ON summary_share_grant (snapshot_id, channel_id, channel_type);
+
+-- +migrate Down
+DROP TABLE IF EXISTS summary_share_grant;
+DROP TABLE IF EXISTS summary_share_snapshot;
+`)},
 }
 
 func testSource() migrate.MigrationSource {
@@ -242,14 +285,15 @@ func TestRunMigrations_NewDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runMigrationsCore: %v", err)
 	}
-	if n != 10 {
-		t.Fatalf("expected 10 migrations applied, got %d", n)
+	if n != 11 {
+		t.Fatalf("expected 11 migrations applied, got %d", n)
 	}
 
 	tables := []string{
 		"summary_chunk", "summary_event", "summary_participant",
 		"summary_personal_result", "summary_result", "summary_schedule",
 		"summary_source", "summary_task", "summary_user_template",
+		"summary_share_snapshot", "summary_share_grant",
 	}
 	for _, tbl := range tables {
 		var name string
@@ -318,8 +362,8 @@ func TestRunMigrations_ExistingDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runMigrationsCore: %v", err)
 	}
-	if n != 9 {
-		t.Fatalf("expected 9 migrations applied (006+007+workflow_stage+user_template+template_compat+description_1000+title_1300+task_topic+content_2000), got %d", n)
+	if n != 10 {
+		t.Fatalf("expected 10 migrations applied (including summary share snapshot/grant), got %d", n)
 	}
 }
 
@@ -344,8 +388,8 @@ func TestRunMigrations_Idempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first run: %v", err)
 	}
-	if n1 != 10 {
-		t.Fatalf("first run: expected 10, got %d", n1)
+	if n1 != 11 {
+		t.Fatalf("first run: expected 11, got %d", n1)
 	}
 
 	n2, err := runMigrationsCore(db, "sqlite3", testSource())
