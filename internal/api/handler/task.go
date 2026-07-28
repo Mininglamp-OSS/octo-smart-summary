@@ -42,11 +42,19 @@ type TaskHandler struct {
 	imDB                *gorm.DB
 	workerTriggerURL    string
 	customTemplateLimit int
+	llm                 *service.LLMClient
 }
 
 // NewTaskHandler creates a new TaskHandler.
 func NewTaskHandler(db, imDB *gorm.DB, workerTriggerURL string) *TaskHandler {
 	return &TaskHandler{db: db, imDB: imDB, workerTriggerURL: workerTriggerURL, customTemplateLimit: defaultCustomTemplateLimit}
+}
+
+// SetLLM wires the LLM client used for best-effort lazy abstract generation on
+// read. Optional: when nil, GetSummary simply returns the stored abstract (or
+// empty) and never generates.
+func (h *TaskHandler) SetLLM(llm *service.LLMClient) {
+	h.llm = llm
 }
 
 func (h *TaskHandler) SetCustomTemplateLimit(limit int) {
@@ -1129,8 +1137,20 @@ func (h *TaskHandler) GetResult(c *gin.Context) {
 		plainCitations = []model.Citation{}
 	}
 
+	// Lazy, best-effort abstract (Option B): generate once on first read when
+	// missing and cache it back to the row. This uniformly covers worker-
+	// generated summaries and backfills older rows without touching the write
+	// paths; failures leave it empty so the callout is simply hidden.
+	if h.llm != nil && result.Abstract == "" && result.ID != 0 && strings.TrimSpace(result.Content) != "" {
+		if a := service.GenerateAbstract(c.Request.Context(), h.llm, result.Content); a != "" {
+			result.Abstract = a
+			h.db.Model(&model.SummaryResult{}).Where("id = ? AND abstract = ?", result.ID, "").Update("abstract", a)
+		}
+	}
+
 	ok(c, gin.H{
 		"content":          result.Content,
+		"abstract":         result.Abstract,
 		"citations":        plainCitations,
 		"team_citations":   result.GetTeamCitations(),
 		"total_msg_count":  result.TotalMsgCount,

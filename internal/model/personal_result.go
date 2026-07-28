@@ -38,6 +38,7 @@ type PersonalResult struct {
 	ParticipantRefID int64      `gorm:"column:participant_ref_id;not null" json:"participant_ref_id"`
 	UserID           string     `gorm:"column:user_id;type:varchar(64);not null" json:"user_id"`
 	Content          string     `gorm:"column:content;type:mediumtext;not null" json:"content"`
+	Abstract         string     `gorm:"column:abstract;type:varchar(300);not null;default:''" json:"abstract"`
 	CitationsJSON    string     `gorm:"column:citations_json;type:mediumtext" json:"-"`
 	SnapshotJSON     *string    `gorm:"column:snapshot_json;type:mediumtext" json:"-"`
 	MsgCount         int        `gorm:"column:msg_count;not null;default:0" json:"msg_count"`

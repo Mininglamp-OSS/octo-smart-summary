@@ -51,6 +51,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	}
 	editH := handler.NewEditHandler(db, refineLLM)
 	personalH.SetLLM(refineLLM)
+	taskH.SetLLM(refineLLM)
 	streamH := handler.NewStreamHandler(db, streamHub)
 	shareH := handler.NewShareHandler(db, imDB)
 

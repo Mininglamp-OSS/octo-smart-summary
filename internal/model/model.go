@@ -256,6 +256,7 @@ type SummaryResult struct {
 	ID                int64      `gorm:"primaryKey;autoIncrement" json:"id"`
 	TaskID            int64      `gorm:"column:task_id;not null" json:"task_id"`
 	Content           string     `gorm:"column:content;type:mediumtext;not null" json:"content"`
+	Abstract          string     `gorm:"column:abstract;type:varchar(300);not null;default:''" json:"abstract"`
 	CitationsJSON     string     `gorm:"column:citations_json;type:mediumtext" json:"-"`
 	TeamCitationsJSON string     `gorm:"column:team_citations_json;type:mediumtext" json:"-"`
 	TotalMsgCount     int        `gorm:"column:total_msg_count;not null;default:0" json:"total_msg_count"`

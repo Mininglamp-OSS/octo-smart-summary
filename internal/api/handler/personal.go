@@ -451,12 +451,23 @@ func (h *PersonalHandler) GetPersonal(c *gin.Context) {
 		version = 1
 	}
 
+	// Lazy, best-effort abstract for personal/agent deliverables (Option B,
+	// mirrors TaskHandler.GetSummary): agent summaries store their content here,
+	// so this is where their abstract is generated + cached on first read.
+	if h.llm != nil && pr.Abstract == "" && pr.ID != 0 && strings.TrimSpace(pr.Content) != "" {
+		if a := service.GenerateAbstract(c.Request.Context(), h.llm, pr.Content); a != "" {
+			pr.Abstract = a
+			h.db.Model(&model.PersonalResult{}).Where("id = ? AND abstract = ?", pr.ID, "").Update("abstract", a)
+		}
+	}
+
 	result := gin.H{
 		"id":                 pr.ID,
 		"version":            version,
 		"worker_status":      pr.WorkerStatus,
 		"workflow_stage":     pr.WorkflowStage,
 		"content":            pr.Content,
+		"abstract":           pr.Abstract,
 		"citations":          pr.GetCitations(),
 		"submitted_at":       nil,
 		"generated_at":       nil,
