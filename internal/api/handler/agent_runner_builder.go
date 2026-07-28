@@ -11,7 +11,9 @@ import (
 // buildRunner constructs a runner for the given profile name with LLM configuration.
 // If uid is non-empty and profile is "summary" or "summary_refine", it will be injected into tool handlers.
 // This is a shared helper used by both AgentChatHandler and AgentSummaryHandler.
-func buildRunner(profileName, uid, sessionID, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int) (*agent.Runner, string, error) {
+// llmFallbackModels forwards the ordered fallback list from LLM_FALLBACK_MODELS
+// (empty preserves single-model behavior — see issue #179).
+func buildRunner(profileName, uid, sessionID, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int, llmFallbackModels []string) (*agent.Runner, string, error) {
 	profile, err := agent.GetProfile(profileName)
 	if err != nil {
 		return nil, "", fmt.Errorf("load profile %q: %w", profileName, err)
@@ -31,7 +33,7 @@ func buildRunner(profileName, uid, sessionID, llmApiURL, llmApiKey, llmModel str
 		return nil, "", fmt.Errorf("build registry: %w", err)
 	}
 
-	client := agent.NewClient(llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
+	client := agent.NewClient(llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens, llmFallbackModels)
 	pool := agent.NewPool(4)
 	runner := agent.NewRunner(client, reg, pool, profile.Policy)
 	return runner, system, nil

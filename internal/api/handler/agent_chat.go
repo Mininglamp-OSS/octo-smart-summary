@@ -40,11 +40,12 @@ var sessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 // LLM 配置（url/key/model/...）在构造期注入并留存，供每请求动态建 runner；
 // 敏感值（key）全程从环境变量经 config 传入，不出现在代码中。
 type AgentChatHandler struct {
-	llmApiURL    string
-	llmApiKey    string
-	llmModel     string
-	llmTimeout   int
-	llmMaxTokens int
+	llmApiURL         string
+	llmApiKey         string
+	llmModel          string
+	llmFallbackModels []string
+	llmTimeout        int
+	llmMaxTokens      int
 
 	db     *gorm.DB          // 用于 fetch 引用总结的产物 + 快照(见 CHAT-REFERENCE-BASED-DESIGN-v1)
 	store  agentHistoryStore // 多轮记忆读写（生产为 gorm 实现，测试可注入 mock）
@@ -68,16 +69,19 @@ func newAgentChatHandlerWithRunner(r *agent.Runner, system string, store agentHi
 
 // NewAgentChatHandler 生产构造：留存 LLM 配置供每请求动态建 runner，
 // 并接入多轮记忆存储（db）与滑窗。提示词/工具/策略在 profile.go 与 prompts/*.md 配置。
-func NewAgentChatHandler(db *gorm.DB, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int) *AgentChatHandler {
+// llmFallbackModels 是可选的按序 fallback 模型列表（LLM_FALLBACK_MODELS）；
+// 传 nil 保持单模型行为，见 issue #179。
+func NewAgentChatHandler(db *gorm.DB, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int, llmFallbackModels []string) *AgentChatHandler {
 	return &AgentChatHandler{
-		llmApiURL:    llmApiURL,
-		llmApiKey:    llmApiKey,
-		llmModel:     llmModel,
-		llmTimeout:   llmTimeout,
-		llmMaxTokens: llmMaxTokens,
-		db:           db,
-		store:        newAgentMessageRepo(db),
-		window:       agent.HistoryWindow(),
+		llmApiURL:         llmApiURL,
+		llmApiKey:         llmApiKey,
+		llmModel:          llmModel,
+		llmFallbackModels: llmFallbackModels,
+		llmTimeout:        llmTimeout,
+		llmMaxTokens:      llmMaxTokens,
+		db:                db,
+		store:             newAgentMessageRepo(db),
+		window:            agent.HistoryWindow(),
 	}
 }
 
@@ -103,7 +107,7 @@ func (h *AgentChatHandler) buildRunnerForProfile(profileName, uid, sessionID str
 		return nil, "", fmt.Errorf("build registry: %w", err)
 	}
 
-	client := agent.NewClient(h.llmApiURL, h.llmApiKey, h.llmModel, h.llmTimeout, h.llmMaxTokens)
+	client := agent.NewClient(h.llmApiURL, h.llmApiKey, h.llmModel, h.llmTimeout, h.llmMaxTokens, h.llmFallbackModels)
 	pool := agent.NewPool(4)
 	runner := agent.NewRunner(client, reg, pool, profile.Policy)
 	return runner, system, nil
