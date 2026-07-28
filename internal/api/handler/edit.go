@@ -142,6 +142,7 @@ func (h *EditHandler) EditSummary(c *gin.Context) {
 				"content":        req.Content,
 				"citations_json": citationsJSON,
 				"edited_at":      now,
+				"abstract":       "",
 			})
 		if result.Error != nil {
 			return result.Error

@@ -927,6 +927,15 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 
 	var resultOut interface{}
 	if hasResult {
+		// Lazy, best-effort abstract on the PRIMARY detail payload (mirrors
+		// GetResult): the detail-page callout reads result.abstract from here, so
+		// generate once when missing and cache it back to the row.
+		if h.llm != nil && latestResult.Abstract == "" && latestResult.ID != 0 && strings.TrimSpace(latestResult.Content) != "" {
+			if a := service.GenerateAbstract(c.Request.Context(), h.llm, latestResult.Content); a != "" {
+				latestResult.Abstract = a
+				h.db.Model(&model.SummaryResult{}).Where("id = ? AND abstract = ?", latestResult.ID, "").Update("abstract", a)
+			}
+		}
 		// B2 (privacy, yujiawei P1): plain citations embed the RAW chat messages of
 		// the member who PRODUCED them and may only be returned to that member. The
 		// old gate stripped only when participantCount>1, which leaked memberA's raw
@@ -942,6 +951,7 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		}
 		resultOut = gin.H{
 			"content":          latestResult.Content,
+			"abstract":         latestResult.Abstract,
 			"citations":        plainCitations,
 			"team_citations":   latestResult.GetTeamCitations(),
 			"total_msg_count":  latestResult.TotalMsgCount,

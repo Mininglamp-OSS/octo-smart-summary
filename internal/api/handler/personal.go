@@ -672,6 +672,7 @@ func (h *PersonalHandler) PersonalEdit(c *gin.Context) {
 				"content":        req.Content,
 				"citations_json": citationsJSON,
 				"edited_at":      now,
+				"abstract":       "",
 			})
 		if result.Error != nil {
 			return result.Error
@@ -986,6 +987,7 @@ func (h *PersonalHandler) PersonalDraft(c *gin.Context) {
 			Updates(map[string]interface{}{
 				"content":        req.Content,
 				"citations_json": citationsJSON,
+				"abstract":       "",
 			})
 		if res.Error != nil {
 			return res.Error

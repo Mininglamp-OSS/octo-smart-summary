@@ -12,6 +12,12 @@ import (
 // returns.
 const maxAbstractRunes = 120
 
+// maxAbstractInputRunes bounds how much of the summary body we send to the LLM.
+// Bodies can be large, and this call is made lazily on the first detail read —
+// capping the input keeps that read fast and cheap. The leading portion carries
+// the gist for a short abstract.
+const maxAbstractInputRunes = 8000
+
 const abstractPromptTemplate = `你是文本摘要助手。把下面的「总结正文」压缩成 2-4 句、不超过 120 字的中文摘要。直接输出摘要本身:不要加"摘要:"之类的前缀,不要标题,不要 Markdown 语法(不要 #、*、列表、表格、代码块)。
 
 总结正文:
@@ -31,6 +37,9 @@ func GenerateAbstract(ctx context.Context, llm *LLMClient, content string) strin
 	body := strings.TrimSpace(content)
 	if body == "" {
 		return ""
+	}
+	if runes := []rune(body); len(runes) > maxAbstractInputRunes {
+		body = string(runes[:maxAbstractInputRunes])
 	}
 	out, _, err := llm.Call(ctx, []ChatMessage{{Role: "user", Content: fmt.Sprintf(abstractPromptTemplate, body)}}, 0.3)
 	if err != nil {

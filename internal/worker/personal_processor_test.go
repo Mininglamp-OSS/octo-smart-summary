@@ -100,6 +100,15 @@ func TestCompletedPersonalResultUpdates_SetGenerateStageOnAllPaths(t *testing.T)
 	if skip["workflow_stage"] != model.WorkflowStageGenerateSummary {
 		t.Fatalf("skip workflow_stage=%v", skip["workflow_stage"])
 	}
+	// Regenerating content must drop the stale cached abstract so the next read
+	// regenerates it against the new content. When content is skipped, abstract
+	// must be left untouched (not cleared).
+	if v, ok := full["abstract"]; !ok || v != "" {
+		t.Fatalf("full path should clear abstract to \"\", got ok=%v v=%v", ok, v)
+	}
+	if _, ok := skip["abstract"]; ok {
+		t.Fatalf("skip-content path must not touch abstract, but it was set")
+	}
 }
 
 // normalizeTargetMsgCount mirrors the F1 fix in executePersonalPipeline: on

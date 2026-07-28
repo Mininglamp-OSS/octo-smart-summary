@@ -183,6 +183,7 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 			Where("id = ? AND task_id = ? AND user_id = ? AND worker_status = ?", latestPR.ID, taskID, userID, model.PersonalStatusCompleted).
 			Updates(map[string]interface{}{
 				"content":            newContent,
+				"abstract":           "",
 				"citations_json":     citationsJSON,
 				"total_token_used":   latestPR.TotalTokenUsed + tokens,
 				"model_version":      h.llm.ModelVersion(),
@@ -417,6 +418,7 @@ func (h *PersonalHandler) RefinePersonalSummaryStream(c *gin.Context) {
 			Where("id = ? AND task_id = ? AND user_id = ?", latestPR.ID, taskID, userID).
 			Updates(map[string]interface{}{
 				"content":            newContent,
+				"abstract":           "",
 				"citations_json":     citationsJSON,
 				"total_token_used":   latestPR.TotalTokenUsed + tokens,
 				"model_version":      h.llm.ModelVersion(),
@@ -625,6 +627,7 @@ func (h *PersonalHandler) RestorePersonalVersion(c *gin.Context) {
 			Where("id = ? AND task_id = ? AND user_id = ?", latestPR.ID, taskID, userID).
 			Updates(map[string]interface{}{
 				"content":            source.Content,
+				"abstract":           "",
 				"citations_json":     source.CitationsJSON,
 				"msg_count":          source.MsgCount,
 				"total_token_used":   source.TotalTokenUsed,
@@ -747,6 +750,7 @@ func (h *PersonalHandler) RegeneratePersonalSummary(c *gin.Context) {
 				"workflow_stage":     "",
 				"retry_count":        0,
 				"content":            "",
+				"abstract":           "",
 				"citations_json":     "",
 				"msg_count":          0,
 				"total_token_used":   0,

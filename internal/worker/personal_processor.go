@@ -64,6 +64,7 @@ func completedPersonalResultUpdates(pr model.PersonalResult, content string, cit
 	}
 	pr.SetCitations(citations)
 	updates["content"] = content
+	updates["abstract"] = "" // content changed → drop stale cached abstract; next read regenerates
 	updates["citations_json"] = pr.CitationsJSON
 	updates["msg_count"] = msgCount
 	updates["total_token_used"] = totalTokens
