@@ -62,6 +62,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		botV1.GET("/summaries", taskH.ListSummaries)
 		botV1.GET("/summaries/:id", taskH.GetSummary)
 		botV1.GET("/summaries/:id/result", taskH.GetResult)
+		botV1.POST("/summaries", taskH.CreateBotSummary)
 	}
 
 	v1 := r.Group("/api/v1")
