@@ -16,6 +16,7 @@ All configuration is done via environment variables.
 | `LLM_API_URL` | LLM gateway base URL (OpenAI-compatible) | Yes (Worker) | — |
 | `LLM_API_KEY` | API key for the LLM gateway | Yes (Worker) | — |
 | `LLM_MODEL` | Model identifier to use for summarization | Yes | — |
+| `LLM_FALLBACK_MODELS` | Comma-separated ordered list of models the agent client tries when the primary `LLM_MODEL` exhausts its per-model retry budget (network/5xx/429). Empty preserves single-model behavior. Example: `claude-sonnet-4-6,qwen3.6-max`. All models must be served by the same `LLM_API_URL` gateway under the same `LLM_API_KEY`; cross-provider redundancy is not supported by this knob. To leave adequate budget for at least one fallback, keep `maxAttempts*LLM_TIMEOUT + backoffs (3s) <= AGENT_STEP_TIMEOUT` — the client reserves budget for fallbacks by escalating early when the remaining deadline is too tight for another full-timeout attempt. | No | — |
 | `LLM_TIMEOUT` | LLM request timeout in seconds | No | `180` |
 | `AGENT_STEP_TIMEOUT` | Maximum duration in seconds for one agent planning step; streaming requests remain capped by the 300-second request deadline | No | `240` |
 | `LLM_MAX_TOKENS` | Maximum tokens for LLM response | No | `4096` |
