@@ -538,8 +538,8 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 		}
 	}
 	if s := c.Query("keyword"); s != "" {
-		whereSQL += " AND title LIKE ?"
-		args = append(args, "%"+s+"%")
+		whereSQL += " AND (title LIKE ? OR topic LIKE ?)"
+		args = append(args, "%"+s+"%", "%"+s+"%")
 	}
 	if s := c.Query("origin_channel_id"); s != "" {
 		whereSQL += " AND origin_channel_id = ?"
@@ -932,6 +932,7 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		if !callerPlainCitationsVisible(h.db, &task, callerID, &latestResult) {
 			plainCitations = []model.Citation{}
 		}
+		plainCitations = citationsForRequest(c, plainCitations)
 		resultOut = gin.H{
 			"content":          latestResult.Content,
 			"citations":        plainCitations,
@@ -1110,6 +1111,15 @@ func (h *TaskHandler) GetResult(c *gin.Context) {
 	var result model.SummaryResult
 	var found bool
 	if result, found = h.pickDisplayResult(taskID); !found {
+		if bot, _ := c.Get("bot_request"); bot == true && taskPtr.SummaryMode == model.ModeByPerson {
+			var personal model.PersonalResult
+			userID := middleware.GetUserID(c)
+			err := h.db.Where("task_id = ? AND user_id = ? AND worker_status = ?", taskID, userID, model.PersonalStatusCompleted).First(&personal).Error
+			if err == nil && strings.TrimSpace(personal.Content) != "" {
+				h.writeBotPersonalResult(c, personal)
+				return
+			}
+		}
 		bizErr(c, service.NewBizError(40008, "暂无结果", http.StatusNotFound))
 		return
 	}
@@ -1128,6 +1138,7 @@ func (h *TaskHandler) GetResult(c *gin.Context) {
 	if !callerPlainCitationsVisible(h.db, taskPtr, callerID, &result) {
 		plainCitations = []model.Citation{}
 	}
+	plainCitations = citationsForRequest(c, plainCitations)
 
 	ok(c, gin.H{
 		"content":          result.Content,
@@ -1149,6 +1160,45 @@ func (h *TaskHandler) GetResult(c *gin.Context) {
 			return result.EditedAt.Format(time.RFC3339)
 		}(),
 	})
+}
+
+func (h *TaskHandler) writeBotPersonalResult(c *gin.Context, result model.PersonalResult) {
+	var generatedAt interface{}
+	if result.GeneratedAt != nil {
+		generatedAt = result.GeneratedAt.Format(time.RFC3339)
+	}
+	ok(c, gin.H{
+		"content":             result.Content,
+		"citations":           citationsForRequest(c, result.GetCitations()),
+		"team_citations":      []model.TeamCitation{},
+		"total_msg_count":     result.MsgCount,
+		"total_token_used":    result.TotalTokenUsed,
+		"model_version":       result.ModelVersion,
+		"generated_at":        generatedAt,
+		"result_source":       "personal",
+		"personal_result_id":  result.ID,
+		"personal_version_id": result.CurrentVersionID,
+		"result_is_edited":    result.EditedAt != nil,
+		"result_edited_at": func() interface{} {
+			if result.EditedAt == nil {
+				return nil
+			}
+			return result.EditedAt.Format(time.RFC3339)
+		}(),
+	})
+}
+
+func citationsForRequest(c *gin.Context, citations []model.Citation) []model.Citation {
+	if bot, _ := c.Get("bot_request"); bot != true {
+		return citations
+	}
+	out := make([]model.Citation, len(citations))
+	copy(out, citations)
+	for i := range out {
+		out[i].ContextBefore = nil
+		out[i].ContextAfter = nil
+	}
+	return out
 }
 
 // regenerateReq is the optional request body for Regenerate. When Topic is

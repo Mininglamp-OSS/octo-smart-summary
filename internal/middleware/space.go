@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -10,6 +11,44 @@ import (
 // TokenResolver resolves a token string to a user ID.
 type TokenResolver interface {
 	ResolveUID(ctx context.Context, token string) (string, error)
+}
+
+type BotIdentity struct {
+	BotUID   string
+	OwnerUID string
+	SpaceID  string
+}
+
+type BotTokenResolver interface {
+	ResolveBot(ctx context.Context, token string) (BotIdentity, error)
+}
+
+// StrictBotAuthMiddleware authenticates the bot realm and injects the bot's
+// human owner as the effective reader. Space is exclusively server-resolved.
+func StrictBotAuthMiddleware(resolver BotTokenResolver) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		parts := strings.Fields(strings.TrimSpace(c.GetHeader("Authorization")))
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || !strings.HasPrefix(parts[1], "bf_") || resolver == nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "authentication required"})
+			return
+		}
+		identity, err := resolver.ResolveBot(c.Request.Context(), parts[1])
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"code": 5001, "message": "bot token resolution error"})
+			return
+		}
+		if identity.BotUID == "" || identity.OwnerUID == "" || identity.SpaceID == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": 4010, "message": "invalid or expired bot token"})
+			return
+		}
+		c.Set("actor_type", "bot")
+		c.Set("actor_id", identity.BotUID)
+		c.Set("bot_id", identity.BotUID)
+		c.Set("user_id", identity.OwnerUID)
+		c.Set("space_id", identity.SpaceID)
+		c.Set("bot_request", true)
+		c.Next()
+	}
 }
 
 // SpaceMiddleware extracts X-Space-Id (or X-Org-Id for backward compat) header
