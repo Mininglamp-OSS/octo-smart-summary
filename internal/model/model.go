@@ -162,12 +162,19 @@ type SummaryTask struct {
 // for it. The composite unique index is the concurrency authority: duplicate
 // requests must return the original task without dispatching another worker.
 type SummaryBotCreateIdempotency struct {
-	ID             int64     `gorm:"primaryKey;autoIncrement"`
-	SpaceID        string    `gorm:"column:space_id;type:varchar(64);not null;uniqueIndex:uk_bot_summary_idempotency"`
-	BotID          string    `gorm:"column:bot_id;type:varchar(64);not null;uniqueIndex:uk_bot_summary_idempotency"`
-	IdempotencyKey string    `gorm:"column:idempotency_key;type:varchar(128);not null;uniqueIndex:uk_bot_summary_idempotency"`
-	TaskID         int64     `gorm:"column:task_id;not null"`
-	CreatedAt      time.Time `gorm:"column:created_at;not null"`
+	ID             int64  `gorm:"primaryKey;autoIncrement"`
+	SpaceID        string `gorm:"column:space_id;type:varchar(64);not null;uniqueIndex:uk_bot_summary_idempotency"`
+	BotID          string `gorm:"column:bot_id;type:varchar(64);not null;uniqueIndex:uk_bot_summary_idempotency"`
+	IdempotencyKey string `gorm:"column:idempotency_key;type:varchar(128);not null;uniqueIndex:uk_bot_summary_idempotency"`
+	// RequestHash is a sha256 fingerprint of the create request payload
+	// (title, topic, time range, sources, origin channel, include_archived).
+	// When a client reuses the same (space_id, bot_id, idempotency_key) tuple
+	// with a different body, the mismatch surfaces as HTTP 409 instead of
+	// silently returning the original task. Mirrors summary_share_snapshot
+	// which established this contract in the same repo. See issue #181 P1-2.
+	RequestHash string    `gorm:"column:request_hash;type:char(64);not null"`
+	TaskID      int64     `gorm:"column:task_id;not null"`
+	CreatedAt   time.Time `gorm:"column:created_at;not null"`
 }
 
 func (SummaryBotCreateIdempotency) TableName() string { return "summary_bot_create_idempotency" }

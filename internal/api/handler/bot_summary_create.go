@@ -2,6 +2,8 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +30,67 @@ const maxBotIdempotencyKeyLen = 128
 var botIdempotencyKeyPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]*$`)
 
 var errBotIdempotencyConflict = errors.New("bot summary idempotency conflict")
+
+// errBotIdempotencyBodyMismatch signals that (space_id, bot_id, idempotency_key)
+// matched an existing binding, but the current request's canonical hash does
+// not match the one persisted with it. This is HTTP 409 territory: the client
+// reused an idempotency key across two different intents, and returning the
+// original task would silently discard the new intent. Mirrors the contract
+// summary_share_snapshot enforces with the same-key/different-hash case
+// (share.go:244). See issue #181 P1-2.
+var errBotIdempotencyBodyMismatch = errors.New("bot summary idempotency body mismatch")
+
+// canonicalBotCreateRequestHash returns a deterministic sha256 fingerprint of
+// the semantic content of a create request. Fields are drawn from the
+// resolved (canonicalized) sources, the persisted origin channel, the title,
+// topic, the exact time range, and include_archived — everything the worker
+// would actually use. The client's raw --data ordering, whitespace, or key
+// order does not affect the hash: only the resolved values do, so a client
+// that re-sends the same intent with cosmetic differences replays cleanly.
+func canonicalBotCreateRequestHash(req createBotSummaryReq, sources []canonicalBotSource, originID string, originType int) string {
+	// Sort a copy of the resolved sources so map iteration order or client
+	// ordering never breaks replay determinism.
+	sorted := make([]canonicalBotSource, len(sources))
+	copy(sorted, sources)
+	// Simple string-key sort keeps the dependency footprint small; sources
+	// are capped at maxSourceCount so O(n^2) is fine.
+	for i := 0; i < len(sorted); i++ {
+		for j := i + 1; j < len(sorted); j++ {
+			ki := fmt.Sprintf("%d:%s", sorted[i].SourceType, sorted[i].SourceID)
+			kj := fmt.Sprintf("%d:%s", sorted[j].SourceType, sorted[j].SourceID)
+			if ki > kj {
+				sorted[i], sorted[j] = sorted[j], sorted[i]
+			}
+		}
+	}
+	payload := struct {
+		Title            string               `json:"title"`
+		Topic            string               `json:"topic"`
+		TimeRangeStart   string               `json:"time_range_start"`
+		TimeRangeEnd     string               `json:"time_range_end"`
+		Sources          []canonicalBotSource `json:"sources"`
+		OriginChannelID  string               `json:"origin_channel_id"`
+		OriginChannelTp  int                  `json:"origin_channel_type"`
+		IncludeArchived  bool                 `json:"include_archived"`
+	}{
+		Title:           strings.TrimSpace(req.Title),
+		Topic:           strings.TrimSpace(req.Topic),
+		// Format the times as RFC3339Nano so the hash is stable across the
+		// binding lifetime regardless of the client's original serialization
+		// (RFC3339 vs RFC3339Nano vs a slightly different offset). The
+		// backend has already unified the field into a time.Time at this
+		// point.
+		TimeRangeStart:  req.TimeRange.Start.UTC().Format(time.RFC3339Nano),
+		TimeRangeEnd:    req.TimeRange.End.UTC().Format(time.RFC3339Nano),
+		Sources:         sorted,
+		OriginChannelID: originID,
+		OriginChannelTp: originType,
+		IncludeArchived: req.IncludeArchived,
+	}
+	b, _ := json.Marshal(payload)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
 
 type createBotSummaryReq struct {
 	Title             string      `json:"title"`
@@ -97,14 +160,40 @@ func (h *TaskHandler) CreateBotSummary(c *gin.Context) {
 		return
 	}
 
-	if existing, ok := h.findBotIdempotentTask(spaceID, botUID, idempotencyKey); ok {
+	// Compute the canonical request hash once, from the resolved sources +
+	// persisted origin channel. This is what will be stored in the binding
+	// on first-write and compared against on replay. Reused for the "second
+	// call, same key, different body" 409 case.
+	originID := ""
+	originType := 0
+	if req.OriginChannelID != "" {
+		originID = canonicalBotSourceID(sourceReq{SourceType: req.OriginChannelType, SourceID: req.OriginChannelID}, ownerUID)
+		originType = req.OriginChannelType
+	}
+	requestHash := canonicalBotCreateRequestHash(req, sources, originID, originType)
+
+	if existing, mismatched, ok := h.findBotIdempotentTaskWithHash(spaceID, botUID, idempotencyKey, requestHash); ok {
+		if mismatched {
+			// Same idempotency key, different intent. Do not silently return
+			// the original task — surface the collision so the caller can
+			// pick a new key.
+			c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "idempotency key already used for a different request"})
+			return
+		}
 		c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok", Data: botCreateResponse(existing)})
 		return
 	}
 
-	task, participantID, err := h.persistBotSummary(ownerUID, botUID, spaceID, idempotencyKey, req, sources)
+	task, participantID, err := h.persistBotSummary(ownerUID, botUID, spaceID, idempotencyKey, requestHash, req, sources)
 	if errors.Is(err, errBotIdempotencyConflict) {
-		if existing, ok := h.findBotIdempotentTask(spaceID, botUID, idempotencyKey); ok {
+		// Racing writer beat us to the insert. Re-fetch and treat as a replay
+		// — but honour the hash check so a concurrent replay that happens to
+		// carry a mismatched body still surfaces as 409.
+		if existing, mismatched, ok := h.findBotIdempotentTaskWithHash(spaceID, botUID, idempotencyKey, requestHash); ok {
+			if mismatched {
+				c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "idempotency key already used for a different request"})
+				return
+			}
 			c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok", Data: botCreateResponse(existing)})
 			return
 		}
@@ -214,7 +303,33 @@ func (h *TaskHandler) resolveAuthorizedBotSources(ctx context.Context, ownerUID,
 			if channel.ChannelID != canonicalID || channel.ChannelType != imType {
 				continue
 			}
-			if imType != model.ChannelTypeDM && channel.SpaceID != spaceID {
+			// DM sources need special handling: pipeline.GetUserChannels
+			// returns DMs with no space filter (their ChannelInfo.SpaceID is
+			// empty), so the channel-side space comparison below cannot
+			// authorize them. Instead, verify that the DM peer is a member
+			// of the token's space via space_member, mirroring the DM path
+			// candidates.go:231 already uses for exactly this data. Without
+			// this check a space-scoped bot token can reach the owner's DMs
+			// with peers outside that space (issue #181 P1-1).
+			if imType == model.ChannelTypeDM {
+				peer := getDMPeer(canonicalID, ownerUID)
+				if peer == "" {
+					// A malformed DM channel id (no @ separator, or self-DM)
+					// cannot be attributed to a peer, so it cannot be
+					// authorized against the space. Reject rather than
+					// silently accept.
+					wrongSpace = true
+					continue
+				}
+				inSpace, err := peerInSpace(ctx, h.imDB, spaceID, peer)
+				if err != nil {
+					return nil, 50000, fmt.Errorf("check DM peer space membership: %w", err)
+				}
+				if !inSpace {
+					wrongSpace = true
+					continue
+				}
+			} else if channel.SpaceID != spaceID {
 				wrongSpace = true
 				continue
 			}
@@ -237,6 +352,45 @@ func (h *TaskHandler) resolveAuthorizedBotSources(ctx context.Context, ownerUID,
 	return result, 0, nil
 }
 
+// getDMPeer extracts the peer UID from a canonicalized DM channel id of the
+// form "a@b" (WuKongIM's larger-CRC32-first layout). Returns "" when the id
+// is malformed or degenerate (self-DM). Kept as a small local helper rather
+// than exported from pipeline because the shape of "canonical" is a private
+// contract between canonicalBotSourceID and this file.
+func getDMPeer(canonicalID, ownerUID string) string {
+	parts := strings.SplitN(canonicalID, "@", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	if parts[0] == ownerUID && parts[1] != ownerUID {
+		return parts[1]
+	}
+	if parts[1] == ownerUID && parts[0] != ownerUID {
+		return parts[0]
+	}
+	return ""
+}
+
+// peerInSpace reports whether the given peer uid holds an active space_member
+// row for spaceID. Uses a single-row COUNT probe so it is cheap enough to
+// run in the source-authorization loop without a batch-friendly query — DM
+// sources per request are already capped at maxSourceCount.
+func peerInSpace(ctx context.Context, imDB *gorm.DB, spaceID, peerUID string) (bool, error) {
+	if imDB == nil || spaceID == "" || peerUID == "" {
+		return false, nil
+	}
+	var count int64
+	err := imDB.WithContext(ctx).
+		Table("space_member").
+		Where("space_id = ? AND uid = ? AND status = 1", spaceID, peerUID).
+		Limit(1).
+		Count(&count).Error
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 func canonicalSourcesContain(sources []canonicalBotSource, sourceType int, sourceID, ownerUID string) bool {
 	want := canonicalBotSourceID(sourceReq{SourceType: sourceType, SourceID: sourceID}, ownerUID)
 	for _, source := range sources {
@@ -247,7 +401,7 @@ func canonicalSourcesContain(sources []canonicalBotSource, sourceType int, sourc
 	return false
 }
 
-func (h *TaskHandler) persistBotSummary(ownerUID, botUID, spaceID, key string, req createBotSummaryReq, sources []canonicalBotSource) (model.SummaryTask, int64, error) {
+func (h *TaskHandler) persistBotSummary(ownerUID, botUID, spaceID, key, requestHash string, req createBotSummaryReq, sources []canonicalBotSource) (model.SummaryTask, int64, error) {
 	taskNo := service.GenerateTaskNo()
 	title := strings.TrimSpace(req.Title)
 	if title == "" {
@@ -288,7 +442,7 @@ func (h *TaskHandler) persistBotSummary(ownerUID, botUID, spaceID, key string, r
 			return err
 		}
 		participantID = participant.ID
-		binding := model.SummaryBotCreateIdempotency{SpaceID: spaceID, BotID: botUID, IdempotencyKey: key, TaskID: task.ID, CreatedAt: now}
+		binding := model.SummaryBotCreateIdempotency{SpaceID: spaceID, BotID: botUID, IdempotencyKey: key, RequestHash: requestHash, TaskID: task.ID, CreatedAt: now}
 		insert := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&binding)
 		if insert.Error != nil {
 			return insert.Error
@@ -301,16 +455,34 @@ func (h *TaskHandler) persistBotSummary(ownerUID, botUID, spaceID, key string, r
 	return task, participantID, err
 }
 
-func (h *TaskHandler) findBotIdempotentTask(spaceID, botID, key string) (model.SummaryTask, bool) {
+// findBotIdempotentTaskWithHash resolves an existing idempotency binding and
+// verifies that the caller's current request hash matches the one persisted
+// with it. Return semantics:
+//
+//   - (task, false, true):  binding found AND hashes match. Replay case.
+//   - ({},   true,  true):  binding found but hashes differ. Callers should
+//     answer HTTP 409 rather than silently returning the original task.
+//   - ({},   false, false): no binding for this (space, bot, key) tuple.
+//
+// Falling through to a hash mismatch here mirrors summary_share_snapshot's
+// contract (share.go:244) which is the pattern this repo already established
+// for idempotency-with-body semantics. See issue #181 P1-2.
+func (h *TaskHandler) findBotIdempotentTaskWithHash(spaceID, botID, key, requestHash string) (model.SummaryTask, bool, bool) {
 	var binding model.SummaryBotCreateIdempotency
 	if err := h.db.Where("space_id = ? AND bot_id = ? AND idempotency_key = ?", spaceID, botID, key).First(&binding).Error; err != nil {
-		return model.SummaryTask{}, false
+		return model.SummaryTask{}, false, false
+	}
+	if binding.RequestHash != requestHash {
+		return model.SummaryTask{}, true, true
 	}
 	var task model.SummaryTask
 	if err := h.db.Where("id = ? AND space_id = ? AND creator_bot_id = ?", binding.TaskID, spaceID, botID).First(&task).Error; err != nil {
-		return model.SummaryTask{}, false
+		// The binding row survives but the task row does not — unusual (only
+		// possible if a manual DELETE ran), but treat as "no replay" rather
+		// than surfacing a phantom mismatch.
+		return model.SummaryTask{}, false, false
 	}
-	return task, true
+	return task, false, true
 }
 
 func botCreateResponse(task model.SummaryTask) gin.H {

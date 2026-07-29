@@ -11,6 +11,7 @@ CREATE TABLE summary_bot_create_idempotency (
     space_id VARCHAR(64) NOT NULL,
     bot_id VARCHAR(64) NOT NULL,
     idempotency_key VARCHAR(128) NOT NULL,
+    request_hash CHAR(64) NOT NULL,
     task_id BIGINT NOT NULL,
     created_at DATETIME(3) NOT NULL,
     PRIMARY KEY (id),
