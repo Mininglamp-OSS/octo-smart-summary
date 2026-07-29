@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"regexp"
@@ -75,13 +76,15 @@ func canonicalBotCreateRequestHash(req createBotSummaryReq, sources []canonicalB
 	}{
 		Title:           strings.TrimSpace(req.Title),
 		Topic:           strings.TrimSpace(req.Topic),
-		// Format the times as RFC3339Nano so the hash is stable across the
-		// binding lifetime regardless of the client's original serialization
-		// (RFC3339 vs RFC3339Nano vs a slightly different offset). The
-		// backend has already unified the field into a time.Time at this
-		// point.
-		TimeRangeStart:  req.TimeRange.Start.UTC().Format(time.RFC3339Nano),
-		TimeRangeEnd:    req.TimeRange.End.UTC().Format(time.RFC3339Nano),
+		// Round the time range to whole minutes so a normal client retry
+		// that recomputes a relative window ("summarize the last hour")
+		// replays cleanly instead of colliding on nanosecond drift. A
+		// genuinely different window (measured in minutes or more) still
+		// mismatches. See yujiawei's PR #181 round-3 review — the previous
+		// RFC3339Nano formatting turned every network-timeout retry into
+		// a spurious 40009 conflict.
+		TimeRangeStart:  req.TimeRange.Start.UTC().Truncate(time.Minute).Format(time.RFC3339),
+		TimeRangeEnd:    req.TimeRange.End.UTC().Truncate(time.Minute).Format(time.RFC3339),
 		Sources:         sorted,
 		OriginChannelID: originID,
 		OriginChannelTp: originType,
@@ -172,12 +175,24 @@ func (h *TaskHandler) CreateBotSummary(c *gin.Context) {
 	}
 	requestHash := canonicalBotCreateRequestHash(req, sources, originID, originType)
 
-	if existing, mismatched, ok := h.findBotIdempotentTaskWithHash(spaceID, botUID, idempotencyKey, requestHash); ok {
+	if existing, mismatched, ok, err := h.findBotIdempotentTaskWithHash(spaceID, botUID, idempotencyKey, requestHash); err != nil {
+		// A DB failure here must not silently proceed to insert — that
+		// path would collide on the unique key and then re-read (with the
+		// same failing DB), returning 500 for a request whose replay
+		// actually exists. Surface the read failure.
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "failed to resolve idempotency binding"})
+		return
+	} else if ok {
 		if mismatched {
 			// Same idempotency key, different intent. Do not silently return
 			// the original task — surface the collision so the caller can
-			// pick a new key.
-			c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "idempotency key already used for a different request"})
+			// pick a new key. Echo the existing task_id so an accidental
+			// mismatched retry is still recoverable from the response.
+			c.JSON(http.StatusConflict, apiResponse{
+				Code:    40009,
+				Message: "idempotency key already used for a different request",
+				Data:    gin.H{"existing_task_id": existing.ID},
+			})
 			return
 		}
 		c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok", Data: botCreateResponse(existing)})
@@ -189,9 +204,16 @@ func (h *TaskHandler) CreateBotSummary(c *gin.Context) {
 		// Racing writer beat us to the insert. Re-fetch and treat as a replay
 		// — but honour the hash check so a concurrent replay that happens to
 		// carry a mismatched body still surfaces as 409.
-		if existing, mismatched, ok := h.findBotIdempotentTaskWithHash(spaceID, botUID, idempotencyKey, requestHash); ok {
+		if existing, mismatched, ok, ferr := h.findBotIdempotentTaskWithHash(spaceID, botUID, idempotencyKey, requestHash); ferr != nil {
+			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "failed to resolve idempotency binding"})
+			return
+		} else if ok {
 			if mismatched {
-				c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "idempotency key already used for a different request"})
+				c.JSON(http.StatusConflict, apiResponse{
+					Code:    40009,
+					Message: "idempotency key already used for a different request",
+					Data:    gin.H{"existing_task_id": existing.ID},
+				})
 				return
 			}
 			c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok", Data: botCreateResponse(existing)})
@@ -312,18 +334,37 @@ func (h *TaskHandler) resolveAuthorizedBotSources(ctx context.Context, ownerUID,
 			// this check a space-scoped bot token can reach the owner's DMs
 			// with peers outside that space (issue #181 P1-1).
 			if imType == model.ChannelTypeDM {
-				peer := getDMPeer(canonicalID, ownerUID)
+				// Prefer the peer already resolved by pipeline.GetUserChannels
+				// (ChannelInfo.PeerUID). Falling back to a local re-parse of
+				// the canonical id is a belt-and-braces path for future
+				// callers that populate ChannelInfo differently — normal
+				// flows should always have PeerUID set here.
+				peer := channel.PeerUID
 				if peer == "" {
-					// A malformed DM channel id (no @ separator, or self-DM)
-					// cannot be attributed to a peer, so it cannot be
-					// authorized against the space. Reject rather than
-					// silently accept.
-					wrongSpace = true
+					peer = deriveDMPeer(canonicalID, ownerUID)
+				}
+				// Self-DM ("note to self", peer == owner) is by construction
+				// inside the owner's own space membership set. Probe the
+				// owner's membership directly so we do not misreport 40302
+				// for a resource the owner obviously owns (yujiawei PR #181
+				// round-3 P2-2).
+				if peer == ownerUID {
+					peer = ownerUID
+				} else if peer == "" {
+					// A DM channel id that resolves to no peer at all is
+					// genuinely unparseable — distinct from cross-space.
+					// Reject as unauthorized ("owner does not have access")
+					// rather than 40302 "different space".
 					continue
 				}
-				inSpace, err := peerInSpace(ctx, h.imDB, spaceID, peer)
-				if err != nil {
-					return nil, 50000, fmt.Errorf("check DM peer space membership: %w", err)
+				inSpace, ierr := peerInSpace(ctx, h.imDB, spaceID, peer)
+				if ierr != nil {
+					// Return a static message: apiResponse surfaces
+					// this err.Error() to the caller (see task.go:219
+					// and safeErrorDetail in agent_chat.go:679). The
+					// wrapped detail stays here for logs only.
+					log.Printf("[bot-summary-create] DM peer space check failed peer=%s space=%s: %v", peer, spaceID, ierr)
+					return nil, 50000, errors.New("failed to resolve DM peer space membership")
 				}
 				if !inSpace {
 					wrongSpace = true
@@ -352,22 +393,26 @@ func (h *TaskHandler) resolveAuthorizedBotSources(ctx context.Context, ownerUID,
 	return result, 0, nil
 }
 
-// getDMPeer extracts the peer UID from a canonicalized DM channel id of the
-// form "a@b" (WuKongIM's larger-CRC32-first layout). Returns "" when the id
-// is malformed or degenerate (self-DM). Kept as a small local helper rather
-// than exported from pipeline because the shape of "canonical" is a private
-// contract between canonicalBotSourceID and this file.
-func getDMPeer(canonicalID, ownerUID string) string {
+// deriveDMPeer is a fallback that extracts the peer UID from a canonicalized
+// DM channel id of the form "a@b" (WuKongIM's larger-CRC32-first layout).
+// Only used when pipeline.GetUserChannels did not populate ChannelInfo.PeerUID
+// on the matching row — the normal path prefers channel.PeerUID directly.
+// Returns "" for an unparseable id (no @ separator); the self-DM case
+// (owner@owner) is handled at the call site so the ambiguity can be resolved
+// with knowledge of the owner UID.
+func deriveDMPeer(canonicalID, ownerUID string) string {
 	parts := strings.SplitN(canonicalID, "@", 2)
 	if len(parts) != 2 {
 		return ""
 	}
-	if parts[0] == ownerUID && parts[1] != ownerUID {
+	if parts[0] == ownerUID {
 		return parts[1]
 	}
-	if parts[1] == ownerUID && parts[0] != ownerUID {
+	if parts[1] == ownerUID {
 		return parts[0]
 	}
+	// Neither half is the owner: either a malformed id or a canonical form
+	// this handler does not understand. Let the caller decide.
 	return ""
 }
 
@@ -459,30 +504,37 @@ func (h *TaskHandler) persistBotSummary(ownerUID, botUID, spaceID, key, requestH
 // verifies that the caller's current request hash matches the one persisted
 // with it. Return semantics:
 //
-//   - (task, false, true):  binding found AND hashes match. Replay case.
-//   - ({},   true,  true):  binding found but hashes differ. Callers should
-//     answer HTTP 409 rather than silently returning the original task.
-//   - ({},   false, false): no binding for this (space, bot, key) tuple.
-//
-// Falling through to a hash mismatch here mirrors summary_share_snapshot's
-// contract (share.go:244) which is the pattern this repo already established
-// for idempotency-with-body semantics. See issue #181 P1-2.
-func (h *TaskHandler) findBotIdempotentTaskWithHash(spaceID, botID, key, requestHash string) (model.SummaryTask, bool, bool) {
+//   - (task, false, true,  nil):  binding found AND hashes match. Replay.
+//   - (task, true,  true,  nil):  binding found but hashes differ. Callers
+//     should answer HTTP 409 and include existing.task_id in the payload so
+//     a mismatched retry is recoverable (yujiawei PR #181 round-3).
+//   - ({},   false, false, nil):  no binding for this (space, bot, key) tuple.
+//   - ({},   false, false, err):  DB error other than record-not-found. Callers
+//     must fail loudly rather than silently proceeding to insert — mirroring
+//     share.go:232-241's distinction between "not found" and "read failed".
+func (h *TaskHandler) findBotIdempotentTaskWithHash(spaceID, botID, key, requestHash string) (model.SummaryTask, bool, bool, error) {
 	var binding model.SummaryBotCreateIdempotency
 	if err := h.db.Where("space_id = ? AND bot_id = ? AND idempotency_key = ?", spaceID, botID, key).First(&binding).Error; err != nil {
-		return model.SummaryTask{}, false, false
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return model.SummaryTask{}, false, false, nil
+		}
+		return model.SummaryTask{}, false, false, err
 	}
-	if binding.RequestHash != requestHash {
-		return model.SummaryTask{}, true, true
-	}
+	// Load the referenced task so callers can echo task_id in either the
+	// replay or the mismatch case. When the binding survives but the task
+	// row does not (only possible if a manual DELETE ran), treat as "no
+	// replay" and let the caller proceed with a fresh create.
 	var task model.SummaryTask
 	if err := h.db.Where("id = ? AND space_id = ? AND creator_bot_id = ?", binding.TaskID, spaceID, botID).First(&task).Error; err != nil {
-		// The binding row survives but the task row does not — unusual (only
-		// possible if a manual DELETE ran), but treat as "no replay" rather
-		// than surfacing a phantom mismatch.
-		return model.SummaryTask{}, false, false
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return model.SummaryTask{}, false, false, nil
+		}
+		return model.SummaryTask{}, false, false, err
 	}
-	return task, false, true
+	if binding.RequestHash != requestHash {
+		return task, true, true, nil
+	}
+	return task, false, true, nil
 }
 
 func botCreateResponse(task model.SummaryTask) gin.H {

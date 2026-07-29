@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,14 +50,17 @@ func setupBotCreateTest(t *testing.T) (*TaskHandler, *gin.Engine, *gorm.DB) {
 	now := time.Now()
 	imDB.Exec(`INSERT INTO "group" VALUES (?, ?, ?, 1, ?), (?, ?, ?, 1, ?)`, "group-a", "A", "space-a", now, "group-b", "B", "space-b", now)
 	imDB.Exec(`INSERT INTO group_member VALUES (?, ?, 0), (?, ?, 0)`, "group-a", "owner", "group-b", "owner")
-	// Owner has DM conversations with two peers. peer-in-a shares the token's
-	// space; peer-in-b belongs to a different space entirely. The canonical
+	// Owner has DM conversations with three peers plus a "note to self"
+	// self-DM. peer-in-a shares the token's space; peer-in-b belongs to a
+	// different space entirely; the owner is trivially a member of its own
+	// space so the self-DM must succeed (PR #181 round-3 P2-2). The canonical
 	// DM channel_id layout stores the larger-CRC32 uid first, so we seed with
 	// the raw values pipeline.GetUserChannels would emit and let
 	// NormalizeDMChannelID canonicalize at request time.
-	imDB.Exec(`INSERT INTO conversation_extra VALUES ('peer-in-a', 'owner', 1, ?), ('peer-in-b', 'owner', 1, ?)`, now, now)
-	// Space membership: only peer-in-a is a member of space-a. peer-in-b
-	// belongs to space-b, matching the failure scenario in the review.
+	imDB.Exec(`INSERT INTO conversation_extra VALUES ('peer-in-a', 'owner', 1, ?), ('peer-in-b', 'owner', 1, ?), ('owner', 'owner', 1, ?)`, now, now, now)
+	// Space membership: peer-in-a and owner belong to space-a; peer-in-b
+	// belongs to space-b. The owner row is what makes the self-DM path
+	// succeed (peer==owner ⇒ peerInSpace(owner, space-a) must find this row).
 	imDB.Exec(`INSERT INTO space_member VALUES ('space-a','owner',1), ('space-a','peer-in-a',1), ('space-b','peer-in-b',1)`)
 
 	h := NewTaskHandler(db, imDB, "")
@@ -122,8 +126,13 @@ func TestCreateBotSummaryRejectsCrossSpaceSource(t *testing.T) {
 func TestCreateBotSummaryIdempotent(t *testing.T) {
 	t.Setenv("BOT_SUMMARY_CREATE_ENABLED", "true")
 	_, r, db := setupBotCreateTest(t)
-	first := requestBotCreate(r, "stable-key", botCreateBody("group-a"))
-	second := requestBotCreate(r, "stable-key", botCreateBody("group-a"))
+	// Hoist the body so both requests carry the *same* time_range —
+	// previously each call re-sampled time.Now() and the test passed only
+	// when both requests landed in the same wall-clock second, which is
+	// exactly the flake yujiawei's PR #181 round-3 review caught.
+	body := botCreateBody("group-a")
+	first := requestBotCreate(r, "stable-key", body)
+	second := requestBotCreate(r, "stable-key", body)
 	if first.Code != http.StatusCreated || second.Code != http.StatusOK {
 		t.Fatalf("first=%d %s second=%d %s", first.Code, first.Body.String(), second.Code, second.Body.String())
 	}
@@ -255,5 +264,130 @@ func TestCreateBotSummaryIdempotencyHashMatchReplays(t *testing.T) {
 	db.Model(&model.SummaryTask{}).Count(&count)
 	if count != 1 {
 		t.Fatalf("replay must not create a second task; count=%d", count)
+	}
+}
+
+// TestCreateBotSummaryIdempotencyReplaysAcrossSubSecondDrift is the direct
+// regression for yujiawei's PR #181 round-3 P1-1: two calls that request the
+// same relative window but hit the server on either side of a second boundary
+// must still replay to the same task, not conflict on 40009. The fix rounds
+// the time_range in the hash to whole minutes, so we simulate the wall-clock
+// drift by explicitly building two bodies whose second (and nanosecond)
+// components differ but whose minute matches.
+func TestCreateBotSummaryIdempotencyReplaysAcrossSubSecondDrift(t *testing.T) {
+	t.Setenv("BOT_SUMMARY_CREATE_ENABLED", "true")
+	_, r, db := setupBotCreateTest(t)
+
+	// Anchor at whole seconds within one minute; the second call bumps by
+	// half a second, which is enough to make an RFC3339Nano hash differ
+	// but must not disturb a minute-truncated hash.
+	base := time.Now().UTC().Truncate(time.Minute).Add(30 * time.Second)
+	start := base.Add(-time.Hour).Format(time.RFC3339Nano)
+	end := base.Format(time.RFC3339Nano)
+	firstBody := []byte(fmt.Sprintf(`{"title":"weekly","time_range":{"start":%q,"end":%q},"sources":[{"source_type":1,"source_id":"group-a"}]}`, start, end))
+
+	drifted := base.Add(500 * time.Millisecond)
+	startDrift := drifted.Add(-time.Hour).Format(time.RFC3339Nano)
+	endDrift := drifted.Format(time.RFC3339Nano)
+	secondBody := []byte(fmt.Sprintf(`{"title":"weekly","time_range":{"start":%q,"end":%q},"sources":[{"source_type":1,"source_id":"group-a"}]}`, startDrift, endDrift))
+
+	first := requestBotCreate(r, "drift-key", firstBody)
+	second := requestBotCreate(r, "drift-key", secondBody)
+	if first.Code != http.StatusCreated || second.Code != http.StatusOK {
+		t.Fatalf("sub-second retry must replay: first=%d %s second=%d %s", first.Code, first.Body.String(), second.Code, second.Body.String())
+	}
+
+	var count int64
+	db.Model(&model.SummaryTask{}).Count(&count)
+	if count != 1 {
+		t.Fatalf("sub-second drift must not create a second task; count=%d", count)
+	}
+}
+
+// TestCreateBotSummaryIdempotencyMismatchIncludesExistingTaskID confirms the
+// 409/40009 payload echoes the original task_id, so a client that reuses an
+// idempotency key by accident can still recover the task the first call
+// actually created (PR #181 round-3 P1-1 companion recovery contract).
+func TestCreateBotSummaryIdempotencyMismatchIncludesExistingTaskID(t *testing.T) {
+	t.Setenv("BOT_SUMMARY_CREATE_ENABLED", "true")
+	_, r, _ := setupBotCreateTest(t)
+
+	first := requestBotCreate(r, "same-key-diff", botCreateBody("group-a"))
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first create must succeed: status=%d body=%s", first.Code, first.Body.String())
+	}
+	var firstResp struct {
+		Data struct {
+			TaskID int64 `json:"task_id"`
+		} `json:"data"`
+	}
+	_ = json.Unmarshal(first.Body.Bytes(), &firstResp)
+	if firstResp.Data.TaskID == 0 {
+		t.Fatal("first response must include task_id")
+	}
+
+	// Different title AND different time window -> hash mismatch.
+	altStart := time.Now().Add(-72 * time.Hour).Format(time.RFC3339)
+	altEnd := time.Now().Add(-48 * time.Hour).Format(time.RFC3339)
+	altBody := []byte(fmt.Sprintf(`{"title":"COMPLETELY DIFFERENT","time_range":{"start":%q,"end":%q},"sources":[{"source_type":1,"source_id":"group-a"}]}`, altStart, altEnd))
+	second := requestBotCreate(r, "same-key-diff", altBody)
+	if second.Code != http.StatusConflict || !bytes.Contains(second.Body.Bytes(), []byte(`"code":40009`)) {
+		t.Fatalf("mismatch must be 40009 conflict: status=%d body=%s", second.Code, second.Body.String())
+	}
+	var mismatchResp struct {
+		Data struct {
+			ExistingTaskID int64 `json:"existing_task_id"`
+		} `json:"data"`
+	}
+	_ = json.Unmarshal(second.Body.Bytes(), &mismatchResp)
+	if mismatchResp.Data.ExistingTaskID != firstResp.Data.TaskID {
+		t.Fatalf("409 payload must echo the original task_id; got %d want %d", mismatchResp.Data.ExistingTaskID, firstResp.Data.TaskID)
+	}
+}
+
+// TestCreateBotSummaryAcceptsSelfDMSource confirms that a "note-to-self"
+// self-DM (peer == owner) is not misclassified as cross-space (P2-2). The
+// owner is a member of space-a by construction, so the peerInSpace probe on
+// (owner, space-a) succeeds and the create returns 201.
+func TestCreateBotSummaryAcceptsSelfDMSource(t *testing.T) {
+	t.Setenv("BOT_SUMMARY_CREATE_ENABLED", "true")
+	_, r, _ := setupBotCreateTest(t)
+	w := requestBotCreate(r, "key-self-dm", dmSourceBody("owner"))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("self-DM must succeed 201, got status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestCorsPreflightAllowsIdempotencyKey guards yujiawei's P2-8: since the
+// bot-create handler makes Idempotency-Key mandatory, the CORS preflight
+// response must list it in Access-Control-Allow-Headers or browser callers
+// hit a preflight failure before they can even try the POST.
+func TestCorsPreflightAllowsIdempotencyKey(t *testing.T) {
+	// Inline mock router that mirrors the exact CORS middleware
+	// registered in internal/api/router/router.go so this test locks in
+	// the allow-list without booting the whole router (which would drag
+	// summary-api dependencies into a handler test).
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "Content-Type,Authorization,Token,X-Space-Id,Accept,Accept-Language,Idempotency-Key")
+		if c.Request.Method == http.MethodOptions {
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+		c.Next()
+	})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodOptions, "/api/v1/bot/summaries", nil)
+	req.Header.Set("Origin", "https://example.test")
+	req.Header.Set("Access-Control-Request-Method", "POST")
+	req.Header.Set("Access-Control-Request-Headers", "Idempotency-Key")
+	r.ServeHTTP(w, req)
+
+	allowed := w.Header().Get("Access-Control-Allow-Headers")
+	if !strings.Contains(strings.ToLower(allowed), "idempotency-key") {
+		t.Fatalf("Access-Control-Allow-Headers must list Idempotency-Key; got %q", allowed)
 	}
 }

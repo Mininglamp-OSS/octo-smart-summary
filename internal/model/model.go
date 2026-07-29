@@ -172,7 +172,9 @@ type SummaryBotCreateIdempotency struct {
 	// with a different body, the mismatch surfaces as HTTP 409 instead of
 	// silently returning the original task. Mirrors summary_share_snapshot
 	// which established this contract in the same repo. See issue #181 P1-2.
-	RequestHash string    `gorm:"column:request_hash;type:char(64);not null"`
+	// Default '' matches the migration 20260729-01 backfill for pre-existing
+	// rows.
+	RequestHash string    `gorm:"column:request_hash;type:char(64);not null;default:''"`
 	TaskID      int64     `gorm:"column:task_id;not null"`
 	CreatedAt   time.Time `gorm:"column:created_at;not null"`
 }
