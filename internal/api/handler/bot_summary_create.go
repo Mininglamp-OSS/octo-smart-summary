@@ -80,7 +80,7 @@ func canonicalBotCreateRequestHash(req createBotSummaryReq, sources []canonicalB
 		// that recomputes a relative window ("summarize the last hour")
 		// replays cleanly instead of colliding on nanosecond drift. A
 		// genuinely different window (measured in minutes or more) still
-		// mismatches. See yujiawei's PR #181 round-3 review — the previous
+		// mismatches. See PR #181 discussion — the previous
 		// RFC3339Nano formatting turned every network-timeout retry into
 		// a spurious 40009 conflict.
 		TimeRangeStart:  req.TimeRange.Start.UTC().Truncate(time.Minute).Format(time.RFC3339),
@@ -334,29 +334,33 @@ func (h *TaskHandler) resolveAuthorizedBotSources(ctx context.Context, ownerUID,
 			// this check a space-scoped bot token can reach the owner's DMs
 			// with peers outside that space (issue #181 P1-1).
 			if imType == model.ChannelTypeDM {
-				// Prefer the peer already resolved by pipeline.GetUserChannels
-				// (ChannelInfo.PeerUID). Falling back to a local re-parse of
-				// the canonical id is a belt-and-braces path for future
-				// callers that populate ChannelInfo differently — normal
-				// flows should always have PeerUID set here.
-				peer := channel.PeerUID
+				// P1-1 (PR #181): use the owner-anchored
+				// derivation as the authorization primitive. deriveDMPeer
+				// returns "" when neither half of the canonical id is the
+				// owner, which is the only correct behaviour for a channel
+				// the owner is not a party to. channel.PeerUID (populated
+				// by pipeline.getPeerUID, which does NOT re-check that the
+				// remaining half is the owner) is used purely as a
+				// cross-check: any disagreement rejects rather than picks
+				// one.
+				peer := deriveDMPeer(canonicalID, ownerUID)
 				if peer == "" {
-					peer = deriveDMPeer(canonicalID, ownerUID)
-				}
-				// Self-DM ("note to self", peer == owner) is by construction
-				// inside the owner's own space membership set. Probe the
-				// owner's membership directly so we do not misreport 40302
-				// for a resource the owner obviously owns (yujiawei PR #181
-				// round-3 P2-2).
-				if peer == ownerUID {
-					peer = ownerUID
-				} else if peer == "" {
-					// A DM channel id that resolves to no peer at all is
-					// genuinely unparseable — distinct from cross-space.
-					// Reject as unauthorized ("owner does not have access")
-					// rather than 40302 "different space".
+					// Not a DM the owner is a party to — reject as
+					// unauthorized rather than probing a third party.
 					continue
 				}
+				if channel.PeerUID != "" && channel.PeerUID != peer {
+					// Owner-anchored derivation disagrees with the pipeline
+					// value. Refuse to guess which one is correct — this
+					// signals an inconsistency in the canonical id or a
+					// malformed ChannelInfo, either of which is safer to
+					// reject than to authorize.
+					continue
+				}
+				// Self-DM ("note to self", peer == owner) is by construction
+				// inside the owner's own space membership set. The peerInSpace
+				// probe below finds the owner's own row and passes, so no
+				// special-case branch is needed here — see PR #181 P2-4.
 				inSpace, ierr := peerInSpace(ctx, h.imDB, spaceID, peer)
 				if ierr != nil {
 					// Return a static message: apiResponse surfaces
@@ -507,7 +511,7 @@ func (h *TaskHandler) persistBotSummary(ownerUID, botUID, spaceID, key, requestH
 //   - (task, false, true,  nil):  binding found AND hashes match. Replay.
 //   - (task, true,  true,  nil):  binding found but hashes differ. Callers
 //     should answer HTTP 409 and include existing.task_id in the payload so
-//     a mismatched retry is recoverable (yujiawei PR #181 round-3).
+//     a mismatched retry is recoverable (PR #181).
 //   - ({},   false, false, nil):  no binding for this (space, bot, key) tuple.
 //   - ({},   false, false, err):  DB error other than record-not-found. Callers
 //     must fail loudly rather than silently proceeding to insert — mirroring

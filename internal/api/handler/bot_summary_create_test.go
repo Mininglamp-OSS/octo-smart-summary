@@ -53,7 +53,7 @@ func setupBotCreateTest(t *testing.T) (*TaskHandler, *gin.Engine, *gorm.DB) {
 	// Owner has DM conversations with three peers plus a "note to self"
 	// self-DM. peer-in-a shares the token's space; peer-in-b belongs to a
 	// different space entirely; the owner is trivially a member of its own
-	// space so the self-DM must succeed (PR #181 round-3 P2-2). The canonical
+	// space so the self-DM must succeed (PR #181 P2-2). The canonical
 	// DM channel_id layout stores the larger-CRC32 uid first, so we seed with
 	// the raw values pipeline.GetUserChannels would emit and let
 	// NormalizeDMChannelID canonicalize at request time.
@@ -129,7 +129,7 @@ func TestCreateBotSummaryIdempotent(t *testing.T) {
 	// Hoist the body so both requests carry the *same* time_range —
 	// previously each call re-sampled time.Now() and the test passed only
 	// when both requests landed in the same wall-clock second, which is
-	// exactly the flake yujiawei's PR #181 round-3 review caught.
+	// exactly the flake PR #181 review caught.
 	body := botCreateBody("group-a")
 	first := requestBotCreate(r, "stable-key", body)
 	second := requestBotCreate(r, "stable-key", body)
@@ -172,7 +172,7 @@ func dmSourceBody(peerUID string) []byte {
 }
 
 // TestCreateBotSummaryRejectsCrossSpaceDMSource reproduces the failure scenario
-// described in yujiawei's review (issue #181 P1-1): the owner is a member of
+// described in the PR #181 review (issue #181 P1-1): the owner is a member of
 // space-a and has a DM with peer-in-b (a member of space-b only). A bot token
 // scoped to space-a must NOT be allowed to reach that DM, since the token's
 // stated authority is one space. The pre-fix code returned 201 because the DM
@@ -199,7 +199,7 @@ func TestCreateBotSummaryAcceptsInSpaceDMSource(t *testing.T) {
 	}
 }
 
-// TestCreateBotSummaryIdempotencyBodyMismatch reproduces yujiawei's P1-2
+// TestCreateBotSummaryIdempotencyBodyMismatch reproduces the PR #181 P1-2
 // failure scenario: same (space, bot, idempotency_key) tuple used with two
 // different bodies. Pre-fix, the second request returned 200 with the first
 // task's identifiers, silently discarding the new intent. Post-fix, the hash
@@ -268,7 +268,7 @@ func TestCreateBotSummaryIdempotencyHashMatchReplays(t *testing.T) {
 }
 
 // TestCreateBotSummaryIdempotencyReplaysAcrossSubSecondDrift is the direct
-// regression for yujiawei's PR #181 round-3 P1-1: two calls that request the
+// regression for PR #181 P1-1: two calls that request the
 // same relative window but hit the server on either side of a second boundary
 // must still replay to the same task, not conflict on 40009. The fix rounds
 // the time_range in the hash to whole minutes, so we simulate the wall-clock
@@ -307,7 +307,7 @@ func TestCreateBotSummaryIdempotencyReplaysAcrossSubSecondDrift(t *testing.T) {
 // TestCreateBotSummaryIdempotencyMismatchIncludesExistingTaskID confirms the
 // 409/40009 payload echoes the original task_id, so a client that reuses an
 // idempotency key by accident can still recover the task the first call
-// actually created (PR #181 round-3 P1-1 companion recovery contract).
+// actually created (PR #181 P1-1 companion recovery contract).
 func TestCreateBotSummaryIdempotencyMismatchIncludesExistingTaskID(t *testing.T) {
 	t.Setenv("BOT_SUMMARY_CREATE_ENABLED", "true")
 	_, r, _ := setupBotCreateTest(t)
@@ -358,7 +358,7 @@ func TestCreateBotSummaryAcceptsSelfDMSource(t *testing.T) {
 	}
 }
 
-// TestCorsPreflightAllowsIdempotencyKey guards yujiawei's P2-8: since the
+// TestCorsPreflightAllowsIdempotencyKey guards PR #181 P2-8: since the
 // bot-create handler makes Idempotency-Key mandatory, the CORS preflight
 // response must list it in Access-Control-Allow-Headers or browser callers
 // hit a preflight failure before they can even try the POST.
