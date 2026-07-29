@@ -16,7 +16,7 @@ import (
 // 合并上游后统一签名：customTemplateLimit(上游模板) + streamHub(上游 SSE) + agent 原始 LLM 配置
 // (agent chat/summary handler 用) + 变参 llm(上游 refine/personal 用的 *service.LLMClient，
 // 可选，须置于末尾)。
-func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middleware.TokenResolver, botAuthResolver middleware.BotTokenResolver, workerTriggerURL string, candidateQueryLimit int, featureTeamSchedule bool, customTemplateLimit int, streamHub *streaming.Hub, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int, llm ...*service.LLMClient) *gin.Engine {
+func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middleware.TokenResolver, botAuthResolver middleware.BotTokenResolver, workerTriggerURL string, candidateQueryLimit int, featureTeamSchedule bool, customTemplateLimit int, streamHub *streaming.Hub, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int, llmFallbackModels []string, llm ...*service.LLMClient) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
 
@@ -149,7 +149,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	// Agent chat: requires auth. creator_uid is derived from the auth middleware
 	// (not from LLM params); the summary profile injects it into tool handlers for
 	// channel/message-level permission isolation. db backs multi-turn history.
-	agentChatH := handler.NewAgentChatHandler(db, llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
+	agentChatH := handler.NewAgentChatHandler(db, llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens, llmFallbackModels)
 	agentGroup := r.Group("/api/v1/agent")
 	agentGroup.Use(middleware.StrictAuthMiddleware(authResolver), middleware.StrictSpaceMiddleware())
 	{

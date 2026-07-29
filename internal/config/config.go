@@ -33,6 +33,12 @@ type Config struct {
 	LLMApiURL         string
 	LLMApiKey         string
 	LLMModel          string
+	// LLMFallbackModels is an ordered list of model identifiers to try when
+	// the primary LLMModel exhausts its retry budget on a Chat request.
+	// Sourced from LLM_FALLBACK_MODELS as a comma-separated list. Empty by
+	// default (no cross-model fallback), preserving current single-model
+	// behavior. See issue #179.
+	LLMFallbackModels []string
 	LLMTimeout        int
 	LLMMaxToken       int
 	LLMTemperature    float64
@@ -150,6 +156,7 @@ func Load() *Config {
 		LLMApiURL:         envStr("LLM_API_URL", ""),
 		LLMApiKey:         envStr("LLM_API_KEY", ""),
 		LLMModel:          envStr("LLM_MODEL", ""),
+		LLMFallbackModels: envStrList("LLM_FALLBACK_MODELS", nil),
 		LLMTimeout:        envInt("LLM_TIMEOUT", 180),
 		LLMMaxToken:       envInt("LLM_MAX_TOKENS", 4096),
 		LLMTemperature:    getEnvFloat("LLM_TEMPERATURE", 0.3),
@@ -234,6 +241,32 @@ func envStr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envStrList reads a comma-separated environment variable into a slice of
+// trimmed, non-empty strings. Returns def when the variable is unset or
+// contains only whitespace / empty entries.
+//
+// Consumers that treat "no value" and "explicit empty list" the same (which
+// is currently the case for LLM_FALLBACK_MODELS) can rely on this returning
+// def in both cases.
+func envStrList(key string, def []string) []string {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return def
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return def
+	}
+	return out
 }
 
 func envInt(key string, def int) int {
