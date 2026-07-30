@@ -24,7 +24,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	r.Use(func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type,Authorization,Token,X-Space-Id,Accept,Accept-Language")
+		c.Header("Access-Control-Allow-Headers", "Content-Type,Authorization,Token,X-Space-Id,Accept,Accept-Language,Idempotency-Key")
 		if c.Request.Method == http.MethodOptions {
 			c.AbortWithStatus(http.StatusNoContent)
 			return
@@ -54,14 +54,16 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	streamH := handler.NewStreamHandler(db, streamHub)
 	shareH := handler.NewShareHandler(db, imDB)
 
-	// Bot-facing read-only mount. Identity and space both come from verify-bot;
-	// this group deliberately does not use the human-token or space middleware.
+	// Bot-facing mount (read plus owner-scoped create). Identity and space both come from
+	// verify-bot; this group deliberately does not use the human-token or space middleware.
+	// The POST route additionally requires BOT_SUMMARY_CREATE_ENABLED=1 at request time.
 	botV1 := r.Group("/api/v1/bot")
 	botV1.Use(middleware.StrictBotAuthMiddleware(botAuthResolver))
 	{
 		botV1.GET("/summaries", taskH.ListSummaries)
 		botV1.GET("/summaries/:id", taskH.GetSummary)
 		botV1.GET("/summaries/:id/result", taskH.GetResult)
+		botV1.POST("/summaries", taskH.CreateBotSummary)
 	}
 
 	v1 := r.Group("/api/v1")

@@ -75,6 +75,9 @@ const (
 	// and content is filled synchronously from the agent's produced deliverable;
 	// no worker dispatch is triggered.
 	TriggerAgent = 3
+	// TriggerBot marks a traditional asynchronous summary created by a
+	// personal bot acting with its human owner's permissions.
+	TriggerBot = 4
 )
 
 // Scheduled multi-participant confirm policy constants (summary_schedule.confirm_policy).
@@ -127,6 +130,7 @@ type SummaryTask struct {
 	TaskNo             string     `gorm:"column:task_no;type:varchar(32);uniqueIndex:uk_task_no;not null" json:"task_no"`
 	SpaceID            string     `gorm:"column:space_id;type:varchar(64);not null;default:''" json:"space_id"`
 	CreatorID          string     `gorm:"column:creator_id;type:varchar(64);not null" json:"creator_id"`
+	CreatorBotID       string     `gorm:"column:creator_bot_id;type:varchar(64);not null;default:'';index:idx_summary_task_creator_bot_id" json:"creator_bot_id,omitempty"`
 	Title              string     `gorm:"column:title;type:varchar(2300);not null;default:''" json:"title"`
 	Topic              string     `gorm:"column:topic;type:varchar(2300);not null;default:''" json:"topic"`
 	SummaryMode        int        `gorm:"column:summary_mode;type:tinyint;not null" json:"summary_mode"`
@@ -153,6 +157,29 @@ type SummaryTask struct {
 	// summaries as reference material via the chat UI.
 	ReferencedTaskIDs *string `gorm:"column:referenced_task_ids;type:text" json:"-"`
 }
+
+// SummaryBotCreateIdempotency binds one bot request key to the task created
+// for it. The composite unique index is the concurrency authority: duplicate
+// requests must return the original task without dispatching another worker.
+type SummaryBotCreateIdempotency struct {
+	ID             int64  `gorm:"primaryKey;autoIncrement"`
+	SpaceID        string `gorm:"column:space_id;type:varchar(64);not null;uniqueIndex:uk_bot_summary_idempotency"`
+	BotID          string `gorm:"column:bot_id;type:varchar(64);not null;uniqueIndex:uk_bot_summary_idempotency"`
+	IdempotencyKey string `gorm:"column:idempotency_key;type:varchar(128);not null;uniqueIndex:uk_bot_summary_idempotency"`
+	// RequestHash is a sha256 fingerprint of the create request payload
+	// (title, topic, time range, sources, origin channel, include_archived).
+	// When a client reuses the same (space_id, bot_id, idempotency_key) tuple
+	// with a different body, the mismatch surfaces as HTTP 409 instead of
+	// silently returning the original task. Mirrors summary_share_snapshot
+	// which established this contract in the same repo. See issue #181 P1-2.
+	// Default '' matches the migration 20260729-01 backfill for pre-existing
+	// rows.
+	RequestHash string    `gorm:"column:request_hash;type:char(64);not null;default:''"`
+	TaskID      int64     `gorm:"column:task_id;not null"`
+	CreatedAt   time.Time `gorm:"column:created_at;not null"`
+}
+
+func (SummaryBotCreateIdempotency) TableName() string { return "summary_bot_create_idempotency" }
 
 // EffectiveTopic keeps existing tasks compatible while new tasks persist the
 // complete summary instruction separately from the display title.
