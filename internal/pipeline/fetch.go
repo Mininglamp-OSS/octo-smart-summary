@@ -254,11 +254,13 @@ func getPeerUID(channelID, selfUID string) string {
 	return parts[0]
 }
 
-// NormalizeDMChannelID converts a logical DM channel id (peerUID or peer@self)
-// into the WuKongIM storage format: the UID with the larger CRC32 hash comes first.
-// For non-DM channels (channelType != 1), returns input unchanged.
+// NormalizeDMChannelID canonicalises the WuKongIM DM channel_id ("uid_a@uid_b")
+// into the WuKongIM storage format: the UID with the larger CRC32 hash comes
+// first. For non-DM channels (channelType != model.ChannelTypeDM), returns
+// input unchanged. The channel id may be logical (peerUID or peer@self) on
+// input.
 func NormalizeDMChannelID(channelID string, selfUID string, channelType int) string {
-	if channelType != 1 {
+	if channelType != model.ChannelTypeDM {
 		return channelID
 	}
 	var a, b string
@@ -275,16 +277,20 @@ func NormalizeDMChannelID(channelID string, selfUID string, channelType int) str
 	return b + "@" + a
 }
 
-// mapFrontendSourceType maps frontend source_type to backend channelType.
-// Frontend: 1=group, 3=DM; Backend IM server: 1=DM, 2=group
+// mapFrontendSourceType maps smart-summary's frontend source_type
+// (see model.SourceGroup / SourceThread / SourceDirect) to octo-server's
+// WuKongIM channel_type (see model.ChannelTypeDM / ChannelTypeGroup /
+// ChannelTypeThread). The two enums intentionally use different numbers
+// — see the discussion in each const block in model/model.go and the
+// PR that introduced these constants (#181).
 func mapFrontendSourceType(frontendType int) int {
 	switch frontendType {
-	case 1: // frontend group -> backend group
-		return 2
-	case 2: // frontend thread -> backend thread
-		return 5
-	case 3: // frontend DM -> backend DM
-		return 1
+	case model.SourceGroup:
+		return model.ChannelTypeGroup
+	case model.SourceThread:
+		return model.ChannelTypeThread
+	case model.SourceDirect:
+		return model.ChannelTypeDM
 	default:
 		return frontendType
 	}
@@ -303,14 +309,14 @@ func sourceType(s map[string]interface{}) int {
 }
 
 // selectedThreadChannelIDs returns the channel ids of explicitly-selected thread
-// sources (frontend source_type=2). These scope the archived-thread relaxation in
-// GetUserChannels so that only threads the user actually picked can be archived;
-// auto/background summaries (no explicit sources) get an empty slice and never
-// surface archived threads.
+// sources (frontend source_type == model.SourceThread). These scope the
+// archived-thread relaxation in GetUserChannels so that only threads the user
+// actually picked can be archived; auto/background summaries (no explicit
+// sources) get an empty slice and never surface archived threads.
 func selectedThreadChannelIDs(specifiedSources []map[string]interface{}) []string {
 	var ids []string
 	for _, s := range specifiedSources {
-		if mapFrontendSourceType(sourceType(s)) != 5 {
+		if mapFrontendSourceType(sourceType(s)) != model.ChannelTypeThread {
 			continue
 		}
 		if id, ok := s["source_id"].(string); ok && id != "" {
