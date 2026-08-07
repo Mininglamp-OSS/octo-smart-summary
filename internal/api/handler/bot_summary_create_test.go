@@ -94,6 +94,37 @@ func requestBotCreate(r *gin.Engine, key string, body []byte) *httptest.Response
 	return w
 }
 
+func TestCreateBotSummaryResponseIncludesBotIdentity(t *testing.T) {
+	t.Setenv("BOT_SUMMARY_CREATE_ENABLED", "true")
+	_, r, _ := setupBotCreateTest(t)
+	w := requestBotCreate(r, "botname-key", botCreateBody("group-a"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Data struct {
+			TriggerType    int    `json:"trigger_type"`
+			CreatorID      string `json:"creator_id"`
+			CreatorBotID   string `json:"creator_bot_id"`
+			CreatorBotName string `json:"creator_bot_name"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, w.Body.String())
+	}
+	// Bot-created summaries must expose the acting bot so the frontend can mark
+	// the card as "由 <bot> 创建".
+	if resp.Data.CreatorBotID != "bot-1" {
+		t.Fatalf("creator_bot_id=%q, want bot-1", resp.Data.CreatorBotID)
+	}
+	if resp.Data.CreatorBotName == "" {
+		t.Fatalf("creator_bot_name is empty; want resolved bot name")
+	}
+	if resp.Data.CreatorID != "owner" {
+		t.Fatalf("creator_id=%q, want owner (the human on whose behalf the bot acts)", resp.Data.CreatorID)
+	}
+}
+
 func TestCreateBotSummaryFeatureDisabled(t *testing.T) {
 	t.Setenv("BOT_SUMMARY_CREATE_ENABLED", "false")
 	_, r, _ := setupBotCreateTest(t)
