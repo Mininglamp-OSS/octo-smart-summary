@@ -149,6 +149,13 @@ func (p *Processor) notifyTaskTerminal(taskID int64, status int) {
 		errMsg = *task.ErrorMessage
 	}
 	p.notifier.OnTaskTerminal(task, status, errMsg)
+	// #289 server-driven group tip (successor of the abandoned web-only #1234).
+	// OnGroupTip is scope-guarded: it no-ops for Failed / by-person / non-group-
+	// source tasks, so we can call it unconditionally here on any terminal.
+	// Reusing the summary_notification state machine with kind=group_tip means
+	// each (task, group) is delivered at most once even if this terminal fires
+	// multiple times.
+	p.notifier.OnGroupTip(task)
 }
 
 // TriggerCh returns the channel for worker trigger requests.

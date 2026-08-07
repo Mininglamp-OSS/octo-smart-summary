@@ -8,6 +8,12 @@ import "time"
 const (
 	NotifyKindCompleted = "completed"
 	NotifyKindFailed    = "failed"
+	// NotifyKindGroupTip is the passive grey system tip fanned out to every
+	// group source of a Completed non-by-person task. Server-driven successor
+	// of the abandoned web-only #1234 attempt (see #289). Distinct kind so
+	// its per-(task, kind, source_channel_id) dedup row does not collide with
+	// the creator-DM Completed notification.
+	NotifyKindGroupTip = "group_tip"
 )
 
 // Notification status constants (summary_notification.status).

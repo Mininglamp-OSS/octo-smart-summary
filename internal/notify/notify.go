@@ -197,6 +197,130 @@ func kindForStatus(status int) (string, bool) {
 	}
 }
 
+// OnGroupTip fans out a passive "{creator} 总结了群聊内容" system tip to every
+// group source of a completed non-by-person task. Server-driven successor of
+// the abandoned web-only #1234 attempt — server is now the authoritative
+// exactly-once source for the tip.
+//
+// Scope guards (each an early return, all defensive):
+//   - only Status == Completed (Failed / Cancelled / mid-flight never emit).
+//   - only NON-by-person tasks (by-person's fan-out already goes to
+//     participants via personal DMs; layering a group tip on top is out of
+//     scope for #289).
+//   - only sources with SourceType == SourceGroup (SourceThread / SourceDirect
+//     never receive this tip).
+//   - only tasks with a Creator (empty creator → nothing to render).
+//
+// Idempotency: reuses the summary_notification state machine with
+// notify_kind = NotifyKindGroupTip and recipient_uid = source.ChannelID (the
+// GROUP channel_id), so retries and multiple triggers of the same completion
+// converge on one row per (task, group).
+func (n *Notifier) OnGroupTip(task model.SummaryTask) {
+	if n == nil || !n.cfg.Enabled || n.deliverer == nil || n.db == nil {
+		return
+	}
+	if task.Status != model.StatusCompleted {
+		return
+	}
+	if task.SummaryMode == model.ModeByPerson {
+		// By-person tasks fan out to participants individually — the group
+		// tip is orthogonal to that flow. Keeping this scope guard explicit
+		// so a future by-person change doesn't accidentally start double-
+		// broadcasting.
+		return
+	}
+	if task.CreatorID == "" {
+		return
+	}
+
+	// Resolve group sources. A source resolution error is not fatal — we log
+	// and skip; on the next trigger/sweep the resolution runs again.
+	var sources []model.SummarySource
+	if err := n.db.Where("task_id = ? AND source_type = ?", task.ID, model.SourceGroup).
+		Find(&sources).Error; err != nil {
+		log.Printf("[notify] task=%d kind=%s: resolve group sources failed: %v",
+			task.ID, model.NotifyKindGroupTip, err)
+		return
+	}
+	if len(sources) == 0 {
+		return
+	}
+
+	// Each group source runs the claim/deliver/mark state machine on its own
+	// (task, kind, source_channel_id) row so one group's delivery failure
+	// never blocks the others (matches OnTaskTerminal's fan-out semantics).
+	for _, src := range sources {
+		target := deliveryTarget{
+			ChannelID:   src.SourceID,
+			ChannelType: WireChannelGroup,
+			// TargetUID intentionally empty for group回发: no EnsureFriend
+			// is needed and octo-server does not build a whitelist DM channel
+			// for a group destination.
+			SpaceID: task.SpaceID,
+		}
+		n.deliverGroupTipToSource(task, target, src)
+	}
+}
+
+// deliverGroupTipToSource runs the per-source claim/deliver/mark state machine
+// for one group source. Extracted so OnGroupTip's loop stays flat and each
+// source's failure isolates from the others.
+func (n *Notifier) deliverGroupTipToSource(task model.SummaryTask, target deliveryTarget, src model.SummarySource) {
+	kind := model.NotifyKindGroupTip
+	uid := src.SourceID // recipient_uid slot repurposed for the group channel id
+
+	claimed, _, err := n.claim(task.ID, kind, uid)
+	if err != nil {
+		log.Printf("[notify] task=%d kind=%s group=%s: claim failed: %v", task.ID, kind, uid, err)
+		return
+	}
+	if !claimed {
+		// Already delivered / in-flight / attempts exhausted — dedup row
+		// carries the terminal state.
+		return
+	}
+
+	if err := n.deliverGroupTip(task, target, src); err != nil {
+		n.markFailed(task.ID, kind, uid, err)
+		log.Printf("[notify] task=%d kind=%s group=%s: delivery failed: %v",
+			task.ID, kind, uid, sanitize(err.Error()))
+		return
+	}
+	n.markSent(task.ID, kind, uid)
+	log.Printf("[notify] task=%d kind=%s group=%s: delivered", task.ID, kind, uid)
+}
+
+// deliverGroupTip posts the SummaryNotifyContent (contentType=21) system tip
+// to one group channel. It intentionally does NOT reuse `deliver` because:
+//   - group delivery skips EnsureFriend (no per-user relationship needed).
+//   - the payload is not a card but a raw content-type-21 system message
+//     whose renderer lives in octo-web packages/dmworkbase/Messages/SummaryNotify.
+func (n *Notifier) deliverGroupTip(task model.SummaryTask, target deliveryTarget, src model.SummarySource) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	payload := map[string]any{
+		// content_type=21 mirrors packages/dmworkbase/src/Service/Const.ts
+		// (MessageContentTypeConst.summaryNotify) and is decoded by the
+		// SummaryNotifyContent class in the web/mobile renderer PR.
+		"content_type": 21,
+		"from_uid":     task.CreatorID,
+		"task_id":      task.ID,
+		"task_no":      task.TaskNo,
+		"source_id":    src.SourceID,
+	}
+
+	msg := SendMessageRequest{
+		ChannelID:   target.ChannelID,
+		ChannelType: target.ChannelType,
+		Payload:     payload,
+	}
+	if err := n.deliverer.SendMessage(ctx, target.SpaceID, msg); err != nil {
+		return fmt.Errorf("sendMessage: %w", err)
+	}
+	return nil
+}
+
 // claim attempts the preemptive INSERT. Returns claimed=true when this run won
 // the (task, kind) slot. When the row already exists, claimed=false and the
 // existing row is returned so the caller can decide whether retry budget remains.
