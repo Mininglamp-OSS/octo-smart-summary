@@ -495,8 +495,19 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		return
 	}
 
-	if utf8.RuneCountInString(req.Title) > maxSummaryTopicRunes {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 2300 字符"})
+	// SUM-BE1: gate the schedule-create path through the shared validator so
+	// the title cap and (via TargetScheduledWorkflow) the schedule-payload
+	// presence check run in the same place personal/team/agent paths use.
+	// The deep schedule-shape checks (ValidateIntervalForWrite / ValidateRunTime
+	// / ValidateScheduleAnchors) still run below unchanged — the shared
+	// validator only widens the top of the funnel.
+	if bizE := service.ValidateSnapshotScope(userID, service.SnapshotScopeInput{
+		Title:        req.Title,
+		Sources:      snapshotSourcesFromReq(req.Sources),
+		Participants: snapshotParticipantsFromReq(req.Participants),
+		Schedule:     snapshotScheduleFromReq(req),
+	}, service.TargetScheduledWorkflow); bizE != nil {
+		bizErr(c, bizE)
 		return
 	}
 	generationInstruction, err := normalizeScheduleGenerationInstruction(req.GenerationInstruction)

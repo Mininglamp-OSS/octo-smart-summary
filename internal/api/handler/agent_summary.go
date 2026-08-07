@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/http"
 	"sort"
-	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
@@ -277,10 +276,13 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		}
 	}
 
-	if utf8.RuneCountInString(req.Title) > maxSummaryTopicRunes {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 2300 字符"})
-		return
-	}
+	// SUM-BE1: the agent_save-target validator runs a few lines below,
+	// AFTER loadLatestAssistantContent + stripAgentPreamble have resolved
+	// the server-trusted deliverable — that way ContentLen is measured on
+	// the real content the DB will persist, not a request-supplied number
+	// the client could lie about. Running the validator here instead would
+	// force a placeholder ContentLen, which the review comment on SUM-3
+	// specifically flagged as a bypass risk.
 
 	// --- pull the agent's produced deliverable content from agent_message ---
 	// Contract: use the latest role=assistant message on this session as the
@@ -311,6 +313,29 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		log.Printf("[handler] CreateAgentSummary session %s: stripped %d chars of preamble", req.SessionID, len(content)-len(stripped))
 	}
 	content = stripped
+
+	// SUM-BE1: real agent_save gate. Run the shared validator with the
+	// server-trusted content length (post-strip) so a caller can never
+	// bypass the "empty content" check by lying about the payload, and
+	// so a future preview API can call the same validator without
+	// re-implementing the shape rules. Note: an empty content case is
+	// already rejected upstream via errNoAgentOutput -> 40004, so under
+	// normal flow this call is defense-in-depth; it becomes load-bearing
+	// the moment stripAgentPreamble reduces content to empty (an
+	// all-preamble reply), which would otherwise silently save an
+	// empty deliverable.
+	if bizE := service.ValidateSnapshotScope(userID, service.SnapshotScopeInput{
+		Title:             req.Title,
+		OriginChannelID:   finalChannelID,
+		OriginChannelType: finalChannelType,
+		AgentSave: &service.AgentSaveInput{
+			SessionID:  req.SessionID,
+			ContentLen: len(content),
+		},
+	}, service.TargetAgentSave); bizE != nil {
+		bizErr(c, bizE)
+		return
+	}
 
 	// --- title fallback: caller may skip, we generate the same way the
 	// traditional endpoint does so the two look identical in list views. ---
