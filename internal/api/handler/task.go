@@ -347,23 +347,34 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		timeStart = timeEnd.Add(-time.Duration(maxDays) * 24 * time.Hour)
 	}
 
-	// SUM-BE1: replace the previously inline title / topic / origin-channel /
-	// time-range / source-count / scope-signal checks with the shared
-	// service.ValidateSnapshotScope so scheduled / agent-generation /
-	// agent-save paths in the same PR series reuse the same gate.
-	scopeInput := service.SnapshotScopeInput{
-		Title:             req.Title,
-		Topic:             req.Topic,
-		Sources:           snapshotSourcesFromReq(req.Sources),
-		Participants:      snapshotParticipantsFromReq(req.Participants),
-		OriginChannelID:   req.OriginChannelID,
-		OriginChannelType: req.OriginChannelType,
+	// SUM-BE1 (revised per SUM-9): call the shared validator with the ACTUAL
+	// model.SnapshotScope the pipeline downstream will use. ChannelIDs come
+	// from req.Sources (post-origin-channel autofill above); TimeRange
+	// carries the caller-supplied range (only when explicit, so the default
+	// server-computed range still passes untouched). No parallel DTO — the
+	// shared model.SnapshotScope is the validation input.
+	scope := model.SnapshotScope{
+		ChannelIDs: channelIDsFromSources(req.Sources),
 	}
 	if explicitTimeRange {
-		scopeInput.TimeStart = timeStart
-		scopeInput.TimeEnd = timeEnd
+		scope.TimeRange = model.TimeRangeJSON{
+			Start: timeStart.Format(time.RFC3339),
+			End:   timeEnd.Format(time.RFC3339),
+		}
 	}
-	if bizE := service.ValidateSnapshotScope(effectiveUID, scopeInput, service.TargetPersonalWorkflow); bizE != nil {
+	var validatorStart, validatorEnd time.Time
+	if explicitTimeRange {
+		validatorStart, validatorEnd = timeStart, timeEnd
+	}
+	if bizE := service.ValidatePersonalWorkflow(
+		effectiveUID,
+		req.Title, req.Topic,
+		scope,
+		len(req.Sources),
+		req.OriginChannelID, req.OriginChannelType,
+		validatorStart, validatorEnd,
+		maxDays,
+	); bizE != nil {
 		bizErr(c, bizE)
 		return
 	}

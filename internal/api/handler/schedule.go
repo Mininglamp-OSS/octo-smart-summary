@@ -495,18 +495,19 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		return
 	}
 
-	// SUM-BE1: gate the schedule-create path through the shared validator so
-	// the title cap and (via TargetScheduledWorkflow) the schedule-payload
-	// presence check run in the same place personal/team/agent paths use.
-	// The deep schedule-shape checks (ValidateIntervalForWrite / ValidateRunTime
-	// / ValidateScheduleAnchors) still run below unchanged — the shared
-	// validator only widens the top of the funnel.
-	if bizE := service.ValidateSnapshotScope(userID, service.SnapshotScopeInput{
-		Title:        req.Title,
-		Sources:      snapshotSourcesFromReq(req.Sources),
-		Participants: snapshotParticipantsFromReq(req.Participants),
-		Schedule:     snapshotScheduleFromReq(req),
-	}, service.TargetScheduledWorkflow); bizE != nil {
+	// SUM-BE1 (revised per SUM-9): call the shared validator with the ACTUAL
+	// model.SnapshotScope + the recurrence primitives the deep schedule
+	// checks below consume. No parallel DTO. Deep recurrence / anchor /
+	// run-time / day-of-week / day-of-month / time-range-type checks still
+	// run below via service.ValidateInterval* etc. — the shared validator
+	// only widens the top of the funnel with actor + title cap + "at least
+	// one of cron_expr / interval_days / interval_months" presence.
+	if bizE := service.ValidateScheduledWorkflow(
+		userID,
+		req.Title,
+		scheduleScopeFromReq(req),
+		req.CronExpr, req.IntervalDays, req.IntervalMonths,
+	); bizE != nil {
 		bizErr(c, bizE)
 		return
 	}

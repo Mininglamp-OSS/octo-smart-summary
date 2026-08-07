@@ -1,66 +1,48 @@
 package handler
 
-// snapshot_scope_input.go — SUM-BE1 helper glue.
+// snapshot_scope_input.go — SUM-BE1 helper: build the shared
+// model.SnapshotScope used by service.ValidatePersonalWorkflow /
+// ValidateScheduledWorkflow from the handler request structs.
 //
-// The shared service.ValidateSnapshotScope validator takes its own
-// SourceInput / ParticipantInput / ScheduleInput types so it can live in
-// internal/service/ without a cycle back into internal/api/handler/. This
-// file provides the tiny converters + one init() that wires the runtime
-// pipeline.DefaultTimeRangeDays global into the validator's getter, so a
-// single boot-time change to DEFAULT_TIME_RANGE_DAYS still bounds new
-// summaries the same way the old inline check did.
+// Revised per SUM-9: the previous parallel SnapshotScopeInput /
+// SourceInput / ParticipantInput / ScheduleInput mirror types are gone.
+// The shared validator now consumes model.SnapshotScope directly, so this
+// file only has the small extractor that turns []sourceReq into
+// []string channel IDs for the scope. Everything else the validator
+// needs (title, topic, source count, origin channel, time range,
+// participant count, schedule recurrence primitives) is passed as
+// plain arguments; no converter layer.
 
 import (
-	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
-	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 )
 
-func init() {
-	// Wire the pipeline runtime global into the shared validator so a
-	// config-driven DEFAULT_TIME_RANGE_DAYS change is honoured on every
-	// request without either package importing the other for a value.
-	service.SetTimeRangeMaxDaysGetter(func() int { return pipeline.DefaultTimeRangeDays })
-}
-
-// snapshotSourcesFromReq converts the handler-side sourceReq slice into the
-// validator's SourceInput slice. Nil in -> nil out so the validator's empty
-// / count-cap checks stay literal.
-func snapshotSourcesFromReq(in []sourceReq) []service.SourceInput {
+// channelIDsFromSources projects a slice of sourceReq into the channel_ids
+// slice model.SnapshotScope carries. Empty input -> nil (matches the shape
+// SnapshotScope stores when no sources were supplied).
+func channelIDsFromSources(in []sourceReq) []string {
 	if len(in) == 0 {
 		return nil
 	}
-	out := make([]service.SourceInput, len(in))
-	for i, s := range in {
-		out[i] = service.SourceInput{SourceType: s.SourceType, SourceID: s.SourceID}
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s.SourceID != "" {
+			out = append(out, s.SourceID)
+		}
 	}
 	return out
 }
 
-// snapshotParticipantsFromReq mirrors snapshotSourcesFromReq for participants.
-// Empty in -> nil out so validators keying off len(...) == 0 continue to
-// behave as they did on the pre-refactor req.Participants slice.
-func snapshotParticipantsFromReq(in []participantReq) []service.ParticipantInput {
-	if len(in) == 0 {
-		return nil
+// scheduleScopeFromReq builds the shared model.SnapshotScope for a schedule
+// create request. Schedule requests carry sources but no explicit time_range
+// on the wire (time range is derived from time_range_type at run time), so
+// the scope carries ChannelIDs only and leaves TimeRange zero-valued.
+func scheduleScopeFromReq(req createScheduleReq) model.SnapshotScope {
+	return model.SnapshotScope{
+		ChannelIDs: channelIDsFromSources(req.Sources),
 	}
-	out := make([]service.ParticipantInput, len(in))
-	for i, p := range in {
-		out[i] = service.ParticipantInput{UserID: p.UserID, UserName: p.UserName}
-	}
-	return out
 }
 
-// snapshotScheduleFromReq converts createScheduleReq's schedule fields into
-// the validator's ScheduleInput. It never nil-returns because the CreateSchedule
-// handler always has a full schedule shape at hand.
-func snapshotScheduleFromReq(req createScheduleReq) *service.ScheduleInput {
-	return &service.ScheduleInput{
-		CronExpr:       req.CronExpr,
-		IntervalDays:   req.IntervalDays,
-		IntervalMonths: req.IntervalMonths,
-		RunTime:        req.RunTime,
-		DayOfWeek:      req.DayOfWeek,
-		DayOfMonth:     req.DayOfMonth,
-		TimeRangeType:  req.TimeRangeType,
-	}
-}
+// Explicit references so build tools do not flag helpers as unused when only
+// one call site is active in a given build tag configuration.
+var _ = model.SnapshotScope{}

@@ -314,25 +314,27 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	}
 	content = stripped
 
-	// SUM-BE1: real agent_save gate. Run the shared validator with the
-	// server-trusted content length (post-strip) so a caller can never
-	// bypass the "empty content" check by lying about the payload, and
-	// so a future preview API can call the same validator without
-	// re-implementing the shape rules. Note: an empty content case is
-	// already rejected upstream via errNoAgentOutput -> 40004, so under
-	// normal flow this call is defense-in-depth; it becomes load-bearing
-	// the moment stripAgentPreamble reduces content to empty (an
-	// all-preamble reply), which would otherwise silently save an
-	// empty deliverable.
-	if bizE := service.ValidateSnapshotScope(userID, service.SnapshotScopeInput{
-		Title:             req.Title,
-		OriginChannelID:   finalChannelID,
-		OriginChannelType: finalChannelType,
-		AgentSave: &service.AgentSaveInput{
-			SessionID:  req.SessionID,
-			ContentLen: len(content),
-		},
-	}, service.TargetAgentSave); bizE != nil {
+	// SUM-BE1 (revised per SUM-9): real agent_save gate. Run the shared
+	// validator with the server-trusted content (post-strip) so a caller
+	// can never bypass the "empty content" check by lying about the
+	// payload. Defense-in-depth normally — becomes load-bearing the moment
+	// stripAgentPreamble reduces content to empty (an all-preamble reply),
+	// which would otherwise silently save an empty deliverable.
+	//
+	// Note on parameters: message ownership / role / session identity are
+	// already enforced by loadLatestAssistantContent's WHERE clause
+	// (user_id + session_id + role='assistant'), so this call does not
+	// re-declare those. Snapshot-version and message-id enforcement remain
+	// BE-2 scope (they require new storage-side reads BE-1 does not add);
+	// keeping them as declared-but-ignored parameters here would be the
+	// exact shell coverage SUM-9 rejected.
+	if bizE := service.ValidateAgentSave(
+		userID,
+		req.Title,
+		req.SessionID,
+		content,
+		finalChannelID, finalChannelType,
+	); bizE != nil {
 		bizErr(c, bizE)
 		return
 	}

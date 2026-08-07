@@ -1,13 +1,12 @@
 package service
 
-// snapshot_validator_test.go — SUM-BE1 shared validator regression tests.
-//
-// These tests intentionally do NOT touch gorm / gin / any DB. They exercise
-// service.ValidateSnapshotScope directly so every target-specific gate and
-// every base check has a first-class assertion that survives future
-// refactors. CGO-backed SQLite integration tests (see
-// internal/api/handler/task_limit_test.go) continue to cover the end-to-end
-// HTTP shape.
+// snapshot_validator_test.go — SUM-BE1 shared validator tests (revised per
+// SUM-9). These tests exercise each of the three exported entry points
+// (ValidatePersonalWorkflow / ValidateScheduledWorkflow / ValidateAgentSave)
+// directly, with no gorm / gin / DB coupling. handler-level regression tests
+// that exercise Schedule field preservation across create + patch live in
+// internal/api/handler/schedule_scope_preservation_test.go (CGO-gated,
+// matching every other handler test in this repo).
 
 import (
 	"strings"
@@ -17,98 +16,126 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 )
 
-// resetValidatorGlobals restores the package-level tunables the tests touch.
-// t.Cleanup keeps the test's state changes local so no ordering coupling
-// leaks between tests.
-func resetValidatorGlobals(t *testing.T) {
-	t.Helper()
-	prevLimits := scopeLimits
-	prevGetter := timeRangeMaxDaysGetter
-	t.Cleanup(func() {
-		scopeLimits = prevLimits
-		timeRangeMaxDaysGetter = prevGetter
-	})
-}
+// ------------------------------ actor gate ------------------------------
 
-// TestValidateSnapshotScope_UnknownTarget verifies that a caller passing a
-// misspelled target gets a graceful 40000 rather than a panic. This is the
-// only branch that returns 40000 for a non-shape reason so it is worth an
-// explicit assertion.
-func TestValidateSnapshotScope_UnknownTarget(t *testing.T) {
-	resetValidatorGlobals(t)
-	err := ValidateSnapshotScope("user1", SnapshotScopeInput{Topic: "x"}, ScopeValidationTarget("nope"))
-	if err == nil {
-		t.Fatalf("expected error for unknown target, got nil")
-	}
-	if err.Code != 40000 {
-		t.Errorf("unknown target: expected 40000, got %d (%s)", err.Code, err.Message)
+func TestValidatePersonalWorkflow_ActorRequired(t *testing.T) {
+	err := ValidatePersonalWorkflow(
+		"", "title", "topic",
+		model.SnapshotScope{ChannelIDs: []string{"grp1"}},
+		1,
+		"", 0,
+		time.Time{}, time.Time{},
+		31,
+	)
+	if err == nil || err.Code != 40100 || err.HTTPStatus != 401 {
+		t.Fatalf("expected 40100/401 for empty actor, got %v", err)
 	}
 }
 
-// TestValidateSnapshotScope_BaseChecks_ApplyToEveryTarget covers the base
-// gates (title/topic rune caps, origin-channel coupling, source count) with
-// one representative target each so the base branches never regress.
-func TestValidateSnapshotScope_BaseChecks_ApplyToEveryTarget(t *testing.T) {
-	resetValidatorGlobals(t)
+func TestValidateScheduledWorkflow_ActorRequired(t *testing.T) {
+	err := ValidateScheduledWorkflow(
+		"", "daily",
+		model.SnapshotScope{},
+		"", 1, 0,
+	)
+	if err == nil || err.Code != 40100 {
+		t.Fatalf("expected 40100 for empty actor on schedule, got %v", err)
+	}
+}
 
-	tooLong := strings.Repeat("总", 2301)
+func TestValidateAgentSave_ActorRequired(t *testing.T) {
+	err := ValidateAgentSave("", "title", "sess1", "hi", "", 0)
+	if err == nil || err.Code != 40100 {
+		t.Fatalf("expected 40100 for empty actor on agent_save, got %v", err)
+	}
+}
+
+// ------------------------------ base checks -----------------------------
+
+func TestValidatePersonalWorkflow_BaseChecks(t *testing.T) {
+	tooLong := strings.Repeat("总", MaxSummaryTitleRunes+1)
 
 	tests := []struct {
 		name     string
-		input    SnapshotScopeInput
-		target   ScopeValidationTarget
+		title    string
+		topic    string
+		scope    model.SnapshotScope
+		srcCount int
+		origID   string
+		origType int
+		start    time.Time
+		end      time.Time
+		maxDays  int
 		wantCode int
 		wantMsg  string
 	}{
 		{
-			name:     "title over 2300 runes rejected",
-			input:    SnapshotScopeInput{Title: tooLong, Topic: "x"},
-			target:   TargetPersonalWorkflow,
-			wantCode: 40001,
-			wantMsg:  "title 不能超过 2300 字符",
+			name:  "title over 2300 runes rejected",
+			title: tooLong, topic: "x",
+			scope:    model.SnapshotScope{},
+			maxDays:  31,
+			wantCode: 40001, wantMsg: "title 不能超过 2300 字符",
 		},
 		{
-			name:     "topic over 2300 runes rejected",
-			input:    SnapshotScopeInput{Topic: tooLong},
-			target:   TargetPersonalWorkflow,
-			wantCode: 40001,
-			wantMsg:  "topic 不能超过 2300 字符",
+			name:  "topic over 2300 runes rejected",
+			title: "t", topic: tooLong,
+			scope:    model.SnapshotScope{},
+			maxDays:  31,
+			wantCode: 40001, wantMsg: "topic 不能超过 2300 字符",
 		},
 		{
-			name: "origin_channel_id set but type out of range",
-			input: SnapshotScopeInput{
-				Topic:             "x",
-				OriginChannelID:   "grp1",
-				OriginChannelType: 99,
-			},
-			target:   TargetPersonalWorkflow,
-			wantCode: 40001,
-			wantMsg:  "origin_channel_type must be 1, 2, or 3 when origin_channel_id is set",
+			name:  "origin_channel_id set but type out of range",
+			title: "t", topic: "x",
+			scope:  model.SnapshotScope{},
+			origID: "grp1", origType: 99,
+			maxDays:  31,
+			wantCode: 40001, wantMsg: "origin_channel_type must be 1, 2, or 3 when origin_channel_id is set",
 		},
 		{
-			name: "origin_channel_type set but no id",
-			input: SnapshotScopeInput{
-				Topic:             "x",
-				OriginChannelType: 1,
-			},
-			target:   TargetPersonalWorkflow,
-			wantCode: 40001,
-			wantMsg:  "origin_channel_id is required when origin_channel_type is set",
+			name:  "origin_channel_type set but no id",
+			title: "t", topic: "x",
+			scope:    model.SnapshotScope{},
+			origType: 1,
+			maxDays:  31,
+			wantCode: 40001, wantMsg: "origin_channel_id is required when origin_channel_type is set",
 		},
 		{
-			name: "sources over max count",
-			input: SnapshotScopeInput{
-				Sources: manyValidSources(31),
-			},
-			target:   TargetPersonalWorkflow,
-			wantCode: 40003,
-			wantMsg:  "信息来源不能超过30个",
+			name:  "sources over max count",
+			title: "t", topic: "x",
+			scope:    model.SnapshotScope{},
+			srcCount: MaxSummarySourceCount + 1,
+			maxDays:  31,
+			wantCode: 40003, wantMsg: "信息来源不能超过30个",
+		},
+		{
+			name:  "time range over cap",
+			title: "t", topic: "x",
+			scope:    model.SnapshotScope{ChannelIDs: []string{"g1"}},
+			start:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+			end:      time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC), // ~59 days > 31
+			maxDays:  31,
+			wantCode: 40002, wantMsg: "时间范围不能超过31天",
+		},
+		{
+			name:  "scope has no signal, no topic, no time range",
+			title: "t", topic: "",
+			scope:    model.SnapshotScope{},
+			maxDays:  31,
+			wantCode: 40001, wantMsg: "至少提供 sources、topic 或 time_range 之一",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := ValidateSnapshotScope("user1", tc.input, tc.target)
+			got := ValidatePersonalWorkflow(
+				"u1",
+				tc.title, tc.topic,
+				tc.scope,
+				tc.srcCount,
+				tc.origID, tc.origType,
+				tc.start, tc.end,
+				tc.maxDays,
+			)
 			if got == nil {
 				t.Fatalf("expected error, got nil")
 			}
@@ -122,250 +149,159 @@ func TestValidateSnapshotScope_BaseChecks_ApplyToEveryTarget(t *testing.T) {
 	}
 }
 
-// TestValidateSnapshotScope_TimeRangeSpanCap covers the 40002 "时间范围不能超过N天"
-// path — the caller supplies an explicit range that exceeds the pipeline
-// runtime cap. When the caller omits TimeStart/TimeEnd the check is a no-op,
-// matching the pre-refactor behaviour where a nil TimeRange never tripped
-// the span check.
-func TestValidateSnapshotScope_TimeRangeSpanCap(t *testing.T) {
-	resetValidatorGlobals(t)
-
-	// Simulate pipeline.DefaultTimeRangeDays = 31.
-	SetTimeRangeMaxDaysGetter(func() int { return 31 })
-
-	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	longEnd := start.Add(40 * 24 * time.Hour) // 40 days > 31
-	shortEnd := start.Add(10 * 24 * time.Hour)
-
-	// Range too long: rejected 40002.
-	err := ValidateSnapshotScope("user1", SnapshotScopeInput{
-		Topic:     "x",
-		TimeStart: start,
-		TimeEnd:   longEnd,
-	}, TargetPersonalWorkflow)
-	if err == nil {
-		t.Fatalf("expected 40002 for 40-day range against 31-day cap, got nil")
+// TestValidatePersonalWorkflow_SignalSources verifies the three shapes that
+// satisfy the scope-signal gate: channel_ids in the shared scope, topic
+// string, or an explicit time range on the scope.
+func TestValidatePersonalWorkflow_SignalSources(t *testing.T) {
+	cases := []struct {
+		name  string
+		topic string
+		scope model.SnapshotScope
+		start time.Time
+		end   time.Time
+	}{
+		{
+			name:  "channel_ids in scope alone",
+			scope: model.SnapshotScope{ChannelIDs: []string{"g1"}},
+		},
+		{
+			name:  "topic alone",
+			topic: "hello",
+			scope: model.SnapshotScope{},
+		},
+		{
+			name: "time range in scope alone",
+			scope: model.SnapshotScope{
+				TimeRange: model.TimeRangeJSON{Start: "2026-01-01T00:00:00Z", End: "2026-01-02T00:00:00Z"},
+			},
+		},
+		{
+			name:  "explicit time endpoints alone (no scope signal, no topic)",
+			scope: model.SnapshotScope{},
+			start: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+			end:   time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
+		},
 	}
-	if err.Code != 40002 {
-		t.Errorf("code: want 40002 got %d (%s)", err.Code, err.Message)
-	}
-	if !strings.Contains(err.Message, "时间范围不能超过31天") {
-		t.Errorf("msg: want to contain \"时间范围不能超过31天\", got %q", err.Message)
-	}
-
-	// Range within cap: accepted.
-	if err := ValidateSnapshotScope("user1", SnapshotScopeInput{
-		Topic:     "x",
-		TimeStart: start,
-		TimeEnd:   shortEnd,
-	}, TargetPersonalWorkflow); err != nil {
-		t.Errorf("expected no error for 10-day range, got %v", err)
-	}
-
-	// No range supplied: check is a no-op (topic alone satisfies scope signal).
-	if err := ValidateSnapshotScope("user1", SnapshotScopeInput{
-		Topic: "x",
-	}, TargetPersonalWorkflow); err != nil {
-		t.Errorf("expected no error when time range is absent, got %v", err)
-	}
-}
-
-// TestValidateSnapshotScope_PersonalWorkflow_ScopeSignal preserves the
-// pre-refactor "至少提供 sources、topic 或 time_range 之一" contract.
-func TestValidateSnapshotScope_PersonalWorkflow_ScopeSignal(t *testing.T) {
-	resetValidatorGlobals(t)
-
-	// Empty scope signal: rejected 40001.
-	err := ValidateSnapshotScope("user1", SnapshotScopeInput{
-		Title: "t",
-	}, TargetPersonalWorkflow)
-	if err == nil {
-		t.Fatalf("expected 40001 for empty scope signal, got nil")
-	}
-	if err.Code != 40001 {
-		t.Errorf("code: want 40001 got %d (%s)", err.Code, err.Message)
-	}
-	if err.Message != "至少提供 sources、topic 或 time_range 之一" {
-		t.Errorf("msg: unexpected %q", err.Message)
-	}
-
-	// Topic alone: accepted.
-	if err := ValidateSnapshotScope("user1", SnapshotScopeInput{Topic: "x"}, TargetPersonalWorkflow); err != nil {
-		t.Errorf("topic alone should pass, got %v", err)
-	}
-	// Sources alone: accepted.
-	if err := ValidateSnapshotScope("user1", SnapshotScopeInput{
-		Sources: []SourceInput{{SourceType: 1, SourceID: "grp1"}},
-	}, TargetPersonalWorkflow); err != nil {
-		t.Errorf("sources alone should pass, got %v", err)
-	}
-	// TimeStart alone (as a time signal): accepted.
-	if err := ValidateSnapshotScope("user1", SnapshotScopeInput{
-		TimeStart: time.Now().Add(-time.Hour),
-	}, TargetPersonalWorkflow); err != nil {
-		t.Errorf("time signal alone should pass, got %v", err)
-	}
-	// TimeRange strings alone (test-only path): accepted.
-	if err := ValidateSnapshotScope("user1", SnapshotScopeInput{
-		Scope: model.SnapshotScope{TimeRange: model.TimeRangeJSON{Start: "2026-01-01T00:00:00Z"}},
-	}, TargetPersonalWorkflow); err != nil {
-		t.Errorf("time-range Scope signal alone should pass, got %v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// The "explicit time endpoints alone" case relies on scope-signal
+			// being satisfied by the caller providing a time range on the
+			// shared scope. Populate the scope's TimeRange to reflect what
+			// handler.CreateSummary does today.
+			scope := tc.scope
+			if !tc.start.IsZero() {
+				scope.TimeRange = model.TimeRangeJSON{
+					Start: tc.start.Format(time.RFC3339),
+					End:   tc.end.Format(time.RFC3339),
+				}
+			}
+			err := ValidatePersonalWorkflow(
+				"u1", "title", tc.topic,
+				scope, 0, "", 0,
+				tc.start, tc.end,
+				31,
+			)
+			if err != nil {
+				t.Errorf("expected nil, got %v", err)
+			}
+		})
 	}
 }
 
-// TestValidateSnapshotScope_TeamWorkflow_ParticipantsRequired exercises the
-// team-target-only rule that a payload without participants is not a
-// legitimate team workflow.
-func TestValidateSnapshotScope_TeamWorkflow_ParticipantsRequired(t *testing.T) {
-	resetValidatorGlobals(t)
-
-	// Scope signal present, but no participants: team-target rejects.
-	err := ValidateSnapshotScope("user1", SnapshotScopeInput{
-		Topic:        "team weekly",
-		Participants: nil,
-	}, TargetTeamWorkflow)
-	if err == nil {
-		t.Fatalf("expected team-target rejection for zero participants, got nil")
-	}
-	if err.Code != 40001 || err.Message != "team_workflow 需要至少一个参与者" {
-		t.Errorf("unexpected error: code=%d msg=%q", err.Code, err.Message)
-	}
-
-	// With one participant: accepted.
-	if err := ValidateSnapshotScope("user1", SnapshotScopeInput{
-		Topic:        "team weekly",
-		Participants: []ParticipantInput{{UserID: "u1"}},
-	}, TargetTeamWorkflow); err != nil {
-		t.Errorf("team-target with 1 participant should pass, got %v", err)
+// TestValidatePersonalWorkflow_NoTimeRangeSpanCapWhenAbsent guarantees the
+// pre-refactor behaviour: when the caller does NOT provide an explicit
+// range (both endpoints zero), the validator does not enforce the cap.
+// This is why CreateSummary's default range (end=now, start=now-maxDays)
+// still passes for topic-only payloads.
+func TestValidatePersonalWorkflow_NoTimeRangeSpanCapWhenAbsent(t *testing.T) {
+	err := ValidatePersonalWorkflow(
+		"u1", "t", "topic",
+		model.SnapshotScope{},
+		0, "", 0,
+		time.Time{}, time.Time{},
+		31,
+	)
+	if err != nil {
+		t.Errorf("expected nil when no explicit range and topic supplied, got %v", err)
 	}
 }
 
-// TestValidateSnapshotScope_ScheduledWorkflow_SchedulePayloadRequired covers
-// section 4.1 / 7.6: schedule fields must be present when the caller declares
-// a scheduled_workflow target. A nil Schedule pointer signals a caller that
-// forgot to plumb schedule through — a common regression risk in the design
-// (patching zero-value Schedule fields).
-func TestValidateSnapshotScope_ScheduledWorkflow_SchedulePayloadRequired(t *testing.T) {
-	resetValidatorGlobals(t)
+// ------------------------- scheduled_workflow ---------------------------
 
-	err := ValidateSnapshotScope("user1", SnapshotScopeInput{
-		Title:    "daily",
-		Schedule: nil,
-	}, TargetScheduledWorkflow)
-	if err == nil {
-		t.Fatalf("expected 40010 when Schedule is nil, got nil")
-	}
-	if err.Code != 40010 {
-		t.Errorf("code: want 40010 got %d (%s)", err.Code, err.Message)
-	}
-
-	// Present but empty recurrence -> still rejected.
-	err = ValidateSnapshotScope("user1", SnapshotScopeInput{
-		Title:    "daily",
-		Schedule: &ScheduleInput{},
-	}, TargetScheduledWorkflow)
+func TestValidateScheduledWorkflow_RecurrenceRequired(t *testing.T) {
+	err := ValidateScheduledWorkflow(
+		"u1", "daily",
+		model.SnapshotScope{},
+		"", 0, 0,
+	)
 	if err == nil || err.Code != 40010 {
-		t.Errorf("expected 40010 for empty recurrence, got %v", err)
+		t.Fatalf("expected 40010 for empty recurrence, got %v", err)
 	}
 
-	// Full Schedule payload with interval_days: accepted.
-	if err := ValidateSnapshotScope("user1", SnapshotScopeInput{
-		Title:    "daily",
-		Schedule: &ScheduleInput{IntervalDays: 1, RunTime: "09:00", TimeRangeType: 2},
-	}, TargetScheduledWorkflow); err != nil {
-		t.Errorf("full schedule should pass, got %v", err)
+	// interval_days > 0 passes.
+	if err := ValidateScheduledWorkflow("u1", "daily", model.SnapshotScope{}, "", 1, 0); err != nil {
+		t.Errorf("interval_days=1 should pass, got %v", err)
 	}
-}
-
-// TestValidateSnapshotScope_ScheduledWorkflow_PreservesEveryScheduleField
-// asserts that every field the validator was given on the Schedule pointer
-// makes it through untouched. Section 7.6 mandates the input Schedule must
-// not be mutated on either the success or failure path — a validator that
-// silently zeroed a field would be the exact regression this test guards.
-func TestValidateSnapshotScope_ScheduledWorkflow_PreservesEveryScheduleField(t *testing.T) {
-	resetValidatorGlobals(t)
-
-	// Deliberately non-zero on every field so a zeroing bug pops immediately.
-	full := ScheduleInput{
-		CronExpr:       "0 9 * * *",
-		IntervalDays:   7,
-		IntervalMonths: 0,
-		RunTime:        "09:30",
-		DayOfWeek:      3,
-		DayOfMonth:     15,
-		TimeRangeType:  2,
+	// cron_expr passes.
+	if err := ValidateScheduledWorkflow("u1", "daily", model.SnapshotScope{}, "0 9 * * *", 0, 0); err != nil {
+		t.Errorf("cron_expr should pass, got %v", err)
 	}
-	before := full // struct copy for post-call comparison
-
-	if err := ValidateSnapshotScope("user1", SnapshotScopeInput{
-		Title:    "weekly",
-		Schedule: &full,
-	}, TargetScheduledWorkflow); err != nil {
-		t.Fatalf("full schedule should pass, got %v", err)
-	}
-
-	if full != before {
-		t.Errorf("validator mutated schedule payload\n  before: %+v\n   after: %+v", before, full)
+	// interval_months passes.
+	if err := ValidateScheduledWorkflow("u1", "monthly", model.SnapshotScope{}, "", 0, 1); err != nil {
+		t.Errorf("interval_months=1 should pass, got %v", err)
 	}
 }
 
-// TestValidateSnapshotScope_AgentGeneration_ScopeSignal — the agent-generation
-// target reuses the "at least one signal" rule so authors cannot walk around
-// the traditional path's gate by going through the agent.
-func TestValidateSnapshotScope_AgentGeneration_ScopeSignal(t *testing.T) {
-	resetValidatorGlobals(t)
-
-	err := ValidateSnapshotScope("user1", SnapshotScopeInput{Title: "t"}, TargetAgentGeneration)
-	if err == nil || err.Code != 40001 {
-		t.Errorf("expected 40001 for empty scope signal on agent_generation, got %v", err)
-	}
-
-	if err := ValidateSnapshotScope("user1", SnapshotScopeInput{Topic: "x"}, TargetAgentGeneration); err != nil {
-		t.Errorf("topic alone should pass agent_generation, got %v", err)
+func TestValidateScheduledWorkflow_TitleCapEnforced(t *testing.T) {
+	err := ValidateScheduledWorkflow(
+		"u1", strings.Repeat("总", MaxSummaryTitleRunes+1),
+		model.SnapshotScope{},
+		"", 1, 0,
+	)
+	if err == nil || err.Code != 40001 || err.Message != "title 不能超过 2300 字符" {
+		t.Fatalf("expected 40001 title over cap, got %v", err)
 	}
 }
 
-// TestValidateSnapshotScope_AgentSave_ShapeChecks covers session_id / content
-// rules for the agent-save target.
-func TestValidateSnapshotScope_AgentSave_ShapeChecks(t *testing.T) {
-	resetValidatorGlobals(t)
+// ---------------------------- agent_save --------------------------------
 
-	// Missing AgentSave payload: 40000.
-	err := ValidateSnapshotScope("user1", SnapshotScopeInput{}, TargetAgentSave)
+func TestValidateAgentSave_ContentAndSession(t *testing.T) {
+	// empty session id -> 40000
+	err := ValidateAgentSave("u1", "t", "", "content", "", 0)
 	if err == nil || err.Code != 40000 {
-		t.Errorf("expected 40000 for missing AgentSave, got %v", err)
+		t.Fatalf("expected 40000 for empty session id, got %v", err)
 	}
-
-	// Empty session id: 40000.
-	err = ValidateSnapshotScope("user1", SnapshotScopeInput{
-		AgentSave: &AgentSaveInput{},
-	}, TargetAgentSave)
-	if err == nil || err.Code != 40000 {
-		t.Errorf("expected 40000 for empty session id, got %v", err)
-	}
-
-	// Empty content: 40004.
-	err = ValidateSnapshotScope("user1", SnapshotScopeInput{
-		AgentSave: &AgentSaveInput{SessionID: "s1", ContentLen: 0},
-	}, TargetAgentSave)
+	// empty content -> 40004
+	err = ValidateAgentSave("u1", "t", "sess1", "", "", 0)
 	if err == nil || err.Code != 40004 {
-		t.Errorf("expected 40004 for empty content, got %v", err)
+		t.Fatalf("expected 40004 for empty content, got %v", err)
 	}
-
-	// All good.
-	if err := ValidateSnapshotScope("user1", SnapshotScopeInput{
-		AgentSave: &AgentSaveInput{SessionID: "s1", ContentLen: 128},
-	}, TargetAgentSave); err != nil {
-		t.Errorf("full agent_save payload should pass, got %v", err)
+	if err.Message != "session 无有效产出,请先在对话中生成总结再保存" {
+		t.Errorf("agent_save empty-content msg mismatch: %q", err.Message)
+	}
+	// valid -> nil
+	if err := ValidateAgentSave("u1", "t", "sess1", "hello", "", 0); err != nil {
+		t.Errorf("expected nil for valid agent_save, got %v", err)
 	}
 }
 
-// manyValidSources returns n structurally-valid SourceInput records — used to
-// exercise the source-count cap without stubbing the whole handler stack.
-func manyValidSources(n int) []SourceInput {
-	out := make([]SourceInput, n)
-	for i := range out {
-		out[i] = SourceInput{SourceType: 1, SourceID: "grp"}
+func TestValidateAgentSave_OriginCoupling(t *testing.T) {
+	// origin_channel_type out of range with id -> 40001
+	err := ValidateAgentSave("u1", "t", "sess1", "hello", "grp1", 99)
+	if err == nil || err.Code != 40001 {
+		t.Fatalf("expected 40001, got %v", err)
 	}
-	return out
+	// type without id -> 40001
+	err = ValidateAgentSave("u1", "t", "sess1", "hello", "", 2)
+	if err == nil || err.Code != 40001 {
+		t.Fatalf("expected 40001, got %v", err)
+	}
+	// both zero -> nil
+	if err := ValidateAgentSave("u1", "t", "sess1", "hello", "", 0); err != nil {
+		t.Errorf("expected nil, got %v", err)
+	}
+	// coupled correctly -> nil
+	if err := ValidateAgentSave("u1", "t", "sess1", "hello", "grp1", 1); err != nil {
+		t.Errorf("expected nil, got %v", err)
+	}
 }
