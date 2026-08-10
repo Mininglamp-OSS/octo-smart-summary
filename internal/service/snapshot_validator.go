@@ -181,22 +181,44 @@ func ValidateScheduledWorkflow(
 	return nil
 }
 
+// AgentSaveExpectedSnapshotVersion is the only snapshot_version an Agent draft
+// save is currently allowed to declare. BE-2 lands the first-generation save
+// path; the future Refine pipeline (BE-3+) will lift this cap once it starts
+// producing snapshot_version=2..N, at which point ValidateAgentSave switches
+// from "must equal 1" to "must equal PersonalResult.snapshot_json version".
+// Declaring the constant here (instead of leaving it a magic number in the
+// handler) keeps the invariant reviewable in one place.
+const AgentSaveExpectedSnapshotVersion = 1
+
 // ValidateAgentSave is called by handler.CreateAgentSummary AFTER the
 // server-trusted assistant content has been loaded and preamble-stripped.
-// The handler owns the message ownership / role / session identity DB reads
-// (loadLatestAssistantContent already filters WHERE user_id = ? AND
-// session_id = ? AND role = 'assistant'), so this validator focuses on the
-// shape / length checks and leaves the DB-side identity contract with the
-// handler where it can actually be enforced.
 //
-// The design lists Snapshot-version and message-id enforcement under the
-// agent_save target; those DB-driven checks are BE-2 scope (they require new
-// storage-side reads and version columns that BE-1 does not add), so they
-// are NOT declared as parameters here — leaving them as unused fields on a
-// DTO would be exactly the "shell coverage" SUM-9 rejected.
+// SUM-BE1 (reviewed under SUM-9) intentionally dropped AgentMessageID /
+// SnapshotVersion from this signature because BE-1 could not persist them —
+// carrying them as unused parameters would have been the exact "shell
+// coverage" the review rejected. SUM-BE2 lands the storage side
+// (summary_task.agent_message_id / agent_session_id / snapshot_version, see
+// migration 20260810-01), so the parameters are now real inputs the caller
+// must fill from server-trusted state and this function enforces them.
+//
+// Message ownership / role / session identity is still the handler's DB job
+// (loadAgentMessageForSave filters WHERE id = ? AND user_id = ? AND
+// session_id = ? AND role = 'assistant' AND tool_calls IS NULL). This
+// function checks the SHAPE contract:
+//
+//   - actor / session_id / content: unchanged from BE-1.
+//   - agentMessageID: must be positive when supplied. Zero is allowed only
+//     when expectedSnapshotVersion is also zero, i.e. the caller is still
+//     on the pre-BE-2 "latest assistant" fallback path (FE-2 will supply
+//     both fields; older FE builds supply neither). Mixing the two —
+//     message id without version or vice versa — is a client bug and 400.
+//   - expectedSnapshotVersion: when the client claims a version, it must
+//     equal AgentSaveExpectedSnapshotVersion (BE-2 only writes v1); any
+//     other value is a stale-draft race and maps to AGENT_DRAFT_STALE.
 func ValidateAgentSave(
 	actor, title, sessionID, content string,
 	originChannelID string, originChannelType int,
+	agentMessageID int64, expectedSnapshotVersion int,
 ) *BizError {
 	if err := requireActor(actor); err != nil {
 		return err
@@ -212,6 +234,21 @@ func ValidateAgentSave(
 	}
 	if content == "" {
 		return NewBizError(40004, "session 无有效产出,请先在对话中生成总结再保存", http.StatusBadRequest)
+	}
+	// Message-id / snapshot-version pairing: either both set (new FE-2 path)
+	// or both zero (legacy pre-BE-2 path). Half-supplied is a client bug.
+	if (agentMessageID > 0) != (expectedSnapshotVersion > 0) {
+		return NewBizError(40001, "agent_message_id 与 snapshot_version 必须同时提供或同时省略", http.StatusBadRequest)
+	}
+	if agentMessageID < 0 {
+		return NewBizError(40001, "agent_message_id 必须为正整数", http.StatusBadRequest)
+	}
+	if expectedSnapshotVersion > 0 && expectedSnapshotVersion != AgentSaveExpectedSnapshotVersion {
+		// AGENT_DRAFT_STALE — client is looking at a snapshot the server never
+		// wrote. Once Refine lands v2+, the caller-supplied version must
+		// match the persisted PersonalResult snapshot version and this hard
+		// equality relaxes into a lookup.
+		return NewBizError(40901, "agent_draft_stale: snapshot 版本已过期,请刷新草稿", http.StatusConflict)
 	}
 	return nil
 }

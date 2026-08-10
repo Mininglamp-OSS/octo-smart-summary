@@ -161,6 +161,15 @@ type SummaryTask struct {
 	// trigger_type=agent summaries where the user picked one or more existing
 	// summaries as reference material via the chat UI.
 	ReferencedTaskIDs *string `gorm:"column:referenced_task_ids;type:text" json:"-"`
+	// AgentSessionID / AgentMessageID / SnapshotVersion are the safe-save
+	// audit trail for trigger_type=Agent tasks (SUM-BE2). They record the
+	// exact assistant reply and snapshot version the client confirmed at
+	// save time, so a reviewer or the future Refine pipeline can trace which
+	// draft became this summary. Non-agent tasks leave them at the zero
+	// value; the migration (20260810-01) backfills existing rows likewise.
+	AgentSessionID  string `gorm:"column:agent_session_id;type:varchar(128);not null;default:'';index:idx_summary_task_agent_session" json:"agent_session_id,omitempty"`
+	AgentMessageID  int64  `gorm:"column:agent_message_id;not null;default:0" json:"agent_message_id,omitempty"`
+	SnapshotVersion int    `gorm:"column:snapshot_version;type:int;not null;default:0" json:"snapshot_version,omitempty"`
 }
 
 // SummaryBotCreateIdempotency binds one bot request key to the task created
@@ -185,6 +194,25 @@ type SummaryBotCreateIdempotency struct {
 }
 
 func (SummaryBotCreateIdempotency) TableName() string { return "summary_bot_create_idempotency" }
+
+// SummaryAgentSaveIdempotency is the Agent-save analogue of
+// SummaryBotCreateIdempotency (see above): one (space_id, user_id,
+// idempotency_key) tuple binds to exactly one saved task_id. Same
+// same-key-same-body-replay / same-key-different-body-409 contract; the only
+// axis change is the actor — Agent save is user-owned, not bot-owned, so the
+// unique index uses user_id where the bot table uses bot_id (see migration
+// 20260810-01-agent-draft-save.sql).
+type SummaryAgentSaveIdempotency struct {
+	ID             int64     `gorm:"primaryKey;autoIncrement"`
+	SpaceID        string    `gorm:"column:space_id;type:varchar(64);not null;uniqueIndex:uk_agent_save_idempotency"`
+	UserID         string    `gorm:"column:user_id;type:varchar(64);not null;uniqueIndex:uk_agent_save_idempotency"`
+	IdempotencyKey string    `gorm:"column:idempotency_key;type:varchar(128);not null;uniqueIndex:uk_agent_save_idempotency"`
+	RequestHash    string    `gorm:"column:request_hash;type:char(64);not null;default:''"`
+	TaskID         int64     `gorm:"column:task_id;not null"`
+	CreatedAt      time.Time `gorm:"column:created_at;not null"`
+}
+
+func (SummaryAgentSaveIdempotency) TableName() string { return "summary_agent_save_idempotency" }
 
 // EffectiveTopic keeps existing tasks compatible while new tasks persist the
 // complete summary instruction separately from the display title.

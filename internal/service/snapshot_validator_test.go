@@ -44,7 +44,7 @@ func TestValidateScheduledWorkflow_ActorRequired(t *testing.T) {
 }
 
 func TestValidateAgentSave_ActorRequired(t *testing.T) {
-	err := ValidateAgentSave("", "title", "sess1", "hi", "", 0)
+	err := ValidateAgentSave("", "title", "sess1", "hi", "", 0, 0, 0)
 	if err == nil || err.Code != 40100 {
 		t.Fatalf("expected 40100 for empty actor on agent_save, got %v", err)
 	}
@@ -267,12 +267,12 @@ func TestValidateScheduledWorkflow_TitleCapEnforced(t *testing.T) {
 
 func TestValidateAgentSave_ContentAndSession(t *testing.T) {
 	// empty session id -> 40000
-	err := ValidateAgentSave("u1", "t", "", "content", "", 0)
+	err := ValidateAgentSave("u1", "t", "", "content", "", 0, 0, 0)
 	if err == nil || err.Code != 40000 {
 		t.Fatalf("expected 40000 for empty session id, got %v", err)
 	}
 	// empty content -> 40004
-	err = ValidateAgentSave("u1", "t", "sess1", "", "", 0)
+	err = ValidateAgentSave("u1", "t", "sess1", "", "", 0, 0, 0)
 	if err == nil || err.Code != 40004 {
 		t.Fatalf("expected 40004 for empty content, got %v", err)
 	}
@@ -280,28 +280,90 @@ func TestValidateAgentSave_ContentAndSession(t *testing.T) {
 		t.Errorf("agent_save empty-content msg mismatch: %q", err.Message)
 	}
 	// valid -> nil
-	if err := ValidateAgentSave("u1", "t", "sess1", "hello", "", 0); err != nil {
+	if err := ValidateAgentSave("u1", "t", "sess1", "hello", "", 0, 0, 0); err != nil {
 		t.Errorf("expected nil for valid agent_save, got %v", err)
 	}
 }
 
 func TestValidateAgentSave_OriginCoupling(t *testing.T) {
 	// origin_channel_type out of range with id -> 40001
-	err := ValidateAgentSave("u1", "t", "sess1", "hello", "grp1", 99)
+	err := ValidateAgentSave("u1", "t", "sess1", "hello", "grp1", 99, 0, 0)
 	if err == nil || err.Code != 40001 {
 		t.Fatalf("expected 40001, got %v", err)
 	}
 	// type without id -> 40001
-	err = ValidateAgentSave("u1", "t", "sess1", "hello", "", 2)
+	err = ValidateAgentSave("u1", "t", "sess1", "hello", "", 2, 0, 0)
 	if err == nil || err.Code != 40001 {
 		t.Fatalf("expected 40001, got %v", err)
 	}
 	// both zero -> nil
-	if err := ValidateAgentSave("u1", "t", "sess1", "hello", "", 0); err != nil {
+	if err := ValidateAgentSave("u1", "t", "sess1", "hello", "", 0, 0, 0); err != nil {
 		t.Errorf("expected nil, got %v", err)
 	}
 	// coupled correctly -> nil
-	if err := ValidateAgentSave("u1", "t", "sess1", "hello", "grp1", 1); err != nil {
+	if err := ValidateAgentSave("u1", "t", "sess1", "hello", "grp1", 1, 0, 0); err != nil {
 		t.Errorf("expected nil, got %v", err)
+	}
+}
+
+// ---------------------------- agent_save (BE-2 additions) ---------------
+//
+// BE-2 extends the signature with agent_message_id + expected_snapshot_version
+// so the caller can supply the trusted draft reference the design (section
+// 6.5) requires. The tests below cover the four invariants the validator now
+// enforces at the shape level; DB-side ownership / role / session-identity
+// checks stay in the handler (loadAgentMessageForSave) and are exercised by
+// the handler cgo tests.
+
+func TestValidateAgentSave_MessageIDAndSnapshotVersionMustBePaired(t *testing.T) {
+	// message id without version -> 40001
+	err := ValidateAgentSave("u1", "t", "sess1", "hello", "", 0, 42, 0)
+	if err == nil || err.Code != 40001 {
+		t.Fatalf("expected 40001 for msg_id without version, got %v", err)
+	}
+	// version without message id -> 40001
+	err = ValidateAgentSave("u1", "t", "sess1", "hello", "", 0, 0, 1)
+	if err == nil || err.Code != 40001 {
+		t.Fatalf("expected 40001 for version without msg_id, got %v", err)
+	}
+	// both zero (legacy) -> nil
+	if err := ValidateAgentSave("u1", "t", "sess1", "hello", "", 0, 0, 0); err != nil {
+		t.Errorf("expected nil for both-zero legacy path, got %v", err)
+	}
+	// both set correctly (v1 == AgentSaveExpectedSnapshotVersion) -> nil
+	if err := ValidateAgentSave("u1", "t", "sess1", "hello", "", 0, 42, AgentSaveExpectedSnapshotVersion); err != nil {
+		t.Errorf("expected nil for paired msg_id+v1, got %v", err)
+	}
+}
+
+func TestValidateAgentSave_NegativeMessageIDRejected(t *testing.T) {
+	err := ValidateAgentSave("u1", "t", "sess1", "hello", "", 0, -1, 0)
+	if err == nil || err.Code != 40001 {
+		t.Fatalf("expected 40001 for negative msg_id, got %v", err)
+	}
+}
+
+func TestValidateAgentSave_SnapshotVersionMustBeV1(t *testing.T) {
+	// version 2 while BE-2 only writes v1 -> AGENT_DRAFT_STALE (40901 / 409)
+	err := ValidateAgentSave("u1", "t", "sess1", "hello", "", 0, 42, 2)
+	if err == nil {
+		t.Fatalf("expected error for version=2, got nil")
+	}
+	if err.Code != 40901 {
+		t.Errorf("expected AGENT_DRAFT_STALE code 40901, got %d", err.Code)
+	}
+	if err.HTTPStatus != 409 {
+		t.Errorf("expected HTTP 409 for stale draft, got %d", err.HTTPStatus)
+	}
+	// version 1 -> nil
+	if err := ValidateAgentSave("u1", "t", "sess1", "hello", "", 0, 42, AgentSaveExpectedSnapshotVersion); err != nil {
+		t.Errorf("expected nil for v=%d, got %v", AgentSaveExpectedSnapshotVersion, err)
+	}
+}
+
+func TestValidateAgentSave_ActorStillRequiredWithNewParams(t *testing.T) {
+	err := ValidateAgentSave("", "t", "sess1", "hello", "", 0, 42, 1)
+	if err == nil || err.Code != 40100 {
+		t.Fatalf("expected 40100 for empty actor even with paired msg_id, got %v", err)
 	}
 }
