@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
@@ -23,6 +24,10 @@ func setupCandidateImDB(t *testing.T) *gorm.DB {
 	imDB.Exec(`CREATE TABLE "group" (group_no TEXT NOT NULL, name TEXT, space_id TEXT, status INTEGER DEFAULT 1)`)
 	imDB.Exec(`CREATE TABLE thread (id INTEGER PRIMARY KEY, short_id TEXT, name TEXT, group_no TEXT, status INTEGER DEFAULT 1, message_count INTEGER DEFAULT 0)`)
 	imDB.Exec(`CREATE TABLE group_member (group_no TEXT NOT NULL, uid TEXT NOT NULL, is_deleted INTEGER DEFAULT 0)`)
+	// Tables for SearchCandidates (member-candidates) space-membership authz.
+	imDB.Exec(`CREATE TABLE user (uid TEXT, name TEXT, username TEXT, robot INTEGER DEFAULT 0)`)
+	imDB.Exec(`CREATE TABLE robot (robot_id TEXT)`)
+	imDB.Exec(`CREATE TABLE space_member (space_id TEXT, uid TEXT, status INTEGER DEFAULT 1)`)
 	return imDB
 }
 
@@ -356,5 +361,93 @@ func TestSearchChatCandidates_GroupAndDirectHaveIsArchivedFalse(t *testing.T) {
 	}
 	if v != false {
 		t.Errorf("group is_archived should be false, got %v", v)
+	}
+}
+
+// --- SearchCandidates (member-candidates) space-membership authorization ---
+
+func setupMemberRouter(h *CandidateHandler) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(middleware.AuthMiddleware(&mockTokenResolver{}), middleware.SpaceMiddleware())
+	r.GET("/api/v1/summary-member-candidates", h.SearchCandidates)
+	return r
+}
+
+// doMemberRequest issues a member-candidates request. When spaceHeader is empty
+// the X-Space-Id header is omitted (simulating a request with no space scope).
+func doMemberRequest(r *gin.Engine, userID, spaceHeader string) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/summary-member-candidates", nil)
+	if userID != "" {
+		req.Header.Set("Token", userID)
+	}
+	if spaceHeader != "" {
+		req.Header.Set("X-Space-Id", spaceHeader)
+	}
+	r.ServeHTTP(w, req)
+	return w
+}
+
+const (
+	memCaller   = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" // 32-hex; space1 member
+	memPeer     = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" // 32-hex; space1 member
+	memOutsider = "cccccccccccccccccccccccccccccccc" // 32-hex; NOT in space1
+)
+
+func seedMemberSpace(imDB *gorm.DB) {
+	imDB.Exec(`INSERT INTO user (uid, name, username, robot) VALUES (?, 'Caller', 'caller', 0)`, memCaller)
+	imDB.Exec(`INSERT INTO user (uid, name, username, robot) VALUES (?, 'Peer', 'peer', 0)`, memPeer)
+	imDB.Exec(`INSERT INTO user (uid, name, username, robot) VALUES (?, 'Outsider', 'outsider', 0)`, memOutsider)
+	// space1 members: caller + peer (outsider intentionally absent).
+	imDB.Exec(`INSERT INTO space_member (space_id, uid, status) VALUES ('space1', ?, 1)`, memCaller)
+	imDB.Exec(`INSERT INTO space_member (space_id, uid, status) VALUES ('space1', ?, 1)`, memPeer)
+}
+
+func TestSearchCandidates_MemberGetsSpaceRoster(t *testing.T) {
+	imDB := setupCandidateImDB(t)
+	seedMemberSpace(imDB)
+	r := setupMemberRouter(NewCandidateHandler(imDB, -1))
+
+	w := doMemberRequest(r, memCaller, "space1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("member should get 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, memPeer) {
+		t.Fatalf("expected peer in roster, body=%s", body)
+	}
+	if strings.Contains(body, memCaller) {
+		t.Fatalf("caller should be excluded from own roster, body=%s", body)
+	}
+}
+
+func TestSearchCandidates_NonMemberForbidden(t *testing.T) {
+	imDB := setupCandidateImDB(t)
+	seedMemberSpace(imDB)
+	r := setupMemberRouter(NewCandidateHandler(imDB, -1))
+
+	// Outsider is authenticated but not a member of space1 → 403, no roster.
+	w := doMemberRequest(r, memOutsider, "space1")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("non-member should get 403, got %d body=%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), memPeer) {
+		t.Fatalf("non-member must not see any roster, body=%s", w.Body.String())
+	}
+}
+
+func TestSearchCandidates_NoSpaceNoFullDump(t *testing.T) {
+	imDB := setupCandidateImDB(t)
+	seedMemberSpace(imDB)
+	r := setupMemberRouter(NewCandidateHandler(imDB, -1))
+
+	// No X-Space-Id header and no space_id query → must NOT fall back to all users.
+	w := doMemberRequest(r, memCaller, "")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("missing space must be 403 (no full-user dump), got %d body=%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), memPeer) || strings.Contains(w.Body.String(), memOutsider) {
+		t.Fatalf("no users must be leaked without a space, body=%s", w.Body.String())
 	}
 }

@@ -36,23 +36,51 @@ func (imUser) TableName() string { return "user" }
 
 // SearchCandidates handles GET /api/v1/summary-member-candidates
 // Returns human members of the current Space only (excludes bots).
-// Falls back to all human users if no space_id is available.
+//
+// Security (summary member-candidates full-user leak, pentest 高危): the space
+// scope is REQUIRED and the caller MUST be an active member of that space.
+// Previously an empty space_id fell back to querying ALL human users (org-wide
+// roster leak) and a client-supplied space_id was trusted without a membership
+// check (cross-space enumeration). Both are closed here — mirrors the docs /
+// Matter space-membership authorization.
 func (h *CandidateHandler) SearchCandidates(c *gin.Context) {
 	if h.imDB == nil {
 		c.JSON(http.StatusOK, gin.H{"code": 0, "data": []interface{}{}})
 		return
 	}
 	keyword := c.Query("keyword")
-	// Space ID: prefer explicit query param (sent by frontend), fallback to middleware context.
+
+	// Resolve current user (set by AuthMiddleware via token).
+	currentUID, _ := c.Get("user_id")
+	currentUIDStr, _ := currentUID.(string)
+	if currentUIDStr == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": 40100, "message": "authentication required"})
+		return
+	}
+
+	// Space ID: prefer explicit query param (sent by frontend), fallback to
+	// middleware context (X-Space-Id).
 	spaceIDStr := c.Query("space_id")
 	if spaceIDStr == "" {
 		v, _ := c.Get("space_id")
 		spaceIDStr, _ = v.(string)
 	}
-
-	// Resolve current user (set by AuthMiddleware via token)
-	currentUID, _ := c.Get("user_id")
-	currentUIDStr, _ := currentUID.(string)
+	// Never fall back to "all users": without a resolvable space we cannot scope
+	// the roster, so deny instead of leaking every user.
+	if spaceIDStr == "" {
+		c.JSON(http.StatusForbidden, gin.H{"code": 40300, "message": "space membership required"})
+		return
+	}
+	// The caller must be an active member of the target space; otherwise a
+	// non-member could enumerate that space's roster by supplying its space_id.
+	var memberCnt int64
+	h.imDB.Table("space_member").
+		Where("space_id = ? AND uid = ? AND status = 1", spaceIDStr, currentUIDStr).
+		Count(&memberCnt)
+	if memberCnt == 0 {
+		c.JSON(http.StatusForbidden, gin.H{"code": 40300, "message": "not a member of this space"})
+		return
+	}
 
 	var users []imUser
 
@@ -60,22 +88,16 @@ func (h *CandidateHandler) SearchCandidates(c *gin.Context) {
 	// 1. user.robot = 1 (flag on user row)
 	// 2. uid in robot table (some system bots have robot=0, e.g. BotFather)
 	// 3. uid is not a 32-char hex string (system accounts like fileHelper/botfather)
+	//
+	// The space_member join is now UNCONDITIONAL (space is guaranteed non-empty
+	// and the caller is a verified member), so results are always space-scoped.
 	q := h.imDB.Table("user u").Select("u.uid, u.name").
 		Where("u.robot = 0").
 		Where("u.uid NOT IN (SELECT robot_id FROM robot)").
-		Where("LENGTH(u.uid) = 32")
-
-	if spaceIDStr != "" {
-		// Filter by Space members
-		q = q.
-			Joins("INNER JOIN space_member sm ON sm.uid = u.uid").
-			Where("sm.space_id = ? AND sm.status = 1", spaceIDStr)
-	}
-
-	// Exclude the currently logged-in user (task creator doesn't add themselves)
-	if currentUIDStr != "" {
-		q = q.Where("u.uid != ?", currentUIDStr)
-	}
+		Where("LENGTH(u.uid) = 32").
+		Joins("INNER JOIN space_member sm ON sm.uid = u.uid").
+		Where("sm.space_id = ? AND sm.status = 1", spaceIDStr).
+		Where("u.uid != ?", currentUIDStr)
 
 	if keyword != "" {
 		q = q.Where("u.name LIKE ? OR u.username LIKE ?", "%"+keyword+"%", "%"+keyword+"%")
@@ -187,7 +209,7 @@ func (h *CandidateHandler) SearchChatCandidates(c *gin.Context) {
 		if currentUIDStr != "" {
 			// Use group_member instead of thread_member so that all threads in the
 			// user's groups are returned, not just threads the user has posted in.
-			q = q.Joins("INNER JOIN group_member gm ON gm.group_no" + h.collate + " = t.group_no").
+			q = q.Joins("INNER JOIN group_member gm ON gm.group_no"+h.collate+" = t.group_no").
 				Where("gm.uid = ? AND gm.is_deleted = 0", currentUIDStr)
 		}
 		if spaceIDStr != "" {
