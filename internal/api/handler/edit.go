@@ -564,6 +564,15 @@ func (h *EditHandler) ListSummaryVersions(c *gin.Context) {
 		}
 	}
 	spaceID := middleware.GetSpaceID(c)
+	// fail-closed hard gate: GET requests are NOT caught by StrictSpaceMiddleware,
+	// and SummaryTask.SpaceID is `not null default ''`, so rows with space_id=''
+	// may exist; querying `space_id=''` would MATCH them, leaking a cross-space
+	// version-history read. Reject an empty X-Space-Id before any query (mirrors
+	// authorizeTaskAccess / requireTaskInSpace / ListSummaries).
+	if spaceID == "" {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
+		return
+	}
 	var task model.SummaryTask
 	if err := h.db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).First(&task).Error; err != nil {
 		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
@@ -618,6 +627,15 @@ func (h *EditHandler) GetSummaryVersion(c *gin.Context) {
 		return
 	}
 	spaceID := middleware.GetSpaceID(c)
+	// fail-closed hard gate: GET requests are NOT caught by StrictSpaceMiddleware,
+	// and SummaryTask.SpaceID is `not null default ''`, so rows with space_id=''
+	// may exist; querying `space_id=''` would MATCH them, leaking a cross-space
+	// version read. Reject an empty X-Space-Id before any query (mirrors
+	// authorizeTaskAccess / requireTaskInSpace / ListSummaries).
+	if spaceID == "" {
+		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
+		return
+	}
 	var task model.SummaryTask
 	if err := h.db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).First(&task).Error; err != nil {
 		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
