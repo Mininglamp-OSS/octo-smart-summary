@@ -27,16 +27,21 @@ const (
 // 【元信息】 header that could trick the model into treating following text as
 // framing/instructions. We strip the fence tags and fold the structural glyphs
 // down to plain ASCII; the content stays readable, it just can no longer
-// impersonate the framing.
+// impersonate the framing. Additionally, control characters (CR, tab, NUL)
+// are stripped to prevent line-break manipulation within data fence fields.
 func sanitizeRef(s string) string {
-	return strings.NewReplacer(
+	s = strings.NewReplacer(
 		refDataOpen, "",
 		refDataClose, "",
 		"═", "=",
 		"─", "-",
 		"【", "[",
 		"】", "]",
+		"\r", "",
+		"\t", " ",
+		"\x00", "",
 	).Replace(s)
+	return s
 }
 
 // buildReferencedSummariesContext fetches the referenced summary tasks and
@@ -105,10 +110,14 @@ func buildReferencedSummariesContext(
 		loaded = append(loaded, tid)
 		sb.WriteString(fmt.Sprintf("─── 引用总结 · task_id=%d · %s ───\n\n", art.Task.ID, sanitizeRef(art.Task.EffectiveTopic())))
 
-		// Snapshot section (agent summaries only): reference metadata only
+		// Snapshot section (agent summaries only): reference metadata only.
+		// All snapshot strings are untrusted (may contain user-supplied channel IDs,
+		// timestamps, tool traces) and must be sanitized and placed inside the
+		// <引用数据> fence to prevent prompt injection (SUM-25 review blocker).
 		if art.HasSnapshot && art.Snapshot != nil {
 			snap := art.Snapshot
 			sb.WriteString("【元信息 · 老总结的生成语境(仅供参考)】\n")
+			sb.WriteString(refDataOpen + "\n")
 			if snap.Requirement != "" {
 				sb.WriteString("- 老需求: " + sanitizeRef(snap.Requirement) + "\n")
 			}
@@ -117,13 +126,13 @@ func buildReferencedSummariesContext(
 				sb.WriteString("- 候选频道 (candidate channels):\n")
 				for _, cid := range snap.Scope.ChannelIDs {
 					sb.WriteString(fmt.Sprintf("  * channel_id=%s channel_type=%d %s\n",
-						cid, storageType, channelTypeLabel(storageType)))
+						sanitizeRef(cid), storageType, channelTypeLabel(storageType)))
 				}
 				sb.WriteString("  (你可以复用其中一个,或让用户明确,或用 list_channels 探索其他)\n")
 				sb.WriteString("  ⚠️ 调用 fetch_channel/peek_channel 时必须**原样复制**上面的 channel_type 数字,不要猜、不要默认 1\n")
 			}
 			sb.WriteString(fmt.Sprintf("- ⚠️ 老时间窗 (已过期,不要复制作为 fetch 参数): %s ~ %s\n",
-				snap.Scope.TimeRange.Start, snap.Scope.TimeRange.End))
+				sanitizeRef(snap.Scope.TimeRange.Start), sanitizeRef(snap.Scope.TimeRange.End)))
 			sb.WriteString("  (若用户说'最新/今天/最近'请用 get_current_time 决定新时间窗)\n")
 			if len(snap.ToolSummary) > 0 {
 				sb.WriteString(fmt.Sprintf("- 老工具轨迹 (历史,不必复现): %s\n", sanitizeRef(fmt.Sprintf("%v", snap.ToolSummary))))
@@ -131,11 +140,12 @@ func buildReferencedSummariesContext(
 			if snap.DataFreshnessNote != "" {
 				sb.WriteString("- 老数据新鲜度声明: " + sanitizeRef(snap.DataFreshnessNote) + "\n")
 			}
-			sb.WriteString("\n")
+			sb.WriteString(refDataClose + "\n\n")
 		} else {
 			// Traditional summary without snapshot: provide topic, time range,
 			// and sources as read-only historical metadata.
 			sb.WriteString("【元信息 · 传统总结历史语境(仅供参考)】\n")
+			sb.WriteString(refDataOpen + "\n")
 			sb.WriteString(fmt.Sprintf("- 任务标题: %s\n", sanitizeRef(art.Task.Title)))
 			sb.WriteString(fmt.Sprintf("- 历史时间范围: %s ~ %s\n",
 				art.Task.TimeRangeStart.Format("2006-01-02 15:04"),
@@ -147,7 +157,8 @@ func buildReferencedSummariesContext(
 					sb.WriteString(fmt.Sprintf("  * %s (type=%d)\n", sanitizeRef(s.SourceName), s.SourceType))
 				}
 			}
-			sb.WriteString("  (仅供参考,不得自动作为新工具调用参数)\n\n")
+			sb.WriteString("  (仅供参考,不得自动作为新工具调用参数)\n")
+			sb.WriteString(refDataClose + "\n\n")
 		}
 
 		sb.WriteString("【老产物内容 · 参考文本】\n")

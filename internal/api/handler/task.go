@@ -729,9 +729,11 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 
 		// SUM-19: expose referenceable status so the frontend can filter
 		// candidates without guessing from trigger_type.
+		// Use checkReferenceableFast on the list endpoint to avoid N+1 queries
+		// that load sources/content/citations per row (SUM-25 review finding).
 		refable, refType, refReason := false, "", ""
 		if t.Status == model.StatusCompleted {
-			refable, refType, refReason = checkReferenceable(c.Request.Context(), h.db, t.ID, spaceID, userID)
+			refable, refType, refReason = checkReferenceableFast(c.Request.Context(), h.db, t.ID, spaceID, userID)
 		} else {
 			refReason = "not_completed"
 		}

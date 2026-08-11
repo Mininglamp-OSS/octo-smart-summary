@@ -142,3 +142,65 @@ func checkReferenceable(
 	}
 	return true, art.Type, ""
 }
+
+// checkReferenceableFast is a lightweight check that determines whether a
+// task is referenceable WITHOUT loading sources, content, citations, or
+// snapshot. It only checks: task exists in space, not deleted, completed,
+	// caller has access, and a visible product (team result or personal result)
+// exists. This avoids the N+1 query problem on list endpoints where we only
+// need the boolean referenceable flag and artifact type, not the full content.
+//
+// For the list endpoint, callers should prefer this over checkReferenceable
+// to avoid loading unnecessary sources/content per row.
+func checkReferenceableFast(
+	ctx context.Context,
+	db *gorm.DB,
+	taskID int64,
+	spaceID string,
+	userID string,
+) (referenceable bool, artifactType string, unavailableReason string) {
+	// 1. Load task, space-scoped, not deleted — only the columns we need.
+	var task model.SummaryTask
+	err := db.WithContext(ctx).
+		Select("id", "space_id", "creator_id", "status", "deleted_at").
+		Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).
+		First(&task).Error
+	if err != nil {
+		return false, "", "not_found"
+	}
+
+	// 2. Completed check.
+	if task.Status != model.StatusCompleted {
+		return false, "", "not_completed"
+	}
+
+	// 3. Access check.
+	if !canAccessTaskDB(db.WithContext(ctx), userID, task.ID, task.CreatorID) {
+		return false, "", "forbidden"
+	}
+
+	// 4. Check if a team-level SummaryResult exists (current_result or highest
+	// version) — just existence, no content loading.
+	var resultCount int64
+	db.WithContext(ctx).Model(&model.SummaryResult{}).
+		Where("task_id = ?", task.ID).
+		Count(&resultCount)
+	if resultCount > 0 {
+		// Verify the display result actually has content.
+		result, err := queryDisplayResult(db.WithContext(ctx), task.ID)
+		if err == nil && result.ID != 0 {
+			return true, "team_result", ""
+		}
+	}
+
+	// 5. Check caller's own PersonalResult — just existence, no content loading.
+	var prCount int64
+	db.WithContext(ctx).Model(&model.PersonalResult{}).
+		Where("task_id = ? AND user_id = ? AND content != ?", task.ID, userID, "").
+		Count(&prCount)
+	if prCount > 0 {
+		return true, "personal_result", ""
+	}
+
+	return false, "", "no_visible_content"
+}

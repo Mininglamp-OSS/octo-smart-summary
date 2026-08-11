@@ -202,6 +202,44 @@ func TestErrReferenceUnavailable(t *testing.T) {
 	}
 }
 
+// TestSanitizeRef_ControlChars verifies that control characters (CR, tab,
+// NUL) are stripped to prevent line-break manipulation within data fence
+// fields (SUM-25 review finding).
+func TestSanitizeRef_ControlChars(t *testing.T) {
+	cases := []struct {
+		name   string
+		in     string
+		absent []string
+	}{
+		{
+			name:   "strips carriage return",
+			in:     "line1\rline2",
+			absent: []string{"\r"},
+		},
+		{
+			name:   "replaces tab with space",
+			in:     "col1\tcol2",
+			absent: []string{"\t"},
+		},
+		{
+			name:   "strips NUL",
+			in:     "before\x00after",
+			absent: []string{"\x00"},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := sanitizeRef(c.in)
+			for _, a := range c.absent {
+				if strings.Contains(got, a) {
+					t.Errorf("sanitizeRef(%q) still contains %q: got %q", c.in, a, got)
+				}
+			}
+		})
+	}
+}
+
 // TestBuildReferencedSummariesContextEmpty verifies that the context builder
 // returns empty results when no task IDs are provided (SUM-19).
 func TestBuildReferencedSummariesContextEmpty(t *testing.T) {
