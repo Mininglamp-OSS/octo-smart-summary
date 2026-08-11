@@ -727,6 +727,15 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			parts = []gin.H{}
 		}
 
+		// SUM-19: expose referenceable status so the frontend can filter
+		// candidates without guessing from trigger_type.
+		refable, refType, refReason := false, "", ""
+		if t.Status == model.StatusCompleted {
+			refable, refType, refReason = checkReferenceable(c.Request.Context(), h.db, t.ID, spaceID, userID)
+		} else {
+			refReason = "not_completed"
+		}
+
 		items = append(items, gin.H{
 			"task_id":                     t.ID,
 			"task_no":                     t.TaskNo,
@@ -756,6 +765,9 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			"current_result_id":           attention.ListCurrentResultID,
 			"current_personal_version_id": attention.CurrentPersonalVersionID,
 			"activity_at":                 attention.ActivityAt,
+			"referenceable":               refable,
+			"reference_artifact_type":     refType,
+			"reference_unavailable_reason": refReason,
 		})
 	}
 
@@ -1001,6 +1013,17 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		resp["result_edited_at"] = nil
 		resp["result_is_edited"] = false
 	}
+
+	// SUM-19: expose referenceable status in detail response
+	refable, refType, refReason := false, "", ""
+	if task.Status == model.StatusCompleted {
+		refable, refType, refReason = checkReferenceable(c.Request.Context(), h.db, task.ID, task.SpaceID, middleware.GetUserID(c))
+	} else {
+		refReason = "not_completed"
+	}
+	resp["referenceable"] = refable
+	resp["reference_artifact_type"] = refType
+	resp["reference_unavailable_reason"] = refReason
 
 	// Add personal_result and members info
 	userID := middleware.GetUserID(c)

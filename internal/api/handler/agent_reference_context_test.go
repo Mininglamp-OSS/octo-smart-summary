@@ -11,11 +11,9 @@ import (
 // buildReferencedSummariesContext.
 func TestSanitizeRef(t *testing.T) {
 	cases := []struct {
-		name string
-		in   string
-		// substrings that must NOT survive in the output
+		name   string
+		in     string
 		absent []string
-		// substrings that must still be present (content preserved)
 		present []string
 	}{
 		{
@@ -58,5 +56,194 @@ func TestSanitizeRef(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestSerializeReferencedTaskIDs verifies the JSON serialization of task ID
+// slices for the ReferencedTaskIDs column (SUM-19).
+func TestSerializeReferencedTaskIDs(t *testing.T) {
+	t.Run("nil for empty slice", func(t *testing.T) {
+		got := serializeReferencedTaskIDs(nil)
+		if got != nil {
+			t.Errorf("serializeReferencedTaskIDs(nil) = %v, want nil", got)
+		}
+	})
+
+	t.Run("nil for empty non-nil slice", func(t *testing.T) {
+		got := serializeReferencedTaskIDs([]int64{})
+		if got != nil {
+			t.Errorf("serializeReferencedTaskIDs([]) = %v, want nil", got)
+		}
+	})
+
+	t.Run("valid JSON for single ID", func(t *testing.T) {
+		got := serializeReferencedTaskIDs([]int64{42})
+		if got == nil {
+			t.Fatal("expected non-nil result")
+		}
+		if *got != "[42]" {
+			t.Errorf("serializeReferencedTaskIDs([42]) = %q, want %q", *got, "[42]")
+		}
+	})
+
+	t.Run("valid JSON for multiple IDs", func(t *testing.T) {
+		got := serializeReferencedTaskIDs([]int64{1, 2, 3})
+		if got == nil {
+			t.Fatal("expected non-nil result")
+		}
+		if *got != "[1,2,3]" {
+			t.Errorf("serializeReferencedTaskIDs([1,2,3]) = %q, want %q", *got, "[1,2,3]")
+		}
+	})
+}
+
+// TestAppOriginToStorageChannelType verifies the mapping between application-
+// layer OriginChannelType and WuKongIM storage-layer channel_type
+// (SUM-158 blocker 4).
+func TestAppOriginToStorageChannelType(t *testing.T) {
+	cases := []struct {
+		name   string
+		origin int
+		want   int
+	}{
+		{"group", 1, 2},   // OriginChannelGroup → ChannelTypeGroup
+		{"thread", 2, 5},  // OriginChannelThread → ChannelTypeThread
+		{"dm", 3, 1},      // OriginChannelDM → ChannelTypeDM
+		{"unknown", 0, 0},
+		{"invalid", 99, 0},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := appOriginToStorageChannelType(c.origin)
+			if got != c.want {
+				t.Errorf("appOriginToStorageChannelType(%d) = %d, want %d", c.origin, got, c.want)
+			}
+		})
+	}
+}
+
+// TestStorageChannelTypeToAppOrigin verifies the reverse mapping from
+// WuKongIM storage-layer channel_type back to application-layer
+// OriginChannelType (SUM-158 blocker 4).
+func TestStorageChannelTypeToAppOrigin(t *testing.T) {
+	cases := []struct {
+		name    string
+		storage int
+		want    int
+		ok      bool
+	}{
+		{"dm", 1, 3, true},     // ChannelTypeDM → OriginChannelDM
+		{"group", 2, 1, true},  // ChannelTypeGroup → OriginChannelGroup
+		{"thread", 5, 2, true}, // ChannelTypeThread → OriginChannelThread
+		{"unknown", 0, 0, false},
+		{"invalid", 99, 0, false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := storageChannelTypeToAppOrigin(c.storage)
+			if ok != c.ok {
+				t.Errorf("storageChannelTypeToAppOrigin(%d) ok = %v, want %v", c.storage, ok, c.ok)
+			}
+			if got != c.want {
+				t.Errorf("storageChannelTypeToAppOrigin(%d) = %d, want %d", c.storage, got, c.want)
+			}
+		})
+	}
+}
+
+// TestChannelTypeLabel verifies the human-readable label for storage-layer
+// channel types used in reference context output.
+func TestChannelTypeLabel(t *testing.T) {
+	cases := []struct {
+		t     int
+		want  string
+		found bool
+	}{
+		{1, "(DM 私聊)", true},
+		{2, "(Group 群)", true},
+		{5, "(Thread 子区)", true},
+		{0, "(未知类型)", false},
+		{99, "(未知类型)", false},
+	}
+
+	for _, c := range cases {
+		t.Run("", func(t *testing.T) {
+			got := channelTypeLabel(c.t)
+			if got != c.want {
+				t.Errorf("channelTypeLabel(%d) = %q, want %q", c.t, got, c.want)
+			}
+		})
+	}
+}
+
+// TestErrReferenceUnavailable verifies the structured error type used to
+// report why a referenced summary is not available (SUM-19).
+func TestErrReferenceUnavailable(t *testing.T) {
+	err := &ErrReferenceUnavailable{
+		TaskID: 42,
+		Reason: "not_found",
+	}
+
+	if err.TaskID != 42 {
+		t.Errorf("TaskID = %d, want 42", err.TaskID)
+	}
+	if err.Reason != "not_found" {
+		t.Errorf("Reason = %q, want %q", err.Reason, "not_found")
+	}
+
+	got := err.Error()
+	if !strings.Contains(got, "42") {
+		t.Errorf("Error() should contain task ID: got %q", got)
+	}
+	if !strings.Contains(got, "not_found") {
+		t.Errorf("Error() should contain reason: got %q", got)
+	}
+}
+
+// TestBuildReferencedSummariesContextEmpty verifies that the context builder
+// returns empty results when no task IDs are provided (SUM-19).
+func TestBuildReferencedSummariesContextEmpty(t *testing.T) {
+	ctx := t.Context()
+	got, loaded, err := buildReferencedSummariesContext(ctx, nil, "space1", "user1", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "" {
+		t.Errorf("expected empty context, got %q", got)
+	}
+	if loaded != nil {
+		t.Errorf("expected nil loaded, got %v", loaded)
+	}
+
+	got, loaded, err = buildReferencedSummariesContext(ctx, nil, "space1", "user1", []int64{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "" {
+		t.Errorf("expected empty context for empty slice, got %q", got)
+	}
+	if loaded != nil {
+		t.Errorf("expected nil loaded for empty slice, got %v", loaded)
+	}
+}
+
+// TestReferencedSummaryArtifactFields verifies the ReferencedSummaryArtifact
+// struct fields are accessible (SUM-19).
+func TestReferencedSummaryArtifactFields(t *testing.T) {
+	art := &ReferencedSummaryArtifact{
+		Type:    "team_result",
+		Content: "summary content here",
+		HasSnapshot: false,
+	}
+	if art.Type != "team_result" {
+		t.Errorf("Type = %q, want %q", art.Type, "team_result")
+	}
+	if art.Content != "summary content here" {
+		t.Errorf("Content = %q, want %q", art.Content, "summary content here")
+	}
+	if art.HasSnapshot {
+		t.Errorf("HasSnapshot = true, want false")
 	}
 }
