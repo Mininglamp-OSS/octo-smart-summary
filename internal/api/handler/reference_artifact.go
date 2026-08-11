@@ -2,7 +2,9 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"gorm.io/gorm"
@@ -12,16 +14,14 @@ import (
 // It carries whatever the caller is allowed to see for this task, plus
 // metadata about the artifact type for API responses.
 type ReferencedSummaryArtifact struct {
-	TaskID   int64
-	Task     model.SummaryTask
-	Type     string // "team_result" or "personal_result"
-	Content  string
-	Citations []model.Citation
+	Task          model.SummaryTask
+	Type          string // "team_result" or "personal_result"
+	Content       string
+	Citations     []model.Citation
 	TeamCitations []model.TeamCitation
-	Snapshot *model.Snapshot
+	Snapshot      *model.Snapshot
 	// Sources and historical metadata for traditional summaries without snapshots
-	Sources      []model.SummarySource
-	HasSnapshot  bool
+	Sources []model.SummarySource
 }
 
 // ErrReferenceUnavailable is a structured rejection reason used when a
@@ -55,6 +55,10 @@ func resolveReferencedArtifact(
 		Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).
 		First(&task).Error
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, &ErrReferenceUnavailable{Reason: "not_found", TaskID: taskID}
+		}
+		log.Printf("[reference] DB error loading task %d: %v", taskID, err)
 		return nil, &ErrReferenceUnavailable{Reason: "not_found", TaskID: taskID}
 	}
 
@@ -75,15 +79,18 @@ func resolveReferencedArtifact(
 	if err == nil && result.ID != 0 {
 		// Determine citations visibility per detail-page privacy rules.
 		plainCitations := result.GetCitations()
-		if !callerPlainCitationsVisible(db.WithContext(ctx), &task, userID, &result) {
+		citationsVisible := callerPlainCitationsVisible(db.WithContext(ctx), &task, userID, &result)
+		if !citationsVisible {
 			plainCitations = []model.Citation{}
 		}
 		// Load sources for historical metadata.
 		var sources []model.SummarySource
-		db.WithContext(ctx).Where("task_id = ?", task.ID).Find(&sources)
+		if err := db.WithContext(ctx).Where("task_id = ?", task.ID).Find(&sources).Error; err != nil {
+			log.Printf("[reference] DB error loading sources for task %d: %v", task.ID, err)
+			sources = nil // fail closed: no sources rather than silently incomplete
+		}
 
 		return &ReferencedSummaryArtifact{
-			TaskID:        task.ID,
 			Task:          task,
 			Type:          "team_result",
 			Content:       result.Content,
@@ -91,7 +98,6 @@ func resolveReferencedArtifact(
 			TeamCitations: result.GetTeamCitations(),
 			Snapshot:      nil,
 			Sources:       sources,
-			HasSnapshot:   false,
 		}, nil
 	}
 
@@ -103,11 +109,17 @@ func resolveReferencedArtifact(
 		Order("id DESC").
 		First(&pr).Error
 	if err == nil && pr.ID != 0 && pr.Content != "" {
+		// Only load sources if there is no snapshot — sources are rendered
+		// only in the no-snapshot (traditional summary) branch (P2-4).
 		var sources []model.SummarySource
-		db.WithContext(ctx).Where("task_id = ?", task.ID).Find(&sources)
+		if pr.GetSnapshot() == nil {
+			if err := db.WithContext(ctx).Where("task_id = ?", task.ID).Find(&sources).Error; err != nil {
+				log.Printf("[reference] DB error loading sources for task %d: %v", task.ID, err)
+				sources = nil
+			}
+		}
 
 		return &ReferencedSummaryArtifact{
-			TaskID:        task.ID,
 			Task:          task,
 			Type:          "personal_result",
 			Content:       pr.Content,
@@ -115,11 +127,11 @@ func resolveReferencedArtifact(
 			TeamCitations: []model.TeamCitation{},
 			Snapshot:      pr.GetSnapshot(),
 			Sources:       sources,
-			HasSnapshot:   pr.GetSnapshot() != nil,
 		}, nil
 	}
 
 	// 6. No visible product.
+	log.Printf("[reference] no visible content for task %d, user %s", taskID, userID)
 	return nil, &ErrReferenceUnavailable{Reason: "no_visible_content", TaskID: taskID}
 }
 
@@ -135,7 +147,8 @@ func checkReferenceable(
 ) (referenceable bool, artifactType string, unavailableReason string) {
 	art, err := resolveReferencedArtifact(ctx, db, taskID, spaceID, userID)
 	if err != nil {
-		if refErr, ok := err.(*ErrReferenceUnavailable); ok {
+		var refErr *ErrReferenceUnavailable
+		if errors.As(err, &refErr) {
 			return false, "", refErr.Reason
 		}
 		return false, "", "error"
@@ -146,7 +159,7 @@ func checkReferenceable(
 // checkReferenceableFast is a lightweight check that determines whether a
 // task is referenceable WITHOUT loading sources, content, citations, or
 // snapshot. It only checks: task exists in space, not deleted, completed,
-	// caller has access, and a visible product (team result or personal result)
+// caller has access, and a visible product (team result or personal result)
 // exists. This avoids the N+1 query problem on list endpoints where we only
 // need the boolean referenceable flag and artifact type, not the full content.
 //
@@ -182,9 +195,12 @@ func checkReferenceableFast(
 	// 4. Check if a team-level SummaryResult exists (current_result or highest
 	// version) — just existence, no content loading.
 	var resultCount int64
-	db.WithContext(ctx).Model(&model.SummaryResult{}).
+	if err := db.WithContext(ctx).Model(&model.SummaryResult{}).
 		Where("task_id = ?", task.ID).
-		Count(&resultCount)
+		Count(&resultCount).Error; err != nil {
+		log.Printf("[reference-fast] DB error counting results for task %d: %v", task.ID, err)
+		return false, "", "error"
+	}
 	if resultCount > 0 {
 		// Verify the display result actually has content.
 		result, err := queryDisplayResult(db.WithContext(ctx), task.ID)
@@ -195,12 +211,16 @@ func checkReferenceableFast(
 
 	// 5. Check caller's own PersonalResult — just existence, no content loading.
 	var prCount int64
-	db.WithContext(ctx).Model(&model.PersonalResult{}).
+	if err := db.WithContext(ctx).Model(&model.PersonalResult{}).
 		Where("task_id = ? AND user_id = ? AND content != ?", task.ID, userID, "").
-		Count(&prCount)
+		Count(&prCount).Error; err != nil {
+		log.Printf("[reference-fast] DB error counting personal results for task %d: %v", task.ID, err)
+		return false, "", "error"
+	}
 	if prCount > 0 {
 		return true, "personal_result", ""
 	}
 
+	log.Printf("[reference-fast] no visible content for task %d, user %s", taskID, userID)
 	return false, "", "no_visible_content"
 }

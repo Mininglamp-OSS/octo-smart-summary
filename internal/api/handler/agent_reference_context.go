@@ -103,18 +103,24 @@ func buildReferencedSummariesContext(
 			if refErr, ok := err.(*ErrReferenceUnavailable); ok {
 				reason = refErr.Reason
 			}
-			sb.WriteString(fmt.Sprintf("【引用总结 · task_id=%d】(不可引用: %s, 跳过)\n\n", tid, reason))
+			// Collapse forbidden/not_found to a single opaque reason in the
+			// prompt to avoid giving the model an existence oracle (P2-6).
+			displayReason := reason
+			if reason == "forbidden" {
+				displayReason = "not_found"
+			}
+			sb.WriteString(fmt.Sprintf("【引用总结 · task_id=%d】(不可引用: %s, 跳过)\n\n", tid, displayReason))
 			continue
 		}
 
 		loaded = append(loaded, tid)
-		sb.WriteString(fmt.Sprintf("─── 引用总结 · task_id=%d · %s ───\n\n", art.Task.ID, sanitizeRef(art.Task.EffectiveTopic())))
+		sb.WriteString(fmt.Sprintf("─── 引用总结 · task_id=%d · %s ───\n\n", art.Task.ID, sanitizeRef(art.Task.Title)))
 
 		// Snapshot section (agent summaries only): reference metadata only.
 		// All snapshot strings are untrusted (may contain user-supplied channel IDs,
 		// timestamps, tool traces) and must be sanitized and placed inside the
 		// <引用数据> fence to prevent prompt injection (SUM-25 review blocker).
-		if art.HasSnapshot && art.Snapshot != nil {
+		if art.Snapshot != nil {
 			snap := art.Snapshot
 			sb.WriteString("【元信息 · 老总结的生成语境(仅供参考)】\n")
 			sb.WriteString(refDataOpen + "\n")
@@ -312,8 +318,28 @@ func (h *AgentSummaryHandler) borrowCitationsFromReference(
 	}
 
 	// Only borrow plain citations, never team citations.
-	if len(art.Citations) == 0 {
-		return []model.Citation{}
+	if len(art.Citations) > 0 {
+		return art.Citations
 	}
-	return art.Citations
+
+	// P1-2: If the resolved artifact is a team_result with redacted citations
+	// (BY_PERSON privacy gate), try the caller's own PersonalResult as a
+	// fallback for citation alignment. The caller's PersonalResult has
+	// [n] markers and citations that are aligned — using it prevents
+	// dangling [n] markers in the refined content.
+	if art.Type == "team_result" {
+		var pr model.PersonalResult
+		err := h.db.WithContext(ctx).
+			Where("task_id = ? AND user_id = ?", refTaskID, userID).
+			Order("id DESC").
+			First(&pr).Error
+		if err == nil && pr.ID != 0 {
+			prCitations := pr.GetCitations()
+			if len(prCitations) > 0 {
+				return prCitations
+			}
+		}
+	}
+
+	return []model.Citation{}
 }

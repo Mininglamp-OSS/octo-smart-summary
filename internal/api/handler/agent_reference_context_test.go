@@ -11,9 +11,9 @@ import (
 // buildReferencedSummariesContext.
 func TestSanitizeRef(t *testing.T) {
 	cases := []struct {
-		name   string
-		in     string
-		absent []string
+		name    string
+		in      string
+		absent  []string
 		present []string
 	}{
 		{
@@ -106,9 +106,9 @@ func TestAppOriginToStorageChannelType(t *testing.T) {
 		origin int
 		want   int
 	}{
-		{"group", 1, 2},   // OriginChannelGroup → ChannelTypeGroup
-		{"thread", 2, 5},  // OriginChannelThread → ChannelTypeThread
-		{"dm", 3, 1},      // OriginChannelDM → ChannelTypeDM
+		{"group", 1, 2},  // OriginChannelGroup → ChannelTypeGroup
+		{"thread", 2, 5}, // OriginChannelThread → ChannelTypeThread
+		{"dm", 3, 1},     // OriginChannelDM → ChannelTypeDM
 		{"unknown", 0, 0},
 		{"invalid", 99, 0},
 	}
@@ -273,7 +273,6 @@ func TestReferencedSummaryArtifactFields(t *testing.T) {
 	art := &ReferencedSummaryArtifact{
 		Type:    "team_result",
 		Content: "summary content here",
-		HasSnapshot: false,
 	}
 	if art.Type != "team_result" {
 		t.Errorf("Type = %q, want %q", art.Type, "team_result")
@@ -281,7 +280,7 @@ func TestReferencedSummaryArtifactFields(t *testing.T) {
 	if art.Content != "summary content here" {
 		t.Errorf("Content = %q, want %q", art.Content, "summary content here")
 	}
-	if art.HasSnapshot {
-		t.Errorf("HasSnapshot = true, want false")
+	if art.Snapshot != nil {
+		t.Error("Snapshot should be nil by default")
 	}
 }
