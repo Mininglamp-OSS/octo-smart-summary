@@ -122,18 +122,13 @@ func buildReferencedSummariesContext(
 		return "", nil
 	}
 
-	// Deduplicate referenced task IDs first, then cap (P2-2: if cap is
-	// applied before dedupe, [999×25, 1, 2, 3] would use the entire budget
-	// on duplicates and drop the unique IDs).
-	seen := make(map[int64]bool, len(taskIDs))
-	deduped := make([]int64, 0, len(taskIDs))
-	for _, id := range taskIDs {
-		if !seen[id] {
-			seen[id] = true
-			deduped = append(deduped, id)
-		}
-	}
-	taskIDs = deduped
+	// Deduplicate referenced task IDs first, then cap (R4 yj P2-2, R5 yj
+	// P3, R5 ms P2-4, R5 jx non-blocking #1). Callers at the handler
+	// binding layer (Chat, ChatStream) also dedupe-then-check against
+	// maxReferencedTaskIDs, so the same helper here is a defensive
+	// no-op — but it keeps this function a stand-alone unit that cannot
+	// silently exceed the cap if some future caller forgets the check.
+	taskIDs = dedupReferencedTaskIDs(taskIDs)
 
 	// Cap referenced task IDs to prevent unbounded query fanout (P1-3).
 	if len(taskIDs) > maxReferencedTaskIDs {

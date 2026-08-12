@@ -199,9 +199,36 @@ func referenceableFromLoaded(
 	return false, "", "no_visible_content"
 }
 
-// maxReferencedTaskIDs caps the number of referenced task IDs accepted by
-// the chat path to prevent unbounded query fanout (P1-3).
+// maxReferencedTaskIDs caps the number of *distinct* referenced task IDs
+// accepted by the chat path to prevent unbounded query fanout (P1-3).
+//
+// Callers MUST dedupReferencedTaskIDs first and validate the *deduped*
+// length against this cap; otherwise a payload of {999×25, 1, 2, 3} would
+// exhaust the budget on duplicates and drop the unique IDs (R4 yj P2-2,
+// R5 yj P3, R5 ms P2-4, R5 jx non-blocking #1 — all four reviewers
+// converged on "dedup-then-check at the binding layer").
 const maxReferencedTaskIDs = 20
+
+// dedupReferencedTaskIDs preserves first-seen order and drops repeats.
+// Exported at package scope so both the chat handlers (Chat / ChatStream)
+// and the context builder (buildReferencedSummariesContext) can share one
+// definition — this is the single source of truth for the referenced-ID
+// contract, so the dedup semantics cannot drift between validate-at-binding
+// and consume-at-build.
+func dedupReferencedTaskIDs(ids []int64) []int64 {
+	if len(ids) == 0 {
+		return nil
+	}
+	seen := make(map[int64]bool, len(ids))
+	out := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	return out
+}
 
 // hasNonEmptyPersonalResult reports whether the caller owns a PersonalResult
 // for taskID with non-empty content. This is the single-task form of the
