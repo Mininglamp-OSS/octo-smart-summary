@@ -214,8 +214,8 @@ func callerPlainCitationsVisible(db *gorm.DB, task *model.SummaryTask, callerID 
 }
 
 type apiResponse struct {
-	Code    int         `json:"code"`
-	Message string      `json:"message"`
+	Code    int    `json:"code"`
+	Message string `json:"message"`
 	// Detail carries a compact, safe-to-expose error signature so clients
 	// (F12 devtools, ops) can distinguish sub-causes of a generic Message
 	// without pulling backend logs. Populated only on error responses;
@@ -224,8 +224,8 @@ type apiResponse struct {
 	// (DB paths, tokens, stack fragments). Passthrough of err.Error() from
 	// well-known agent runner failures (context deadline exceeded, max
 	// steps exceeded, LLM returned empty response) is safe by construction.
-	Detail  string      `json:"detail,omitempty"`
-	Data    interface{} `json:"data,omitempty"`
+	Detail string      `json:"detail,omitempty"`
+	Data   interface{} `json:"data,omitempty"`
 }
 
 func ok(c *gin.Context, data interface{}) {
@@ -729,46 +729,55 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 
 		// SUM-19: expose referenceable status so the frontend can filter
 		// candidates without guessing from trigger_type.
-		// Use checkReferenceableFast on the list endpoint to avoid N+1 queries
-		// that load sources/content/citations per row (SUM-25 review finding).
-		refable, refType, refReason := false, "", ""
-		if t.Status == model.StatusCompleted {
-			refable, refType, refReason = checkReferenceableFast(c.Request.Context(), h.db, t.ID, spaceID, userID)
-		} else {
-			refReason = "not_completed"
+		// P1-3: Use referenceableFromLoaded to reuse data already in scope
+		// (task row, display result, participants) instead of issuing 4-5
+		// redundant per-row queries via checkReferenceableFast.
+		isParticipant := t.CreatorID == userID
+		if !isParticipant {
+			for _, p := range partsByTask[t.ID] {
+				if p["user_id"] == userID {
+					isParticipant = true
+					break
+				}
+			}
 		}
+		resultContent := ""
+		if hasResult {
+			resultContent = latestResult.Content
+		}
+		refable, refType, refReason := referenceableFromLoaded(t, hasResult, resultContent, isParticipant)
 
 		items = append(items, gin.H{
-			"task_id":                     t.ID,
-			"task_no":                     t.TaskNo,
-			"title":                       t.Title,
-			"topic":                       t.EffectiveTopic(),
-			"summary_mode":                t.SummaryMode,
-			"status":                      t.Status,
-			"trigger_type":                t.TriggerType,
-			"schedule_id":                 scheduleIDOut,
-			"creator_id":                  t.CreatorID,
-			"participants":                parts,
-			"time_range_start":            t.TimeRangeStart.Format(time.RFC3339),
-			"time_range_end":              t.TimeRangeEnd.Format(time.RFC3339),
-			"sources":                     srcList,
-			"total_msg_count":             totalMsgCount,
-			"creator_name":                creatorName,
-			"origin_channel_id":           t.OriginChannelID,
-			"origin_channel_type":         t.OriginChannelType,
-			"created_at":                  t.CreatedAt.Format(time.RFC3339),
-			"completed_at":                completedAt,
-			"result_is_edited":            resultIsEdited,
-			"result_edited_at":            resultEditedAt,
-			"is_unread":                   attention.IsUnread,
-			"has_pending_invitation":      attention.HasPendingInvitation,
-			"has_pending_submission":      attention.HasPendingSubmission,
-			"needs_attention":             attention.IsUnread || attention.HasPendingInvitation,
-			"current_result_id":           attention.ListCurrentResultID,
-			"current_personal_version_id": attention.CurrentPersonalVersionID,
-			"activity_at":                 attention.ActivityAt,
-			"referenceable":               refable,
-			"reference_artifact_type":     refType,
+			"task_id":                      t.ID,
+			"task_no":                      t.TaskNo,
+			"title":                        t.Title,
+			"topic":                        t.EffectiveTopic(),
+			"summary_mode":                 t.SummaryMode,
+			"status":                       t.Status,
+			"trigger_type":                 t.TriggerType,
+			"schedule_id":                  scheduleIDOut,
+			"creator_id":                   t.CreatorID,
+			"participants":                 parts,
+			"time_range_start":             t.TimeRangeStart.Format(time.RFC3339),
+			"time_range_end":               t.TimeRangeEnd.Format(time.RFC3339),
+			"sources":                      srcList,
+			"total_msg_count":              totalMsgCount,
+			"creator_name":                 creatorName,
+			"origin_channel_id":            t.OriginChannelID,
+			"origin_channel_type":          t.OriginChannelType,
+			"created_at":                   t.CreatedAt.Format(time.RFC3339),
+			"completed_at":                 completedAt,
+			"result_is_edited":             resultIsEdited,
+			"result_edited_at":             resultEditedAt,
+			"is_unread":                    attention.IsUnread,
+			"has_pending_invitation":       attention.HasPendingInvitation,
+			"has_pending_submission":       attention.HasPendingSubmission,
+			"needs_attention":              attention.IsUnread || attention.HasPendingInvitation,
+			"current_result_id":            attention.ListCurrentResultID,
+			"current_personal_version_id":  attention.CurrentPersonalVersionID,
+			"activity_at":                  attention.ActivityAt,
+			"referenceable":                refable,
+			"reference_artifact_type":      refType,
 			"reference_unavailable_reason": refReason,
 		})
 	}
@@ -1016,13 +1025,16 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		resp["result_is_edited"] = false
 	}
 
-	// SUM-19: expose referenceable status in detail response
-	refable, refType, refReason := false, "", ""
-	if task.Status == model.StatusCompleted {
-		refable, refType, refReason = checkReferenceable(c.Request.Context(), h.db, task.ID, task.SpaceID, middleware.GetUserID(c))
-	} else {
-		refReason = "not_completed"
+	// SUM-19: expose referenceable status in detail response.
+	// P1-3: reuse data already loaded (task, display result) instead of
+	// calling checkReferenceable which re-loads all of it.
+	// At this point authorizeTaskAccess has already confirmed the caller is
+	// creator or participant, so isParticipant is true.
+	detailResultContent := ""
+	if hasResult {
+		detailResultContent = latestResult.Content
 	}
+	refable, refType, refReason := referenceableFromLoaded(task, hasResult, detailResultContent, true)
 	resp["referenceable"] = refable
 	resp["reference_artifact_type"] = refType
 	resp["reference_unavailable_reason"] = refReason

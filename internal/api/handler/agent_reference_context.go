@@ -3,7 +3,9 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -18,6 +20,12 @@ const (
 	refDataClose = "</引用数据>"
 )
 
+// fencePlaceholder is the non-empty replacement for stripped fence tags.
+// Using a placeholder (not "") prevents split-token reassembly attacks
+// where deleting a fence tag splices neighbours together to form a new
+// copy of the same token (P1-2 fix).
+const fencePlaceholder = "[引用数据]"
+
 // sanitizeRef neutralizes untrusted referenced-summary text before it is
 // embedded in the agent's system prompt (SUM-158 blocker 3 — prompt
 // injection). A referenced summary may quote arbitrary chat content authored
@@ -25,19 +33,20 @@ const (
 // early, or (b) forge the box-drawing / bracket delimiters this builder uses
 // as section boundaries — e.g. a fake "─── 引用结束 ───" line or a bogus
 // 【元信息】 header that could trick the model into treating following text as
-// framing/instructions. We strip the fence tags and fold the structural glyphs
-// down to plain ASCII; the content stays readable, it just can no longer
-// impersonate the framing. Additionally, control characters (CR, tab, NUL)
-// are stripped to prevent line-break manipulation within data fence fields.
+// framing/instructions. We replace the fence tags with a non-empty placeholder
+// (preventing split-token reassembly — P1-2), fold the structural glyphs
+// down to plain ASCII, and strip control characters including newline (which
+// could forge standalone lines outside the fence).
 func sanitizeRef(s string) string {
 	s = strings.NewReplacer(
-		refDataOpen, "",
-		refDataClose, "",
+		refDataOpen, fencePlaceholder,
+		refDataClose, fencePlaceholder,
 		"═", "=",
 		"─", "-",
 		"【", "[",
 		"】", "]",
 		"\r", "",
+		"\n", " ",
 		"\t", " ",
 		"\x00", "",
 	).Replace(s)
@@ -83,6 +92,22 @@ func buildReferencedSummariesContext(
 		return "", nil, nil
 	}
 
+	// Cap referenced task IDs to prevent unbounded query fanout (P1-3).
+	if len(taskIDs) > maxReferencedTaskIDs {
+		taskIDs = taskIDs[:maxReferencedTaskIDs]
+	}
+
+	// Deduplicate referenced task IDs (P2: dedupe).
+	seen := make(map[int64]bool, len(taskIDs))
+	deduped := make([]int64, 0, len(taskIDs))
+	for _, id := range taskIDs {
+		if !seen[id] {
+			seen[id] = true
+			deduped = append(deduped, id)
+		}
+	}
+	taskIDs = deduped
+
 	loaded := make([]int64, 0, len(taskIDs))
 	var sb strings.Builder
 	sb.WriteString("\n\n═══════════════════════════════════════════════════\n")
@@ -100,20 +125,21 @@ func buildReferencedSummariesContext(
 		art, err := resolveReferencedArtifact(ctx, db, tid, spaceID, userID)
 		if err != nil {
 			reason := "unknown"
-			if refErr, ok := err.(*ErrReferenceUnavailable); ok {
+			var refErr *ErrReferenceUnavailable
+			if errors.As(err, &refErr) {
 				reason = refErr.Reason
 			}
-			// Collapse forbidden/not_found to a single opaque reason in the
-			// prompt to avoid giving the model an existence oracle (P2-6).
-			displayReason := reason
-			if reason == "forbidden" {
-				displayReason = "not_found"
-			}
-			sb.WriteString(fmt.Sprintf("【引用总结 · task_id=%d】(不可引用: %s, 跳过)\n\n", tid, displayReason))
+			// All rejection reasons are already opaque after the P3 fix
+			// (forbidden → not_found in resolver). Log the rejection for
+			// server-side audit (P2-4) and surface a uniform reason.
+			log.Printf("[reference-builder] skip task %d for user %s: %s", tid, userID, reason)
+			sb.WriteString(fmt.Sprintf("【引用总结 · task_id=%d】(不可引用: %s, 跳过)\n\n", tid, reason))
 			continue
 		}
 
 		loaded = append(loaded, tid)
+		// P2-3: Title is rendered outside the data fence, so it must be
+		// sanitized including newline → space to prevent line injection.
 		sb.WriteString(fmt.Sprintf("─── 引用总结 · task_id=%d · %s ───\n\n", art.Task.ID, sanitizeRef(art.Task.Title)))
 
 		// Snapshot section (agent summaries only): reference metadata only.
@@ -300,10 +326,19 @@ func serializeReferencedTaskIDs(ids []int64) *string {
 // bot, agent). Team citations are NOT borrowed as plain citations — they are
 // [Pn] participant references and would produce broken citation links.
 //
+// Critical invariant (P1-1 fix): the borrowed citations MUST belong to the
+// same document whose content was rendered into the prompt. When the team
+// result's plain citations are empty (BY_PERSON redaction), we cannot borrow
+// the caller's PersonalResult citations alone — that would graft one
+// document's citations onto another's content. Instead, we return [] and let
+// the caller handle the dangling markers. The alternative — returning the
+// caller's PersonalResult as the whole artifact — would require changing
+// what content is rendered in the prompt, which is a larger design change.
+//
 // Returns []model.Citation{} (never nil) if:
 //   - the referenced task isn't found in the caller's space
 //   - no visible artifact exists
-//   - the artifact's citations are empty
+//   - the artifact's citations are empty (including BY_PERSON redaction)
 //
 // See CHAT-REFERENCE-BASED-DESIGN-v1 §citation preservation.
 func (h *AgentSummaryHandler) borrowCitationsFromReference(
@@ -317,29 +352,14 @@ func (h *AgentSummaryHandler) borrowCitationsFromReference(
 		return []model.Citation{}
 	}
 
-	// Only borrow plain citations, never team citations.
+	// Only borrow plain citations that belong to the same document whose
+	// content was rendered (P1-1). Never graft citations from a different
+	// document onto the team result's content.
 	if len(art.Citations) > 0 {
 		return art.Citations
 	}
 
-	// P1-2: If the resolved artifact is a team_result with redacted citations
-	// (BY_PERSON privacy gate), try the caller's own PersonalResult as a
-	// fallback for citation alignment. The caller's PersonalResult has
-	// [n] markers and citations that are aligned — using it prevents
-	// dangling [n] markers in the refined content.
-	if art.Type == "team_result" {
-		var pr model.PersonalResult
-		err := h.db.WithContext(ctx).
-			Where("task_id = ? AND user_id = ?", refTaskID, userID).
-			Order("id DESC").
-			First(&pr).Error
-		if err == nil && pr.ID != 0 {
-			prCitations := pr.GetCitations()
-			if len(prCitations) > 0 {
-				return prCitations
-			}
-		}
-	}
-
+	// Citations are empty (BY_PERSON redaction or genuinely empty).
+	// Return empty — do NOT borrow from a different document.
 	return []model.Citation{}
 }

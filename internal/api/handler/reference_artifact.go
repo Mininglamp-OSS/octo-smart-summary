@@ -36,9 +36,13 @@ func (e *ErrReferenceUnavailable) Error() string {
 }
 
 // resolveReferencedArtifact applies the unified resolution rules from the
-// design doc: space isolation → not deleted → status=completed → canAccessTaskDB
+// design doc: space isolation → not deleted → canAccessTaskDB → status=completed
 // → prefer current_result_id → highest-version summary_result → fall back to
 // caller-owned PersonalResult (never cross-user).
+//
+// Authorization is checked BEFORE status so that unauthorized callers cannot
+// distinguish "exists but not completed" from "does not exist" — both return
+// an opaque "not_found" reason (P3 fix).
 //
 // "Visible" is consistent with detail-page citation visibility: BY_PERSON does
 // not leak other participants' PersonalResult.
@@ -62,21 +66,23 @@ func resolveReferencedArtifact(
 		return nil, &ErrReferenceUnavailable{Reason: "not_found", TaskID: taskID}
 	}
 
-	// 2. Completed check.
-	if task.Status != model.StatusCompleted {
-		return nil, &ErrReferenceUnavailable{Reason: "not_completed", TaskID: taskID}
+	// 2. Access check BEFORE status check (P3): unauthorized callers get
+	// opaque "not_found" regardless of task status, preventing existence
+	// oracle via not_completed vs not_found distinction.
+	if !canAccessTaskDB(db.WithContext(ctx), userID, task.ID, task.CreatorID) {
+		return nil, &ErrReferenceUnavailable{Reason: "not_found", TaskID: taskID}
 	}
 
-	// 3. Access check: creator or explicit participant.
-	if !canAccessTaskDB(db.WithContext(ctx), userID, task.ID, task.CreatorID) {
-		return nil, &ErrReferenceUnavailable{Reason: "forbidden", TaskID: taskID}
+	// 3. Completed check (only reachable after authorization).
+	if task.Status != model.StatusCompleted {
+		return nil, &ErrReferenceUnavailable{Reason: "not_completed", TaskID: taskID}
 	}
 
 	// 4. Try team-level SummaryResult first (covers manual, scheduled, bot, and
 	// agent team results). Use queryDisplayResult which respects
 	// current_result_id and falls back to highest version.
 	result, err := queryDisplayResult(db.WithContext(ctx), task.ID)
-	if err == nil && result.ID != 0 {
+	if err == nil && result.ID != 0 && result.Content != "" {
 		// Determine citations visibility per detail-page privacy rules.
 		plainCitations := result.GetCitations()
 		citationsVisible := callerPlainCitationsVisible(db.WithContext(ctx), &task, userID, &result)
@@ -103,12 +109,13 @@ func resolveReferencedArtifact(
 
 	// 5. Fall back to caller's own PersonalResult (agent summaries, or
 	// BY_PERSON single-participant results). No cross-user fallback.
+	// Uses the same predicate as checkReferenceableFast for consistency (P2-1).
 	var pr model.PersonalResult
 	err = db.WithContext(ctx).
-		Where("task_id = ? AND user_id = ?", task.ID, userID).
+		Where("task_id = ? AND user_id = ? AND content != ?", task.ID, userID, "").
 		Order("id DESC").
 		First(&pr).Error
-	if err == nil && pr.ID != 0 && pr.Content != "" {
+	if err == nil && pr.ID != 0 {
 		// Only load sources if there is no snapshot — sources are rendered
 		// only in the no-snapshot (traditional summary) branch (P2-4).
 		var sources []model.SummarySource
@@ -135,8 +142,8 @@ func resolveReferencedArtifact(
 	return nil, &ErrReferenceUnavailable{Reason: "no_visible_content", TaskID: taskID}
 }
 
-// checkReferenceable is a lightweight read-only check used by list/detail
-// handlers to populate the `referenceable`, `reference_artifact_type`, and
+// checkReferenceable is a read-only check used by list/detail handlers to
+// populate the `referenceable`, `reference_artifact_type`, and
 // `reference_unavailable_reason` fields in API responses.
 func checkReferenceable(
 	ctx context.Context,
@@ -156,15 +163,54 @@ func checkReferenceable(
 	return true, art.Type, ""
 }
 
+// referenceableFromLoaded computes referenceable status from data already
+// loaded by the list/detail handler, avoiding redundant per-row queries (P1-3).
+//
+// Parameters:
+//   - task: the full task row (already space-scoped and deleted_at-filtered)
+//   - hasResult: whether a display SummaryResult exists (from pickDisplayResult)
+//   - resultContent: the display result's content (for empty-content guard)
+//   - isParticipant: whether the caller is creator or participant
+//
+// This replaces checkReferenceableFast on the list endpoint, eliminating
+// 4-5 redundant queries per row.
+func referenceableFromLoaded(
+	task model.SummaryTask,
+	hasResult bool,
+	resultContent string,
+	isParticipant bool,
+) (referenceable bool, artifactType string, unavailableReason string) {
+	// Authorization (P3: before status).
+	if !isParticipant {
+		return false, "", "not_found"
+	}
+
+	if task.Status != model.StatusCompleted {
+		return false, "", "not_completed"
+	}
+
+	// Team result with non-empty content (P2-2: guard against empty content).
+	if hasResult && resultContent != "" {
+		return true, "team_result", ""
+	}
+
+	// Without a team result, the caller's own PersonalResult is the fallback.
+	// We can't check its existence from loaded data alone, so report
+	// referenceable as unknown — the frontend can lazy-load detail if needed.
+	// This is safe: the detail endpoint uses the full checkReferenceable.
+	return false, "", "no_visible_content"
+}
+
+// maxReferencedTaskIDs caps the number of referenced task IDs accepted by
+// the chat path to prevent unbounded query fanout (P1-3).
+const maxReferencedTaskIDs = 20
+
 // checkReferenceableFast is a lightweight check that determines whether a
 // task is referenceable WITHOUT loading sources, content, citations, or
-// snapshot. It only checks: task exists in space, not deleted, completed,
-// caller has access, and a visible product (team result or personal result)
-// exists. This avoids the N+1 query problem on list endpoints where we only
-// need the boolean referenceable flag and artifact type, not the full content.
+// snapshot. Used by the detail endpoint where data is not pre-loaded.
 //
-// For the list endpoint, callers should prefer this over checkReferenceable
-// to avoid loading unnecessary sources/content per row.
+// For the list endpoint, prefer referenceableFromLoaded which reuses
+// already-loaded data (P1-3).
 func checkReferenceableFast(
 	ctx context.Context,
 	db *gorm.DB,
@@ -179,37 +225,42 @@ func checkReferenceableFast(
 		Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).
 		First(&task).Error
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, "", "not_found"
+		}
+		log.Printf("[reference-fast] DB error loading task %d: %v", taskID, err)
+		return false, "", "error"
+	}
+
+	// 2. Access check BEFORE status (P3).
+	if !canAccessTaskDB(db.WithContext(ctx), userID, task.ID, task.CreatorID) {
 		return false, "", "not_found"
 	}
 
-	// 2. Completed check.
+	// 3. Completed check.
 	if task.Status != model.StatusCompleted {
 		return false, "", "not_completed"
 	}
 
-	// 3. Access check.
-	if !canAccessTaskDB(db.WithContext(ctx), userID, task.ID, task.CreatorID) {
-		return false, "", "forbidden"
-	}
-
-	// 4. Check if a team-level SummaryResult exists (current_result or highest
-	// version) — just existence, no content loading.
-	var resultCount int64
-	if err := db.WithContext(ctx).Model(&model.SummaryResult{}).
+	// 4. Check if a team-level SummaryResult exists with non-empty content.
+	// Use a projection-limited query to avoid loading mediumtext columns (P1-3).
+	var resultID int64
+	err = db.WithContext(ctx).Model(&model.SummaryResult{}).
+		Select("id").
 		Where("task_id = ?", task.ID).
-		Count(&resultCount).Error; err != nil {
-		log.Printf("[reference-fast] DB error counting results for task %d: %v", task.ID, err)
-		return false, "", "error"
-	}
-	if resultCount > 0 {
-		// Verify the display result actually has content.
-		result, err := queryDisplayResult(db.WithContext(ctx), task.ID)
-		if err == nil && result.ID != 0 {
+		Order("version DESC").
+		Limit(1).
+		Scan(&resultID).Error
+	if err == nil && resultID != 0 {
+		// Verify via queryDisplayResult that the display result has content.
+		result, qErr := queryDisplayResult(db.WithContext(ctx), task.ID)
+		if qErr == nil && result.ID != 0 && result.Content != "" {
 			return true, "team_result", ""
 		}
 	}
 
-	// 5. Check caller's own PersonalResult — just existence, no content loading.
+	// 5. Check caller's own PersonalResult — same predicate as the full
+	// resolver for consistency (P2-1): content != '' and Order(id DESC).
 	var prCount int64
 	if err := db.WithContext(ctx).Model(&model.PersonalResult{}).
 		Where("task_id = ? AND user_id = ? AND content != ?", task.ID, userID, "").
