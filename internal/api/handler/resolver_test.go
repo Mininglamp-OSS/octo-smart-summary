@@ -491,3 +491,117 @@ func TestBorrowCitations_EmptyCitationsReturnsEmpty(t *testing.T) {
 		t.Fatalf("expected 0 citations (no grafting), got %d", len(cits))
 	}
 }
+
+// --- P1-1 shared-predicate regression tests (R4 yj/ms/jx) ---
+
+// TestHasNonEmptyPersonalResult_EmptyContentIsNotReferenceable is the direct
+// regression for the empty-window scheduled-task case. The producer
+// (completeTaskWithoutNewResult) writes a placeholder PersonalResult with
+// content="" so the caller has *something* to render, but that placeholder
+// carries no visible summary text. Before R4 the list handler's SQL only
+// checked row existence, so the picker reported referenceable=true while the
+// resolver — which requires content != '' — rejected the same task as
+// no_visible_content. Both sides now share this predicate.
+func TestHasNonEmptyPersonalResult_EmptyContentIsNotReferenceable(t *testing.T) {
+	db := setupResolverTestDB(t)
+	task := createCompletedTask(t, db, "space1", "creator1", model.OriginChannelGroup)
+	addPersonalResult(t, db, task.ID, "creator1", "") // empty placeholder
+
+	got, err := hasNonEmptyPersonalResult(db, task.ID, "creator1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got {
+		t.Fatal("empty-content PersonalResult must not count as referenceable")
+	}
+}
+
+// TestHasNonEmptyPersonalResult_NonEmptyContent verifies the positive case.
+func TestHasNonEmptyPersonalResult_NonEmptyContent(t *testing.T) {
+	db := setupResolverTestDB(t)
+	task := createCompletedTask(t, db, "space1", "creator1", model.OriginChannelGroup)
+	addPersonalResult(t, db, task.ID, "creator1", "actual summary text")
+
+	got, err := hasNonEmptyPersonalResult(db, task.ID, "creator1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !got {
+		t.Fatal("non-empty PersonalResult must count as referenceable")
+	}
+}
+
+// TestNonEmptyPersonalResultTaskIDs_MixedBatch is the batch-form regression
+// for the same predicate divergence: given three tasks (one with visible
+// content, one empty-placeholder, one with no personal result at all), only
+// the visible one should appear in the resulting map. This is what the list
+// endpoint's batch build must agree with the resolver on.
+func TestNonEmptyPersonalResultTaskIDs_MixedBatch(t *testing.T) {
+	db := setupResolverTestDB(t)
+	// createCompletedTask hardcodes TaskNo="TST-REF-001" which UNIQUEs; build
+	// three distinct rows directly so we can batch across them.
+	mk := func(taskNo string) model.SummaryTask {
+		task := model.SummaryTask{
+			TaskNo:            taskNo,
+			SpaceID:           "space1",
+			CreatorID:         "creator1",
+			SummaryMode:       model.ModeByPerson,
+			Status:            model.StatusCompleted,
+			OriginChannelType: model.OriginChannelGroup,
+		}
+		if err := db.Create(&task).Error; err != nil {
+			t.Fatalf("create task %s: %v", taskNo, err)
+		}
+		return task
+	}
+	task1 := mk("TST-BATCH-1")
+	task2 := mk("TST-BATCH-2")
+	task3 := mk("TST-BATCH-3")
+
+	addPersonalResult(t, db, task1.ID, "creator1", "visible content")
+	addPersonalResult(t, db, task2.ID, "creator1", "") // empty placeholder
+	// task3 has no PersonalResult at all.
+
+	got, err := nonEmptyPersonalResultTaskIDs(db, []int64{task1.ID, task2.ID, task3.ID}, "creator1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !got[task1.ID] {
+		t.Errorf("task1 (visible content) must be in the map")
+	}
+	if got[task2.ID] {
+		t.Errorf("task2 (empty placeholder) must NOT be in the map")
+	}
+	if got[task3.ID] {
+		t.Errorf("task3 (no personal result) must NOT be in the map")
+	}
+	if len(got) != 1 {
+		t.Errorf("map size = %d, want 1", len(got))
+	}
+}
+
+// TestNonEmptyPersonalResultTaskIDs_EmptyInputs guards the fast paths: no
+// task IDs, or an anonymous caller, must return an empty (but non-nil) map
+// so callers can index it without nil-check.
+func TestNonEmptyPersonalResultTaskIDs_EmptyInputs(t *testing.T) {
+	db := setupResolverTestDB(t)
+
+	got, err := nonEmptyPersonalResultTaskIDs(db, nil, "creator1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("nil taskIDs must return a non-nil empty map")
+	}
+	if len(got) != 0 {
+		t.Errorf("expected empty map, got %d entries", len(got))
+	}
+
+	got, err = nonEmptyPersonalResultTaskIDs(db, []int64{1, 2}, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("empty userID must return an empty map, got %d entries", len(got))
+	}
+}

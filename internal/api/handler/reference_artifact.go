@@ -26,8 +26,18 @@ type ReferencedSummaryArtifact struct {
 
 // ErrReferenceUnavailable is a structured rejection reason used when a
 // referenced task cannot provide visible content to the caller.
+//
+// The Reason enum lists the values actually emitted by the resolver and
+// referenceableFromLoaded (P2-5 fix, R4 yj):
+//   - "not_found"            (task missing, soft-deleted, or caller unauthorized)
+//   - "not_completed"        (authorized caller, task exists but not completed)
+//   - "no_visible_content"   (authorized + completed but nothing to show)
+//   - "error"                (transient DB failure loading the task itself)
+//
+// "forbidden" and "deleted" are collapsed into "not_found" at :63/:76 by
+// design (existence-oracle avoidance, see P3) and MUST NOT be added back.
 type ErrReferenceUnavailable struct {
-	Reason string // "not_found" / "forbidden" / "not_completed" / "deleted" / "no_visible_content"
+	Reason string
 	TaskID int64
 }
 
@@ -112,7 +122,9 @@ func resolveReferencedArtifact(
 
 	// 5. Fall back to caller's own PersonalResult (agent summaries, or
 	// BY_PERSON single-participant results). No cross-user fallback.
-	// Uses the same predicate as checkReferenceableFast for consistency (P2-1).
+	// Uses the same content!='' predicate as hasNonEmptyPersonalResult /
+	// nonEmptyPersonalResultTaskIDs so the list/detail referenceable flag
+	// and this resolver step agree on what "visible" means (P1-1, R4 yj).
 	var pr model.PersonalResult
 	err = db.WithContext(ctx).
 		Where("task_id = ? AND user_id = ? AND content != ?", task.ID, userID, "").
@@ -190,3 +202,50 @@ func referenceableFromLoaded(
 // maxReferencedTaskIDs caps the number of referenced task IDs accepted by
 // the chat path to prevent unbounded query fanout (P1-3).
 const maxReferencedTaskIDs = 20
+
+// hasNonEmptyPersonalResult reports whether the caller owns a PersonalResult
+// for taskID with non-empty content. This is the single-task form of the
+// shared predicate used by the reference resolver, the detail endpoint's
+// referenceable flag, and the list endpoint's batch build. All three MUST
+// agree on what "visible" means to prevent the list/detail vs resolver
+// divergence flagged in R3/R4 (yj/ms/jx). Returns (false, err) on real DB
+// errors so callers can distinguish "no visible content" from "lookup
+// failed" (P1-1 R4 yj: the batch call in ListSummaries silently swallowed
+// its .Error, hiding every personal-result-only referenceable=true).
+func hasNonEmptyPersonalResult(db *gorm.DB, taskID int64, userID string) (bool, error) {
+	if userID == "" {
+		return false, nil
+	}
+	var count int64
+	err := db.Model(&model.PersonalResult{}).
+		Where("task_id = ? AND user_id = ? AND content != ?", taskID, userID, "").
+		Count(&count).Error
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// nonEmptyPersonalResultTaskIDs is the batch form of hasNonEmptyPersonalResult.
+// Returns the set of taskIDs (from the given slice) where the caller owns at
+// least one PersonalResult with non-empty content. Selects only task_id so a
+// list of up to page_size=100 tasks does not materialize the medium-text
+// Content / SnapshotJSON columns just to populate a boolean map (P2-3 R4 yj).
+func nonEmptyPersonalResultTaskIDs(db *gorm.DB, taskIDs []int64, userID string) (map[int64]bool, error) {
+	out := make(map[int64]bool, len(taskIDs))
+	if len(taskIDs) == 0 || userID == "" {
+		return out, nil
+	}
+	var ids []int64
+	err := db.Model(&model.PersonalResult{}).
+		Where("task_id IN ? AND user_id = ? AND content != ?", taskIDs, userID, "").
+		Distinct().
+		Pluck("task_id", &ids).Error
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range ids {
+		out[id] = true
+	}
+	return out, nil
+}

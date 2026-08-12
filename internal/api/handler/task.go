@@ -671,20 +671,31 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 		}
 	}
 
-	// P1-1: Batch-load personal results for the current user across all listed
-	// tasks. This lets referenceableFromLoaded correctly report agent summaries
-	// (which write PersonalResult, not SummaryResult) as referenceable without
-	// an N+1 per-row query.
+	// P1-1 (R4 yj/ms/jx): Batch-load whether the caller owns a non-empty
+	// PersonalResult for each listed task, using the SAME predicate as the
+	// resolver and the detail endpoint (nonEmptyPersonalResultTaskIDs / the
+	// content!='' clause in resolveReferencedArtifact:118). This closes the
+	// R3->R4 regression where an empty placeholder PersonalResult (written
+	// by completeTaskWithoutNewResult on an empty window) made the picker
+	// advertise a task as referenceable that the resolver would then reject
+	// as no_visible_content. Errors are now surfaced instead of silently
+	// producing an all-false map.
 	prByTask := make(map[int64]bool)
 	if len(tasks) > 0 && userID != "" {
 		taskIDs := make([]int64, 0, len(tasks))
 		for _, t := range tasks {
 			taskIDs = append(taskIDs, t.ID)
 		}
-		var prs []model.PersonalResult
-		h.db.Where("task_id IN ? AND user_id = ?", taskIDs, userID).Find(&prs)
-		for _, pr := range prs {
-			prByTask[pr.TaskID] = true
+		var err error
+		prByTask, err = nonEmptyPersonalResultTaskIDs(h.db, taskIDs, userID)
+		if err != nil {
+			// Fail closed on the referenceable dimension only: log and
+			// continue with an empty map. The task list itself is still
+			// returned; only the personal-result-only branch of
+			// referenceable will report false. This is strictly safer than
+			// silently reporting true.
+			log.Printf("[list] batch load personal_result referenceable failed: %v", err)
+			prByTask = map[int64]bool{}
 		}
 	}
 
@@ -1063,9 +1074,17 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 	}
 	hasPersonalResult := false
 	if userID != "" {
-		var prCheck model.PersonalResult
-		if err := h.db.Where("task_id = ? AND user_id = ?", taskID, userID).First(&prCheck).Error; err == nil {
-			hasPersonalResult = true
+		// P1-1 (R4 yj/ms/jx): Use the shared content!='' predicate. First()
+		// without Order was also flagged as an accidental primary-key-ascending
+		// pick when multiple PersonalResult rows exist for the same
+		// (task_id, user_id) — hasNonEmptyPersonalResult uses Count so the
+		// order question does not arise, and errors are surfaced.
+		hp, err := hasNonEmptyPersonalResult(h.db, taskID, userID)
+		if err != nil {
+			log.Printf("[detail] check personal_result referenceable failed for task %d: %v", taskID, err)
+			hasPersonalResult = false
+		} else {
+			hasPersonalResult = hp
 		}
 	}
 	refable, refType, refReason := referenceableFromLoaded(task, hasResult, detailResultContent, true, hasPersonalResult)
