@@ -440,13 +440,26 @@ func TestReferenceableFromLoaded_BY_PERSON_Privacy(t *testing.T) {
 
 // TestBorrowCitations_TeamResultWithCitations verifies that when a team result
 // has plain citations, they are borrowed as-is.
+//
+// The fixture uses SummaryMode != ModeByPerson (BY_GROUP semantics) so that
+// callerPlainCitationsVisible returns true and the plain citations survive to
+// the borrow path. Under ModeByPerson the caller-owned PersonalResult with a
+// matching citations_json is required to unlock plain citations, which is a
+// separate branch that other resolver tests cover.
 func TestBorrowCitations_TeamResultWithCitations(t *testing.T) {
 	db := setupResolverTestDB(t)
 	task := createCompletedTask(t, db, "space1", "creator1", model.OriginChannelGroup)
+	// Override to BY_GROUP so plain citations are not redacted for the caller.
+	// model does not currently export a ModeByGroup constant; the field is a
+	// plain int and any non-ModeByPerson value satisfies callerPlainCitationsVisible.
+	task.SummaryMode = 1
+	if err := db.Save(&task).Error; err != nil {
+		t.Fatalf("update summary_mode: %v", err)
+	}
 	result := addTeamResult(t, db, task.ID, "team content")
 	result.SetCitations([]model.Citation{
-		{ID: "msg1", ChannelID: "ch1", Content: "hello"},
-		{ID: "msg2", ChannelID: "ch1", Content: "world"},
+		{Index: 1, ChannelID: "ch1", Content: "hello"},
+		{Index: 2, ChannelID: "ch1", Content: "world"},
 	})
 	db.Save(&result)
 
@@ -455,8 +468,11 @@ func TestBorrowCitations_TeamResultWithCitations(t *testing.T) {
 	if len(cits) != 2 {
 		t.Fatalf("expected 2 citations, got %d", len(cits))
 	}
-	if cits[0].ID != "msg1" {
-		t.Errorf("cits[0].ID = %q, want msg1", cits[0].ID)
+	if cits[0].Index != 1 {
+		t.Errorf("cits[0].Index = %d, want 1", cits[0].Index)
+	}
+	if cits[0].Content != "hello" {
+		t.Errorf("cits[0].Content = %q, want hello", cits[0].Content)
 	}
 }
 
