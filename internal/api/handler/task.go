@@ -671,6 +671,23 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 		}
 	}
 
+	// P1-1: Batch-load personal results for the current user across all listed
+	// tasks. This lets referenceableFromLoaded correctly report agent summaries
+	// (which write PersonalResult, not SummaryResult) as referenceable without
+	// an N+1 per-row query.
+	prByTask := make(map[int64]bool)
+	if len(tasks) > 0 && userID != "" {
+		taskIDs := make([]int64, 0, len(tasks))
+		for _, t := range tasks {
+			taskIDs = append(taskIDs, t.ID)
+		}
+		var prs []model.PersonalResult
+		h.db.Where("task_id IN ? AND user_id = ?", taskIDs, userID).Find(&prs)
+		for _, pr := range prs {
+			prByTask[pr.TaskID] = true
+		}
+	}
+
 	items := make([]gin.H, 0, len(tasks))
 	for _, t := range tasks {
 		attention := rowByTask[t.ID]
@@ -735,17 +752,24 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 		isParticipant := t.CreatorID == userID
 		if !isParticipant {
 			for _, p := range partsByTask[t.ID] {
-				if p["user_id"] == userID {
+				if uid, ok := p["user_id"].(string); ok && uid == userID {
 					isParticipant = true
 					break
 				}
 			}
 		}
+		// P2-7: schedule-config invitees (unconfirmed roster members) are not
+		// in summary_participant, so isParticipant=false for them. This means
+		// referenceableFromLoaded returns not_found for their perspective. This
+		// is a known limitation — schedule-config invitees can see the task in
+		// the list (via scheduleVisibilityExpr) but cannot reference it until
+		// they confirm. This is acceptable: unconfirmed invitees have not yet
+		// joined the task.
 		resultContent := ""
 		if hasResult {
 			resultContent = latestResult.Content
 		}
-		refable, refType, refReason := referenceableFromLoaded(t, hasResult, resultContent, isParticipant)
+		refable, refType, refReason := referenceableFromLoaded(t, hasResult, resultContent, isParticipant, prByTask[t.ID])
 
 		items = append(items, gin.H{
 			"task_id":                      t.ID,
@@ -1030,17 +1054,26 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 	// calling checkReferenceable which re-loads all of it.
 	// At this point authorizeTaskAccess has already confirmed the caller is
 	// creator or participant, so isParticipant is true.
+	// P1-1: Also check PersonalResult for agent summaries (which write
+	// PersonalResult, not SummaryResult).
+	userID := middleware.GetUserID(c)
 	detailResultContent := ""
 	if hasResult {
 		detailResultContent = latestResult.Content
 	}
-	refable, refType, refReason := referenceableFromLoaded(task, hasResult, detailResultContent, true)
+	hasPersonalResult := false
+	if userID != "" {
+		var prCheck model.PersonalResult
+		if err := h.db.Where("task_id = ? AND user_id = ?", taskID, userID).First(&prCheck).Error; err == nil {
+			hasPersonalResult = true
+		}
+	}
+	refable, refType, refReason := referenceableFromLoaded(task, hasResult, detailResultContent, true, hasPersonalResult)
 	resp["referenceable"] = refable
 	resp["reference_artifact_type"] = refType
 	resp["reference_unavailable_reason"] = refReason
 
 	// Add personal_result and members info
-	userID := middleware.GetUserID(c)
 
 	// B1 (permission split):
 	//   can_edit: legacy field, kept for backward-compat with the current frontend.

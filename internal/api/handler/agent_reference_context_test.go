@@ -206,30 +206,37 @@ func TestErrReferenceUnavailable(t *testing.T) {
 // NUL, newline) are stripped to prevent line-break manipulation within data fence
 // fields (SUM-25 review finding).
 func TestSanitizeRef_ControlChars(t *testing.T) {
+	// P1-2: CR and NUL must map to space (not empty) to prevent
+	// split-token fence reassembly. Tab also maps to space.
 	cases := []struct {
 		name   string
 		in     string
 		absent []string
+		want   string // expected output after sanitization
 	}{
 		{
-			name:   "strips carriage return",
+			name:   "CR becomes space (not deleted)",
 			in:     "line1\rline2",
 			absent: []string{"\r"},
+			want:   "line1 line2",
 		},
 		{
-			name:   "replaces tab with space",
+			name:   "tab becomes space",
 			in:     "col1\tcol2",
 			absent: []string{"\t"},
+			want:   "col1 col2",
 		},
 		{
-			name:   "strips NUL",
+			name:   "NUL becomes space (not deleted)",
 			in:     "before\x00after",
 			absent: []string{"\x00"},
+			want:   "before after",
 		},
 		{
-			name:   "replaces newline with space",
+			name:   "newline becomes space in sanitizeRefLine",
 			in:     "line1\nline2",
 			absent: []string{"\n"},
+			want:   "line1 line2",
 		},
 	}
 
@@ -241,7 +248,30 @@ func TestSanitizeRef_ControlChars(t *testing.T) {
 					t.Errorf("sanitizeRef(%q) still contains %q: got %q", c.in, a, got)
 				}
 			}
+			if c.want != "" && got != c.want {
+				t.Errorf("sanitizeRef(%q) = %q, want %q", c.in, got, c.want)
+			}
 		})
+	}
+}
+
+// TestSanitizeRefBlock_PreservesNewline verifies that sanitizeRefBlock
+// preserves newlines (P2-9: fence-inside body content should keep paragraph
+// formatting) while still neutralizing CR, NUL, and fence tags.
+func TestSanitizeRefBlock_PreservesNewline(t *testing.T) {
+	in := "paragraph1\nparagraph2\nparagraph3"
+	got := sanitizeRefBlock(in)
+	if !strings.Contains(got, "paragraph1\nparagraph2") {
+		t.Errorf("sanitizeRefBlock should preserve newlines, got %q", got)
+	}
+	if strings.Contains(got, "\r") {
+		t.Errorf("sanitizeRefBlock should strip CR, got %q", got)
+	}
+	if strings.Contains(got, "\x00") {
+		t.Errorf("sanitizeRefBlock should strip NUL, got %q", got)
+	}
+	if strings.Contains(got, refDataOpen) || strings.Contains(got, refDataClose) {
+		t.Errorf("sanitizeRefBlock should neutralize fence tags, got %q", got)
 	}
 }
 
@@ -272,10 +302,7 @@ func TestSanitizeRef_FenceReassembly(t *testing.T) {
 // returns empty results when no task IDs are provided (SUM-19).
 func TestBuildReferencedSummariesContextEmpty(t *testing.T) {
 	ctx := t.Context()
-	got, loaded, err := buildReferencedSummariesContext(ctx, nil, "space1", "user1", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	got, loaded := buildReferencedSummariesContext(ctx, nil, "space1", "user1", nil)
 	if got != "" {
 		t.Errorf("expected empty context, got %q", got)
 	}
@@ -283,10 +310,7 @@ func TestBuildReferencedSummariesContextEmpty(t *testing.T) {
 		t.Errorf("expected nil loaded, got %v", loaded)
 	}
 
-	got, loaded, err = buildReferencedSummariesContext(ctx, nil, "space1", "user1", []int64{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	got, loaded = buildReferencedSummariesContext(ctx, nil, "space1", "user1", []int64{})
 	if got != "" {
 		t.Errorf("expected empty context for empty slice, got %q", got)
 	}

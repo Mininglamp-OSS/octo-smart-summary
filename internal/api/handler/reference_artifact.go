@@ -62,8 +62,11 @@ func resolveReferencedArtifact(
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, &ErrReferenceUnavailable{Reason: "not_found", TaskID: taskID}
 		}
+		// P2-5: Distinguish real DB errors from not-found. A transient DB
+		// failure (connection, timeout) should not be reported as "not_found"
+		// which would mislead the caller into thinking the task doesn't exist.
 		log.Printf("[reference] DB error loading task %d: %v", taskID, err)
-		return nil, &ErrReferenceUnavailable{Reason: "not_found", TaskID: taskID}
+		return nil, &ErrReferenceUnavailable{Reason: "error", TaskID: taskID}
 	}
 
 	// 2. Access check BEFORE status check (P3): unauthorized callers get
@@ -142,27 +145,6 @@ func resolveReferencedArtifact(
 	return nil, &ErrReferenceUnavailable{Reason: "no_visible_content", TaskID: taskID}
 }
 
-// checkReferenceable is a read-only check used by list/detail handlers to
-// populate the `referenceable`, `reference_artifact_type`, and
-// `reference_unavailable_reason` fields in API responses.
-func checkReferenceable(
-	ctx context.Context,
-	db *gorm.DB,
-	taskID int64,
-	spaceID string,
-	userID string,
-) (referenceable bool, artifactType string, unavailableReason string) {
-	art, err := resolveReferencedArtifact(ctx, db, taskID, spaceID, userID)
-	if err != nil {
-		var refErr *ErrReferenceUnavailable
-		if errors.As(err, &refErr) {
-			return false, "", refErr.Reason
-		}
-		return false, "", "error"
-	}
-	return true, art.Type, ""
-}
-
 // referenceableFromLoaded computes referenceable status from data already
 // loaded by the list/detail handler, avoiding redundant per-row queries (P1-3).
 //
@@ -171,14 +153,14 @@ func checkReferenceable(
 //   - hasResult: whether a display SummaryResult exists (from pickDisplayResult)
 //   - resultContent: the display result's content (for empty-content guard)
 //   - isParticipant: whether the caller is creator or participant
-//
-// This replaces checkReferenceableFast on the list endpoint, eliminating
-// 4-5 redundant queries per row.
+//   - hasPersonalResult: whether the caller has a PersonalResult for this task
+//     (P1-1: agent summaries write PersonalResult, not SummaryResult)
 func referenceableFromLoaded(
 	task model.SummaryTask,
 	hasResult bool,
 	resultContent string,
 	isParticipant bool,
+	hasPersonalResult bool,
 ) (referenceable bool, artifactType string, unavailableReason string) {
 	// Authorization (P3: before status).
 	if !isParticipant {
@@ -194,84 +176,17 @@ func referenceableFromLoaded(
 		return true, "team_result", ""
 	}
 
-	// Without a team result, the caller's own PersonalResult is the fallback.
-	// We can't check its existence from loaded data alone, so report
-	// referenceable as unknown — the frontend can lazy-load detail if needed.
-	// This is safe: the detail endpoint uses the full checkReferenceable.
+	// P1-1: For agent summaries (no team SummaryResult), check the caller's
+	// own PersonalResult. If one exists, the task is referenceable as a
+	// personal_result — this is exactly what SUM-19 needs to unify across
+	// summary types (agent summaries write PersonalResult, not SummaryResult).
+	if hasPersonalResult {
+		return true, "personal_result", ""
+	}
+
 	return false, "", "no_visible_content"
 }
 
 // maxReferencedTaskIDs caps the number of referenced task IDs accepted by
 // the chat path to prevent unbounded query fanout (P1-3).
 const maxReferencedTaskIDs = 20
-
-// checkReferenceableFast is a lightweight check that determines whether a
-// task is referenceable WITHOUT loading sources, content, citations, or
-// snapshot. Used by the detail endpoint where data is not pre-loaded.
-//
-// For the list endpoint, prefer referenceableFromLoaded which reuses
-// already-loaded data (P1-3).
-func checkReferenceableFast(
-	ctx context.Context,
-	db *gorm.DB,
-	taskID int64,
-	spaceID string,
-	userID string,
-) (referenceable bool, artifactType string, unavailableReason string) {
-	// 1. Load task, space-scoped, not deleted — only the columns we need.
-	var task model.SummaryTask
-	err := db.WithContext(ctx).
-		Select("id", "space_id", "creator_id", "status", "deleted_at").
-		Where("id = ? AND space_id = ? AND deleted_at IS NULL", taskID, spaceID).
-		First(&task).Error
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return false, "", "not_found"
-		}
-		log.Printf("[reference-fast] DB error loading task %d: %v", taskID, err)
-		return false, "", "error"
-	}
-
-	// 2. Access check BEFORE status (P3).
-	if !canAccessTaskDB(db.WithContext(ctx), userID, task.ID, task.CreatorID) {
-		return false, "", "not_found"
-	}
-
-	// 3. Completed check.
-	if task.Status != model.StatusCompleted {
-		return false, "", "not_completed"
-	}
-
-	// 4. Check if a team-level SummaryResult exists with non-empty content.
-	// Use a projection-limited query to avoid loading mediumtext columns (P1-3).
-	var resultID int64
-	err = db.WithContext(ctx).Model(&model.SummaryResult{}).
-		Select("id").
-		Where("task_id = ?", task.ID).
-		Order("version DESC").
-		Limit(1).
-		Scan(&resultID).Error
-	if err == nil && resultID != 0 {
-		// Verify via queryDisplayResult that the display result has content.
-		result, qErr := queryDisplayResult(db.WithContext(ctx), task.ID)
-		if qErr == nil && result.ID != 0 && result.Content != "" {
-			return true, "team_result", ""
-		}
-	}
-
-	// 5. Check caller's own PersonalResult — same predicate as the full
-	// resolver for consistency (P2-1): content != '' and Order(id DESC).
-	var prCount int64
-	if err := db.WithContext(ctx).Model(&model.PersonalResult{}).
-		Where("task_id = ? AND user_id = ? AND content != ?", task.ID, userID, "").
-		Count(&prCount).Error; err != nil {
-		log.Printf("[reference-fast] DB error counting personal results for task %d: %v", task.ID, err)
-		return false, "", "error"
-	}
-	if prCount > 0 {
-		return true, "personal_result", ""
-	}
-
-	log.Printf("[reference-fast] no visible content for task %d, user %s", taskID, userID)
-	return false, "", "no_visible_content"
-}

@@ -343,13 +343,15 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 	// 第 2+ 轮 agent 看不到引用材料(见 CHAT-REFERENCE-BASED-DESIGN-v1
 	// 多轮上下文修复)。token 增量按引用大小约 5-15K/轮,可接受。
 	if len(req.ReferencedTaskIDs) > 0 {
+		// P2-2: Validate at binding layer — reject if too many referenced task IDs.
+		if len(req.ReferencedTaskIDs) > maxReferencedTaskIDs {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("too many referenced task IDs: %d (max %d)", len(req.ReferencedTaskIDs), maxReferencedTaskIDs)})
+			return
+		}
 		spaceID := middleware.GetSpaceID(c)
-		refContext, loaded, refErr := buildReferencedSummariesContext(
+		refContext, loaded := buildReferencedSummariesContext(
 			ctx, h.db, spaceID, uid, req.ReferencedTaskIDs)
-		if refErr != nil {
-			log.Printf("[agent] chat build reference context error: %v", refErr)
-			// 引用加载失败不阻断本次对话,agent 走无引用路径
-		} else if refContext != "" {
+		if refContext != "" {
 			system = system + refContext
 			log.Printf("[agent] chat session=%s loaded %d referenced tasks: %v", req.SessionID, len(loaded), loaded)
 		}
@@ -572,12 +574,15 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	// 每轮 chat 都重新拼引用进 system —— 与 Chat 逻辑严格一致
 	// (见 CHAT-REFERENCE-BASED-DESIGN-v1 多轮上下文修复)。
 	if len(req.ReferencedTaskIDs) > 0 {
+		// P2-2: Validate at binding layer — reject if too many referenced task IDs.
+		if len(req.ReferencedTaskIDs) > maxReferencedTaskIDs {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("too many referenced task IDs: %d (max %d)", len(req.ReferencedTaskIDs), maxReferencedTaskIDs)})
+			return
+		}
 		spaceID := middleware.GetSpaceID(c)
-		refContext, loaded, refErr := buildReferencedSummariesContext(
+		refContext, loaded := buildReferencedSummariesContext(
 			ctx, h.db, spaceID, uid, req.ReferencedTaskIDs)
-		if refErr != nil {
-			log.Printf("[agent] chat/stream build reference context error: %v", refErr)
-		} else if refContext != "" {
+		if refContext != "" {
 			system = system + refContext
 			log.Printf("[agent] chat/stream session=%s loaded %d referenced tasks: %v", req.SessionID, len(loaded), loaded)
 		}

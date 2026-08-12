@@ -31,13 +31,25 @@ const fencePlaceholder = "[引用数据]"
 // injection). A referenced summary may quote arbitrary chat content authored
 // by other people, so its text must not be able to (a) close the data fence
 // early, or (b) forge the box-drawing / bracket delimiters this builder uses
-// as section boundaries — e.g. a fake "─── 引用结束 ───" line or a bogus
-// 【元信息】 header that could trick the model into treating following text as
-// framing/instructions. We replace the fence tags with a non-empty placeholder
-// (preventing split-token reassembly — P1-2), fold the structural glyphs
-// down to plain ASCII, and strip control characters including newline (which
-// could forge standalone lines outside the fence).
+// as section boundaries.
+//
+// All replacements map to NON-EMPTY strings (space or placeholder) so that
+// a single-pass replacer can never splice adjacent characters together to
+// reassemble a fence tag (P1-2 fix: CR and NUL previously mapped to "" which
+// allowed split-token reassembly).
+//
+// Newline is replaced with space here because sanitizeRef is used for fence
+// OUTSIDE text (titles, labels) where line breaks could forge standalone
+// lines. For fence INSIDE text (body content) use sanitizeRefBlock which
+// preserves newlines so paragraph formatting is not compressed (P2-9).
 func sanitizeRef(s string) string {
+	return sanitizeRefLine(s)
+}
+
+// sanitizeRefLine sanitizes text that appears OUTSIDE the data fence (titles,
+// labels, metadata fields). Newlines are replaced with space to prevent
+// line-break manipulation (P2-9).
+func sanitizeRefLine(s string) string {
 	s = strings.NewReplacer(
 		refDataOpen, fencePlaceholder,
 		refDataClose, fencePlaceholder,
@@ -45,10 +57,28 @@ func sanitizeRef(s string) string {
 		"─", "-",
 		"【", "[",
 		"】", "]",
-		"\r", "",
+		"\r", " ",
 		"\n", " ",
 		"\t", " ",
-		"\x00", "",
+		"\x00", " ",
+	).Replace(s)
+	return s
+}
+
+// sanitizeRefBlock sanitizes text that appears INSIDE the data fence (body
+// content, citations). Newlines are PRESERVED so paragraph formatting is
+// not compressed (P2-9 fix). CR/NUL/tab are still neutralized to space.
+func sanitizeRefBlock(s string) string {
+	s = strings.NewReplacer(
+		refDataOpen, fencePlaceholder,
+		refDataClose, fencePlaceholder,
+		"═", "=",
+		"─", "-",
+		"【", "[",
+		"】", "]",
+		"\r", " ",
+		"\t", " ",
+		"\x00", " ",
 	).Replace(s)
 	return s
 }
@@ -87,17 +117,14 @@ func buildReferencedSummariesContext(
 	spaceID string,
 	userID string,
 	taskIDs []int64,
-) (string, []int64, error) {
+) (string, []int64) {
 	if len(taskIDs) == 0 {
-		return "", nil, nil
+		return "", nil
 	}
 
-	// Cap referenced task IDs to prevent unbounded query fanout (P1-3).
-	if len(taskIDs) > maxReferencedTaskIDs {
-		taskIDs = taskIDs[:maxReferencedTaskIDs]
-	}
-
-	// Deduplicate referenced task IDs (P2: dedupe).
+	// Deduplicate referenced task IDs first, then cap (P2-2: if cap is
+	// applied before dedupe, [999×25, 1, 2, 3] would use the entire budget
+	// on duplicates and drop the unique IDs).
 	seen := make(map[int64]bool, len(taskIDs))
 	deduped := make([]int64, 0, len(taskIDs))
 	for _, id := range taskIDs {
@@ -107,6 +134,11 @@ func buildReferencedSummariesContext(
 		}
 	}
 	taskIDs = deduped
+
+	// Cap referenced task IDs to prevent unbounded query fanout (P1-3).
+	if len(taskIDs) > maxReferencedTaskIDs {
+		taskIDs = taskIDs[:maxReferencedTaskIDs]
+	}
 
 	loaded := make([]int64, 0, len(taskIDs))
 	var sb strings.Builder
@@ -140,7 +172,7 @@ func buildReferencedSummariesContext(
 		loaded = append(loaded, tid)
 		// P2-3: Title is rendered outside the data fence, so it must be
 		// sanitized including newline → space to prevent line injection.
-		sb.WriteString(fmt.Sprintf("─── 引用总结 · task_id=%d · %s ───\n\n", art.Task.ID, sanitizeRef(art.Task.Title)))
+		sb.WriteString(fmt.Sprintf("─── 引用总结 · task_id=%d · %s ───\n\n", art.Task.ID, sanitizeRefLine(art.Task.Title)))
 
 		// Snapshot section (agent summaries only): reference metadata only.
 		// All snapshot strings are untrusted (may contain user-supplied channel IDs,
@@ -151,26 +183,26 @@ func buildReferencedSummariesContext(
 			sb.WriteString("【元信息 · 老总结的生成语境(仅供参考)】\n")
 			sb.WriteString(refDataOpen + "\n")
 			if snap.Requirement != "" {
-				sb.WriteString("- 老需求: " + sanitizeRef(snap.Requirement) + "\n")
+				sb.WriteString("- 老需求: " + sanitizeRefBlock(snap.Requirement) + "\n")
 			}
 			if len(snap.Scope.ChannelIDs) > 0 {
 				storageType := appOriginToStorageChannelType(art.Task.OriginChannelType)
 				sb.WriteString("- 候选频道 (candidate channels):\n")
 				for _, cid := range snap.Scope.ChannelIDs {
 					sb.WriteString(fmt.Sprintf("  * channel_id=%s channel_type=%d %s\n",
-						sanitizeRef(cid), storageType, channelTypeLabel(storageType)))
+						sanitizeRefBlock(cid), storageType, channelTypeLabel(storageType)))
 				}
 				sb.WriteString("  (你可以复用其中一个,或让用户明确,或用 list_channels 探索其他)\n")
 				sb.WriteString("  ⚠️ 调用 fetch_channel/peek_channel 时必须**原样复制**上面的 channel_type 数字,不要猜、不要默认 1\n")
 			}
 			sb.WriteString(fmt.Sprintf("- ⚠️ 老时间窗 (已过期,不要复制作为 fetch 参数): %s ~ %s\n",
-				sanitizeRef(snap.Scope.TimeRange.Start), sanitizeRef(snap.Scope.TimeRange.End)))
+				sanitizeRefBlock(snap.Scope.TimeRange.Start), sanitizeRefBlock(snap.Scope.TimeRange.End)))
 			sb.WriteString("  (若用户说'最新/今天/最近'请用 get_current_time 决定新时间窗)\n")
 			if len(snap.ToolSummary) > 0 {
-				sb.WriteString(fmt.Sprintf("- 老工具轨迹 (历史,不必复现): %s\n", sanitizeRef(fmt.Sprintf("%v", snap.ToolSummary))))
+				sb.WriteString(fmt.Sprintf("- 老工具轨迹 (历史,不必复现): %s\n", sanitizeRefBlock(fmt.Sprintf("%v", snap.ToolSummary))))
 			}
 			if snap.DataFreshnessNote != "" {
-				sb.WriteString("- 老数据新鲜度声明: " + sanitizeRef(snap.DataFreshnessNote) + "\n")
+				sb.WriteString("- 老数据新鲜度声明: " + sanitizeRefBlock(snap.DataFreshnessNote) + "\n")
 			}
 			sb.WriteString(refDataClose + "\n\n")
 		} else {
@@ -178,7 +210,7 @@ func buildReferencedSummariesContext(
 			// and sources as read-only historical metadata.
 			sb.WriteString("【元信息 · 传统总结历史语境(仅供参考)】\n")
 			sb.WriteString(refDataOpen + "\n")
-			sb.WriteString(fmt.Sprintf("- 任务标题: %s\n", sanitizeRef(art.Task.Title)))
+			sb.WriteString(fmt.Sprintf("- 任务标题: %s\n", sanitizeRefBlock(art.Task.Title)))
 			sb.WriteString(fmt.Sprintf("- 历史时间范围: %s ~ %s\n",
 				art.Task.TimeRangeStart.Format("2006-01-02 15:04"),
 				art.Task.TimeRangeEnd.Format("2006-01-02 15:04")))
@@ -186,7 +218,7 @@ func buildReferencedSummariesContext(
 			if len(art.Sources) > 0 {
 				sb.WriteString("- 数据来源:\n")
 				for _, s := range art.Sources {
-					sb.WriteString(fmt.Sprintf("  * %s (type=%d)\n", sanitizeRef(s.SourceName), s.SourceType))
+					sb.WriteString(fmt.Sprintf("  * %s (type=%d)\n", sanitizeRefBlock(s.SourceName), s.SourceType))
 				}
 			}
 			sb.WriteString("  (仅供参考,不得自动作为新工具调用参数)\n")
@@ -195,7 +227,9 @@ func buildReferencedSummariesContext(
 
 		sb.WriteString("【老产物内容 · 参考文本】\n")
 		sb.WriteString(refDataOpen + "\n")
-		sb.WriteString(sanitizeRef(art.Content))
+		// P2-9: Use sanitizeRefBlock for fence-inside body content so newlines
+		// are preserved and paragraph formatting is not compressed.
+		sb.WriteString(sanitizeRefBlock(art.Content))
 		sb.WriteString("\n" + refDataClose + "\n\n")
 
 		// Old citations: the messages the old summary was grounded in
@@ -203,7 +237,7 @@ func buildReferencedSummariesContext(
 			citJSON, _ := json.Marshal(art.Citations)
 			sb.WriteString("【老 citations · 参考证据】\n")
 			sb.WriteString(refDataOpen + "\n")
-			sb.WriteString(sanitizeRef(string(citJSON)))
+			sb.WriteString(sanitizeRefBlock(string(citJSON)))
 			sb.WriteString("\n" + refDataClose + "\n\n")
 		}
 
@@ -213,7 +247,7 @@ func buildReferencedSummariesContext(
 			teamCitJSON, _ := json.Marshal(art.TeamCitations)
 			sb.WriteString("【团队 citations · [Pn] 参与者引用】\n")
 			sb.WriteString(refDataOpen + "\n")
-			sb.WriteString(sanitizeRef(string(teamCitJSON)))
+			sb.WriteString(sanitizeRefBlock(string(teamCitJSON)))
 			sb.WriteString("\n" + refDataClose + "\n\n")
 			sb.WriteString("⚠️ 团队 citations 是 [Pn] 参与者引用,不可作为普通 [n] citation 借用\n\n")
 		}
@@ -222,9 +256,9 @@ func buildReferencedSummariesContext(
 	}
 
 	if len(loaded) == 0 {
-		return "", nil, nil
+		return "", nil
 	}
-	return sb.String(), loaded, nil
+	return sb.String(), loaded
 }
 
 // channelTypeLabel returns a human-readable label for a **storage-layer**

@@ -172,23 +172,24 @@ func TestResolve_BY_PERSON_PrivacyNoCrossUser(t *testing.T) {
 	}
 }
 
-// TestResolve_Forbidden_NoAccess verifies that a user with no access gets
-// a forbidden error.
-func TestResolve_Forbidden_NoAccess(t *testing.T) {
+// TestResolve_Forbidden_NoAccess_OpaqueNotFound verifies that a user with no
+// access gets an opaque not_found reason (not forbidden), because the P3 fix
+// moves authorization before status to prevent existence oracle (P0-1).
+func TestResolve_Forbidden_NoAccess_OpaqueNotFound(t *testing.T) {
 	db := setupResolverTestDB(t)
 	task := createCompletedTask(t, db, "space1", "creator1", model.OriginChannelGroup)
 	addTeamResult(t, db, task.ID, "content")
 
 	_, err := resolveReferencedArtifact(context.Background(), db, task.ID, "space1", "stranger")
 	if err == nil {
-		t.Fatal("expected forbidden error, got nil")
+		t.Fatal("expected not_found error, got nil")
 	}
 	refErr, ok := err.(*ErrReferenceUnavailable)
 	if !ok {
 		t.Fatalf("expected ErrReferenceUnavailable, got %T", err)
 	}
-	if refErr.Reason != "forbidden" {
-		t.Errorf("Reason = %q, want forbidden", refErr.Reason)
+	if refErr.Reason != "not_found" {
+		t.Errorf("Reason = %q, want not_found (opaque)", refErr.Reason)
 	}
 }
 
@@ -312,10 +313,7 @@ func TestResolve_SnapshotWithMaliciousChannelID(t *testing.T) {
 		t.Fatalf("create personal result: %v", err)
 	}
 
-	ctx, loaded, err := buildReferencedSummariesContext(context.Background(), db, "space1", "creator1", []int64{task.ID})
-	if err != nil {
-		t.Fatalf("buildReferencedSummariesContext: %v", err)
-	}
+	ctx, loaded := buildReferencedSummariesContext(context.Background(), db, "space1", "creator1", []int64{task.ID})
 	if len(loaded) != 1 {
 		t.Fatalf("expected 1 loaded, got %d", len(loaded))
 	}
@@ -340,14 +338,14 @@ func TestResolve_SnapshotWithMaliciousChannelID(t *testing.T) {
 	}
 }
 
-// --- checkReferenceableFast tests ---
+// --- referenceableFromLoaded tests (ported from checkReferenceableFast, P2-1) ---
 
-func TestCheckReferenceableFast_TeamResult(t *testing.T) {
+func TestReferenceableFromLoaded_TeamResult(t *testing.T) {
 	db := setupResolverTestDB(t)
 	task := createCompletedTask(t, db, "space1", "creator1", model.OriginChannelGroup)
 	addTeamResult(t, db, task.ID, "content")
 
-	refable, artType, reason := checkReferenceableFast(context.Background(), db, task.ID, "space1", "creator1")
+	refable, artType, reason := referenceableFromLoaded(task, true, "content", true, false)
 	if !refable {
 		t.Errorf("expected referenceable=true, got false (reason=%q)", reason)
 	}
@@ -359,12 +357,12 @@ func TestCheckReferenceableFast_TeamResult(t *testing.T) {
 	}
 }
 
-func TestCheckReferenceableFast_PersonalResult(t *testing.T) {
+func TestReferenceableFromLoaded_PersonalResult(t *testing.T) {
 	db := setupResolverTestDB(t)
 	task := createCompletedTask(t, db, "space1", "creator1", model.OriginChannelDM)
 	addPersonalResult(t, db, task.ID, "creator1", "my content")
 
-	refable, artType, _ := checkReferenceableFast(context.Background(), db, task.ID, "space1", "creator1")
+	refable, artType, _ := referenceableFromLoaded(task, false, "", true, true)
 	if !refable {
 		t.Fatal("expected referenceable=true")
 	}
@@ -373,7 +371,7 @@ func TestCheckReferenceableFast_PersonalResult(t *testing.T) {
 	}
 }
 
-func TestCheckReferenceableFast_NotCompleted(t *testing.T) {
+func TestReferenceableFromLoaded_NotCompleted(t *testing.T) {
 	db := setupResolverTestDB(t)
 	task := model.SummaryTask{
 		TaskNo:    "TST-REF-003",
@@ -383,7 +381,7 @@ func TestCheckReferenceableFast_NotCompleted(t *testing.T) {
 	}
 	db.Create(&task)
 
-	refable, _, reason := checkReferenceableFast(context.Background(), db, task.ID, "space1", "creator1")
+	refable, _, reason := referenceableFromLoaded(task, false, "", true, false)
 	if refable {
 		t.Fatal("expected referenceable=false")
 	}
@@ -392,25 +390,25 @@ func TestCheckReferenceableFast_NotCompleted(t *testing.T) {
 	}
 }
 
-func TestCheckReferenceableFast_Forbidden(t *testing.T) {
+func TestReferenceableFromLoaded_Forbidden_OpaqueNotFound(t *testing.T) {
 	db := setupResolverTestDB(t)
 	task := createCompletedTask(t, db, "space1", "creator1", model.OriginChannelGroup)
 	addTeamResult(t, db, task.ID, "content")
 
-	refable, _, reason := checkReferenceableFast(context.Background(), db, task.ID, "space1", "stranger")
+	refable, _, reason := referenceableFromLoaded(task, true, "content", false, false)
 	if refable {
 		t.Fatal("expected referenceable=false for stranger")
 	}
-	if reason != "forbidden" {
-		t.Errorf("reason = %q, want forbidden", reason)
+	if reason != "not_found" {
+		t.Errorf("reason = %q, want not_found (opaque)", reason)
 	}
 }
 
-func TestCheckReferenceableFast_NoContent(t *testing.T) {
+func TestReferenceableFromLoaded_NoContent(t *testing.T) {
 	db := setupResolverTestDB(t)
 	task := createCompletedTask(t, db, "space1", "creator1", model.OriginChannelGroup)
 
-	refable, _, reason := checkReferenceableFast(context.Background(), db, task.ID, "space1", "creator1")
+	refable, _, reason := referenceableFromLoaded(task, false, "", true, false)
 	if refable {
 		t.Fatal("expected referenceable=false")
 	}
@@ -419,7 +417,7 @@ func TestCheckReferenceableFast_NoContent(t *testing.T) {
 	}
 }
 
-func TestCheckReferenceableFast_BY_PERSON_Privacy(t *testing.T) {
+func TestReferenceableFromLoaded_BY_PERSON_Privacy(t *testing.T) {
 	db := setupResolverTestDB(t)
 	task := createCompletedTask(t, db, "space1", "creator1", model.OriginChannelGroup)
 	task.SummaryMode = model.ModeByPerson
@@ -427,11 +425,53 @@ func TestCheckReferenceableFast_BY_PERSON_Privacy(t *testing.T) {
 	addParticipant(t, db, task.ID, "user2", "User 2")
 	addPersonalResult(t, db, task.ID, "user2", "user2's private summary")
 
-	refable, _, reason := checkReferenceableFast(context.Background(), db, task.ID, "space1", "creator1")
+	// Creator has no personal result — should be no_visible_content, not
+	// leaking user2's personal result.
+	refable, _, reason := referenceableFromLoaded(task, false, "", true, false)
 	if refable {
 		t.Fatal("expected referenceable=false for cross-user personal result")
 	}
 	if reason != "no_visible_content" {
 		t.Errorf("reason = %q, want no_visible_content", reason)
+	}
+}
+
+// --- P2-3: borrowCitationsFromReference tests ---
+
+// TestBorrowCitations_TeamResultWithCitations verifies that when a team result
+// has plain citations, they are borrowed as-is.
+func TestBorrowCitations_TeamResultWithCitations(t *testing.T) {
+	db := setupResolverTestDB(t)
+	task := createCompletedTask(t, db, "space1", "creator1", model.OriginChannelGroup)
+	result := addTeamResult(t, db, task.ID, "team content")
+	result.SetCitations([]model.Citation{
+		{ID: "msg1", ChannelID: "ch1", Content: "hello"},
+		{ID: "msg2", ChannelID: "ch1", Content: "world"},
+	})
+	db.Save(&result)
+
+	h := &AgentSummaryHandler{db: db}
+	cits := h.borrowCitationsFromReference(context.Background(), task.ID, "space1", "creator1")
+	if len(cits) != 2 {
+		t.Fatalf("expected 2 citations, got %d", len(cits))
+	}
+	if cits[0].ID != "msg1" {
+		t.Errorf("cits[0].ID = %q, want msg1", cits[0].ID)
+	}
+}
+
+// TestBorrowCitations_EmptyCitationsReturnsEmpty verifies that when a team
+// result has no plain citations (e.g. BY_PERSON redaction), we return empty
+// instead of grafting citations from a different document (P1-1 invariant).
+func TestBorrowCitations_EmptyCitationsReturnsEmpty(t *testing.T) {
+	db := setupResolverTestDB(t)
+	task := createCompletedTask(t, db, "space1", "creator1", model.OriginChannelGroup)
+	addTeamResult(t, db, task.ID, "team content") // no citations set
+	addPersonalResult(t, db, task.ID, "creator1", "personal content")
+
+	h := &AgentSummaryHandler{db: db}
+	cits := h.borrowCitationsFromReference(context.Background(), task.ID, "space1", "creator1")
+	if len(cits) != 0 {
+		t.Fatalf("expected 0 citations (no grafting), got %d", len(cits))
 	}
 }
