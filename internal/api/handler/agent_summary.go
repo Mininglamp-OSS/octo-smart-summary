@@ -153,13 +153,28 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 				var refTask model.SummaryTask
 				if err := h.db.WithContext(c.Request.Context()).
 					Select("id, creator_id, origin_channel_id, origin_channel_type").
-					Where("id = ? AND space_id = ? AND origin_channel_id != ''", req.ReferencedTaskIDs[0], spaceID).
+					Where("id = ? AND space_id = ?", req.ReferencedTaskIDs[0], spaceID).
 					First(&refTask).Error; err == nil {
 					if canAccessTaskDB(h.db.WithContext(c.Request.Context()), userID, refTask.ID, refTask.CreatorID) {
-						finalChannelID = refTask.OriginChannelID
-						finalChannelType = refTask.OriginChannelType
-						log.Printf("[handler] CreateAgentSummary borrowed origin from referenced task_id=%d channel=%s/%d session=%s",
-							refTask.ID, finalChannelID, finalChannelType, req.SessionID)
+						if refTask.OriginChannelID != "" {
+							finalChannelID = refTask.OriginChannelID
+							finalChannelType = refTask.OriginChannelType
+							log.Printf("[handler] CreateAgentSummary borrowed origin from referenced task_id=%d channel=%s/%d session=%s",
+								refTask.ID, finalChannelID, finalChannelType, req.SessionID)
+						} else {
+							// Tier-4 fallback: pipeline/scheduled summaries never set
+							// origin_channel_id. Derive the origin from the referenced
+							// task's summary_source rows (the channels it was generated
+							// from) so a refine of a non-agent summary can still inherit
+							// an origin — the owner's goal of "non-agent summaries
+							// referenceable + iterable like agent ones". Only unambiguous
+							// single-source tasks qualify (see helper).
+							finalChannelID, finalChannelType = h.deriveOriginFromSummarySources(c.Request.Context(), refTask.ID)
+							if finalChannelID != "" {
+								log.Printf("[handler] CreateAgentSummary derived origin from referenced task_id=%d sources channel=%s/%d session=%s",
+									refTask.ID, finalChannelID, finalChannelType, req.SessionID)
+							}
+						}
 					} else {
 						log.Printf("[handler] CreateAgentSummary refused to borrow origin from referenced task_id=%d (user=%s lacks read access) session=%s",
 							refTask.ID, userID, req.SessionID)

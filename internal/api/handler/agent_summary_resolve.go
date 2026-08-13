@@ -99,3 +99,48 @@ func (h *AgentSummaryHandler) resolveOriginChannelFromSession(
 	log.Printf("[resolve] no fetch_channel call found in session=%s", sessionID)
 	return "", 0, nil
 }
+
+// deriveOriginFromSummarySources derives an origin channel from the channels
+// a referenced task was generated from (its summary_source rows).
+//
+// Pipeline/scheduled/bot summaries never populate summary_task.origin_channel_id,
+// so the tier-3 borrow (refTask.OriginChannelID) comes up empty for them and a
+// pure refine of such a task used to dead-end in 40001. This tier-4 fallback
+// recovers the origin from the task's generation sources so non-agent
+// summaries can be referenced + refined + iterated like agent ones.
+//
+// Deterministic: the FIRST usable source row (by summary_source.id, creation
+// order) wins; multi-source tasks inherit their first channel — consistent
+// with the tier-3 precedent of borrowing the FIRST referenced task's origin.
+// source_type is stored in the same application-layer enum as
+// OriginChannelType (1=Group/2=Thread/3=DM) and source_id is already a
+// canonical channel ID, so no conversion is needed.
+//
+// Returns ("", 0) when the task has no usable source rows — the caller then
+// falls through to the 40001 error as before. Authorization is enforced by
+// the caller (canAccessTaskDB on the referenced task) — this helper must only
+// be reached for tasks the user can already read.
+func (h *AgentSummaryHandler) deriveOriginFromSummarySources(ctx context.Context, taskID int64) (string, int) {
+	var sources []model.SummarySource
+	if err := h.db.WithContext(ctx).
+		Where("task_id = ?", taskID).
+		Order("id ASC").
+		Find(&sources).Error; err != nil {
+		log.Printf("[resolve] query summary_source failed task_id=%d: %v", taskID, err)
+		return "", 0
+	}
+	for _, s := range sources {
+		if s.SourceID == "" {
+			continue
+		}
+		if s.SourceType < model.OriginChannelGroup || s.SourceType > model.OriginChannelDM {
+			continue
+		}
+		if len(sources) > 1 {
+			log.Printf("[resolve] task_id=%d has %d summary_source rows; inheriting first usable channel=%s/%d",
+				taskID, len(sources), s.SourceID, s.SourceType)
+		}
+		return s.SourceID, s.SourceType
+	}
+	return "", 0
+}
