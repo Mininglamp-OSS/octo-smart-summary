@@ -36,6 +36,8 @@ func TestBackfillSourcesFromMessages_AddsMissingChannels(t *testing.T) {
 		{ChannelID: "grp-a", ChannelType: model.ChannelTypeGroup, SourceName: "群A"},
 		{ChannelID: "grp-a", ChannelType: model.ChannelTypeGroup, SourceName: "群A"}, // dup, one row
 		{ChannelID: "grp-a____thr1", ChannelType: model.ChannelTypeThread, SourceName: "子区1"},
+		// R9 P1: DM messages are present but must NEVER be backfilled —
+		// see TestBackfillSourcesFromMessages_SkipsDMChannels.
 		{ChannelID: "u2@u1", ChannelType: model.ChannelTypeDM, SourceName: "私聊-u2"},
 	}
 
@@ -48,8 +50,8 @@ func TestBackfillSourcesFromMessages_AddsMissingChannels(t *testing.T) {
 	if err := db.Where("task_id = ?", task.ID).Order("id").Find(&rows).Error; err != nil {
 		t.Fatalf("query rows: %v", err)
 	}
-	if len(rows) != 3 {
-		t.Fatalf("expected 3 deduped rows, got %d: %+v", len(rows), rows)
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 deduped rows (DM skipped per R9 P1), got %d: %+v", len(rows), rows)
 	}
 	type want struct {
 		sourceType int
@@ -59,7 +61,6 @@ func TestBackfillSourcesFromMessages_AddsMissingChannels(t *testing.T) {
 	wants := []want{
 		{model.SourceGroup, "grp-a", "群A"},
 		{model.SourceThread, "grp-a____thr1", "子区1"},
-		{model.SourceDirect, "u2@u1", "私聊-u2"},
 	}
 	for i, w := range wants {
 		if rows[i].SourceType != w.sourceType || rows[i].SourceID != w.sourceID {
@@ -146,8 +147,8 @@ func TestBackfillSourcesFromMessages_SkipsUnknownTypeAndEmptyID(t *testing.T) {
 	}
 
 	msgs := []pipeline.Message{
-		{ChannelID: "grp-a", ChannelType: 3, SourceName: "保留类型3"},  // WuKongIM reserved, unmapped
-		{ChannelID: "grp-b", ChannelType: 0, SourceName: "零类型"},     // unset
+		{ChannelID: "grp-a", ChannelType: 3, SourceName: "保留类型3"}, // WuKongIM reserved, unmapped
+		{ChannelID: "grp-b", ChannelType: 0, SourceName: "零类型"},   // unset
 		{ChannelID: "", ChannelType: model.ChannelTypeGroup, SourceName: "空ID"},
 		{ChannelID: "grp-ok", ChannelType: model.ChannelTypeGroup, SourceName: "有效"},
 	}
@@ -220,5 +221,85 @@ func TestBackfillSourcesFromMessages_CapsTotalRows(t *testing.T) {
 	}
 	if count != 30 {
 		t.Fatalf("expected cap at 30 total rows, got %d", count)
+	}
+}
+
+// R9 P1 (yujiawei, PR #190 review 4926742282): the backfill turned the
+// creator's private-chat partners into a field every task reader can see —
+// DM rows name the peer UID and survive in a user-visible table whose roster
+// is mutable after generation (AddMembers on Completed tasks). A DM is also
+// never a useful origin_channel_id for a refined summary, and a normalized
+// DM channel id (uidA@uidB) reaches 65 chars with 32-char UIDs, overflowing
+// summary_source.source_id varchar(64). DM channels must never be
+// backfilled.
+func TestBackfillSourcesFromMessages_SkipsDMChannels(t *testing.T) {
+	db := newFileBackedTestDB(t)
+	task := model.SummaryTask{TaskNo: "BF-NODM", SpaceID: "sp", CreatorID: "u1", Title: "t", SummaryMode: model.ModeByPerson}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+
+	msgs := []pipeline.Message{
+		{ChannelID: "grp-a", ChannelType: model.ChannelTypeGroup, SourceName: "群A"},
+		{ChannelID: "grp-a____thr1", ChannelType: model.ChannelTypeThread, SourceName: "子区1"},
+		{ChannelID: "u2@u1", ChannelType: model.ChannelTypeDM, SourceName: "私聊-u2"},
+	}
+
+	p := &Processor{db: db}
+	if err := p.backfillSourcesFromMessages(task.ID, msgs); err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+
+	var rows []model.SummarySource
+	if err := db.Where("task_id = ?", task.ID).Order("id").Find(&rows).Error; err != nil {
+		t.Fatalf("query rows: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows (group+thread, DM skipped), got %d: %+v", len(rows), rows)
+	}
+	for _, r := range rows {
+		if r.SourceType == model.SourceDirect {
+			t.Errorf("DM row persisted: %+v", r)
+		}
+	}
+}
+
+// R9 P1: backfilled rows must be flagged derived=1 so every user-visible
+// projection (list/detail sources, share snapshot, reference-context
+// bullets) can exclude them while tier-4 origin derivation keeps reading
+// them. User-specified rows are never re-flagged.
+func TestBackfillSourcesFromMessages_MarksBackfilledRowsDerived(t *testing.T) {
+	db := newFileBackedTestDB(t)
+	task := model.SummaryTask{TaskNo: "BF-FLAG", SpaceID: "sp", CreatorID: "u1", Title: "t", SummaryMode: model.ModeByPerson}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+	explicit := model.SummarySource{TaskID: task.ID, SourceType: model.SourceGroup, SourceID: "grp-explicit", SourceName: "用户选的群"}
+	if err := db.Create(&explicit).Error; err != nil {
+		t.Fatalf("seed explicit source: %v", err)
+	}
+
+	msgs := []pipeline.Message{
+		{ChannelID: "grp-explicit", ChannelType: model.ChannelTypeGroup, SourceName: "用户选的群"},
+		{ChannelID: "grp-auto", ChannelType: model.ChannelTypeGroup, SourceName: "自动抓取的群"},
+	}
+
+	p := &Processor{db: db}
+	if err := p.backfillSourcesFromMessages(task.ID, msgs); err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+
+	var rows []model.SummarySource
+	if err := db.Where("task_id = ?", task.ID).Order("id").Find(&rows).Error; err != nil {
+		t.Fatalf("query rows: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d: %+v", len(rows), rows)
+	}
+	if rows[0].ID != explicit.ID || rows[0].Derived {
+		t.Errorf("explicit row re-flagged or replaced: id=%d derived=%v, want id=%d derived=false", rows[0].ID, rows[0].Derived, explicit.ID)
+	}
+	if rows[1].SourceID != "grp-auto" || !rows[1].Derived {
+		t.Errorf("backfilled row = (id %q, derived %v), want (grp-auto, true)", rows[1].SourceID, rows[1].Derived)
 	}
 }

@@ -194,13 +194,20 @@ func (SummaryTask) TableName() string { return "summary_task" }
 
 // SummarySource represents a data source for a task.
 type SummarySource struct {
-	ID            int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	TaskID        int64     `gorm:"column:task_id;not null;index:idx_task_id" json:"task_id"`
-	SourceType    int       `gorm:"column:source_type;type:tinyint;not null" json:"source_type"`
-	SourceID      string    `gorm:"column:source_id;type:varchar(64);not null" json:"source_id"`
-	SourceName    string    `gorm:"column:source_name;type:varchar(200);not null;default:''" json:"source_name"`
-	ParticipantID *int64    `gorm:"column:participant_id;index:idx_participant_id" json:"participant_id"`
-	CreatedAt     time.Time `gorm:"column:created_at;not null" json:"created_at"`
+	ID            int64  `gorm:"primaryKey;autoIncrement" json:"id"`
+	TaskID        int64  `gorm:"column:task_id;not null;index:idx_task_id" json:"task_id"`
+	SourceType    int    `gorm:"column:source_type;type:tinyint;not null" json:"source_type"`
+	SourceID      string `gorm:"column:source_id;type:varchar(64);not null" json:"source_id"`
+	SourceName    string `gorm:"column:source_name;type:varchar(200);not null;default:''" json:"source_name"`
+	ParticipantID *int64 `gorm:"column:participant_id;index:idx_participant_id" json:"participant_id"`
+	// R9 P1 (PR #190): 1 = row written by worker source backfill from the
+	// pipeline's auto-selected channels. Such rows are excluded from every
+	// user-visible projection (list/detail `sources`, share snapshot, agent
+	// reference-context bullets) because they record the creator's channel
+	// membership while read authorization is any task participant (roster is
+	// mutable after generation). Tier-4 origin derivation still reads them.
+	Derived   bool      `gorm:"column:derived;type:tinyint;not null;default:0" json:"-"`
+	CreatedAt time.Time `gorm:"column:created_at;not null" json:"created_at"`
 }
 
 func (SummarySource) TableName() string { return "summary_source" }
