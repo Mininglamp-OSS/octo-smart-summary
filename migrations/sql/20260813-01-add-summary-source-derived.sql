@@ -14,6 +14,16 @@
 -- DEFAULT 0: all rows written before this column existed are
 -- user-specified (create endpoint / bot create / schedule materialization)
 -- and must remain visible.
+--
+-- R11 Q6 (yujiawei, review 4929031900): the claim above holds for
+-- production — internal/worker/source_backfill.go has never existed on
+-- main, so no production row predates the flag. It does NOT hold for any
+-- non-production environment that deployed an earlier head of this branch
+-- (commit 79396e9 shipped the backfill BEFORE 306588d added this column):
+-- rows written in that window landed as derived=0 and the projection
+-- filters keep exposing them. Such environments need a one-time manual
+-- cleanup (e.g. mark auto-selected rows written in that window), since the
+-- schema alone cannot distinguish them.
 ALTER TABLE summary_source
     ADD COLUMN derived TINYINT NOT NULL DEFAULT 0
     COMMENT '1=row written by worker source backfill (auto-selected channels); excluded from user-visible projections';

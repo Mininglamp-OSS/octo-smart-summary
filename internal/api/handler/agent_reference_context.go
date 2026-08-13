@@ -264,17 +264,25 @@ func buildReferencedSummariesContext(
 			sb.WriteString(fmt.Sprintf("- 历史时间范围: %s ~ %s\n",
 				art.Task.TimeRangeStart.Format("2006-01-02 15:04"),
 				art.Task.TimeRangeEnd.Format("2006-01-02 15:04")))
-			if len(art.Sources) > 0 {
+			// R11 Q8 (yujiawei, review 4929031900): filter in a pre-pass
+			// and emit the header only when the filtered slice is
+			// non-empty — an all-derived task previously got a dangling
+			// `- 数据来源:` label with nothing under it inside the fence.
+			visible := make([]model.SummarySource, 0, len(art.Sources))
+			for _, s := range art.Sources {
+				// R9 P1 (PR #190): derived rows (worker backfill of
+				// auto-selected channels) are excluded from the
+				// reference-context bullets — the prompt is visible to
+				// any task reader, same authorization domain as the
+				// list/detail projections.
+				if s.Derived {
+					continue
+				}
+				visible = append(visible, s)
+			}
+			if len(visible) > 0 {
 				sb.WriteString("- 数据来源:\n")
-				for _, s := range art.Sources {
-					// R9 P1 (PR #190): derived rows (worker backfill of
-					// auto-selected channels) are excluded from the
-					// reference-context bullets — the prompt is visible to
-					// any task reader, same authorization domain as the
-					// list/detail projections.
-					if s.Derived {
-						continue
-					}
+				for _, s := range visible {
 					sb.WriteString(fmt.Sprintf("  * %s (type=%d)\n", sanitizeRefLine(s.SourceName), s.SourceType))
 				}
 			}

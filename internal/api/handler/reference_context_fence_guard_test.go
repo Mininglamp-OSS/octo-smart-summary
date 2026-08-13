@@ -231,3 +231,51 @@ func TestBuildReferencedSummariesContext_NoDanglingSourceHeader(t *testing.T) {
 		t.Errorf("dangling `- 数据来源:` header emitted with all sources derived")
 	}
 }
+
+// R11 Q4 (yujiawei, review 4929031900): "The share-snapshot filter and the
+// reference-context-bullet filter ... have no coverage." This locks the
+// reference-context-bullet half: derived rows must not appear in the
+// `- 数据来源:` bullets of the traditional-task context. The R9 filter
+// already worked; this test pins it so a future refactor cannot silently
+// re-open the leak (Q3-style regression shape).
+func TestBuildReferencedSummariesContext_DerivedSourcesFiltered(t *testing.T) {
+	db := setupResolverTestDB(t)
+
+	task := model.SummaryTask{
+		TaskNo:      "TST-CTX-DERIVED",
+		SpaceID:     "space1",
+		CreatorID:   "creator1",
+		Title:       "derived filter",
+		SummaryMode: model.ModeByPerson,
+		Status:      model.StatusCompleted,
+		TriggerType: model.TriggerManual,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	addTeamResult(t, db, task.ID, "TEAM-BODY")
+	if err := db.Create(&model.SummarySource{
+		TaskID: task.ID, SourceType: model.SourceGroup,
+		SourceID: "grp_explicit", SourceName: "显式来源",
+	}).Error; err != nil {
+		t.Fatalf("create explicit source: %v", err)
+	}
+	if err := db.Create(&model.SummarySource{
+		TaskID: task.ID, SourceType: model.SourceGroup,
+		SourceID: "grp_auto", SourceName: "自动回填来源", Derived: true,
+	}).Error; err != nil {
+		t.Fatalf("create derived source: %v", err)
+	}
+
+	ctx, loaded := buildReferencedSummariesContext(
+		context.Background(), db, "space1", "creator1", []int64{task.ID})
+	if len(loaded) != 1 {
+		t.Fatalf("expected 1 loaded task, got %d", len(loaded))
+	}
+	if !strings.Contains(ctx, "显式来源") {
+		t.Errorf("explicit source missing from context bullets")
+	}
+	if strings.Contains(ctx, "自动回填来源") {
+		t.Errorf("derived source leaked into reference-context bullets")
+	}
+}

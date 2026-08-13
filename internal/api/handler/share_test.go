@@ -432,3 +432,14 @@ func TestStripUnresolvedCitationMarkers_PreservesNonCitationBrackets(t *testing.
 		})
 	}
 }
+
+// Real dangling citation markers must still be stripped (the R9 P2-2
+// behaviour this function exists for). Guards the scoped strip of R11 Q5:
+// narrowing must not turn the strip into a no-op.
+func TestStripUnresolvedCitationMarkers_StripsRealMarkers(t *testing.T) {
+	got := stripUnresolvedCitationMarkers("结论 [1] 与 [P2] 如下")
+	want := "结论  与  如下" // marker runs dropped; spacing otherwise untouched
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}

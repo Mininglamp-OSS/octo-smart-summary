@@ -81,18 +81,11 @@ func (p *Processor) backfillSourcesFromMessages(taskID int64, messages []pipelin
 			continue
 		}
 		seen[key] = struct{}{}
-		name := m.SourceName
-		if name == "" {
-			// Both fetch backends normally fill SourceName from the channel
-			// info; fall back to IM-db resolution (nil imDB degrades to a
-			// placeholder) so rows never ship with an empty display name.
-			name = service.ResolveSourceNameWithType(m.ChannelID, sourceType, p.imDB)
-		}
 		additions = append(additions, model.SummarySource{
 			TaskID:     taskID,
 			SourceType: sourceType,
 			SourceID:   m.ChannelID,
-			SourceName: name,
+			SourceName: m.SourceName, // resolved after the cap (R11 N2)
 			Derived:    true,
 		})
 	}
@@ -104,6 +97,20 @@ func (p *Processor) backfillSourcesFromMessages(taskID int64, messages []pipelin
 	}
 	if len(additions) > room {
 		additions = additions[:room]
+	}
+
+	// R11 N2 (yujiawei, review 4929031900): resolve display names only for
+	// the rows that survive the cap. The old order resolved every distinct
+	// candidate channel in the IM DB first, so 500 fetched channels with
+	// backfillMaxSources = 30 paid 500 lookups to keep 30 rows.
+	for i := range additions {
+		if additions[i].SourceName != "" {
+			continue
+		}
+		// Both fetch backends normally fill SourceName from the channel
+		// info; fall back to IM-db resolution (nil imDB degrades to a
+		// placeholder) so rows never ship with an empty display name.
+		additions[i].SourceName = service.ResolveSourceNameWithType(additions[i].SourceID, additions[i].SourceType, p.imDB)
 	}
 
 	// R10 (yujiawei, issue comment 5280351017): conflict-tolerant insert.
