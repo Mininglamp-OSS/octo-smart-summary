@@ -718,6 +718,13 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 
 		srcList := make([]gin.H, 0, len(sources))
 		for _, s := range sources {
+			// R9 P1 (PR #190): derived rows record the pipeline's
+			// auto-selected channels under the creator's membership; read
+			// authorization here is any task participant, so they must not
+			// appear in the user-visible sources projection.
+			if s.Derived {
+				continue
+			}
 			srcList = append(srcList, gin.H{
 				"source_type": s.SourceType,
 				"source_id":   s.SourceID,
@@ -962,6 +969,13 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 
 	srcList := make([]gin.H, 0, len(sources))
 	for _, s := range sources {
+		// R9 P1 (PR #190): derived rows (worker backfill of auto-selected
+		// channels) are excluded from the user-visible detail projection —
+		// see ListSummaries for the authorization rationale. Tier-4 origin
+		// derivation reads the table directly and is unaffected.
+		if s.Derived {
+			continue
+		}
 		srcList = append(srcList, gin.H{
 			"source_type": s.SourceType,
 			"source_id":   s.SourceID,

@@ -267,6 +267,14 @@ func buildReferencedSummariesContext(
 			if len(art.Sources) > 0 {
 				sb.WriteString("- 数据来源:\n")
 				for _, s := range art.Sources {
+					// R9 P1 (PR #190): derived rows (worker backfill of
+					// auto-selected channels) are excluded from the
+					// reference-context bullets — the prompt is visible to
+					// any task reader, same authorization domain as the
+					// list/detail projections.
+					if s.Derived {
+						continue
+					}
 					sb.WriteString(fmt.Sprintf("  * %s (type=%d)\n", sanitizeRefLine(s.SourceName), s.SourceType))
 				}
 			}

@@ -125,15 +125,20 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	var finalChannelID string
 	var finalChannelType int
 
-	// R7 P2-3: normalize referenced_task_ids at the entry point — dedup
-	// first, then cap against maxReferencedTaskIDs, the same contract Chat /
-	// ChatStream enforce at the binding layer. Previously this handler
-	// persisted the raw, un-deduped, uncapped array into a text column
-	// (~10k ids → Data too long / truncated JSON). All downstream consumers
-	// below (origin borrow, persist, citation borrow) see the clean list.
+	// R7 P2-3 / R9 P2-3 (PR #190): normalize referenced_task_ids at the entry
+	// point — dedup first, then REJECT if still over maxReferencedTaskIDs.
+	// Chat (agent_chat.go) and ChatStream enforce the identical contract at
+	// their binding layer with apiResponse{Code:40000}; previously this path
+	// silently truncated to the cap and persisted a partial lineage, breaking
+	// contract symmetry. All downstream consumers below (origin borrow,
+	// persist, citation borrow) see the clean, in-cap list.
 	req.ReferencedTaskIDs = dedupReferencedTaskIDs(req.ReferencedTaskIDs)
 	if len(req.ReferencedTaskIDs) > maxReferencedTaskIDs {
-		req.ReferencedTaskIDs = req.ReferencedTaskIDs[:maxReferencedTaskIDs]
+		c.JSON(http.StatusBadRequest, apiResponse{
+			Code:    40000,
+			Message: fmt.Sprintf("too many referenced task IDs: %d distinct (max %d)", len(req.ReferencedTaskIDs), maxReferencedTaskIDs),
+		})
+		return
 	}
 
 	if req.OriginChannelID == nil {
@@ -162,9 +167,18 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			// sibling paths here.
 			if len(req.ReferencedTaskIDs) > 0 {
 				var refTask model.SummaryTask
+				// R9 P2-4 (PR #190, raised in two preceding reviews): gate the
+				// borrow on deleted_at IS NULL AND status = completed, mirroring
+				// resolveReferencedArtifact. SummaryTask.DeletedAt is *time.Time
+				// (not gorm.DeletedAt), so GORM does NOT auto-filter soft-deleted
+				// rows — without this the borrow happily inherits origin from a
+				// deleted or still-processing task while borrowCitationsFromReference
+				// on the same request correctly refuses it (same referenced task,
+				// two different answers).
 				if err := h.db.WithContext(c.Request.Context()).
 					Select("id, creator_id, origin_channel_id, origin_channel_type").
-					Where("id = ? AND space_id = ?", req.ReferencedTaskIDs[0], spaceID).
+					Where("id = ? AND space_id = ? AND deleted_at IS NULL AND status = ?",
+						req.ReferencedTaskIDs[0], spaceID, model.StatusCompleted).
 					First(&refTask).Error; err == nil {
 					if canAccessTaskDB(h.db.WithContext(c.Request.Context()), userID, refTask.ID, refTask.CreatorID) {
 						if refTask.OriginChannelID != "" {
@@ -387,6 +401,18 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 				cits = borrowedCits
 				log.Printf("[handler] CreateAgentSummary borrowed %d citations from referenced task_id=%d session=%s",
 					len(cits), req.ReferencedTaskIDs[0], req.SessionID)
+			} else {
+				// R9 P2-2 (PR #190, yujiawei review 4926742282): the borrow
+				// returned empty (referenced task's citations redacted or
+				// genuinely absent) but content still carries the referenced
+				// summary's [n] markers. Save with empty citations + live
+				// markers → frontend renders broken/dangling citation links.
+				// Strip every unresolvable numeric marker here (markdown
+				// links like [1](url) are preserved).
+				content = stripUnresolvedCitationMarkers(content)
+				creatorPR.Content = content
+				log.Printf("[handler] CreateAgentSummary stripped dangling citation markers (borrow returned empty) session=%s ref_task_id=%d",
+					req.SessionID, req.ReferencedTaskIDs[0])
 			}
 		}
 		creatorPR.SetCitations(cits)

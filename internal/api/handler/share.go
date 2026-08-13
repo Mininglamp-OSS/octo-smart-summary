@@ -169,6 +169,41 @@ func stripCitationTokens(content string, plain []model.Citation, team []model.Te
 	return strings.TrimSpace(b.String())
 }
 
+// stripUnresolvedCitationMarkers removes ALL numeric citation markers ([n]
+// and [Pn]) from content regardless of any citation set. Used when a refine
+// save carries the referenced summary's markers but has no borrowable
+// citations (R9 P2-2, PR #190): leaving the markers with an empty citation
+// array renders broken links in the frontend. Markdown links like [1](url)
+// are content and preserved, same rule as stripCitationTokens.
+func stripUnresolvedCitationMarkers(content string) string {
+	var b strings.Builder
+	for i := 0; i < len(content); {
+		if content[i] != '[' {
+			b.WriteByte(content[i])
+			i++
+			continue
+		}
+		end := strings.IndexByte(content[i:], ']')
+		if end < 0 {
+			b.WriteString(content[i:])
+			break
+		}
+		end += i
+		token := content[i+1 : end]
+		number := strings.TrimPrefix(token, "P")
+		_, err := strconv.Atoi(number)
+		// A numeric markdown link such as [1](url) is content, not a citation.
+		isLink := end+1 < len(content) && content[end+1] == '('
+		if err == nil && !isLink {
+			i = end + 1 // drop the marker entirely
+			continue
+		}
+		b.WriteString(content[i : end+1])
+		i = end + 1
+	}
+	return strings.TrimSpace(b.String())
+}
+
 func sharePreview(content string) string {
 	lines := strings.Split(content, "\n")
 	parts := make([]string, 0, len(lines))
@@ -321,6 +356,13 @@ func (h *ShareHandler) Create(c *gin.Context) {
 	}
 	names := make([]string, 0, len(sources))
 	for _, source := range sources {
+		// R9 P1 (PR #190): derived rows (worker backfill of auto-selected
+		// channels) are excluded from the share snapshot — a share is
+		// readable by anyone with the link, an even broader audience than
+		// task participants.
+		if source.Derived {
+			continue
+		}
 		if strings.TrimSpace(source.SourceName) != "" {
 			names = append(names, source.SourceName)
 		}

@@ -35,6 +35,15 @@ const backfillMaxSources = 30
 //   - messages with an unmappable storage channel_type (WuKongIM reserved
 //     values 3/4, unset 0) or empty channel_id are skipped — never persist
 //     a garbage source_type
+//   - R9 P1 (PR #190): DM channels are NEVER backfilled. A DM's source_id
+//     names the peer UID, and persisting it would expose the creator's
+//     private-chat partners to any task participant (roster is mutable after
+//     generation); a DM is also never a useful origin_channel_id for a
+//     refined summary, and a normalized uidA@uidB id (2×32-char UIDs = 65
+//     chars) overflows summary_source.source_id varchar(64)
+//   - every persisted row carries Derived=true so user-visible projections
+//     (list/detail sources, share snapshot, reference-context bullets) can
+//     exclude it while tier-4 origin derivation keeps reading it
 //   - total rows capped at backfillMaxSources; existing rows count first
 //
 // Returns an error only on real DB failures; callers log and continue —
@@ -62,6 +71,10 @@ func (p *Processor) backfillSourcesFromMessages(taskID int64, messages []pipelin
 		if !ok {
 			continue
 		}
+		// R9 P1: DM channels are never backfilled (see doc comment).
+		if sourceType == model.SourceDirect {
+			continue
+		}
 		key := sourceBackfillKey(sourceType, m.ChannelID)
 		if _, dup := seen[key]; dup {
 			continue
@@ -79,6 +92,7 @@ func (p *Processor) backfillSourcesFromMessages(taskID int64, messages []pipelin
 			SourceType: sourceType,
 			SourceID:   m.ChannelID,
 			SourceName: name,
+			Derived:    true,
 		})
 	}
 
