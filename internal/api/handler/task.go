@@ -759,7 +759,8 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 		// candidates without guessing from trigger_type.
 		// P1-3: Use referenceableFromLoaded to reuse data already in scope
 		// (task row, display result, participants) instead of issuing 4-5
-		// redundant per-row queries via checkReferenceableFast.
+		// redundant per-row queries. The caller's PersonalResult existence
+		// is batch-loaded above via nonEmptyPersonalResultTaskIDs.
 		isParticipant := t.CreatorID == userID
 		if !isParticipant {
 			for _, p := range partsByTask[t.ID] {
@@ -1061,12 +1062,13 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 	}
 
 	// SUM-19: expose referenceable status in detail response.
-	// P1-3: reuse data already loaded (task, display result) instead of
-	// calling checkReferenceable which re-loads all of it.
+	// P1-3: reuse data already loaded (task, display result) via
+	// referenceableFromLoaded instead of re-loading all of it.
 	// At this point authorizeTaskAccess has already confirmed the caller is
 	// creator or participant, so isParticipant is true.
 	// P1-1: Also check PersonalResult for agent summaries (which write
-	// PersonalResult, not SummaryResult).
+	// PersonalResult, not SummaryResult) via the shared
+	// hasNonEmptyPersonalResult predicate (content != '').
 	userID := middleware.GetUserID(c)
 	detailResultContent := ""
 	if hasResult {

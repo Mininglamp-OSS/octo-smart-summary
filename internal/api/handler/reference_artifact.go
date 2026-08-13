@@ -94,7 +94,20 @@ func resolveReferencedArtifact(
 	// 4. Try team-level SummaryResult first (covers manual, scheduled, bot, and
 	// agent team results). Use queryDisplayResult which respects
 	// current_result_id and falls back to highest version.
+	//
+	// R5 yj P2-2: queryDisplayResult returns a bare gorm error. A transient
+	// failure (connection / timeout) must NOT fall through to the personal
+	// branch and ultimately "no_visible_content" — that would report a
+	// completed, accessible task with valid content as having no visible
+	// artifact, with no error surfaced. Distinguish ErrRecordNotFound
+	// (absence → fall through) from a real error (Reason "error"), mirroring
+	// the handling this function already applies to its own first query
+	// above (:68-80).
 	result, err := queryDisplayResult(db.WithContext(ctx), task.ID)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		log.Printf("[reference] DB error loading display result for task %d: %v", task.ID, err)
+		return nil, &ErrReferenceUnavailable{Reason: "error", TaskID: taskID}
+	}
 	if err == nil && result.ID != 0 && result.Content != "" {
 		// Determine citations visibility per detail-page privacy rules.
 		plainCitations := result.GetCitations()
@@ -125,11 +138,19 @@ func resolveReferencedArtifact(
 	// Uses the same content!='' predicate as hasNonEmptyPersonalResult /
 	// nonEmptyPersonalResultTaskIDs so the list/detail referenceable flag
 	// and this resolver step agree on what "visible" means (P1-1, R4 yj).
+	//
+	// R5 yj P2-2: same error discipline as the team query above — a real DB
+	// failure here previously fell through to "no_visible_content" (:145),
+	// silently reporting a completed task as having nothing to show.
 	var pr model.PersonalResult
 	err = db.WithContext(ctx).
 		Where("task_id = ? AND user_id = ? AND content != ?", task.ID, userID, "").
 		Order("id DESC").
 		First(&pr).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		log.Printf("[reference] DB error loading personal result for task %d, user %s: %v", task.ID, userID, err)
+		return nil, &ErrReferenceUnavailable{Reason: "error", TaskID: taskID}
+	}
 	if err == nil && pr.ID != 0 {
 		// Only load sources if there is no snapshot — sources are rendered
 		// only in the no-snapshot (traditional summary) branch (P2-4).
