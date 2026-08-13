@@ -810,6 +810,14 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 		return fmt.Errorf("fetch messages: %w", err)
 	}
 
+	// Backfill summary_source from the channels actually fetched. Tasks
+	// created without explicit sources (auto-selected channels) otherwise
+	// end up with zero source rows, which breaks reference → refine → save's
+	// tier-4 origin derivation. Best-effort: log and continue on failure.
+	if err := p.backfillSourcesFromMessages(task.ID, messages); err != nil {
+		log.Printf("[processor] task %d: backfill summary_source failed: %v", task.ID, err)
+	}
+
 	if len(messages) == 0 {
 		log.Printf("[processor] task %d: 0 messages fetched", task.ID)
 		return nil
