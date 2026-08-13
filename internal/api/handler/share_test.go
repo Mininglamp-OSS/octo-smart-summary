@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -361,5 +362,47 @@ func TestSummaryShare_AgentPersonalResultFallback(t *testing.T) {
 	}
 	if snap.Content != agentContent {
 		t.Fatalf("snapshot content = %q, want PersonalResult content %q", snap.Content, agentContent)
+	}
+}
+
+// R10 blocking (Jerry-Xin, review 4928758044): "share snapshots still leak
+// hidden derived-source cardinality through source_count ... derived rows
+// are skipped for SourceName, but SourceCount is still set to len(sources).
+// A shared link is broader than task read access ... Count only non-derived
+// rows, and add a share-level regression test."
+func TestSummaryShare_SourceCountExcludesDerivedSources(t *testing.T) {
+	db, imDB, r, taskID := setupShareTest(t)
+	_ = imDB
+
+	// setupShareTest already created one explicit (non-derived) source.
+	// Add two derived (worker-backfilled) rows — they must be invisible in
+	// BOTH fields of the share snapshot.
+	for i, name := range []string{"私聊-derived-a", "derived-group-b"} {
+		if err := db.Create(&model.SummarySource{
+			TaskID:     taskID,
+			SourceType: model.SourceGroup,
+			SourceID:   fmt.Sprintf("derived-src-%d", i),
+			SourceName: name,
+			Derived:    true,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	body := gin.H{"idempotency_key": "share-derived-count", "targets": []gin.H{{"channel_id": "group1", "channel_type": model.ChannelTypeGroup}}}
+	w := shareRequest(t, r, http.MethodPost, "/api/v1/summaries/ST-share-1/shares", "creator", "space1", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create=%d %s", w.Code, w.Body.String())
+	}
+
+	var snap model.SummaryShareSnapshot
+	if err := db.Where("task_id = ?", taskID).First(&snap).Error; err != nil {
+		t.Fatalf("snapshot not created: %v", err)
+	}
+	if snap.SourceCount != 1 {
+		t.Errorf("source_count = %d, want 1 (derived rows must not leak their cardinality)", snap.SourceCount)
+	}
+	if snap.SourceName != "Source group" {
+		t.Errorf("source_name = %q, want only the explicit source", snap.SourceName)
 	}
 }

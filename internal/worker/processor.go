@@ -745,14 +745,7 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 	}
 
 	// Build specified sources for pipeline
-	specifiedSources := make([]map[string]interface{}, 0, len(sources))
-	for _, s := range sources {
-		specifiedSources = append(specifiedSources, map[string]interface{}{
-			"source_id":   s.SourceID,
-			"source_type": s.SourceType,
-			"source_name": s.SourceName,
-		})
-	}
+	specifiedSources := explicitSpecifiedSources(sources)
 
 	// Fetch messages via pipeline. Tool-call / raw LLM uses in this (fetch) path
 	// are accounted under the same task_no, so they appear in the same per-run

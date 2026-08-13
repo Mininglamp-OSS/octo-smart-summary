@@ -666,14 +666,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		return "", nil, 0, 0, "", fmt.Errorf("load sources: %w", err)
 	}
 
-	specifiedSources := make([]map[string]interface{}, 0, len(sources))
-	for _, s := range sources {
-		specifiedSources = append(specifiedSources, map[string]interface{}{
-			"source_id":   s.SourceID,
-			"source_type": s.SourceType,
-			"source_name": s.SourceName,
-		})
-	}
+	specifiedSources := explicitSpecifiedSources(sources)
 
 	// Unified LLM tool-call callback (shared by all Function Call sites).
 	// purpose is derived from forceFn so the report says what each call did

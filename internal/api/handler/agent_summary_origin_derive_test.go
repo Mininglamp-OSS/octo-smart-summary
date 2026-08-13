@@ -266,6 +266,18 @@ func TestCreateAgentSummary_DeriveOriginNoSourcesStill40001(t *testing.T) {
 	if resp["code"].(float64) != 40001 {
 		t.Errorf("expected code=40001, got %v", resp["code"])
 	}
+	// R10 (yujiawei, issue comment 5280351017): historical pipeline tasks
+	// have zero source rows (the channels lived only in the in-memory
+	// channelSet and were never persisted before the backfill landed), so a
+	// reference → refine → save of such a task fails 40001 at the very end
+	// of the flow. A one-shot historical backfill is impossible — there is
+	// no persisted record of which channels were used — so the message must
+	// say WHY inheritance was impossible instead of leaving the user
+	// guessing.
+	expectedMsg := "origin_channel_id 未传且无法从 session 反查(session 无 fetch_channel 调用),引用总结也未能提供 origin:引用任务未记录生成频道(无 origin 且无可用来源行)"
+	if resp["message"].(string) != expectedMsg {
+		t.Errorf("expected message %q, got %q", expectedMsg, resp["message"])
+	}
 }
 
 // TestCreateAgentSummary_DeriveOriginNoAccessRefused: a user who cannot read

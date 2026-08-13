@@ -4,6 +4,7 @@ package worker
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -301,5 +302,91 @@ func TestBackfillSourcesFromMessages_MarksBackfilledRowsDerived(t *testing.T) {
 	}
 	if rows[1].SourceID != "grp-auto" || !rows[1].Derived {
 		t.Errorf("backfilled row = (id %q, derived %v), want (grp-auto, true)", rows[1].SourceID, rows[1].Derived)
+	}
+}
+
+// R10 (Jerry-Xin, review 4928758044): "Derived rows now feed back into
+// generation scope. Both processor.go and personal_processor.go load all
+// summary_source rows into specifiedSources ... later processing treats
+// auto-backfilled internal rows as explicit source constraints. If that is
+// not intended, filter derived = 0 in worker fetch input and reserve derived
+// rows for deriveOriginFromSummarySources." — not intended: derived rows are
+// a tier-4 origin-derivation footprint, not user-specified constraints.
+func TestExplicitSpecifiedSources_ExcludesDerivedRows(t *testing.T) {
+	sources := []model.SummarySource{
+		{SourceType: model.SourceGroup, SourceID: "grp-explicit", SourceName: "显式群", Derived: false},
+		{SourceType: model.SourceGroup, SourceID: "grp-derived", SourceName: "auto-backfilled", Derived: true},
+		{SourceType: model.SourceThread, SourceID: "grp-explicit____thr", SourceName: "显式子区", Derived: false},
+	}
+	got := explicitSpecifiedSources(sources)
+	if len(got) != 2 {
+		t.Fatalf("specifiedSources = %d rows, want 2 (derived row must not feed back into fetch scope)", len(got))
+	}
+	for _, m := range got {
+		if m["source_id"] == "grp-derived" {
+			t.Fatalf("derived row leaked into specifiedSources: %v", m)
+		}
+	}
+}
+
+// R10 (yujiawei, issue comment 5280351017): "A unique index on (task_id,
+// source_type, source_id) plus ON DUPLICATE KEY UPDATE / INSERT IGNORE would
+// make idempotency hold structurally rather than by timing." Concrete
+// trigger: scanStuckTasks flips Processing → Pending when the lease expires
+// WITHOUT signalling the original worker; two workers then race the
+// read-then-insert backfill and both persist the same rows.
+func TestSummarySource_UniqueConstraintRejectsDuplicate(t *testing.T) {
+	db := newFileBackedTestDB(t)
+	task := model.SummaryTask{TaskNo: "BF-UNIQ", SpaceID: "sp", CreatorID: "u1", Title: "t", SummaryMode: model.ModeByPerson}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+	row := model.SummarySource{TaskID: task.ID, SourceType: model.SourceGroup, SourceID: "grp-x", SourceName: "群X"}
+	if err := db.Create(&row).Error; err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+	dup := model.SummarySource{TaskID: task.ID, SourceType: model.SourceGroup, SourceID: "grp-x", SourceName: "群X-dup"}
+	if err := db.Create(&dup).Error; err == nil {
+		t.Fatal("duplicate (task_id, source_type, source_id) insert succeeded; want unique-constraint rejection")
+	}
+}
+
+func TestBackfillSourcesFromMessages_ConcurrentRaceNoDuplicates(t *testing.T) {
+	for iter := 0; iter < 20; iter++ {
+		db := newFileBackedTestDB(t)
+		task := model.SummaryTask{TaskNo: fmt.Sprintf("BF-RACE-%d", iter), SpaceID: "sp", CreatorID: "u1", Title: "t", SummaryMode: model.ModeByPerson}
+		if err := db.Create(&task).Error; err != nil {
+			t.Fatalf("seed task: %v", err)
+		}
+		msgs := []pipeline.Message{
+			{ChannelID: "grp-race", ChannelType: model.ChannelTypeGroup, SourceName: "竞速群"},
+			{ChannelID: fmt.Sprintf("grp-race-extra-%d", iter), ChannelType: model.ChannelTypeGroup, SourceName: "竞速群2"},
+		}
+		// Two workers claim the same task after a lease expiry and both
+		// reach backfillSourcesFromMessages with an empty read.
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		errs := make([]error, 2)
+		for i := 0; i < 2; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				p := &Processor{db: db}
+				errs[i] = p.backfillSourcesFromMessages(task.ID, msgs)
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("iter %d worker %d: backfill must be conflict-tolerant, got: %v", iter, i, err)
+			}
+		}
+		var count int64
+		db.Model(&model.SummarySource{}).Where("task_id = ? AND source_id = ?", task.ID, "grp-race").Count(&count)
+		if count != 1 {
+			t.Fatalf("iter %d: %d rows for the same (task_id, source_type, source_id); want exactly 1 (race lost the structural guarantee)", iter, count)
+		}
 	}
 }
