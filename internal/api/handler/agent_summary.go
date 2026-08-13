@@ -125,6 +125,17 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	var finalChannelID string
 	var finalChannelType int
 
+	// R7 P2-3: normalize referenced_task_ids at the entry point — dedup
+	// first, then cap against maxReferencedTaskIDs, the same contract Chat /
+	// ChatStream enforce at the binding layer. Previously this handler
+	// persisted the raw, un-deduped, uncapped array into a text column
+	// (~10k ids → Data too long / truncated JSON). All downstream consumers
+	// below (origin borrow, persist, citation borrow) see the clean list.
+	req.ReferencedTaskIDs = dedupReferencedTaskIDs(req.ReferencedTaskIDs)
+	if len(req.ReferencedTaskIDs) > maxReferencedTaskIDs {
+		req.ReferencedTaskIDs = req.ReferencedTaskIDs[:maxReferencedTaskIDs]
+	}
+
 	if req.OriginChannelID == nil {
 		// Not provided → resolve from session tool traces
 		resolvedID, resolvedType, err := h.resolveOriginChannelFromSession(c.Request.Context(), req.SessionID, userID)
@@ -167,8 +178,11 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 							// task's summary_source rows (the channels it was generated
 							// from) so a refine of a non-agent summary can still inherit
 							// an origin — the owner's goal of "non-agent summaries
-							// referenceable + iterable like agent ones". Only unambiguous
-							// single-source tasks qualify (see helper).
+							// referenceable + iterable like agent ones". The helper takes
+							// the FIRST usable source row (by id order) and logs when
+							// several exist — multi-source tasks inherit their first
+							// channel, consistent with the tier-3 first-referenced-task
+							// precedent (see deriveOriginFromSummarySources).
 							finalChannelID, finalChannelType = h.deriveOriginFromSummarySources(c.Request.Context(), refTask.ID)
 							if finalChannelID != "" {
 								log.Printf("[handler] CreateAgentSummary derived origin from referenced task_id=%d sources channel=%s/%d session=%s",

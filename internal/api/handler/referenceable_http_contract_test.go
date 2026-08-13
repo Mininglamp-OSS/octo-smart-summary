@@ -110,11 +110,11 @@ func TestGetSummary_ReferenceableContract(t *testing.T) {
 	r := setupRouter(h)
 
 	for _, tc := range []struct {
-		name           string
-		taskID         int64
-		wantRefable    bool
-		wantType       string
-		wantReason     string
+		name        string
+		taskID      int64
+		wantRefable bool
+		wantType    string
+		wantReason  string
 	}{
 		{"completed team result", doneID, true, "team_result", ""},
 		{"not completed", openID, false, "", "not_completed"},

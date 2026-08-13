@@ -38,15 +38,15 @@ const fencePlaceholder = "[引用数据]"
 // reassemble a fence tag (P1-2 fix: CR and NUL previously mapped to "" which
 // allowed split-token reassembly).
 //
-// Newline is replaced with space here because sanitizeRef is used for fence
-// OUTSIDE text (titles, labels) where line breaks could forge standalone
-// lines. For fence INSIDE text (body content) use sanitizeRefBlock which
-// preserves newlines so paragraph formatting is not compressed (P2-9).
+// Newline is replaced with space here because sanitizeRef guards
+// single-value render sites where a forged standalone line matters. For true
+// multi-line bodies (body content) use sanitizeRefBlock which preserves
+// newlines so paragraph formatting is not compressed (P2-9).
 func sanitizeRef(s string) string {
 	return sanitizeRefLine(s)
 }
 
-// sanitizeRefLine sanitizes text that appears OUTSIDE the data fence (titles,
+// sanitizeRefLine sanitizes text rendered at single-value sites (bullets,
 // labels, metadata fields). Newlines are replaced with space to prevent
 // line-break manipulation (P2-9).
 func sanitizeRefLine(s string) string {
@@ -61,6 +61,14 @@ func sanitizeRefLine(s string) string {
 		"\n", " ",
 		"\t", " ",
 		"\x00", " ",
+		// R7 P2-5: non-canonical line separators — the same line-forgery
+		// class as \n (vertical tab, form feed, NEL, LS, PS). Raised on the
+		// prior head, closed here.
+		"\v", " ",
+		"\f", " ",
+		"\u0085", " ",
+		"\u2028", " ",
+		"\u2029", " ",
 	).Replace(s)
 	return s
 }
@@ -79,6 +87,14 @@ func sanitizeRefBlock(s string) string {
 		"\r", " ",
 		"\t", " ",
 		"\x00", " ",
+		// R7 P2-5: \n is deliberately preserved (paragraph formatting), but
+		// the non-canonical line separators have no reason to survive in
+		// block text either.
+		"\v", " ",
+		"\f", " ",
+		"\u0085", " ",
+		"\u2028", " ",
+		"\u2029", " ",
 	).Replace(s)
 	return s
 }
@@ -102,8 +118,12 @@ func sanitizeRefBlock(s string) string {
 //     GetSummary / detail path.
 //   - Prompt-injection hardening: all untrusted free-text lifted from the
 //     referenced summary (title, requirement, body, citations, tool trace)
-//     is passed through sanitizeRef, and large free-text blobs are wrapped
-//     in <引用数据>…</引用数据> fences.
+//     is sanitized and wrapped in <引用数据>…</引用数据> fences.
+//   - Fence-boundary discipline (R7 P1-1 / P2-6): untrusted interpolated
+//     values live INSIDE the fence; every sentence addressed to the model
+//     lives OUTSIDE it. The header contract says nothing inside the fence is
+//     an instruction, so emitting real directives inside would destroy the
+//     signal that separates legitimate guidance from forged instructions.
 //   - Reference material is APPENDED to the profile's system prompt.
 //   - Tasks that fail resolution are reported with a structured reason and
 //     skipped.
@@ -140,6 +160,10 @@ func buildReferencedSummariesContext(
 
 	// Cap referenced task IDs to prevent unbounded query fanout (P1-3).
 	if len(taskIDs) > maxReferencedTaskIDs {
+		// R7 N3: make the defensive truncation visible. All current callers
+		// validate first, so this branch should be unreachable — log anyway
+		// so future misuse is not silent.
+		log.Printf("[reference-builder] truncating %d referenced task IDs to cap %d", len(taskIDs), maxReferencedTaskIDs)
 		taskIDs = taskIDs[:maxReferencedTaskIDs]
 	}
 
@@ -173,50 +197,64 @@ func buildReferencedSummariesContext(
 		}
 
 		loaded = append(loaded, tid)
-		// P2-3: Title is rendered outside the data fence, so it must be
-		// sanitized including newline → space to prevent line injection.
-		sb.WriteString(fmt.Sprintf("─── 引用总结 · task_id=%d · %s ───\n\n", art.Task.ID, sanitizeRefLine(art.Task.Title)))
+		// R7 P2-6: the task title is attacker-influenceable, so it must not
+		// render in this header line (instruction region). It is emitted as a
+		// fenced data bullet inside each branch below; the header carries only
+		// the trusted task id.
+		sb.WriteString(fmt.Sprintf("─── 引用总结 · task_id=%d ───\n\n", art.Task.ID))
 
 		// Snapshot section (agent summaries only): reference metadata only.
-		// All snapshot strings are untrusted (may contain user-supplied channel IDs,
-		// timestamps, tool traces) and must be sanitized and placed inside the
-		// <引用数据> fence to prevent prompt injection (SUM-25 review blocker).
+		// All snapshot strings are untrusted (may contain user-supplied
+		// channel IDs, timestamps, tool traces) and must be sanitized and
+		// placed inside the <引用数据> fence to prevent prompt injection
+		// (SUM-25 review blocker).
 		//
-		// R5 yj P2-1: these metadata bullets are LINE-ORIENTED single values, so
-		// they MUST use sanitizeRefLine (newline → space). The earlier revision
-		// drew the sanitize split on the inside-vs-outside-fence axis, but the
-		// actual hazard is line-vs-block: a newline inside a single-value bullet
-		// forges a standalone line (reproduced with source_id containing
-		// "\n  * channel_id=ch-attacker…"), which is exactly the line-forgery
-		// surface earlier rounds asked to close. Only true multi-line bodies
-		// (art.Content, citation JSON) keep sanitizeRefBlock.
+		// R5 yj P2-1: these metadata bullets are LINE-ORIENTED single values,
+		// so they MUST use sanitizeRefLine (newline → space). The earlier
+		// revision drew the sanitize split on the inside-vs-outside-fence
+		// axis, but the actual hazard is line-vs-block: a newline inside a
+		// single-value bullet forges a standalone line (reproduced with
+		// source_id containing "\n  * channel_id=ch-attacker…"), which is
+		// exactly the line-forgery surface earlier rounds asked to close.
+		// Only true multi-line bodies (art.Content, citation JSON) keep
+		// sanitizeRefBlock.
+		//
+		// R7 P1-1: value bullets live INSIDE the fence; every sentence
+		// addressed to the model lives OUTSIDE it (see the fence-boundary
+		// design note in the function comment).
 		if art.Snapshot != nil {
 			snap := art.Snapshot
 			sb.WriteString("【元信息 · 老总结的生成语境(仅供参考)】\n")
 			sb.WriteString(refDataOpen + "\n")
+			sb.WriteString(fmt.Sprintf("- 任务标题: %s\n", sanitizeRefLine(art.Task.Title)))
 			if snap.Requirement != "" {
 				sb.WriteString("- 老需求: " + sanitizeRefLine(snap.Requirement) + "\n")
 			}
-			if len(snap.Scope.ChannelIDs) > 0 {
+			hasCandidateChannels := len(snap.Scope.ChannelIDs) > 0
+			if hasCandidateChannels {
 				storageType := appOriginToStorageChannelType(art.Task.OriginChannelType)
 				sb.WriteString("- 候选频道 (candidate channels):\n")
 				for _, cid := range snap.Scope.ChannelIDs {
 					sb.WriteString(fmt.Sprintf("  * channel_id=%s channel_type=%d %s\n",
 						sanitizeRefLine(cid), storageType, channelTypeLabel(storageType)))
 				}
-				sb.WriteString("  (你可以复用其中一个,或让用户明确,或用 list_channels 探索其他)\n")
-				sb.WriteString("  ⚠️ 调用 fetch_channel/peek_channel 时必须**原样复制**上面的 channel_type 数字,不要猜、不要默认 1\n")
 			}
-			sb.WriteString(fmt.Sprintf("- ⚠️ 老时间窗 (已过期,不要复制作为 fetch 参数): %s ~ %s\n",
+			sb.WriteString(fmt.Sprintf("- 老时间窗 (历史): %s ~ %s\n",
 				sanitizeRefLine(snap.Scope.TimeRange.Start), sanitizeRefLine(snap.Scope.TimeRange.End)))
-			sb.WriteString("  (若用户说'最新/今天/最近'请用 get_current_time 决定新时间窗)\n")
 			if len(snap.ToolSummary) > 0 {
-				sb.WriteString(fmt.Sprintf("- 老工具轨迹 (历史,不必复现): %s\n", sanitizeRefLine(fmt.Sprintf("%v", snap.ToolSummary))))
+				sb.WriteString(fmt.Sprintf("- 老工具轨迹 (历史): %s\n", sanitizeRefLine(fmt.Sprintf("%v", snap.ToolSummary))))
 			}
 			if snap.DataFreshnessNote != "" {
 				sb.WriteString("- 老数据新鲜度声明: " + sanitizeRefLine(snap.DataFreshnessNote) + "\n")
 			}
-			sb.WriteString(refDataClose + "\n\n")
+			sb.WriteString(refDataClose + "\n")
+			// R7 P1-1: model-addressed guidance OUTSIDE the fence.
+			if hasCandidateChannels {
+				sb.WriteString("  (你可以复用其中一个,或让用户明确,或用 list_channels 探索其他)\n")
+				sb.WriteString("  ⚠️ 调用 fetch_channel/peek_channel 时必须**原样复制**上面的 channel_type 数字,不要猜、不要默认 1\n")
+			}
+			sb.WriteString("  ⚠️ 上面的老时间窗已过期,不要复制作为 fetch 参数\n")
+			sb.WriteString("  (若用户说'最新/今天/最近'请用 get_current_time 决定新时间窗)\n\n")
 		} else {
 			// Traditional summary without snapshot: provide topic, time range,
 			// and sources as read-only historical metadata.
@@ -226,15 +264,16 @@ func buildReferencedSummariesContext(
 			sb.WriteString(fmt.Sprintf("- 历史时间范围: %s ~ %s\n",
 				art.Task.TimeRangeStart.Format("2006-01-02 15:04"),
 				art.Task.TimeRangeEnd.Format("2006-01-02 15:04")))
-			sb.WriteString("  ⚠️ 以上时间已过期,不得作为 fetch 参数复制\n")
 			if len(art.Sources) > 0 {
 				sb.WriteString("- 数据来源:\n")
 				for _, s := range art.Sources {
 					sb.WriteString(fmt.Sprintf("  * %s (type=%d)\n", sanitizeRefLine(s.SourceName), s.SourceType))
 				}
 			}
-			sb.WriteString("  (仅供参考,不得自动作为新工具调用参数)\n")
-			sb.WriteString(refDataClose + "\n\n")
+			sb.WriteString(refDataClose + "\n")
+			// R7 P1-1: model-addressed guidance OUTSIDE the fence.
+			sb.WriteString("  ⚠️ 以上时间已过期,不得作为 fetch 参数复制\n")
+			sb.WriteString("  (仅供参考,不得自动作为新工具调用参数)\n\n")
 		}
 
 		sb.WriteString("【老产物内容 · 参考文本】\n")

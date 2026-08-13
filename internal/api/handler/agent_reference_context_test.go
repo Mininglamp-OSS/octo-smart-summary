@@ -238,6 +238,38 @@ func TestSanitizeRef_ControlChars(t *testing.T) {
 			absent: []string{"\n"},
 			want:   "line1 line2",
 		},
+		// R7 P2-5: non-canonical line separators must not survive either —
+		// same line-forgery class as \n.
+		{
+			name:   "vertical tab becomes space",
+			in:     "line1\vline2",
+			absent: []string{"\v"},
+			want:   "line1 line2",
+		},
+		{
+			name:   "form feed becomes space",
+			in:     "line1\fline2",
+			absent: []string{"\f"},
+			want:   "line1 line2",
+		},
+		{
+			name:   "NEL (U+0085) becomes space",
+			in:     "line1\u0085line2",
+			absent: []string{"\u0085"},
+			want:   "line1 line2",
+		},
+		{
+			name:   "LINE SEPARATOR (U+2028) becomes space",
+			in:     "line1\u2028line2",
+			absent: []string{"\u2028"},
+			want:   "line1 line2",
+		},
+		{
+			name:   "PARAGRAPH SEPARATOR (U+2029) becomes space",
+			in:     "line1\u2029line2",
+			absent: []string{"\u2029"},
+			want:   "line1 line2",
+		},
 	}
 
 	for _, c := range cases {

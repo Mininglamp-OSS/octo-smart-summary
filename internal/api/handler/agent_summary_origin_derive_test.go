@@ -114,8 +114,8 @@ func TestCreateAgentSummary_DeriveOriginMultiSourceInheritsFirst(t *testing.T) {
 
 	ref := seedPipelineRefTask(t, h, "ST-PIPE-002")
 	for _, src := range []struct {
-		id   string
-		typ  int
+		id  string
+		typ int
 	}{
 		{"CH-FIRST", model.SourceGroup},
 		{"CH-SECOND", model.SourceGroup},

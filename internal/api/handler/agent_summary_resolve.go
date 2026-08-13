@@ -112,9 +112,12 @@ func (h *AgentSummaryHandler) resolveOriginChannelFromSession(
 // Deterministic: the FIRST usable source row (by summary_source.id, creation
 // order) wins; multi-source tasks inherit their first channel — consistent
 // with the tier-3 precedent of borrowing the FIRST referenced task's origin.
-// source_type is stored in the same application-layer enum as
-// OriginChannelType (1=Group/2=Thread/3=DM) and source_id is already a
-// canonical channel ID, so no conversion is needed.
+// source_type and origin_channel_type are two separate enums that happen to
+// be numerically aligned today (SourceGroup/Thread/Direct = 1/2/3 vs
+// OriginChannelGroup/Thread/DM = 1/2/3 — see model.go:103-115), and
+// source_id is already a canonical channel ID, so no conversion is needed.
+// The range check below uses the Source* constants because the value under
+// test is a SummarySource.SourceType.
 //
 // Returns ("", 0) when the task has no usable source rows — the caller then
 // falls through to the 40001 error as before. Authorization is enforced by
@@ -133,7 +136,10 @@ func (h *AgentSummaryHandler) deriveOriginFromSummarySources(ctx context.Context
 		if s.SourceID == "" {
 			continue
 		}
-		if s.SourceType < model.OriginChannelGroup || s.SourceType > model.OriginChannelDM {
+		// R7 P2-4: bound by the Source* enum (the value under test is a
+		// SummarySource.SourceType), not the OriginChannel* enum — the two
+		// are separate enums that only happen to share values today.
+		if s.SourceType < model.SourceGroup || s.SourceType > model.SourceDirect {
 			continue
 		}
 		if len(sources) > 1 {

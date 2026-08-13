@@ -657,7 +657,18 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			taskIDs = append(taskIDs, t.ID)
 		}
 		var allParts []model.SummaryParticipant
-		h.db.Where("task_id IN ?", taskIDs).Find(&allParts)
+		if err := h.db.Where("task_id IN ?", taskIDs).Find(&allParts).Error; err != nil {
+			// R7 P2-2: partsByTask is load-bearing for the new
+			// referenceable flag — it feeds isParticipant, which
+			// referenceableFromLoaded uses to reject tasks. Previously this
+			// error was dropped: a transient failure left allParts empty and
+			// the list advertised referenceable=false, reason="not_found"
+			// for tasks the resolver would accept on the very next request.
+			// Mirror the prByTask treatment below: log and continue with what
+			// we have (fail-closed on the referenceable dimension, UX-only).
+			log.Printf("[list] batch load participants failed: %v", err)
+			allParts = nil
+		}
 		for _, p := range allParts {
 			item := gin.H{
 				"user_id":   p.UserID,
