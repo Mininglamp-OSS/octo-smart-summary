@@ -1,0 +1,224 @@
+//go:build cgo
+
+package worker
+
+import (
+	"fmt"
+	"testing"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
+)
+
+// backfillSourcesFromMessages must give every generated summary a
+// summary_source footprint, even when the task was created without explicit
+// sources (the pipeline then auto-selects channels and — before this fix —
+// the actually-used channels were never persisted). Reference → refine → save
+// (tier-4 origin derivation in agent_summary.go) reads summary_source, so a
+// zero-row task can never be iterated on. These tests pin the write-back
+// contract:
+//
+//   - adds rows for channels actually used, mapped via
+//     pipeline.StorageChannelTypeToSourceType
+//   - never overwrites or deletes user-specified rows (append-only merge)
+//   - idempotent across retries (executePipeline re-runs on retry)
+//   - skips messages with unknown storage channel_type or empty channel_id
+//   - caps total rows so a pathological channel explosion can't blow up the table
+
+func TestBackfillSourcesFromMessages_AddsMissingChannels(t *testing.T) {
+	db := newFileBackedTestDB(t)
+	task := model.SummaryTask{TaskNo: "BF-ADD", SpaceID: "sp", CreatorID: "u1", Title: "t", SummaryMode: model.ModeByPerson}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+
+	msgs := []pipeline.Message{
+		{ChannelID: "grp-a", ChannelType: model.ChannelTypeGroup, SourceName: "群A"},
+		{ChannelID: "grp-a", ChannelType: model.ChannelTypeGroup, SourceName: "群A"}, // dup, one row
+		{ChannelID: "grp-a____thr1", ChannelType: model.ChannelTypeThread, SourceName: "子区1"},
+		{ChannelID: "u2@u1", ChannelType: model.ChannelTypeDM, SourceName: "私聊-u2"},
+	}
+
+	p := &Processor{db: db}
+	if err := p.backfillSourcesFromMessages(task.ID, msgs); err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+
+	var rows []model.SummarySource
+	if err := db.Where("task_id = ?", task.ID).Order("id").Find(&rows).Error; err != nil {
+		t.Fatalf("query rows: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("expected 3 deduped rows, got %d: %+v", len(rows), rows)
+	}
+	type want struct {
+		sourceType int
+		sourceID   string
+		name       string
+	}
+	wants := []want{
+		{model.SourceGroup, "grp-a", "群A"},
+		{model.SourceThread, "grp-a____thr1", "子区1"},
+		{model.SourceDirect, "u2@u1", "私聊-u2"},
+	}
+	for i, w := range wants {
+		if rows[i].SourceType != w.sourceType || rows[i].SourceID != w.sourceID {
+			t.Errorf("row %d = (type %d, id %q), want (type %d, id %q)",
+				i, rows[i].SourceType, rows[i].SourceID, w.sourceType, w.sourceID)
+		}
+		if rows[i].SourceName != w.name {
+			t.Errorf("row %d name = %q, want %q", i, rows[i].SourceName, w.name)
+		}
+	}
+}
+
+func TestBackfillSourcesFromMessages_PreservesExistingAndAppendsMissing(t *testing.T) {
+	db := newFileBackedTestDB(t)
+	task := model.SummaryTask{TaskNo: "BF-MERGE", SpaceID: "sp", CreatorID: "u1", Title: "t", SummaryMode: model.ModeByPerson}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+	existing := model.SummarySource{TaskID: task.ID, SourceType: model.SourceGroup, SourceID: "grp-a", SourceName: "用户选的群A"}
+	if err := db.Create(&existing).Error; err != nil {
+		t.Fatalf("seed existing source: %v", err)
+	}
+
+	msgs := []pipeline.Message{
+		{ChannelID: "grp-a", ChannelType: model.ChannelTypeGroup, SourceName: "群A-抓取名"},
+		{ChannelID: "grp-b", ChannelType: model.ChannelTypeGroup, SourceName: "群B"},
+	}
+
+	p := &Processor{db: db}
+	if err := p.backfillSourcesFromMessages(task.ID, msgs); err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+
+	var rows []model.SummarySource
+	if err := db.Where("task_id = ?", task.ID).Order("id").Find(&rows).Error; err != nil {
+		t.Fatalf("query rows: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows (1 kept + 1 appended), got %d: %+v", len(rows), rows)
+	}
+	// Original row must be untouched — same ID, same user-provided name.
+	if rows[0].ID != existing.ID || rows[0].SourceName != "用户选的群A" {
+		t.Errorf("existing row modified: id=%d name=%q, want id=%d name=%q",
+			rows[0].ID, rows[0].SourceName, existing.ID, "用户选的群A")
+	}
+	if rows[1].SourceID != "grp-b" || rows[1].SourceType != model.SourceGroup {
+		t.Errorf("appended row = (type %d, id %q), want (type %d, id %q)",
+			rows[1].SourceType, rows[1].SourceID, model.SourceGroup, "grp-b")
+	}
+}
+
+func TestBackfillSourcesFromMessages_IdempotentAcrossRetries(t *testing.T) {
+	db := newFileBackedTestDB(t)
+	task := model.SummaryTask{TaskNo: "BF-IDEM", SpaceID: "sp", CreatorID: "u1", Title: "t", SummaryMode: model.ModeByPerson}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+	msgs := []pipeline.Message{
+		{ChannelID: "grp-a", ChannelType: model.ChannelTypeGroup, SourceName: "群A"},
+		{ChannelID: "grp-b", ChannelType: model.ChannelTypeGroup, SourceName: "群B"},
+	}
+
+	p := &Processor{db: db}
+	for i := 0; i < 3; i++ { // simulate retries re-running executePipeline
+		if err := p.backfillSourcesFromMessages(task.ID, msgs); err != nil {
+			t.Fatalf("backfill run %d: %v", i+1, err)
+		}
+	}
+
+	var count int64
+	if err := db.Model(&model.SummarySource{}).Where("task_id = ?", task.ID).Count(&count).Error; err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 rows after 3 runs (idempotent), got %d", count)
+	}
+}
+
+func TestBackfillSourcesFromMessages_SkipsUnknownTypeAndEmptyID(t *testing.T) {
+	db := newFileBackedTestDB(t)
+	task := model.SummaryTask{TaskNo: "BF-SKIP", SpaceID: "sp", CreatorID: "u1", Title: "t", SummaryMode: model.ModeByPerson}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+
+	msgs := []pipeline.Message{
+		{ChannelID: "grp-a", ChannelType: 3, SourceName: "保留类型3"},  // WuKongIM reserved, unmapped
+		{ChannelID: "grp-b", ChannelType: 0, SourceName: "零类型"},     // unset
+		{ChannelID: "", ChannelType: model.ChannelTypeGroup, SourceName: "空ID"},
+		{ChannelID: "grp-ok", ChannelType: model.ChannelTypeGroup, SourceName: "有效"},
+	}
+
+	p := &Processor{db: db}
+	if err := p.backfillSourcesFromMessages(task.ID, msgs); err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+
+	var rows []model.SummarySource
+	if err := db.Where("task_id = ?", task.ID).Find(&rows).Error; err != nil {
+		t.Fatalf("query rows: %v", err)
+	}
+	if len(rows) != 1 || rows[0].SourceID != "grp-ok" {
+		t.Fatalf("expected only the valid row, got %+v", rows)
+	}
+}
+
+func TestBackfillSourcesFromMessages_NoMessagesNoRowsNoError(t *testing.T) {
+	db := newFileBackedTestDB(t)
+	task := model.SummaryTask{TaskNo: "BF-EMPTY", SpaceID: "sp", CreatorID: "u1", Title: "t", SummaryMode: model.ModeByPerson}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+
+	p := &Processor{db: db}
+	if err := p.backfillSourcesFromMessages(task.ID, nil); err != nil {
+		t.Fatalf("backfill on empty messages must not error: %v", err)
+	}
+	var count int64
+	if err := db.Model(&model.SummarySource{}).Where("task_id = ?", task.ID).Count(&count).Error; err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected 0 rows, got %d", count)
+	}
+}
+
+// A pathological auto-select (many channels) must not exceed the same cap
+// the create endpoint enforces on user-supplied sources (maxSourceCount=30,
+// api/handler/task.go). Existing rows count toward the cap.
+func TestBackfillSourcesFromMessages_CapsTotalRows(t *testing.T) {
+	db := newFileBackedTestDB(t)
+	task := model.SummaryTask{TaskNo: "BF-CAP", SpaceID: "sp", CreatorID: "u1", Title: "t", SummaryMode: model.ModeByPerson}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+	// 29 existing rows.
+	for i := 0; i < 29; i++ {
+		row := model.SummarySource{TaskID: task.ID, SourceType: model.SourceGroup, SourceID: fmt.Sprintf("grp-existing-%02d", i)}
+		if err := db.Create(&row).Error; err != nil {
+			t.Fatalf("seed row %d: %v", i, err)
+		}
+	}
+
+	msgs := []pipeline.Message{
+		{ChannelID: "new-1", ChannelType: model.ChannelTypeGroup, SourceName: "n1"},
+		{ChannelID: "new-2", ChannelType: model.ChannelTypeGroup, SourceName: "n2"},
+		{ChannelID: "new-3", ChannelType: model.ChannelTypeGroup, SourceName: "n3"},
+	}
+
+	p := &Processor{db: db}
+	if err := p.backfillSourcesFromMessages(task.ID, msgs); err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+
+	var count int64
+	if err := db.Model(&model.SummarySource{}).Where("task_id = ?", task.ID).Count(&count).Error; err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 30 {
+		t.Fatalf("expected cap at 30 total rows, got %d", count)
+	}
+}
