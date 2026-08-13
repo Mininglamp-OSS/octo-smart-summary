@@ -406,3 +406,29 @@ func TestSummaryShare_SourceCountExcludesDerivedSources(t *testing.T) {
 		t.Errorf("source_name = %q, want only the explicit source", snap.SourceName)
 	}
 }
+
+// R11 Q5 (yujiawei, review 4929031900): "stripUnresolvedCitationMarkers
+// deletes every bracketed integer in the document, not just citation
+// markers ... including inside fenced code blocks and tables. ...
+// `use items[0]` is persisted as `use items`. strconv.Atoi also accepts
+// +5 / -3." These cases must survive the strip.
+func TestStripUnresolvedCitationMarkers_PreservesNonCitationBrackets(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"code block index", "use items[0] here"},
+		{"standard number", "按 GB/T 7714 [2020] 执行"},
+		{"reference-style link", "see [1][docs] for details"},
+		{"signed integer", "offset is [+5] and [-3]"},
+		{"fenced code block", "before\n```go\narr[0] = x\n```\nafter"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := stripUnresolvedCitationMarkers(tc.in)
+			if got != tc.in {
+				t.Errorf("strip mutated non-citation content:\n in  = %q\n out = %q", tc.in, got)
+			}
+		})
+	}
+}

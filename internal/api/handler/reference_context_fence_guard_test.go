@@ -194,3 +194,40 @@ func TestBuildReferencedSummariesContext_FenceGuard(t *testing.T) {
 		}
 	}
 }
+
+// R11 Q8 (yujiawei, review 4929031900): "Empty `- 数据来源:` header when
+// every source row is derived ... the prompt gets a dangling
+// `- 数据来源:` label with nothing under it." The header must be emitted
+// only when at least one non-derived source survives the filter.
+func TestBuildReferencedSummariesContext_NoDanglingSourceHeader(t *testing.T) {
+	db := setupResolverTestDB(t)
+
+	task := model.SummaryTask{
+		TaskNo:      "TST-CTX-DANGLE",
+		SpaceID:     "space1",
+		CreatorID:   "creator1",
+		Title:       "all derived",
+		SummaryMode: model.ModeByPerson,
+		Status:      model.StatusCompleted,
+		TriggerType: model.TriggerManual,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	addTeamResult(t, db, task.ID, "TEAM-BODY")
+	if err := db.Create(&model.SummarySource{
+		TaskID: task.ID, SourceType: model.SourceGroup,
+		SourceID: "grp_auto", SourceName: "自动回填来源", Derived: true,
+	}).Error; err != nil {
+		t.Fatalf("create derived source: %v", err)
+	}
+
+	ctx, loaded := buildReferencedSummariesContext(
+		context.Background(), db, "space1", "creator1", []int64{task.ID})
+	if len(loaded) != 1 {
+		t.Fatalf("expected 1 loaded task, got %d", len(loaded))
+	}
+	if strings.Contains(ctx, "- 数据来源:") {
+		t.Errorf("dangling `- 数据来源:` header emitted with all sources derived")
+	}
+}
