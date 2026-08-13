@@ -63,6 +63,23 @@ func resolveReferencedArtifact(
 	spaceID string,
 	userID string,
 ) (*ReferencedSummaryArtifact, error) {
+	// R5 jx blocking: fail-closed on empty spaceID. SummaryTask.SpaceID is
+	// "not null default ''", so without this guard a request missing
+	// X-Space-Id turns the query into space_id = '' and matches any
+	// anomalous empty-space task row — the same vertical-privilege bypass
+	// PR #189 closed on ListSummaryVersions/GetSummaryVersion. 17+ sibling
+	// handlers on this branch (task.go:129, edit.go:572, personal.go:159,
+	// stream.go:81, …) apply the identical fail-closed shape; the deny is
+	// opaque (not_found) so the resolver cannot double as an existence
+	// oracle for empty-space rows (P3 discipline). Defense-in-depth: the
+	// POST routes also mount StrictSpaceMiddleware, but this guard keeps
+	// the resolver a stand-alone safe unit for every caller
+	// (buildReferencedSummariesContext, borrowCitationsFromReference, and
+	// any future entry point).
+	if spaceID == "" {
+		return nil, &ErrReferenceUnavailable{Reason: "not_found", TaskID: taskID}
+	}
+
 	// 1. Load task, space-scoped, not deleted.
 	var task model.SummaryTask
 	err := db.WithContext(ctx).

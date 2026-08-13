@@ -122,6 +122,14 @@ func buildReferencedSummariesContext(
 		return "", nil
 	}
 
+	// R5 jx blocking: fail-closed on empty spaceID at the builder level too,
+	// so the deny path is symmetric with the sibling handlers and no task
+	// ever reaches resolveReferencedArtifact without a space scope (the
+	// resolver also guards this — defense-in-depth).
+	if spaceID == "" {
+		return "", nil
+	}
+
 	// Deduplicate referenced task IDs first, then cap (R4 yj P2-2, R5 yj
 	// P3, R5 ms P2-4, R5 jx non-blocking #1). Callers at the handler
 	// binding layer (Chat, ChatStream) also dedupe-then-check against

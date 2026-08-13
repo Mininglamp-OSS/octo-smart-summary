@@ -731,3 +731,72 @@ func TestBuildReferencedSummaries_ChannelIDBulletLineForgery(t *testing.T) {
 		t.Errorf("R5 yj P2-1: forged channel bullet rendered as standalone line:\n%s", got)
 	}
 }
+
+// R5 jx blocking regression: resolveReferencedArtifact must fail closed on
+// empty spaceID. SummaryTask.SpaceID is "not null default ”", so without
+// the guard a request missing X-Space-Id turns the query into space_id = ”
+// and matches any anomalous empty-space task row — the same vertical-
+// privilege bypass PR #189 closed on ListSummaryVersions/GetSummaryVersion.
+//
+// Anti-oracle: the test seeds an actual empty-space task row (SpaceID="")
+// that IS completed and accessible to the caller. Without the guard the
+// resolver would happily return its content (proven by the row existing and
+// matching space_id = ”); with the guard the resolver must return an
+// opaque not_found.
+func TestResolveReference_EmptySpaceID_FailClosed(t *testing.T) {
+	db := setupResolverTestDB(t)
+
+	// Seed the anomalous empty-space row the bypass would exploit.
+	emptySpaceTask := model.SummaryTask{
+		TaskNo:      "TST-REF-EMPTY-SPACE",
+		SpaceID:     "", // anomalous empty-space row
+		CreatorID:   "creator1",
+		SummaryMode: model.ModeByPerson,
+		Status:      model.StatusCompleted,
+	}
+	if err := db.Create(&emptySpaceTask).Error; err != nil {
+		t.Fatalf("create empty-space task: %v", err)
+	}
+	addTeamResult(t, db, emptySpaceTask.ID, "content that must never leak")
+
+	// Drive the resolver with spaceID="" — must deny, not match the row.
+	_, err := resolveReferencedArtifact(context.Background(), db, emptySpaceTask.ID, "", "creator1")
+	refErr, ok := err.(*ErrReferenceUnavailable)
+	if !ok {
+		t.Fatalf("expected ErrReferenceUnavailable, got %T: %v", err, err)
+	}
+	if refErr.Reason != "not_found" {
+		t.Fatalf("R5 jx blocking: empty spaceID must fail closed with opaque \"not_found\", got %q", refErr.Reason)
+	}
+
+	// Sanity: the same task IS resolvable under its real space once it has
+	// one — proves the deny above is the guard, not a data accident.
+	if err := db.Model(&model.SummaryTask{}).Where("id = ?", emptySpaceTask.ID).
+		Update("space_id", "space-real").Error; err != nil {
+		t.Fatalf("set space_id: %v", err)
+	}
+	art, err := resolveReferencedArtifact(context.Background(), db, emptySpaceTask.ID, "space-real", "creator1")
+	if err != nil {
+		t.Fatalf("task with a real space must resolve, got: %v", err)
+	}
+	if art.Content != "content that must never leak" {
+		t.Fatalf("resolved wrong content: %q", art.Content)
+	}
+}
+
+// R5 jx blocking regression: the builder denies the whole batch before any
+// task reaches the resolver when spaceID is empty. Symmetric deny path with
+// the 17+ sibling handlers that fail closed on missing X-Space-Id.
+func TestBuildReferencedSummariesContext_EmptySpaceID_FailClosed(t *testing.T) {
+	db := setupResolverTestDB(t)
+	task := createCompletedTask(t, db, "space1", "creator1", model.OriginChannelGroup)
+	addTeamResult(t, db, task.ID, "real content")
+
+	got, loaded := buildReferencedSummariesContext(context.Background(), db, "", "creator1", []int64{task.ID})
+	if got != "" {
+		t.Errorf("empty spaceID must produce no reference context, got %q", got)
+	}
+	if len(loaded) != 0 {
+		t.Errorf("empty spaceID must load nothing, got %v", loaded)
+	}
+}
