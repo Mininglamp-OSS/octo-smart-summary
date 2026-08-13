@@ -355,6 +355,7 @@ func (h *ShareHandler) Create(c *gin.Context) {
 		return
 	}
 	names := make([]string, 0, len(sources))
+	visibleCount := 0
 	for _, source := range sources {
 		// R9 P1 (PR #190): derived rows (worker backfill of auto-selected
 		// channels) are excluded from the share snapshot — a share is
@@ -363,6 +364,7 @@ func (h *ShareHandler) Create(c *gin.Context) {
 		if source.Derived {
 			continue
 		}
+		visibleCount++
 		if strings.TrimSpace(source.SourceName) != "" {
 			names = append(names, source.SourceName)
 		}
@@ -373,10 +375,13 @@ func (h *ShareHandler) Create(c *gin.Context) {
 		return
 	}
 	now := time.Now()
+	// R10 (Jerry-Xin, review 4928758044): SourceCount counts only non-derived
+	// rows, mirroring SourceName — len(sources) leaked hidden derived-row
+	// cardinality (1 explicit + 5 derived → source_count=6 on a shared link).
 	snapshot := model.SummaryShareSnapshot{
 		TaskID: task.ID, TaskNo: task.TaskNo, SpaceID: spaceID, CreatorID: userID,
 		IdempotencyKey: req.IdempotencyKey, RequestHash: hash, Title: task.Title,
-		SourceName: strings.Join(names, "、"), SourceCount: len(sources), ParticipantCount: int(participantCount),
+		SourceName: strings.Join(names, "、"), SourceCount: visibleCount, ParticipantCount: int(participantCount),
 		MessageCount: material.messageCount, TimeRangeStart: task.TimeRangeStart, TimeRangeEnd: task.TimeRangeEnd,
 		SummaryMode: task.SummaryMode, ResultVersion: material.version, Preview: sharePreview(content), Content: content,
 		CreatedAt: now, UpdatedAt: now,

@@ -338,6 +338,25 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		sourceList = req.Sources
 	}
 
+	// R10: dedup by (source_type, source_id) before insert.
+	// uk_summary_source_task_type_id (migration 20260814-01) would turn a
+	// duplicate client input into a 500; the create endpoint previously
+	// silently persisted the duplicates, so dedup here preserves the old
+	// accepting behaviour while keeping the table structurally clean.
+	if len(sourceList) > 1 {
+		deduped := make([]sourceReq, 0, len(sourceList))
+		seen := make(map[string]struct{}, len(sourceList))
+		for _, s := range sourceList {
+			key := fmt.Sprintf("%d:%s", s.SourceType, s.SourceID)
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			deduped = append(deduped, s)
+		}
+		sourceList = deduped
+	}
+
 	if len(sourceList) > maxSourceCount {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40003, Message: fmt.Sprintf("信息来源不能超过%d个", maxSourceCount)})
 		return

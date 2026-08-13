@@ -7,6 +7,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"gorm.io/gorm/clause"
 )
 
 // backfillMaxSources mirrors maxSourceCount on the create endpoint
@@ -105,7 +106,17 @@ func (p *Processor) backfillSourcesFromMessages(taskID int64, messages []pipelin
 		additions = additions[:room]
 	}
 
-	if err := p.db.Create(&additions).Error; err != nil {
+	// R10 (yujiawei, issue comment 5280351017): conflict-tolerant insert.
+	// The read-then-insert dedup above holds only for serial retries;
+	// scanStuckTasks can re-dispatch the task on lease expiry while the
+	// original worker is still running, so two backfills can race with
+	// empty reads. uk_summary_source_task_type_id (migration
+	// 20260814-01) + INSERT IGNORE makes idempotency structural: the loser
+	// silently skips rows the winner already persisted.
+	if err := p.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "task_id"}, {Name: "source_type"}, {Name: "source_id"}},
+		DoNothing: true,
+	}).Create(&additions).Error; err != nil {
 		return fmt.Errorf("insert %d backfilled sources: %w", len(additions), err)
 	}
 	log.Printf("[processor] task %d: backfilled %d summary_source rows from fetched channels", taskID, len(additions))

@@ -64,6 +64,7 @@ func buildScheduledTaskSources(tx *gorm.DB, imDB *gorm.DB, taskID int64, raw mod
 	if err := json.Unmarshal(raw, &sources); err != nil {
 		return service.NewBizError(40000, "定时来源配置无效", http.StatusBadRequest)
 	}
+	seenScheduledSource := make(map[string]struct{}, len(sources))
 	for _, src := range sources {
 		if src.SourceID == "" {
 			return fmt.Errorf("scheduled source_id is required")
@@ -74,6 +75,14 @@ func buildScheduledTaskSources(tx *gorm.DB, imDB *gorm.DB, taskID int64, raw mod
 		// unconditionally keeps the stored name consistent with the instant-summary
 		// path, which already drops source_name and lets the backend look it up.
 		sourceName := service.ResolveSourceNameWithType(src.SourceID, src.SourceType, imDB)
+		// R10: batch-internal dedup — uk_summary_source_task_type_id would
+		// turn a duplicate config entry into a hard insert error; skip it
+		// like the create/agent-save endpoints do.
+		key := fmt.Sprintf("%d:%s", src.SourceType, src.SourceID)
+		if _, dup := seenScheduledSource[key]; dup {
+			continue
+		}
+		seenScheduledSource[key] = struct{}{}
 		if err := tx.Create(&model.SummarySource{
 			TaskID:     taskID,
 			SourceType: src.SourceType,
@@ -222,6 +231,7 @@ func syncScheduledTaskSources(tx *gorm.DB, imDB *gorm.DB, taskID int64, raw mode
 	if err := tx.Where("task_id = ?", taskID).Delete(&model.SummarySource{}).Error; err != nil {
 		return err
 	}
+	seenSyncSource := make(map[string]struct{}, len(sources))
 	for _, src := range sources {
 		if src.SourceID == "" {
 			return fmt.Errorf("scheduled source_id is required")
@@ -229,6 +239,12 @@ func syncScheduledTaskSources(tx *gorm.DB, imDB *gorm.DB, taskID int64, raw mode
 		// Always resolve the canonical source name from the IM DB; never trust a
 		// client-supplied source_name (see buildScheduledTaskSources).
 		sourceName := service.ResolveSourceNameWithType(src.SourceID, src.SourceType, imDB)
+		// R10: batch-internal dedup — see buildScheduledTaskSources.
+		key := fmt.Sprintf("%d:%s", src.SourceType, src.SourceID)
+		if _, dup := seenSyncSource[key]; dup {
+			continue
+		}
+		seenSyncSource[key] = struct{}{}
 		if err := tx.Create(&model.SummarySource{
 			TaskID:     taskID,
 			SourceType: src.SourceType,

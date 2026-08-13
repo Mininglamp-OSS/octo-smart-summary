@@ -194,10 +194,10 @@ func (SummaryTask) TableName() string { return "summary_task" }
 
 // SummarySource represents a data source for a task.
 type SummarySource struct {
-	ID            int64  `gorm:"primaryKey;autoIncrement" json:"id"`
-	TaskID        int64  `gorm:"column:task_id;not null;index:idx_task_id" json:"task_id"`
-	SourceType    int    `gorm:"column:source_type;type:tinyint;not null" json:"source_type"`
-	SourceID      string `gorm:"column:source_id;type:varchar(64);not null" json:"source_id"`
+	ID         int64  `gorm:"primaryKey;autoIncrement" json:"id"`
+	TaskID     int64  `gorm:"column:task_id;not null;index:idx_task_id;uniqueIndex:uk_summary_source_task_type_id" json:"task_id"`
+	SourceType int    `gorm:"column:source_type;type:tinyint;not null;uniqueIndex:uk_summary_source_task_type_id" json:"source_type"`
+	SourceID   string `gorm:"column:source_id;type:varchar(64);not null;uniqueIndex:uk_summary_source_task_type_id" json:"source_id"`
 	SourceName    string `gorm:"column:source_name;type:varchar(200);not null;default:''" json:"source_name"`
 	ParticipantID *int64 `gorm:"column:participant_id;index:idx_participant_id" json:"participant_id"`
 	// R9 P1 (PR #190): 1 = row written by worker source backfill from the

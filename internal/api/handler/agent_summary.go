@@ -165,7 +165,15 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			// same-space task's origin_channel_id/type (an in-space authz bypass on
 			// metadata) — enforce the same creator/participant rule as the two
 			// sibling paths here.
+			// R10 (yujiawei, issue comment 5280351017): track WHY origin
+			// inheritance was impossible so the 40001 message says so —
+			// users were left guessing when a historical referenced task
+			// (channels never persisted) failed at the very end of the flow.
+			noOriginReason := "也未指定引用总结;请显式传入 origin_channel_id"
 			if len(req.ReferencedTaskIDs) > 0 {
+				// Pre-populated for the query-miss branch (not found /
+				// deleted / non-completed / wrong space all land here).
+				noOriginReason = "引用总结也未能提供 origin:引用任务不存在/已删除/未完成,或不属于本空间"
 				var refTask model.SummaryTask
 				// R9 P2-4 (PR #190, raised in two preceding reviews): gate the
 				// borrow on deleted_at IS NULL AND status = completed, mirroring
@@ -201,9 +209,16 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 							if finalChannelID != "" {
 								log.Printf("[handler] CreateAgentSummary derived origin from referenced task_id=%d sources channel=%s/%d session=%s",
 									refTask.ID, finalChannelID, finalChannelType, req.SessionID)
+							} else {
+								// R10: the historical-task case — channels
+								// lived only in the in-memory channelSet and
+								// were never persisted before the backfill
+								// landed, so there is nothing to inherit.
+								noOriginReason = "引用总结也未能提供 origin:引用任务未记录生成频道(无 origin 且无可用来源行)"
 							}
 						}
 					} else {
+						noOriginReason = "引用总结也未能提供 origin:您无权读取引用任务"
 						log.Printf("[handler] CreateAgentSummary refused to borrow origin from referenced task_id=%d (user=%s lacks read access) session=%s",
 							refTask.ID, userID, req.SessionID)
 					}
@@ -211,7 +226,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			}
 			if finalChannelID == "" {
 				// Truly no origin available anywhere → 400 with specific message
-				c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "origin_channel_id 未传且无法从 session 反查(session 无 fetch_channel 调用),也无引用总结可继承 origin"})
+				c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: fmt.Sprintf("origin_channel_id 未传且无法从 session 反查(session 无 fetch_channel 调用),%s", noOriginReason)})
 				return
 			}
 		} else {
@@ -338,10 +353,20 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		// IM DB — the deliverable already contains channel names in prose —
 		// so we store source_id only; a future PR can plumb imDB in and call
 		// ResolveSourceNameWithType if the UI wants the resolved display name.
+		//
+		// R10: dedup by (source_type, source_id) — uk_summary_source_task_type_id
+		// (migration 20260814-01) would turn duplicate front-end input into a
+		// 500; the create endpoint dedups identically.
+		seenSrc := make(map[string]struct{}, len(req.Sources))
 		for _, s := range req.Sources {
 			if s.SourceID == "" {
 				continue
 			}
+			key := fmt.Sprintf("%d:%s", s.SourceType, s.SourceID)
+			if _, dup := seenSrc[key]; dup {
+				continue
+			}
+			seenSrc[key] = struct{}{}
 			src := model.SummarySource{
 				TaskID:     createdTaskID,
 				SourceType: s.SourceType,
