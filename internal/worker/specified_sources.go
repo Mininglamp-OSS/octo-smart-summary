@@ -32,3 +32,22 @@ func explicitSpecifiedSources(sources []model.SummarySource) []map[string]interf
 	}
 	return out
 }
+
+// sourceNameForGeneration returns a display label derived only from explicit
+// sources. Worker-backfilled rows are internal provenance and may name a
+// channel that the personal-summary recipient cannot access.
+func sourceNameForGeneration(sources []model.SummarySource) string {
+	name := "多来源"
+	explicitCount := 0
+	for _, source := range sources {
+		if source.Derived {
+			continue
+		}
+		explicitCount++
+		if explicitCount > 1 {
+			return "多来源"
+		}
+		name = source.SourceName
+	}
+	return name
+}

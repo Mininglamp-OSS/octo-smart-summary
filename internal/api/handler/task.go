@@ -358,6 +358,12 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 	if len(req.Sources) > 0 {
 		sourceList = req.Sources
 	}
+	// Preserve the public API contract: the cap applies to submitted entries,
+	// before duplicate rows are collapsed for persistence.
+	if len(sourceList) > maxSourceCount {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40003, Message: fmt.Sprintf("信息来源不能超过%d个", maxSourceCount)})
+		return
+	}
 
 	// R10: dedup by (source_type, source_id) before insert.
 	// uk_summary_source_task_type_id (migration 20260814-01) would turn a
@@ -376,11 +382,6 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 			deduped = append(deduped, s)
 		}
 		sourceList = deduped
-	}
-
-	if len(sourceList) > maxSourceCount {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40003, Message: fmt.Sprintf("信息来源不能超过%d个", maxSourceCount)})
-		return
 	}
 
 	if len(req.Participants) == 0 {

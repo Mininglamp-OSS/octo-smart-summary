@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -26,6 +27,8 @@ const (
 // copy of the same token (P1-2 fix).
 const fencePlaceholder = "[引用数据]"
 
+var refFenceTagPattern = regexp.MustCompile(`<\s*/?\s*引用数据\s*>`)
+
 // sanitizeRef neutralizes untrusted referenced-summary text before it is
 // embedded in the agent's system prompt (SUM-158 blocker 3 — prompt
 // injection). A referenced summary may quote arbitrary chat content authored
@@ -33,10 +36,11 @@ const fencePlaceholder = "[引用数据]"
 // early, or (b) forge the box-drawing / bracket delimiters this builder uses
 // as section boundaries.
 //
-// All replacements map to NON-EMPTY strings (space or placeholder) so that
-// a single-pass replacer can never splice adjacent characters together to
-// reassemble a fence tag (P1-2 fix: CR and NUL previously mapped to "" which
-// allowed split-token reassembly).
+// Fence-like syntax is normalized before structural matching: full-width
+// angle/slash characters and control separators are folded first, then any
+// opening/closing tag with optional whitespace is replaced by a non-empty
+// placeholder. This ordering prevents normalization from manufacturing a
+// near-tag after the fence check has already run.
 //
 // Newline is replaced with space here because sanitizeRef guards
 // single-value render sites where a forged standalone line matters. For true
@@ -46,29 +50,37 @@ func sanitizeRef(s string) string {
 	return sanitizeRefLine(s)
 }
 
-// sanitizeRefLine sanitizes text rendered at single-value sites (bullets,
-// labels, metadata fields). Newlines are replaced with space to prevent
-// line-break manipulation (P2-9).
-func sanitizeRefLine(s string) string {
-	s = strings.NewReplacer(
-		refDataOpen, fencePlaceholder,
-		refDataClose, fencePlaceholder,
-		"═", "=",
-		"─", "-",
-		"【", "[",
-		"】", "]",
+func normalizeRefFenceSyntax(s string, preserveNewline bool) string {
+	replacements := []string{
+		"＜", "<",
+		"＞", ">",
+		"／", "/",
 		"\r", " ",
-		"\n", " ",
 		"\t", " ",
 		"\x00", " ",
-		// R7 P2-5: non-canonical line separators — the same line-forgery
-		// class as \n (vertical tab, form feed, NEL, LS, PS). Raised on the
-		// prior head, closed here.
 		"\v", " ",
 		"\f", " ",
 		"\u0085", " ",
 		"\u2028", " ",
 		"\u2029", " ",
+	}
+	if !preserveNewline {
+		replacements = append(replacements, "\n", " ")
+	}
+	s = strings.NewReplacer(replacements...).Replace(s)
+	return refFenceTagPattern.ReplaceAllString(s, fencePlaceholder)
+}
+
+// sanitizeRefLine sanitizes text rendered at single-value sites (bullets,
+// labels, metadata fields). Newlines are replaced with space to prevent
+// line-break manipulation (P2-9).
+func sanitizeRefLine(s string) string {
+	s = normalizeRefFenceSyntax(s, false)
+	s = strings.NewReplacer(
+		"═", "=",
+		"─", "-",
+		"【", "[",
+		"】", "]",
 	).Replace(s)
 	return s
 }
@@ -77,24 +89,12 @@ func sanitizeRefLine(s string) string {
 // content, citations). Newlines are PRESERVED so paragraph formatting is
 // not compressed (P2-9 fix). CR/NUL/tab are still neutralized to space.
 func sanitizeRefBlock(s string) string {
+	s = normalizeRefFenceSyntax(s, true)
 	s = strings.NewReplacer(
-		refDataOpen, fencePlaceholder,
-		refDataClose, fencePlaceholder,
 		"═", "=",
 		"─", "-",
 		"【", "[",
 		"】", "]",
-		"\r", " ",
-		"\t", " ",
-		"\x00", " ",
-		// R7 P2-5: \n is deliberately preserved (paragraph formatting), but
-		// the non-canonical line separators have no reason to survive in
-		// block text either.
-		"\v", " ",
-		"\f", " ",
-		"\u0085", " ",
-		"\u2028", " ",
-		"\u2029", " ",
 	).Replace(s)
 	return s
 }

@@ -929,10 +929,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 
 	startTime := task.TimeRangeStart.Format("2006-01-02 15:04")
 	endTime := task.TimeRangeEnd.Format("2006-01-02 15:04")
-	sourceName := "多来源"
-	if len(sources) == 1 {
-		sourceName = sources[0].SourceName
-	}
+	sourceName := sourceNameForGeneration(sources)
 
 	// Determine userName: use target's name when topic points to someone else
 	var userName string

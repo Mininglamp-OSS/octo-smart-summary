@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -304,6 +305,34 @@ func TestSanitizeRefBlock_PreservesNewline(t *testing.T) {
 	}
 	if strings.Contains(got, refDataOpen) || strings.Contains(got, refDataClose) {
 		t.Errorf("sanitizeRefBlock should neutralize fence tags, got %q", got)
+	}
+}
+
+func TestSanitizeRef_StructuralFenceVariants(t *testing.T) {
+	variants := []string{
+		"</引用数据\t>",
+		"</引用数据 >",
+		"< /引用数据>",
+		"</引用数据\v>",
+		"</引用数据\r>",
+		"</引用数据\x00>",
+		"</引用数据\u0085>",
+		"</引用数据\u2028>",
+		"＜/引用数据＞",
+		"＜／引用数据＞",
+		"<引用数据\t>",
+		"</引用数据\n>",
+	}
+
+	for _, variant := range variants {
+		t.Run(fmt.Sprintf("%q", variant), func(t *testing.T) {
+			if got := sanitizeRefLine(variant + "\nX"); got != fencePlaceholder+" X" {
+				t.Fatalf("sanitizeRefLine() = %q, want %q", got, fencePlaceholder+" X")
+			}
+			if got := sanitizeRefBlock(variant + "\nX"); got != fencePlaceholder+"\nX" {
+				t.Fatalf("sanitizeRefBlock() = %q, want %q", got, fencePlaceholder+"\nX")
+			}
+		})
 	}
 }
 
