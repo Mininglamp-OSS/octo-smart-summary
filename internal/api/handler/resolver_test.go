@@ -465,7 +465,7 @@ func TestBorrowCitations_TeamResultWithCitations(t *testing.T) {
 	db.Save(&result)
 
 	h := &AgentSummaryHandler{db: db}
-	cits := h.borrowCitationsFromReference(context.Background(), task.ID, "space1", "creator1")
+	cits, markers := h.borrowCitationsFromReference(context.Background(), task.ID, "space1", "creator1")
 	if len(cits) != 2 {
 		t.Fatalf("expected 2 citations, got %d", len(cits))
 	}
@@ -474,6 +474,9 @@ func TestBorrowCitations_TeamResultWithCitations(t *testing.T) {
 	}
 	if cits[0].Content != "hello" {
 		t.Errorf("cits[0].Content = %q, want hello", cits[0].Content)
+	}
+	if _, ok := markers["1"]; !ok {
+		t.Errorf("marker set does not contain citation index 1: %v", markers)
 	}
 }
 
@@ -487,9 +490,34 @@ func TestBorrowCitations_EmptyCitationsReturnsEmpty(t *testing.T) {
 	addPersonalResult(t, db, task.ID, "creator1", "personal content")
 
 	h := &AgentSummaryHandler{db: db}
-	cits := h.borrowCitationsFromReference(context.Background(), task.ID, "space1", "creator1")
+	cits, markers := h.borrowCitationsFromReference(context.Background(), task.ID, "space1", "creator1")
 	if len(cits) != 0 {
 		t.Fatalf("expected 0 citations (no grafting), got %d", len(cits))
+	}
+	if len(markers) != 0 {
+		t.Fatalf("expected no marker indices when artifact has no citations, got %v", markers)
+	}
+}
+
+func TestBorrowCitations_RedactedCitationsRetainMarkerIndices(t *testing.T) {
+	db := setupResolverTestDB(t)
+	task := createCompletedTask(t, db, "space1", "creator1", model.OriginChannelGroup)
+	result := addTeamResult(t, db, task.ID, "team content [1] [P2]")
+	result.SetCitations([]model.Citation{{Index: 1, Content: "private evidence"}})
+	result.SetTeamCitations([]model.TeamCitation{{Index: 2, UserID: "u2"}})
+	if err := db.Save(&result).Error; err != nil {
+		t.Fatalf("save citations: %v", err)
+	}
+
+	h := &AgentSummaryHandler{db: db}
+	cits, markers := h.borrowCitationsFromReference(context.Background(), task.ID, "space1", "creator1")
+	if len(cits) != 0 {
+		t.Fatalf("expected plain citations to remain redacted, got %d", len(cits))
+	}
+	for _, token := range []string{"1", "P2"} {
+		if _, ok := markers[token]; !ok {
+			t.Errorf("marker set does not contain %q: %v", token, markers)
+		}
 	}
 }
 

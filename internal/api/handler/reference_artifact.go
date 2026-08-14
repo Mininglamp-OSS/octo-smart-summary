@@ -14,14 +14,32 @@ import (
 // It carries whatever the caller is allowed to see for this task, plus
 // metadata about the artifact type for API responses.
 type ReferencedSummaryArtifact struct {
-	Task          model.SummaryTask
-	Type          string // "team_result" or "personal_result"
-	Content       string
-	Citations     []model.Citation
-	TeamCitations []model.TeamCitation
-	Snapshot      *model.Snapshot
+	Task            model.SummaryTask
+	Type            string // "team_result" or "personal_result"
+	Content         string
+	Citations       []model.Citation
+	TeamCitations   []model.TeamCitation
+	CitationMarkers citationMarkerSet
+	Snapshot        *model.Snapshot
 	// Sources and historical metadata for traditional summaries without snapshots
 	Sources []model.SummarySource
+}
+
+type citationMarkerSet map[string]struct{}
+
+func newCitationMarkerSet(plain []model.Citation, team []model.TeamCitation) citationMarkerSet {
+	markers := make(citationMarkerSet, len(plain)+len(team))
+	for _, citation := range plain {
+		if citation.Index > 0 {
+			markers[fmt.Sprintf("%d", citation.Index)] = struct{}{}
+		}
+	}
+	for _, citation := range team {
+		if citation.Index > 0 {
+			markers[fmt.Sprintf("P%d", citation.Index)] = struct{}{}
+		}
+	}
+	return markers
 }
 
 // ErrReferenceUnavailable is a structured rejection reason used when a
@@ -127,7 +145,9 @@ func resolveReferencedArtifact(
 	}
 	if err == nil && result.ID != 0 && result.Content != "" {
 		// Determine citations visibility per detail-page privacy rules.
-		plainCitations := result.GetCitations()
+		allPlainCitations := result.GetCitations()
+		teamCitations := result.GetTeamCitations()
+		plainCitations := allPlainCitations
 		citationsVisible := callerPlainCitationsVisible(db.WithContext(ctx), &task, userID, &result)
 		if !citationsVisible {
 			plainCitations = []model.Citation{}
@@ -140,13 +160,14 @@ func resolveReferencedArtifact(
 		}
 
 		return &ReferencedSummaryArtifact{
-			Task:          task,
-			Type:          "team_result",
-			Content:       result.Content,
-			Citations:     plainCitations,
-			TeamCitations: result.GetTeamCitations(),
-			Snapshot:      nil,
-			Sources:       sources,
+			Task:            task,
+			Type:            "team_result",
+			Content:         result.Content,
+			Citations:       plainCitations,
+			TeamCitations:   teamCitations,
+			CitationMarkers: newCitationMarkerSet(allPlainCitations, teamCitations),
+			Snapshot:        nil,
+			Sources:         sources,
 		}, nil
 	}
 
@@ -169,6 +190,7 @@ func resolveReferencedArtifact(
 		return nil, &ErrReferenceUnavailable{Reason: "error", TaskID: taskID}
 	}
 	if err == nil && pr.ID != 0 {
+		plainCitations := pr.GetCitations()
 		// Only load sources if there is no snapshot — sources are rendered
 		// only in the no-snapshot (traditional summary) branch (P2-4).
 		var sources []model.SummarySource
@@ -180,13 +202,14 @@ func resolveReferencedArtifact(
 		}
 
 		return &ReferencedSummaryArtifact{
-			Task:          task,
-			Type:          "personal_result",
-			Content:       pr.Content,
-			Citations:     pr.GetCitations(),
-			TeamCitations: []model.TeamCitation{},
-			Snapshot:      pr.GetSnapshot(),
-			Sources:       sources,
+			Task:            task,
+			Type:            "personal_result",
+			Content:         pr.Content,
+			Citations:       plainCitations,
+			TeamCitations:   []model.TeamCitation{},
+			CitationMarkers: newCitationMarkerSet(plainCitations, nil),
+			Snapshot:        pr.GetSnapshot(),
+			Sources:         sources,
 		}, nil
 	}
 

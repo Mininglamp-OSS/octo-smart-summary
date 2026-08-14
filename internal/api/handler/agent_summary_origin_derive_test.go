@@ -635,7 +635,7 @@ func TestCreateAgentSummary_DanglingMarkersStrippedWhenBorrowRedacted(t *testing
 		UserID:    "test-user",
 		SessionID: sessionID,
 		Role:      "assistant",
-		Content:   "Refined version [1] of the summary.",
+		Content:   "Refined version [1] returned HTTP [200].",
 	})
 
 	w := postAgentSave(r, map[string]interface{}{
@@ -656,6 +656,9 @@ func TestCreateAgentSummary_DanglingMarkersStrippedWhenBorrowRedacted(t *testing
 	}
 	if strings.Contains(pr.Content, "[1]") {
 		t.Errorf("saved content still carries dangling [1] marker (borrow was redacted): %q", pr.Content)
+	}
+	if !strings.Contains(pr.Content, "[200]") {
+		t.Errorf("saved content lost unrelated bracketed integer [200]: %q", pr.Content)
 	}
 	if got := pr.GetCitations(); len(got) != 0 {
 		t.Errorf("expected empty citations, got %d", len(got))

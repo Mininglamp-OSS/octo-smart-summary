@@ -428,21 +428,21 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		// Without this, refined content shows "[n]" markers pointing at an
 		// empty citations array → frontend renders broken/dangling refs.
 		if len(cits) == 0 && len(req.ReferencedTaskIDs) > 0 {
-			borrowedCits := h.borrowCitationsFromReference(
+			borrowedCits, unresolvedMarkers := h.borrowCitationsFromReference(
 				c.Request.Context(), req.ReferencedTaskIDs[0], spaceID, userID)
 			if len(borrowedCits) > 0 {
 				cits = borrowedCits
 				log.Printf("[handler] CreateAgentSummary borrowed %d citations from referenced task_id=%d session=%s",
 					len(cits), req.ReferencedTaskIDs[0], req.SessionID)
-			} else {
+			} else if len(unresolvedMarkers) > 0 {
 				// R9 P2-2 (PR #190, yujiawei review 4926742282): the borrow
 				// returned empty (referenced task's citations redacted or
 				// genuinely absent) but content still carries the referenced
 				// summary's [n] markers. Save with empty citations + live
 				// markers → frontend renders broken/dangling citation links.
-				// Strip every unresolvable numeric marker here (markdown
-				// links like [1](url) are preserved).
-				content = stripUnresolvedCitationMarkers(content)
+				// Strip only marker indices that belong to the referenced
+				// artifact. Unrelated bracketed integers remain user content.
+				content = stripUnresolvedCitationMarkers(content, unresolvedMarkers)
 				creatorPR.Content = content
 				log.Printf("[handler] CreateAgentSummary stripped dangling citation markers (borrow returned empty) session=%s ref_task_id=%d",
 					req.SessionID, req.ReferencedTaskIDs[0])

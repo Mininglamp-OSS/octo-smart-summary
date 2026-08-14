@@ -169,9 +169,9 @@ func stripCitationTokens(content string, plain []model.Citation, team []model.Te
 	return strings.TrimSpace(b.String())
 }
 
-// stripUnresolvedCitationMarkers removes dangling numeric citation markers
-// ([n] and [Pn]) from content when a refine save carries the referenced
-// summary's markers but has no borrowable citations (R9 P2-2, PR #190):
+// stripUnresolvedCitationMarkers removes dangling citation markers ([n] and
+// [Pn]) that are known to belong to the referenced artifact when a refine
+// save has no borrowable citations (R9 P2-2, PR #190):
 // leaving the markers with an empty citation array renders broken links in
 // the frontend.
 //
@@ -179,13 +179,16 @@ func stripCitationTokens(content string, plain []model.Citation, team []model.Te
 // EVERY bracketed integer anywhere — including inside fenced code blocks,
 // standard numbers like GB/T 7714 [2020], reference-style links [1][docs],
 // and signed integers (strconv.Atoi accepts +5/-3). The strip is now scoped
-// to plausible citation runs only:
+// to the referenced artifact's actual citation index set:
 //   - fenced code regions (``` ... ```) are passed through untouched;
-//   - a marker is stripped only when its index is 1–3 plain digits (1..999,
-//     no sign) — real citation sets never reach four digits;
+//   - ordinary bracketed integers are preserved unless the exact token exists
+//     in markers;
 //   - markdown links [1](url) and reference-style links [1][label] are
 //     content, never markers (same rule as stripCitationTokens).
-func stripUnresolvedCitationMarkers(content string) string {
+func stripUnresolvedCitationMarkers(content string, markers citationMarkerSet) string {
+	if len(markers) == 0 {
+		return strings.TrimSpace(content)
+	}
 	lines := strings.Split(content, "\n")
 	inFence := false
 	for i, line := range lines {
@@ -194,7 +197,7 @@ func stripUnresolvedCitationMarkers(content string) string {
 			continue
 		}
 		if !inFence {
-			lines[i] = stripCitationMarkersInLine(line)
+			lines[i] = stripCitationMarkersInLine(line, markers)
 		}
 	}
 	return strings.TrimSpace(strings.Join(lines, "\n"))
@@ -202,7 +205,7 @@ func stripUnresolvedCitationMarkers(content string) string {
 
 // stripCitationMarkersInLine strips dangling citation markers from a single
 // non-fenced line. See stripUnresolvedCitationMarkers for the scoping rules.
-func stripCitationMarkersInLine(line string) string {
+func stripCitationMarkersInLine(line string, markers citationMarkerSet) string {
 	var b strings.Builder
 	for i := 0; i < len(line); {
 		if line[i] != '[' {
@@ -217,11 +220,7 @@ func stripCitationMarkersInLine(line string) string {
 		}
 		end += i
 		token := line[i+1 : end]
-		number := strings.TrimPrefix(token, "P")
-		// Plausible citation index: 1–3 plain digits (1..999), unsigned.
-		// Four-digit bracketed integers are standard numbers / years
-		// (GB/T 7714 [2020]); signed ones are offsets — never citations.
-		isCitation := len(number) >= 1 && len(number) <= 3 && number != "0" && isPlainDigits(number)
+		_, isCitation := markers[token]
 		// A numeric markdown link [1](url) or reference-style link
 		// [1][label] is content, not a citation.
 		isLink := end+1 < len(line) && line[end+1] == '('

@@ -322,6 +322,20 @@ func TestSanitizeRef_StructuralFenceVariants(t *testing.T) {
 		"＜／引用数据＞",
 		"<引用数据\t>",
 		"</引用数据\n>",
+		"</引用数据\u00a0>",
+		"</引用数据\u3000>",
+		"</引用数据\u1680>",
+		"</引用数据\u2000>",
+		"</引用数据\u2009>",
+		"</引用数据\u202f>",
+		"</引用数据\u205f>",
+		"</引用数据\u200b>",
+		"</引用数据\u2060>",
+		"</引用数据\ufeff>",
+		"</引用数据\u00ad>",
+		"</引用\u200b数据>",
+		"<\u00a0/引用数据>",
+		"<\u00a0引用数据>",
 	}
 
 	for _, variant := range variants {
@@ -333,6 +347,21 @@ func TestSanitizeRef_StructuralFenceVariants(t *testing.T) {
 				t.Fatalf("sanitizeRefBlock() = %q, want %q", got, fencePlaceholder+"\nX")
 			}
 		})
+	}
+}
+
+func TestSanitizeRef_DoesNotAlterNonFenceText(t *testing.T) {
+	inputs := []string{
+		"引用数据",
+		"<引用>",
+		"a<b>c",
+		"<引用数据x>",
+		"code: items[1]",
+	}
+	for _, input := range inputs {
+		if got := sanitizeRefBlock(input); got != input {
+			t.Fatalf("sanitizeRefBlock(%q) = %q", input, got)
+		}
 	}
 }
 

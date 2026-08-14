@@ -27,7 +27,10 @@ const (
 // copy of the same token (P1-2 fix).
 const fencePlaceholder = "[引用数据]"
 
-var refFenceTagPattern = regexp.MustCompile(`<\s*/?\s*引用数据\s*>`)
+var (
+	refInvisiblePattern = regexp.MustCompile(`[\p{Cf}\x{00ad}]`)
+	refFenceTagPattern  = regexp.MustCompile(`<[\s\p{Zs}]*/?[\s\p{Zs}]*引用数据[\s\p{Zs}]*>`)
+)
 
 // sanitizeRef neutralizes untrusted referenced-summary text before it is
 // embedded in the agent's system prompt (SUM-158 blocker 3 — prompt
@@ -68,6 +71,9 @@ func normalizeRefFenceSyntax(s string, preserveNewline bool) string {
 		replacements = append(replacements, "\n", " ")
 	}
 	s = strings.NewReplacer(replacements...).Replace(s)
+	// Format/invisible characters can visually splice or split the tag name
+	// (for example 引用\u200b数据). Remove them before structural matching.
+	s = refInvisiblePattern.ReplaceAllString(s, "")
 	return refFenceTagPattern.ReplaceAllString(s, fencePlaceholder)
 }
 
@@ -436,10 +442,17 @@ func serializeReferencedTaskIDs(ids []int64) *string {
 // caller's PersonalResult as the whole artifact — would require changing
 // what content is rendered in the prompt, which is a larger design change.
 //
-// Returns []model.Citation{} (never nil) if:
+// The second return value contains only citation marker tokens that actually
+// belong to the resolved artifact (for example "1" and "P2"). It is retained
+// even when plain citation details are privacy-redacted, so the save path can
+// remove dangling markers without deleting unrelated bracketed numbers.
+//
+// Returns []model.Citation{} and a nil marker set if:
 //   - the referenced task isn't found in the caller's space
 //   - no visible artifact exists
-//   - the artifact's citations are empty (including BY_PERSON redaction)
+//
+// The citations slice is empty if the artifact has no visible plain citations
+// (including BY_PERSON redaction).
 //
 // See CHAT-REFERENCE-BASED-DESIGN-v1 §citation preservation.
 func (h *AgentSummaryHandler) borrowCitationsFromReference(
@@ -447,20 +460,20 @@ func (h *AgentSummaryHandler) borrowCitationsFromReference(
 	refTaskID int64,
 	spaceID string,
 	userID string,
-) []model.Citation {
+) ([]model.Citation, citationMarkerSet) {
 	art, err := resolveReferencedArtifact(ctx, h.db, refTaskID, spaceID, userID)
 	if err != nil || art == nil {
-		return []model.Citation{}
+		return []model.Citation{}, nil
 	}
 
 	// Only borrow plain citations that belong to the same document whose
 	// content was rendered (P1-1). Never graft citations from a different
 	// document onto the team result's content.
 	if len(art.Citations) > 0 {
-		return art.Citations
+		return art.Citations, art.CitationMarkers
 	}
 
 	// Citations are empty (BY_PERSON redaction or genuinely empty).
 	// Return empty — do NOT borrow from a different document.
-	return []model.Citation{}
+	return []model.Citation{}, art.CitationMarkers
 }

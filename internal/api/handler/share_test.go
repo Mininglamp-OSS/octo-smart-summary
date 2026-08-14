@@ -413,6 +413,7 @@ func TestSummaryShare_SourceCountExcludesDerivedSources(t *testing.T) {
 // `use items[0]` is persisted as `use items`. strconv.Atoi also accepts
 // +5 / -3." These cases must survive the strip.
 func TestStripUnresolvedCitationMarkers_PreservesNonCitationBrackets(t *testing.T) {
+	markers := citationMarkerSet{"1": {}, "P2": {}}
 	cases := []struct {
 		name string
 		in   string
@@ -421,11 +422,13 @@ func TestStripUnresolvedCitationMarkers_PreservesNonCitationBrackets(t *testing.
 		{"standard number", "按 GB/T 7714 [2020] 执行"},
 		{"reference-style link", "see [1][docs] for details"},
 		{"signed integer", "offset is [+5] and [-3]"},
+		{"http status", "HTTP [200] and [404] are status codes"},
+		{"unrelated numeric marker", "keep [2] because only [1] belongs to the reference"},
 		{"fenced code block", "before\n```go\narr[0] = x\n```\nafter"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := stripUnresolvedCitationMarkers(tc.in)
+			got := stripUnresolvedCitationMarkers(tc.in, markers)
 			if got != tc.in {
 				t.Errorf("strip mutated non-citation content:\n in  = %q\n out = %q", tc.in, got)
 			}
@@ -437,7 +440,8 @@ func TestStripUnresolvedCitationMarkers_PreservesNonCitationBrackets(t *testing.
 // behaviour this function exists for). Guards the scoped strip of R11 Q5:
 // narrowing must not turn the strip into a no-op.
 func TestStripUnresolvedCitationMarkers_StripsRealMarkers(t *testing.T) {
-	got := stripUnresolvedCitationMarkers("结论 [1] 与 [P2] 如下")
+	markers := citationMarkerSet{"1": {}, "P2": {}}
+	got := stripUnresolvedCitationMarkers("结论 [1] 与 [P2] 如下", markers)
 	want := "结论  与  如下" // marker runs dropped; spacing otherwise untouched
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
