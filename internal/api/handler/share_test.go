@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -361,5 +362,88 @@ func TestSummaryShare_AgentPersonalResultFallback(t *testing.T) {
 	}
 	if snap.Content != agentContent {
 		t.Fatalf("snapshot content = %q, want PersonalResult content %q", snap.Content, agentContent)
+	}
+}
+
+// R10 blocking (Jerry-Xin, review 4928758044): "share snapshots still leak
+// hidden derived-source cardinality through source_count ... derived rows
+// are skipped for SourceName, but SourceCount is still set to len(sources).
+// A shared link is broader than task read access ... Count only non-derived
+// rows, and add a share-level regression test."
+func TestSummaryShare_SourceCountExcludesDerivedSources(t *testing.T) {
+	db, imDB, r, taskID := setupShareTest(t)
+	_ = imDB
+
+	// setupShareTest already created one explicit (non-derived) source.
+	// Add two derived (worker-backfilled) rows — they must be invisible in
+	// BOTH fields of the share snapshot.
+	for i, name := range []string{"私聊-derived-a", "derived-group-b"} {
+		if err := db.Create(&model.SummarySource{
+			TaskID:     taskID,
+			SourceType: model.SourceGroup,
+			SourceID:   fmt.Sprintf("derived-src-%d", i),
+			SourceName: name,
+			Derived:    true,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	body := gin.H{"idempotency_key": "share-derived-count", "targets": []gin.H{{"channel_id": "group1", "channel_type": model.ChannelTypeGroup}}}
+	w := shareRequest(t, r, http.MethodPost, "/api/v1/summaries/ST-share-1/shares", "creator", "space1", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create=%d %s", w.Code, w.Body.String())
+	}
+
+	var snap model.SummaryShareSnapshot
+	if err := db.Where("task_id = ?", taskID).First(&snap).Error; err != nil {
+		t.Fatalf("snapshot not created: %v", err)
+	}
+	if snap.SourceCount != 1 {
+		t.Errorf("source_count = %d, want 1 (derived rows must not leak their cardinality)", snap.SourceCount)
+	}
+	if snap.SourceName != "Source group" {
+		t.Errorf("source_name = %q, want only the explicit source", snap.SourceName)
+	}
+}
+
+// R11 Q5 (yujiawei, review 4929031900): "stripUnresolvedCitationMarkers
+// deletes every bracketed integer in the document, not just citation
+// markers ... including inside fenced code blocks and tables. ...
+// `use items[0]` is persisted as `use items`. strconv.Atoi also accepts
+// +5 / -3." These cases must survive the strip.
+func TestStripUnresolvedCitationMarkers_PreservesNonCitationBrackets(t *testing.T) {
+	markers := citationMarkerSet{"1": {}, "P2": {}}
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"code block index", "use items[0] here"},
+		{"standard number", "按 GB/T 7714 [2020] 执行"},
+		{"reference-style link", "see [1][docs] for details"},
+		{"signed integer", "offset is [+5] and [-3]"},
+		{"http status", "HTTP [200] and [404] are status codes"},
+		{"unrelated numeric marker", "keep [2] and [3] because neither belongs to the reference"},
+		{"fenced code block", "before\n```go\narr[0] = x\n```\nafter"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := stripUnresolvedCitationMarkers(tc.in, markers)
+			if got != tc.in {
+				t.Errorf("strip mutated non-citation content:\n in  = %q\n out = %q", tc.in, got)
+			}
+		})
+	}
+}
+
+// Real dangling citation markers must still be stripped (the R9 P2-2
+// behaviour this function exists for). Guards the scoped strip of R11 Q5:
+// narrowing must not turn the strip into a no-op.
+func TestStripUnresolvedCitationMarkers_StripsRealMarkers(t *testing.T) {
+	markers := citationMarkerSet{"1": {}, "P2": {}}
+	got := stripUnresolvedCitationMarkers("结论 [1] 与 [P2] 如下", markers)
+	want := "结论  与  如下" // marker runs dropped; spacing otherwise untouched
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }

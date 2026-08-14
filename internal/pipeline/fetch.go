@@ -296,6 +296,34 @@ func mapFrontendSourceType(frontendType int) int {
 	}
 }
 
+// StorageChannelTypeToSourceType is the reverse mapping of
+// mapFrontendSourceType: WuKongIM storage-layer channel_type (as carried by
+// fetched Message.ChannelType) back to smart-summary's summary_source.source_type.
+// Used by the worker to back-fill summary_source rows from the channels a task
+// actually fetched messages from (the "generation-time write-back" fix for
+// auto-selected-channel tasks that never got source rows at creation).
+//
+// Storage layer → Source layer:
+//
+//	ChannelTypeDM     (1) → SourceDirect (3)
+//	ChannelTypeGroup  (2) → SourceGroup  (1)
+//	ChannelTypeThread (5) → SourceThread (2)
+//
+// Returns (0, false) for unrecognized storage values so callers skip rather
+// than persist garbage source_type.
+func StorageChannelTypeToSourceType(storage int) (int, bool) {
+	switch storage {
+	case model.ChannelTypeDM:
+		return model.SourceDirect, true
+	case model.ChannelTypeGroup:
+		return model.SourceGroup, true
+	case model.ChannelTypeThread:
+		return model.SourceThread, true
+	default:
+		return 0, false
+	}
+}
+
 // sourceType extracts the integer source_type from a specifiedSources entry,
 // handling both int and float64 (JSON-decoded) representations.
 func sourceType(s map[string]interface{}) int {

@@ -77,6 +77,27 @@ func (h *TaskHandler) schedulePendingInvitationExpr(taskAlias string) string {
  AND ss.confirm_policy=1 AND sc.user_id=? AND sc.confirmed=false)`
 }
 
+// R11 Q2 (owner decision 2026-08-14, option 1): a task whose origin was
+// inherited from a DERIVED (worker-backfilled) source row carries
+// OriginFromDerived=true. List/detail projections mask such an origin to
+// ("", 0) — the viewer may not be a member of the backfilled channel, and
+// echoing it turns ?origin_channel_id= into a membership oracle. The
+// stored value stays intact for server-side consumers (none today: notify
+// always routes to the creator's DM).
+func wireOriginChannelID(t model.SummaryTask) string {
+	if t.OriginFromDerived {
+		return ""
+	}
+	return t.OriginChannelID
+}
+
+func wireOriginChannelType(t model.SummaryTask) int {
+	if t.OriginFromDerived {
+		return 0
+	}
+	return t.OriginChannelType
+}
+
 // canAccessTaskDB reports whether userID may read the task: creator or
 // explicit participant. Source-group membership alone does NOT grant access.
 //
@@ -214,8 +235,8 @@ func callerPlainCitationsVisible(db *gorm.DB, task *model.SummaryTask, callerID 
 }
 
 type apiResponse struct {
-	Code    int         `json:"code"`
-	Message string      `json:"message"`
+	Code    int    `json:"code"`
+	Message string `json:"message"`
 	// Detail carries a compact, safe-to-expose error signature so clients
 	// (F12 devtools, ops) can distinguish sub-causes of a generic Message
 	// without pulling backend logs. Populated only on error responses;
@@ -224,8 +245,8 @@ type apiResponse struct {
 	// (DB paths, tokens, stack fragments). Passthrough of err.Error() from
 	// well-known agent runner failures (context deadline exceeded, max
 	// steps exceeded, LLM returned empty response) is safe by construction.
-	Detail  string      `json:"detail,omitempty"`
-	Data    interface{} `json:"data,omitempty"`
+	Detail string      `json:"detail,omitempty"`
+	Data   interface{} `json:"data,omitempty"`
 }
 
 func ok(c *gin.Context, data interface{}) {
@@ -337,10 +358,30 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 	if len(req.Sources) > 0 {
 		sourceList = req.Sources
 	}
-
+	// Preserve the public API contract: the cap applies to submitted entries,
+	// before duplicate rows are collapsed for persistence.
 	if len(sourceList) > maxSourceCount {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40003, Message: fmt.Sprintf("信息来源不能超过%d个", maxSourceCount)})
 		return
+	}
+
+	// R10: dedup by (source_type, source_id) before insert.
+	// uk_summary_source_task_type_id (migration 20260814-01) would turn a
+	// duplicate client input into a 500; the create endpoint previously
+	// silently persisted the duplicates, so dedup here preserves the old
+	// accepting behaviour while keeping the table structurally clean.
+	if len(sourceList) > 1 {
+		deduped := make([]sourceReq, 0, len(sourceList))
+		seen := make(map[string]struct{}, len(sourceList))
+		for _, s := range sourceList {
+			key := fmt.Sprintf("%d:%s", s.SourceType, s.SourceID)
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			deduped = append(deduped, s)
+		}
+		sourceList = deduped
 	}
 
 	if len(req.Participants) == 0 {
@@ -542,7 +583,11 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 		args = append(args, "%"+s+"%", "%"+s+"%")
 	}
 	if s := c.Query("origin_channel_id"); s != "" {
-		whereSQL += " AND origin_channel_id = ?"
+		// R11 Q2: the filter must not match a masked (derived-inherited)
+		// origin — otherwise it doubles as a membership oracle ("does some
+		// visible task carry channel X as its origin?") for channels the
+		// caller is not a member of.
+		whereSQL += " AND origin_channel_id = ? AND origin_from_derived = 0"
 		args = append(args, s)
 	}
 	if s := c.Query("created_after"); s != "" {
@@ -657,7 +702,18 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			taskIDs = append(taskIDs, t.ID)
 		}
 		var allParts []model.SummaryParticipant
-		h.db.Where("task_id IN ?", taskIDs).Find(&allParts)
+		if err := h.db.Where("task_id IN ?", taskIDs).Find(&allParts).Error; err != nil {
+			// R7 P2-2: partsByTask is load-bearing for the new
+			// referenceable flag — it feeds isParticipant, which
+			// referenceableFromLoaded uses to reject tasks. Previously this
+			// error was dropped: a transient failure left allParts empty and
+			// the list advertised referenceable=false, reason="not_found"
+			// for tasks the resolver would accept on the very next request.
+			// Mirror the prByTask treatment below: log and continue with what
+			// we have (fail-closed on the referenceable dimension, UX-only).
+			log.Printf("[list] batch load participants failed: %v", err)
+			allParts = nil
+		}
 		for _, p := range allParts {
 			item := gin.H{
 				"user_id":   p.UserID,
@@ -671,6 +727,34 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 		}
 	}
 
+	// P1-1 (R4 yj/ms/jx): Batch-load whether the caller owns a non-empty
+	// PersonalResult for each listed task, using the SAME predicate as the
+	// resolver and the detail endpoint (nonEmptyPersonalResultTaskIDs / the
+	// content!='' clause in resolveReferencedArtifact:118). This closes the
+	// R3->R4 regression where an empty placeholder PersonalResult (written
+	// by completeTaskWithoutNewResult on an empty window) made the picker
+	// advertise a task as referenceable that the resolver would then reject
+	// as no_visible_content. Errors are now surfaced instead of silently
+	// producing an all-false map.
+	prByTask := make(map[int64]bool)
+	if len(tasks) > 0 && userID != "" {
+		taskIDs := make([]int64, 0, len(tasks))
+		for _, t := range tasks {
+			taskIDs = append(taskIDs, t.ID)
+		}
+		var err error
+		prByTask, err = nonEmptyPersonalResultTaskIDs(h.db, taskIDs, userID)
+		if err != nil {
+			// Fail closed on the referenceable dimension only: log and
+			// continue with an empty map. The task list itself is still
+			// returned; only the personal-result-only branch of
+			// referenceable will report false. This is strictly safer than
+			// silently reporting true.
+			log.Printf("[list] batch load personal_result referenceable failed: %v", err)
+			prByTask = map[int64]bool{}
+		}
+	}
+
 	items := make([]gin.H, 0, len(tasks))
 	for _, t := range tasks {
 		attention := rowByTask[t.ID]
@@ -679,6 +763,13 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 
 		srcList := make([]gin.H, 0, len(sources))
 		for _, s := range sources {
+			// R9 P1 (PR #190): derived rows record the pipeline's
+			// auto-selected channels under the creator's membership; read
+			// authorization here is any task participant, so they must not
+			// appear in the user-visible sources projection.
+			if s.Derived {
+				continue
+			}
 			srcList = append(srcList, gin.H{
 				"source_type": s.SourceType,
 				"source_id":   s.SourceID,
@@ -727,35 +818,70 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			parts = []gin.H{}
 		}
 
+		// SUM-19: expose referenceable status so the frontend can filter
+		// candidates without guessing from trigger_type.
+		// P1-3: Use referenceableFromLoaded to reuse data already in scope
+		// (task row, display result, participants) instead of issuing 4-5
+		// redundant per-row queries. The caller's PersonalResult existence
+		// is batch-loaded above via nonEmptyPersonalResultTaskIDs.
+		isParticipant := t.CreatorID == userID
+		if !isParticipant {
+			for _, p := range partsByTask[t.ID] {
+				if uid, ok := p["user_id"].(string); ok && uid == userID {
+					isParticipant = true
+					break
+				}
+			}
+		}
+		// P2-7: schedule-config invitees (unconfirmed roster members) are not
+		// in summary_participant, so isParticipant=false for them. This means
+		// referenceableFromLoaded returns not_found for their perspective. This
+		// is a known limitation — schedule-config invitees can see the task in
+		// the list (via scheduleVisibilityExpr) but cannot reference it until
+		// they confirm. This is acceptable: unconfirmed invitees have not yet
+		// joined the task.
+		resultContent := ""
+		if hasResult {
+			resultContent = latestResult.Content
+		}
+		refable, refType, refReason := referenceableFromLoaded(t, hasResult, resultContent, isParticipant, prByTask[t.ID])
+
 		items = append(items, gin.H{
-			"task_id":                     t.ID,
-			"task_no":                     t.TaskNo,
-			"title":                       t.Title,
-			"topic":                       t.EffectiveTopic(),
-			"summary_mode":                t.SummaryMode,
-			"status":                      t.Status,
-			"trigger_type":                t.TriggerType,
-			"schedule_id":                 scheduleIDOut,
-			"creator_id":                  t.CreatorID,
-			"participants":                parts,
-			"time_range_start":            t.TimeRangeStart.Format(time.RFC3339),
-			"time_range_end":              t.TimeRangeEnd.Format(time.RFC3339),
-			"sources":                     srcList,
-			"total_msg_count":             totalMsgCount,
-			"creator_name":                creatorName,
-			"origin_channel_id":           t.OriginChannelID,
-			"origin_channel_type":         t.OriginChannelType,
-			"created_at":                  t.CreatedAt.Format(time.RFC3339),
-			"completed_at":                completedAt,
-			"result_is_edited":            resultIsEdited,
-			"result_edited_at":            resultEditedAt,
-			"is_unread":                   attention.IsUnread,
-			"has_pending_invitation":      attention.HasPendingInvitation,
-			"has_pending_submission":      attention.HasPendingSubmission,
-			"needs_attention":             attention.IsUnread || attention.HasPendingInvitation,
-			"current_result_id":           attention.ListCurrentResultID,
-			"current_personal_version_id": attention.CurrentPersonalVersionID,
-			"activity_at":                 attention.ActivityAt,
+			"task_id":          t.ID,
+			"task_no":          t.TaskNo,
+			"title":            t.Title,
+			"topic":            t.EffectiveTopic(),
+			"summary_mode":     t.SummaryMode,
+			"status":           t.Status,
+			"trigger_type":     t.TriggerType,
+			"schedule_id":      scheduleIDOut,
+			"creator_id":       t.CreatorID,
+			"participants":     parts,
+			"time_range_start": t.TimeRangeStart.Format(time.RFC3339),
+			"time_range_end":   t.TimeRangeEnd.Format(time.RFC3339),
+			"sources":          srcList,
+			"total_msg_count":  totalMsgCount,
+			"creator_name":     creatorName,
+			// R11 Q2: mask a derived-inherited origin on the wire (owner
+			// decision 2026-08-14, option 1) — the refiner may not be a
+			// member of the backfilled channel. The value stays intact in
+			// the DB for future server-side consumers.
+			"origin_channel_id":            wireOriginChannelID(t),
+			"origin_channel_type":          wireOriginChannelType(t),
+			"created_at":                   t.CreatedAt.Format(time.RFC3339),
+			"completed_at":                 completedAt,
+			"result_is_edited":             resultIsEdited,
+			"result_edited_at":             resultEditedAt,
+			"is_unread":                    attention.IsUnread,
+			"has_pending_invitation":       attention.HasPendingInvitation,
+			"has_pending_submission":       attention.HasPendingSubmission,
+			"needs_attention":              attention.IsUnread || attention.HasPendingInvitation,
+			"current_result_id":            attention.ListCurrentResultID,
+			"current_personal_version_id":  attention.CurrentPersonalVersionID,
+			"activity_at":                  attention.ActivityAt,
+			"referenceable":                refable,
+			"reference_artifact_type":      refType,
+			"reference_unavailable_reason": refReason,
 		})
 	}
 
@@ -892,6 +1018,13 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 
 	srcList := make([]gin.H, 0, len(sources))
 	for _, s := range sources {
+		// R9 P1 (PR #190): derived rows (worker backfill of auto-selected
+		// channels) are excluded from the user-visible detail projection —
+		// see ListSummaries for the authorization rationale. Tier-4 origin
+		// derivation reads the table directly and is unaffected.
+		if s.Derived {
+			continue
+		}
 		srcList = append(srcList, gin.H{
 			"source_type": s.SourceType,
 			"source_id":   s.SourceID,
@@ -949,22 +1082,25 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 	}
 
 	resp := gin.H{
-		"task_id":             task.ID,
-		"task_no":             task.TaskNo,
-		"title":               task.Title,
-		"topic":               task.EffectiveTopic(),
-		"summary_mode":        task.SummaryMode,
-		"status":              task.Status,
-		"creator_id":          task.CreatorID,
-		"trigger_type":        task.TriggerType,
-		"time_range_start":    task.TimeRangeStart.Format(time.RFC3339),
-		"time_range_end":      task.TimeRangeEnd.Format(time.RFC3339),
-		"sources":             srcList,
-		"participants":        partList,
-		"result":              resultOut,
-		"error_message":       task.ErrorMessage,
-		"origin_channel_id":   task.OriginChannelID,
-		"origin_channel_type": task.OriginChannelType,
+		"task_id":          task.ID,
+		"task_no":          task.TaskNo,
+		"title":            task.Title,
+		"topic":            task.EffectiveTopic(),
+		"summary_mode":     task.SummaryMode,
+		"status":           task.Status,
+		"creator_id":       task.CreatorID,
+		"trigger_type":     task.TriggerType,
+		"time_range_start": task.TimeRangeStart.Format(time.RFC3339),
+		"time_range_end":   task.TimeRangeEnd.Format(time.RFC3339),
+		"sources":          srcList,
+		"participants":     partList,
+		"result":           resultOut,
+		"error_message":    task.ErrorMessage,
+		// R11 Q2: same wire mask as the list projection — a derived-inherited
+		// origin is never echoed (the viewer may not be a member of the
+		// backfilled channel). Server-side consumers read the DB directly.
+		"origin_channel_id":   wireOriginChannelID(task),
+		"origin_channel_type": wireOriginChannelType(task),
 		"created_at":          task.CreatedAt.Format(time.RFC3339),
 		"updated_at":          task.UpdatedAt.Format(time.RFC3339),
 	}
@@ -1002,8 +1138,40 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		resp["result_is_edited"] = false
 	}
 
-	// Add personal_result and members info
+	// SUM-19: expose referenceable status in detail response.
+	// P1-3: reuse data already loaded (task, display result) via
+	// referenceableFromLoaded instead of re-loading all of it.
+	// At this point authorizeTaskAccess has already confirmed the caller is
+	// creator or participant, so isParticipant is true.
+	// P1-1: Also check PersonalResult for agent summaries (which write
+	// PersonalResult, not SummaryResult) via the shared
+	// hasNonEmptyPersonalResult predicate (content != '').
 	userID := middleware.GetUserID(c)
+	detailResultContent := ""
+	if hasResult {
+		detailResultContent = latestResult.Content
+	}
+	hasPersonalResult := false
+	if userID != "" {
+		// P1-1 (R4 yj/ms/jx): Use the shared content!='' predicate. First()
+		// without Order was also flagged as an accidental primary-key-ascending
+		// pick when multiple PersonalResult rows exist for the same
+		// (task_id, user_id) — hasNonEmptyPersonalResult uses Count so the
+		// order question does not arise, and errors are surfaced.
+		hp, err := hasNonEmptyPersonalResult(h.db, taskID, userID)
+		if err != nil {
+			log.Printf("[detail] check personal_result referenceable failed for task %d: %v", taskID, err)
+			hasPersonalResult = false
+		} else {
+			hasPersonalResult = hp
+		}
+	}
+	refable, refType, refReason := referenceableFromLoaded(task, hasResult, detailResultContent, true, hasPersonalResult)
+	resp["referenceable"] = refable
+	resp["reference_artifact_type"] = refType
+	resp["reference_unavailable_reason"] = refReason
+
+	// Add personal_result and members info
 
 	// B1 (permission split):
 	//   can_edit: legacy field, kept for backward-compat with the current frontend.

@@ -343,13 +343,23 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 	// 第 2+ 轮 agent 看不到引用材料(见 CHAT-REFERENCE-BASED-DESIGN-v1
 	// 多轮上下文修复)。token 增量按引用大小约 5-15K/轮,可接受。
 	if len(req.ReferencedTaskIDs) > 0 {
+		// R4 yj P2-2 / R5 yj P3 / R5 ms P2-4 / R5 jx non-blocking #1:
+		// dedup-then-check at the binding layer, using the same helper the
+		// builder consumes, so {999×25, 1, 2, 3} (one effective reference)
+		// no longer triggers a 400. R5 yj P2-6: use apiResponse envelope
+		// like every other error in this file (Code/Message), not gin.H.
+		dedupedIDs := dedupReferencedTaskIDs(req.ReferencedTaskIDs)
+		if len(dedupedIDs) > maxReferencedTaskIDs {
+			c.JSON(http.StatusBadRequest, apiResponse{
+				Code:    40000,
+				Message: fmt.Sprintf("too many referenced task IDs: %d distinct (max %d)", len(dedupedIDs), maxReferencedTaskIDs),
+			})
+			return
+		}
 		spaceID := middleware.GetSpaceID(c)
-		refContext, loaded, refErr := buildReferencedSummariesContext(
-			ctx, h.db, spaceID, uid, req.ReferencedTaskIDs)
-		if refErr != nil {
-			log.Printf("[agent] chat build reference context error: %v", refErr)
-			// 引用加载失败不阻断本次对话,agent 走无引用路径
-		} else if refContext != "" {
+		refContext, loaded := buildReferencedSummariesContext(
+			ctx, h.db, spaceID, uid, dedupedIDs)
+		if refContext != "" {
 			system = system + refContext
 			log.Printf("[agent] chat session=%s loaded %d referenced tasks: %v", req.SessionID, len(loaded), loaded)
 		}
@@ -493,6 +503,30 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		return
 	}
 
+	// R5 yj P1-2 / R5 ms P2-4 / R5 jx non-blocking #1:
+	// dedup-then-check at the binding layer, BEFORE the SSE header flush
+	// at :510. The earlier revision placed this check ~80 lines below the
+	// flush and returned a JSON body — but by that point response headers
+	// are already committed (Content-Type: text/event-stream + status 200),
+	// as the file's own comment at :524-526 notes, so the client parser
+	// receives an unframed JSON blob in the middle of the event stream.
+	// Every other error path in ChatStream after the flush already honours
+	// this invariant via writeSSEErrorViaSink{,WithDetail} (:527, :543,
+	// :570, :597). Moving the size check UP satisfies the invariant and
+	// also skips the wasted runner build / history load when the request
+	// is invalid.
+	//
+	// R5 yj P2-6: use apiResponse envelope (Code/Message) like the four
+	// preceding pre-flush errors in this handler, not gin.H{"error":...}.
+	dedupedReferencedIDs := dedupReferencedTaskIDs(req.ReferencedTaskIDs)
+	if len(dedupedReferencedIDs) > maxReferencedTaskIDs {
+		c.JSON(http.StatusBadRequest, apiResponse{
+			Code:    40000,
+			Message: fmt.Sprintf("too many referenced task IDs: %d distinct (max %d)", len(dedupedReferencedIDs), maxReferencedTaskIDs),
+		})
+		return
+	}
+
 	profileName := req.Profile
 	if profileName == "" {
 		profileName = agentChatProfile
@@ -571,13 +605,14 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 
 	// 每轮 chat 都重新拼引用进 system —— 与 Chat 逻辑严格一致
 	// (见 CHAT-REFERENCE-BASED-DESIGN-v1 多轮上下文修复)。
-	if len(req.ReferencedTaskIDs) > 0 {
+	//
+	// dedupedReferencedIDs was computed and size-validated pre-flush above;
+	// see the R5 yj P1-2 block for rationale on why the check moved up.
+	if len(dedupedReferencedIDs) > 0 {
 		spaceID := middleware.GetSpaceID(c)
-		refContext, loaded, refErr := buildReferencedSummariesContext(
-			ctx, h.db, spaceID, uid, req.ReferencedTaskIDs)
-		if refErr != nil {
-			log.Printf("[agent] chat/stream build reference context error: %v", refErr)
-		} else if refContext != "" {
+		refContext, loaded := buildReferencedSummariesContext(
+			ctx, h.db, spaceID, uid, dedupedReferencedIDs)
+		if refContext != "" {
 			system = system + refContext
 			log.Printf("[agent] chat/stream session=%s loaded %d referenced tasks: %v", req.SessionID, len(loaded), loaded)
 		}

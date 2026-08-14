@@ -124,6 +124,23 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	// - non-nil and non-empty → use provided value
 	var finalChannelID string
 	var finalChannelType int
+	var finalOriginFromDerived bool
+
+	// R7 P2-3 / R9 P2-3 (PR #190): normalize referenced_task_ids at the entry
+	// point — dedup first, then REJECT if still over maxReferencedTaskIDs.
+	// Chat (agent_chat.go) and ChatStream enforce the identical contract at
+	// their binding layer with apiResponse{Code:40000}; previously this path
+	// silently truncated to the cap and persisted a partial lineage, breaking
+	// contract symmetry. All downstream consumers below (origin borrow,
+	// persist, citation borrow) see the clean, in-cap list.
+	req.ReferencedTaskIDs = dedupReferencedTaskIDs(req.ReferencedTaskIDs)
+	if len(req.ReferencedTaskIDs) > maxReferencedTaskIDs {
+		c.JSON(http.StatusBadRequest, apiResponse{
+			Code:    40000,
+			Message: fmt.Sprintf("too many referenced task IDs: %d distinct (max %d)", len(req.ReferencedTaskIDs), maxReferencedTaskIDs),
+		})
+		return
+	}
 
 	if req.OriginChannelID == nil {
 		// Not provided → resolve from session tool traces
@@ -149,18 +166,64 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			// same-space task's origin_channel_id/type (an in-space authz bypass on
 			// metadata) — enforce the same creator/participant rule as the two
 			// sibling paths here.
+			// R10 (yujiawei, issue comment 5280351017): track WHY origin
+			// inheritance was impossible so the 40001 message says so —
+			// users were left guessing when a historical referenced task
+			// (channels never persisted) failed at the very end of the flow.
+			noOriginReason := "也未指定引用总结;请显式传入 origin_channel_id"
 			if len(req.ReferencedTaskIDs) > 0 {
+				// Pre-populated for the query-miss branch (not found /
+				// deleted / non-completed / wrong space all land here).
+				noOriginReason = "引用总结也未能提供 origin:引用任务不存在/已删除/未完成,或不属于本空间"
 				var refTask model.SummaryTask
+				// R9 P2-4 (PR #190, raised in two preceding reviews): gate the
+				// borrow on deleted_at IS NULL AND status = completed, mirroring
+				// resolveReferencedArtifact. SummaryTask.DeletedAt is *time.Time
+				// (not gorm.DeletedAt), so GORM does NOT auto-filter soft-deleted
+				// rows — without this the borrow happily inherits origin from a
+				// deleted or still-processing task while borrowCitationsFromReference
+				// on the same request correctly refuses it (same referenced task,
+				// two different answers).
 				if err := h.db.WithContext(c.Request.Context()).
-					Select("id, creator_id, origin_channel_id, origin_channel_type").
-					Where("id = ? AND space_id = ? AND origin_channel_id != ''", req.ReferencedTaskIDs[0], spaceID).
+					Select("id, creator_id, origin_channel_id, origin_channel_type, origin_from_derived").
+					Where("id = ? AND space_id = ? AND deleted_at IS NULL AND status = ?",
+						req.ReferencedTaskIDs[0], spaceID, model.StatusCompleted).
 					First(&refTask).Error; err == nil {
 					if canAccessTaskDB(h.db.WithContext(c.Request.Context()), userID, refTask.ID, refTask.CreatorID) {
-						finalChannelID = refTask.OriginChannelID
-						finalChannelType = refTask.OriginChannelType
-						log.Printf("[handler] CreateAgentSummary borrowed origin from referenced task_id=%d channel=%s/%d session=%s",
-							refTask.ID, finalChannelID, finalChannelType, req.SessionID)
+						if refTask.OriginChannelID != "" {
+							finalChannelID = refTask.OriginChannelID
+							finalChannelType = refTask.OriginChannelType
+							// R11 Q2: the mask flag propagates — borrowing a
+							// masked origin keeps it masked (second-generation
+							// refines must not re-expose the channel).
+							finalOriginFromDerived = refTask.OriginFromDerived
+							log.Printf("[handler] CreateAgentSummary borrowed origin from referenced task_id=%d channel=%s/%d from_derived=%t session=%s",
+								refTask.ID, finalChannelID, finalChannelType, finalOriginFromDerived, req.SessionID)
+						} else {
+							// Tier-4 fallback: pipeline/scheduled summaries never set
+							// origin_channel_id. Derive the origin from the referenced
+							// task's summary_source rows (the channels it was generated
+							// from) so a refine of a non-agent summary can still inherit
+							// an origin — the owner's goal of "non-agent summaries
+							// referenceable + iterable like agent ones". The helper takes
+							// the FIRST usable source row (by id order) and logs when
+							// several exist — multi-source tasks inherit their first
+							// channel, consistent with the tier-3 first-referenced-task
+							// precedent (see deriveOriginFromSummarySources).
+							finalChannelID, finalChannelType, finalOriginFromDerived = h.deriveOriginFromSummarySources(c.Request.Context(), refTask.ID)
+							if finalChannelID != "" {
+								log.Printf("[handler] CreateAgentSummary derived origin from referenced task_id=%d sources channel=%s/%d from_derived=%t session=%s",
+									refTask.ID, finalChannelID, finalChannelType, finalOriginFromDerived, req.SessionID)
+							} else {
+								// R10: the historical-task case — channels
+								// lived only in the in-memory channelSet and
+								// were never persisted before the backfill
+								// landed, so there is nothing to inherit.
+								noOriginReason = "引用总结也未能提供 origin:引用任务未记录生成频道(无 origin 且无可用来源行)"
+							}
+						}
 					} else {
+						noOriginReason = "引用总结也未能提供 origin:您无权读取引用任务"
 						log.Printf("[handler] CreateAgentSummary refused to borrow origin from referenced task_id=%d (user=%s lacks read access) session=%s",
 							refTask.ID, userID, req.SessionID)
 					}
@@ -168,7 +231,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			}
 			if finalChannelID == "" {
 				// Truly no origin available anywhere → 400 with specific message
-				c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "origin_channel_id 未传且无法从 session 反查(session 无 fetch_channel 调用),也无引用总结可继承 origin"})
+				c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: fmt.Sprintf("origin_channel_id 未传且无法从 session 反查(session 无 fetch_channel 调用),%s", noOriginReason)})
 				return
 			}
 		} else {
@@ -279,6 +342,9 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		TriggerType:       model.TriggerAgent,
 		OriginChannelID:   finalChannelID,
 		OriginChannelType: finalChannelType,
+		// R11 Q2: persist the provenance flag set by tier-3/tier-4; explicit
+		// and session-resolved origins keep the zero value (unmasked).
+		OriginFromDerived: finalOriginFromDerived,
 		ReferencedTaskIDs: serializeReferencedTaskIDs(req.ReferencedTaskIDs),
 	}
 
@@ -295,10 +361,20 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		// IM DB — the deliverable already contains channel names in prose —
 		// so we store source_id only; a future PR can plumb imDB in and call
 		// ResolveSourceNameWithType if the UI wants the resolved display name.
+		//
+		// R10: dedup by (source_type, source_id) — uk_summary_source_task_type_id
+		// (migration 20260814-01) would turn duplicate front-end input into a
+		// 500; the create endpoint dedups identically.
+		seenSrc := make(map[string]struct{}, len(req.Sources))
 		for _, s := range req.Sources {
 			if s.SourceID == "" {
 				continue
 			}
+			key := fmt.Sprintf("%d:%s", s.SourceType, s.SourceID)
+			if _, dup := seenSrc[key]; dup {
+				continue
+			}
+			seenSrc[key] = struct{}{}
 			src := model.SummarySource{
 				TaskID:     createdTaskID,
 				SourceType: s.SourceType,
@@ -352,12 +428,24 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		// Without this, refined content shows "[n]" markers pointing at an
 		// empty citations array → frontend renders broken/dangling refs.
 		if len(cits) == 0 && len(req.ReferencedTaskIDs) > 0 {
-			borrowedCits := h.borrowCitationsFromReference(
+			borrowedCits, unresolvedMarkers := h.borrowCitationsFromReference(
 				c.Request.Context(), req.ReferencedTaskIDs[0], spaceID, userID)
 			if len(borrowedCits) > 0 {
 				cits = borrowedCits
 				log.Printf("[handler] CreateAgentSummary borrowed %d citations from referenced task_id=%d session=%s",
 					len(cits), req.ReferencedTaskIDs[0], req.SessionID)
+			} else if len(unresolvedMarkers) > 0 {
+				// R9 P2-2 (PR #190, yujiawei review 4926742282): the borrow
+				// returned empty (referenced task's citations redacted or
+				// genuinely absent) but content still carries the referenced
+				// summary's [n] markers. Save with empty citations + live
+				// markers → frontend renders broken/dangling citation links.
+				// Strip only marker indices that belong to the referenced
+				// artifact. Unrelated bracketed integers remain user content.
+				content = stripUnresolvedCitationMarkers(content, unresolvedMarkers)
+				creatorPR.Content = content
+				log.Printf("[handler] CreateAgentSummary stripped dangling citation markers (borrow returned empty) session=%s ref_task_id=%d",
+					req.SessionID, req.ReferencedTaskIDs[0])
 			}
 		}
 		creatorPR.SetCitations(cits)

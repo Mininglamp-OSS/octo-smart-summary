@@ -35,6 +35,7 @@ func setupAgentSummaryTestDB(t *testing.T) *gorm.DB {
 		&model.SummaryTask{},
 		&model.SummarySource{},
 		&model.SummaryParticipant{},
+		&model.SummaryResult{},
 		&model.PersonalResult{},
 	); err != nil {
 		t.Fatalf("failed to migrate: %v", err)
@@ -218,7 +219,11 @@ func TestCreateAgentSummary_NotProvidedResolveFailure(t *testing.T) {
 		t.Errorf("expected code=40001, got %v", resp["code"])
 	}
 
-	expectedMsg := "origin_channel_id 未传且无法从 session 反查(session 无 fetch_channel 调用),也无引用总结可继承 origin"
+	// R10 (yujiawei, issue comment 5280351017): "at minimum making the 40001
+	// message say *why* inheritance was impossible so the user is not left
+	// guessing." No referenced_task_ids in this request → the message must
+	// say so explicitly instead of the old blanket wording.
+	expectedMsg := "origin_channel_id 未传且无法从 session 反查(session 无 fetch_channel 调用),也未指定引用总结;请显式传入 origin_channel_id"
 	if resp["message"].(string) != expectedMsg {
 		t.Errorf("expected new message, got: %s", resp["message"])
 	}

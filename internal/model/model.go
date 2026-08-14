@@ -126,24 +126,29 @@ const (
 
 // SummaryTask represents a summary generation task.
 type SummaryTask struct {
-	ID                 int64      `gorm:"primaryKey;autoIncrement" json:"id"`
-	TaskNo             string     `gorm:"column:task_no;type:varchar(32);uniqueIndex:uk_task_no;not null" json:"task_no"`
-	SpaceID            string     `gorm:"column:space_id;type:varchar(64);not null;default:''" json:"space_id"`
-	CreatorID          string     `gorm:"column:creator_id;type:varchar(64);not null" json:"creator_id"`
-	CreatorBotID       string     `gorm:"column:creator_bot_id;type:varchar(64);not null;default:'';index:idx_summary_task_creator_bot_id" json:"creator_bot_id,omitempty"`
-	Title              string     `gorm:"column:title;type:varchar(2300);not null;default:''" json:"title"`
-	Topic              string     `gorm:"column:topic;type:varchar(2300);not null;default:''" json:"topic"`
-	SummaryMode        int        `gorm:"column:summary_mode;type:tinyint;not null" json:"summary_mode"`
-	TimeRangeStart     time.Time  `gorm:"column:time_range_start;not null" json:"time_range_start"`
-	TimeRangeEnd       time.Time  `gorm:"column:time_range_end;not null" json:"time_range_end"`
-	Status             int        `gorm:"column:status;type:tinyint;not null;default:0" json:"status"`
-	TriggerType        int        `gorm:"column:trigger_type;type:tinyint;not null;default:1" json:"trigger_type"`
-	RetryCount         int        `gorm:"column:retry_count;type:tinyint;not null;default:0" json:"retry_count"`
-	ErrorMessage       *string    `gorm:"column:error_message;type:varchar(500)" json:"error_message"`
-	ScheduleID         *int64     `gorm:"column:schedule_id" json:"schedule_id"`
-	CurrentResultID    *int64     `gorm:"column:current_result_id" json:"current_result_id"`
-	OriginChannelID    string     `gorm:"column:origin_channel_id;type:varchar(64);not null;default:'';index:idx_origin_channel" json:"origin_channel_id"`
-	OriginChannelType  int        `gorm:"column:origin_channel_type;type:tinyint;not null;default:0" json:"origin_channel_type"`
+	ID                int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	TaskNo            string    `gorm:"column:task_no;type:varchar(32);uniqueIndex:uk_task_no;not null" json:"task_no"`
+	SpaceID           string    `gorm:"column:space_id;type:varchar(64);not null;default:''" json:"space_id"`
+	CreatorID         string    `gorm:"column:creator_id;type:varchar(64);not null" json:"creator_id"`
+	CreatorBotID      string    `gorm:"column:creator_bot_id;type:varchar(64);not null;default:'';index:idx_summary_task_creator_bot_id" json:"creator_bot_id,omitempty"`
+	Title             string    `gorm:"column:title;type:varchar(2300);not null;default:''" json:"title"`
+	Topic             string    `gorm:"column:topic;type:varchar(2300);not null;default:''" json:"topic"`
+	SummaryMode       int       `gorm:"column:summary_mode;type:tinyint;not null" json:"summary_mode"`
+	TimeRangeStart    time.Time `gorm:"column:time_range_start;not null" json:"time_range_start"`
+	TimeRangeEnd      time.Time `gorm:"column:time_range_end;not null" json:"time_range_end"`
+	Status            int       `gorm:"column:status;type:tinyint;not null;default:0" json:"status"`
+	TriggerType       int       `gorm:"column:trigger_type;type:tinyint;not null;default:1" json:"trigger_type"`
+	RetryCount        int       `gorm:"column:retry_count;type:tinyint;not null;default:0" json:"retry_count"`
+	ErrorMessage      *string   `gorm:"column:error_message;type:varchar(500)" json:"error_message"`
+	ScheduleID        *int64    `gorm:"column:schedule_id" json:"schedule_id"`
+	CurrentResultID   *int64    `gorm:"column:current_result_id" json:"current_result_id"`
+	OriginChannelID   string    `gorm:"column:origin_channel_id;type:varchar(64);not null;default:'';index:idx_origin_channel" json:"origin_channel_id"`
+	OriginChannelType int       `gorm:"column:origin_channel_type;type:tinyint;not null;default:0" json:"origin_channel_type"`
+	// R11 Q2 (PR #190): provenance flag — the origin was inherited from a
+	// DERIVED (worker-backfilled) source row via tier-3/tier-4, so it is
+	// masked on the wire (list/detail echo "", the list filter excludes the
+	// row). json:"-" so no serializer can leak it; see task.go projections.
+	OriginFromDerived  bool       `gorm:"column:origin_from_derived;type:tinyint;not null;default:0" json:"-"`
 	ProcessingDeadline *time.Time `gorm:"column:processing_deadline" json:"processing_deadline"`
 	ConfirmDeadline    *time.Time `gorm:"column:confirm_deadline" json:"confirm_deadline"`
 	ReminderSentAt     *time.Time `gorm:"column:reminder_sent_at" json:"reminder_sent_at"`
@@ -194,13 +199,20 @@ func (SummaryTask) TableName() string { return "summary_task" }
 
 // SummarySource represents a data source for a task.
 type SummarySource struct {
-	ID            int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	TaskID        int64     `gorm:"column:task_id;not null;index:idx_task_id" json:"task_id"`
-	SourceType    int       `gorm:"column:source_type;type:tinyint;not null" json:"source_type"`
-	SourceID      string    `gorm:"column:source_id;type:varchar(64);not null" json:"source_id"`
-	SourceName    string    `gorm:"column:source_name;type:varchar(200);not null;default:''" json:"source_name"`
-	ParticipantID *int64    `gorm:"column:participant_id;index:idx_participant_id" json:"participant_id"`
-	CreatedAt     time.Time `gorm:"column:created_at;not null" json:"created_at"`
+	ID            int64  `gorm:"primaryKey;autoIncrement" json:"id"`
+	TaskID        int64  `gorm:"column:task_id;not null;index:idx_task_id;uniqueIndex:uk_summary_source_task_type_id" json:"task_id"`
+	SourceType    int    `gorm:"column:source_type;type:tinyint;not null;uniqueIndex:uk_summary_source_task_type_id" json:"source_type"`
+	SourceID      string `gorm:"column:source_id;type:varchar(64);not null;uniqueIndex:uk_summary_source_task_type_id" json:"source_id"`
+	SourceName    string `gorm:"column:source_name;type:varchar(200);not null;default:''" json:"source_name"`
+	ParticipantID *int64 `gorm:"column:participant_id;index:idx_participant_id" json:"participant_id"`
+	// R9 P1 (PR #190): 1 = row written by worker source backfill from the
+	// pipeline's auto-selected channels. Such rows are excluded from every
+	// user-visible projection (list/detail `sources`, share snapshot, agent
+	// reference-context bullets) because they record the creator's channel
+	// membership while read authorization is any task participant (roster is
+	// mutable after generation). Tier-4 origin derivation still reads them.
+	Derived   bool      `gorm:"column:derived;type:tinyint;not null;default:0" json:"-"`
+	CreatedAt time.Time `gorm:"column:created_at;not null" json:"created_at"`
 }
 
 func (SummarySource) TableName() string { return "summary_source" }

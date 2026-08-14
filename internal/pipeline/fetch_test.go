@@ -1,6 +1,10 @@
 package pipeline
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+)
 
 func TestNormalizeDMChannelID(t *testing.T) {
 	tests := []struct {
@@ -62,5 +66,49 @@ func TestNormalizeDMChannelID(t *testing.T) {
 					tt.channelID, tt.selfUID, tt.channelType, got, tt.want)
 			}
 		})
+	}
+}
+
+// StorageChannelTypeToSourceType must be the exact inverse of
+// mapFrontendSourceType on the three known channel kinds, and must reject
+// unknown storage values (0 / WuKongIM-reserved 3,4 / anything else) so the
+// worker never persists a garbage source_type into summary_source.
+func TestStorageChannelTypeToSourceType(t *testing.T) {
+	tests := []struct {
+		name    string
+		storage int
+		want    int
+		wantOK  bool
+	}{
+		{"DM 1 -> SourceDirect 3", model.ChannelTypeDM, model.SourceDirect, true},
+		{"group 2 -> SourceGroup 1", model.ChannelTypeGroup, model.SourceGroup, true},
+		{"thread 5 -> SourceThread 2", model.ChannelTypeThread, model.SourceThread, true},
+		{"unknown 0", 0, 0, false},
+		{"unknown 3 (WuKongIM reserved)", 3, 0, false},
+		{"unknown 4 (WuKongIM reserved)", 4, 0, false},
+		{"unknown 99", 99, 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := StorageChannelTypeToSourceType(tt.storage)
+			if got != tt.want || ok != tt.wantOK {
+				t.Errorf("StorageChannelTypeToSourceType(%d) = (%d, %v), want (%d, %v)",
+					tt.storage, got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}
+
+// Round-trip: every known frontend source type mapped to storage and back
+// must land on the original value. Guards against the two enums drifting
+// apart silently (they intentionally use different numbers).
+func TestStorageChannelTypeToSourceType_RoundTrip(t *testing.T) {
+	for _, frontend := range []int{model.SourceGroup, model.SourceThread, model.SourceDirect} {
+		storage := mapFrontendSourceType(frontend)
+		back, ok := StorageChannelTypeToSourceType(storage)
+		if !ok || back != frontend {
+			t.Errorf("round trip: frontend %d -> storage %d -> (%d, %v), want (%d, true)",
+				frontend, storage, back, ok, frontend)
+		}
 	}
 }

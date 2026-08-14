@@ -745,14 +745,7 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 	}
 
 	// Build specified sources for pipeline
-	specifiedSources := make([]map[string]interface{}, 0, len(sources))
-	for _, s := range sources {
-		specifiedSources = append(specifiedSources, map[string]interface{}{
-			"source_id":   s.SourceID,
-			"source_type": s.SourceType,
-			"source_name": s.SourceName,
-		})
-	}
+	specifiedSources := explicitSpecifiedSources(sources)
 
 	// Fetch messages via pipeline. Tool-call / raw LLM uses in this (fetch) path
 	// are accounted under the same task_no, so they appear in the same per-run
@@ -808,6 +801,14 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 	timing.Observe(task.TaskNo, "fetch_messages", fetchStart)
 	if err != nil {
 		return fmt.Errorf("fetch messages: %w", err)
+	}
+
+	// Backfill summary_source from the channels actually fetched. Tasks
+	// created without explicit sources (auto-selected channels) otherwise
+	// end up with zero source rows, which breaks reference → refine → save's
+	// tier-4 origin derivation. Best-effort: log and continue on failure.
+	if err := p.backfillSourcesFromMessages(task.ID, messages); err != nil {
+		log.Printf("[processor] task %d: backfill summary_source failed: %v", task.ID, err)
 	}
 
 	if len(messages) == 0 {

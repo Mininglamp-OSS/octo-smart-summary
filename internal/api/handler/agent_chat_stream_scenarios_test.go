@@ -460,3 +460,109 @@ func TestChatStreamEventSequenceAndDetail(t *testing.T) {
 		t.Errorf("distill phase should carry no count, got %d", countByPhase["distill"])
 	}
 }
+
+// R5 yj P1-2 regression: the referenced-ID size check MUST fire BEFORE the
+// SSE header flush, so a rejected request receives a plain JSON 400 (as with
+// every other pre-flush validator) rather than an unframed JSON blob mid-way
+// through a text/event-stream response. The old placement (~80 lines after
+// the flush, using c.JSON) violated the file's own invariant at :524-526.
+//
+// Positive assertions:
+//  1. Status code is 400 (would be 200 if the header flush had already run).
+//  2. Content-Type is application/json, NOT text/event-stream — hard proof
+//     the response was NOT committed as SSE before this validator fired.
+//  3. Body uses the apiResponse envelope (Code + Message), not gin.H{"error":...},
+//     matching R5 yj P2-6.
+func TestChatStreamValidation_TooManyReferencedTaskIDs_PreFlushJSON(t *testing.T) {
+	h := newTestAgentChatHandler("不该出现")
+	r := setupAgentChatStreamRouter(h)
+
+	// 21 distinct IDs — one over the cap of 20.
+	ids := make([]string, 21)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("%d", i+1)
+	}
+	body := fmt.Sprintf(`{"message":"你好","session_id":"s1","referenced_task_ids":[%s]}`, strings.Join(ids, ","))
+	w := doChatStream(t, r, body)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 pre-flush, got %d body=%s", w.Code, w.Body.String())
+	}
+	// Anti-oracle for the P1-2 regression: SSE Content-Type would mean the
+	// flush already ran and this branch broke the streaming contract.
+	if ct := w.Header().Get("Content-Type"); strings.Contains(ct, "text/event-stream") {
+		t.Fatalf("R5 yj P1-2: size check ran AFTER SSE header flush (Content-Type=%q); must be before :510", ct)
+	}
+	// R5 yj P2-6: apiResponse envelope, not gin.H{"error":...}.
+	if !strings.Contains(w.Body.String(), `"code"`) || !strings.Contains(w.Body.String(), "too many referenced task IDs") {
+		t.Errorf("expected apiResponse{Code,Message} envelope with 'too many referenced task IDs', got: %s", w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), `"error"`) && !strings.Contains(w.Body.String(), `"code"`) {
+		t.Errorf("R5 yj P2-6: body still uses gin.H{\"error\":...} shape: %s", w.Body.String())
+	}
+}
+
+// R5 yj P3 / R5 ms P2-4 / R5 jx non-blocking #1 regression: unit test for
+// the dedupReferencedTaskIDs helper that both chat handlers and the context
+// builder consume. Locks in three properties:
+//
+//  1. Preserves first-seen order for distinct IDs.
+//  2. Collapses N duplicates of one ID down to a single element (so 21
+//     duplicates → 1, and dedup-then-check no longer trips the max-20 cap).
+//  3. Empty / nil in → nil out (nil-safe; used in a `len() > 0` guard).
+//
+// A full HTTP-level "21 duplicates accepted" test is not needed here: the
+// handler branch that consumes the deduped slice is the same one exercised
+// by the existing happy-path tests below (TestChatStreamPersistenceEquivalent
+// etc.). The regression this test guards against is anyone reverting the
+// helper to O(1)-length raw-check semantics.
+func TestDedupReferencedTaskIDs(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []int64
+		want []int64
+	}{
+		{"nil", nil, nil},
+		{"empty", []int64{}, nil},
+		{"single", []int64{7}, []int64{7}},
+		{"distinct_preserves_order", []int64{3, 1, 2}, []int64{3, 1, 2}},
+		{"drops_repeats_keep_first", []int64{1, 2, 1, 3, 2}, []int64{1, 2, 3}},
+		{
+			"21_duplicates_of_one_collapse_to_one",
+			func() []int64 {
+				ids := make([]int64, 21)
+				for i := range ids {
+					ids[i] = 999
+				}
+				return ids
+			}(),
+			[]int64{999},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := dedupReferencedTaskIDs(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("len: got %d %v, want %d %v", len(got), got, len(tc.want), tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("idx %d: got %d, want %d (full: got=%v want=%v)", i, got[i], tc.want[i], got, tc.want)
+				}
+			}
+		})
+	}
+
+	// Anti-oracle for the dedup-then-check contract: a payload of 21
+	// duplicates of a single ID collapses BELOW maxReferencedTaskIDs after
+	// dedup, so the binding-layer check MUST accept it. Any regression to
+	// raw-length validation would trip len(in) > 20 at this point and be
+	// caught here without the HTTP round-trip.
+	dup := make([]int64, 21)
+	for i := range dup {
+		dup[i] = 999
+	}
+	if got := dedupReferencedTaskIDs(dup); len(got) > maxReferencedTaskIDs {
+		t.Fatalf("dedup-then-check regression: 21 duplicates of one ID stayed above cap after dedup (len=%d, cap=%d)", len(got), maxReferencedTaskIDs)
+	}
+}

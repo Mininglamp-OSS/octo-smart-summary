@@ -99,3 +99,59 @@ func (h *AgentSummaryHandler) resolveOriginChannelFromSession(
 	log.Printf("[resolve] no fetch_channel call found in session=%s", sessionID)
 	return "", 0, nil
 }
+
+// deriveOriginFromSummarySources derives an origin channel from the channels
+// a referenced task was generated from (its summary_source rows).
+//
+// Pipeline/scheduled/bot summaries never populate summary_task.origin_channel_id,
+// so the tier-3 borrow (refTask.OriginChannelID) comes up empty for them and a
+// pure refine of such a task used to dead-end in 40001. This tier-4 fallback
+// recovers the origin from the task's generation sources so non-agent
+// summaries can be referenced + refined + iterated like agent ones.
+//
+// Deterministic: the FIRST usable source row (by summary_source.id, creation
+// order) wins; multi-source tasks inherit their first channel — consistent
+// with the tier-3 precedent of borrowing the FIRST referenced task's origin.
+// source_type and origin_channel_type are two separate enums that happen to
+// be numerically aligned today (SourceGroup/Thread/Direct = 1/2/3 vs
+// OriginChannelGroup/Thread/DM = 1/2/3 — see model.go:103-115), and
+// source_id is already a canonical channel ID, so no conversion is needed.
+// The range check below uses the Source* constants because the value under
+// test is a SummarySource.SourceType.
+//
+// Returns ("", 0) when the task has no usable source rows — the caller then
+// falls through to the 40001 error as before. Authorization is enforced by
+// the caller (canAccessTaskDB on the referenced task) — this helper must only
+// be reached for tasks the user can already read.
+func (h *AgentSummaryHandler) deriveOriginFromSummarySources(ctx context.Context, taskID int64) (string, int, bool) {
+	var sources []model.SummarySource
+	if err := h.db.WithContext(ctx).
+		Where("task_id = ?", taskID).
+		Order("id ASC").
+		Find(&sources).Error; err != nil {
+		log.Printf("[resolve] query summary_source failed task_id=%d: %v", taskID, err)
+		return "", 0, false
+	}
+	for _, s := range sources {
+		if s.SourceID == "" {
+			continue
+		}
+		// R7 P2-4: bound by the Source* enum (the value under test is a
+		// SummarySource.SourceType), not the OriginChannel* enum — the two
+		// are separate enums that only happen to share values today.
+		if s.SourceType < model.SourceGroup || s.SourceType > model.SourceDirect {
+			continue
+		}
+		if len(sources) > 1 {
+			log.Printf("[resolve] task_id=%d has %d summary_source rows; inheriting first usable channel=%s/%d",
+				taskID, len(sources), s.SourceID, s.SourceType)
+		}
+		// R11 Q2: report whether the winning row is DERIVED — a derived
+		// origin must be masked on the wire (owner decision 2026-08-14,
+		// option 1). tier-4 keeps reading derived rows (dropping them would
+		// dead-end auto-select refines into 40001 — the reason this feature
+		// exists); only the echo is masked.
+		return s.SourceID, s.SourceType, s.Derived
+	}
+	return "", 0, false
+}

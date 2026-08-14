@@ -169,6 +169,81 @@ func stripCitationTokens(content string, plain []model.Citation, team []model.Te
 	return strings.TrimSpace(b.String())
 }
 
+// stripUnresolvedCitationMarkers removes dangling citation markers ([n] and
+// [Pn]) that are known to belong to the referenced artifact when a refine
+// save has no borrowable citations (R9 P2-2, PR #190):
+// leaving the markers with an empty citation array renders broken links in
+// the frontend.
+//
+// R11 Q5 (yujiawei, review 4929031900): the previous implementation deleted
+// EVERY bracketed integer anywhere — including inside fenced code blocks,
+// standard numbers like GB/T 7714 [2020], reference-style links [1][docs],
+// and signed integers (strconv.Atoi accepts +5/-3). The strip is now scoped
+// to the referenced artifact's actual citation index set:
+//   - fenced code regions (``` ... ```) are passed through untouched;
+//   - ordinary bracketed integers are preserved unless the exact token exists
+//     in markers;
+//   - markdown links [1](url) and reference-style links [1][label] are
+//     content, never markers (same rule as stripCitationTokens).
+func stripUnresolvedCitationMarkers(content string, markers citationMarkerSet) string {
+	if len(markers) == 0 {
+		return strings.TrimSpace(content)
+	}
+	lines := strings.Split(content, "\n")
+	inFence := false
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimLeft(line, " 	"), "```") {
+			inFence = !inFence
+			continue
+		}
+		if !inFence {
+			lines[i] = stripCitationMarkersInLine(line, markers)
+		}
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+// stripCitationMarkersInLine strips dangling citation markers from a single
+// non-fenced line. See stripUnresolvedCitationMarkers for the scoping rules.
+func stripCitationMarkersInLine(line string, markers citationMarkerSet) string {
+	var b strings.Builder
+	for i := 0; i < len(line); {
+		if line[i] != '[' {
+			b.WriteByte(line[i])
+			i++
+			continue
+		}
+		end := strings.IndexByte(line[i:], ']')
+		if end < 0 {
+			b.WriteString(line[i:])
+			break
+		}
+		end += i
+		token := line[i+1 : end]
+		_, isCitation := markers[token]
+		// A numeric markdown link [1](url) or reference-style link
+		// [1][label] is content, not a citation.
+		isLink := end+1 < len(line) && line[end+1] == '('
+		isRefLink := end+1 < len(line) && line[end+1] == '['
+		if isCitation && !isLink && !isRefLink {
+			i = end + 1 // drop the marker entirely
+			continue
+		}
+		b.WriteString(line[i : end+1])
+		i = end + 1
+	}
+	return b.String()
+}
+
+func isPlainDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func sharePreview(content string) string {
 	lines := strings.Split(content, "\n")
 	parts := make([]string, 0, len(lines))
@@ -320,7 +395,16 @@ func (h *ShareHandler) Create(c *gin.Context) {
 		return
 	}
 	names := make([]string, 0, len(sources))
+	visibleCount := 0
 	for _, source := range sources {
+		// R9 P1 (PR #190): derived rows (worker backfill of auto-selected
+		// channels) are excluded from the share snapshot — a share is
+		// readable by anyone with the link, an even broader audience than
+		// task participants.
+		if source.Derived {
+			continue
+		}
+		visibleCount++
 		if strings.TrimSpace(source.SourceName) != "" {
 			names = append(names, source.SourceName)
 		}
@@ -331,10 +415,13 @@ func (h *ShareHandler) Create(c *gin.Context) {
 		return
 	}
 	now := time.Now()
+	// R10 (Jerry-Xin, review 4928758044): SourceCount counts only non-derived
+	// rows, mirroring SourceName — len(sources) leaked hidden derived-row
+	// cardinality (1 explicit + 5 derived → source_count=6 on a shared link).
 	snapshot := model.SummaryShareSnapshot{
 		TaskID: task.ID, TaskNo: task.TaskNo, SpaceID: spaceID, CreatorID: userID,
 		IdempotencyKey: req.IdempotencyKey, RequestHash: hash, Title: task.Title,
-		SourceName: strings.Join(names, "、"), SourceCount: len(sources), ParticipantCount: int(participantCount),
+		SourceName: strings.Join(names, "、"), SourceCount: visibleCount, ParticipantCount: int(participantCount),
 		MessageCount: material.messageCount, TimeRangeStart: task.TimeRangeStart, TimeRangeEnd: task.TimeRangeEnd,
 		SummaryMode: task.SummaryMode, ResultVersion: material.version, Preview: sharePreview(content), Content: content,
 		CreatedAt: now, UpdatedAt: now,

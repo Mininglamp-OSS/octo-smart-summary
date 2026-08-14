@@ -109,6 +109,26 @@ func TestCreateSummary_SourceCountExceedsLimit(t *testing.T) {
 	}
 }
 
+func TestCreateSummary_SourceCountExceedsLimitBeforeDedup(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupCreateRouter(h)
+
+	sources := makeSources(maxSourceCount)
+	sources = append(sources, sources[0])
+	w := doCreateSummary(r, map[string]interface{}{
+		"title":   "raw-limit-before-dedup",
+		"sources": sources,
+	}, "creator1")
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected HTTP 400 for %d raw sources, got %d: %s", len(sources), w.Code, w.Body.String())
+	}
+	if code := respCode(t, w); code != 40003 {
+		t.Fatalf("expected code 40003 before dedup, got %d: %s", code, w.Body.String())
+	}
+}
+
 func TestCreateSummary_TopicLimit(t *testing.T) {
 	db, imDB := setupTestDBs(t)
 	h := NewTaskHandler(db, imDB, "")
