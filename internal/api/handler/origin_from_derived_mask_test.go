@@ -1,3 +1,5 @@
+//go:build cgo
+
 package handler
 
 // R11 Q2 (yujiawei, review 4929031900, P1 — "Q2 needs a design decision

@@ -846,21 +846,21 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 		refable, refType, refReason := referenceableFromLoaded(t, hasResult, resultContent, isParticipant, prByTask[t.ID])
 
 		items = append(items, gin.H{
-			"task_id":                      t.ID,
-			"task_no":                      t.TaskNo,
-			"title":                        t.Title,
-			"topic":                        t.EffectiveTopic(),
-			"summary_mode":                 t.SummaryMode,
-			"status":                       t.Status,
-			"trigger_type":                 t.TriggerType,
-			"schedule_id":                  scheduleIDOut,
-			"creator_id":                   t.CreatorID,
-			"participants":                 parts,
-			"time_range_start":             t.TimeRangeStart.Format(time.RFC3339),
-			"time_range_end":               t.TimeRangeEnd.Format(time.RFC3339),
-			"sources":                      srcList,
-			"total_msg_count":              totalMsgCount,
-			"creator_name":                 creatorName,
+			"task_id":          t.ID,
+			"task_no":          t.TaskNo,
+			"title":            t.Title,
+			"topic":            t.EffectiveTopic(),
+			"summary_mode":     t.SummaryMode,
+			"status":           t.Status,
+			"trigger_type":     t.TriggerType,
+			"schedule_id":      scheduleIDOut,
+			"creator_id":       t.CreatorID,
+			"participants":     parts,
+			"time_range_start": t.TimeRangeStart.Format(time.RFC3339),
+			"time_range_end":   t.TimeRangeEnd.Format(time.RFC3339),
+			"sources":          srcList,
+			"total_msg_count":  totalMsgCount,
+			"creator_name":     creatorName,
 			// R11 Q2: mask a derived-inherited origin on the wire (owner
 			// decision 2026-08-14, option 1) — the refiner may not be a
 			// member of the backfilled channel. The value stays intact in
@@ -1081,20 +1081,20 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 	}
 
 	resp := gin.H{
-		"task_id":             task.ID,
-		"task_no":             task.TaskNo,
-		"title":               task.Title,
-		"topic":               task.EffectiveTopic(),
-		"summary_mode":        task.SummaryMode,
-		"status":              task.Status,
-		"creator_id":          task.CreatorID,
-		"trigger_type":        task.TriggerType,
-		"time_range_start":    task.TimeRangeStart.Format(time.RFC3339),
-		"time_range_end":      task.TimeRangeEnd.Format(time.RFC3339),
-		"sources":             srcList,
-		"participants":        partList,
-		"result":              resultOut,
-		"error_message":       task.ErrorMessage,
+		"task_id":          task.ID,
+		"task_no":          task.TaskNo,
+		"title":            task.Title,
+		"topic":            task.EffectiveTopic(),
+		"summary_mode":     task.SummaryMode,
+		"status":           task.Status,
+		"creator_id":       task.CreatorID,
+		"trigger_type":     task.TriggerType,
+		"time_range_start": task.TimeRangeStart.Format(time.RFC3339),
+		"time_range_end":   task.TimeRangeEnd.Format(time.RFC3339),
+		"sources":          srcList,
+		"participants":     partList,
+		"result":           resultOut,
+		"error_message":    task.ErrorMessage,
 		// R11 Q2: same wire mask as the list projection — a derived-inherited
 		// origin is never echoed (the viewer may not be a member of the
 		// backfilled channel). Server-side consumers read the DB directly.

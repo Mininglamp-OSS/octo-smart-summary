@@ -1,3 +1,4 @@
+-- +migrate Up
 -- Add summary_task.origin_from_derived — provenance flag for R11 Q2 (PR #190).
 --
 -- tier-3/tier-4 origin inheritance (agent_summary.go) can copy a channel id
@@ -23,3 +24,6 @@
 ALTER TABLE summary_task
     ADD COLUMN origin_from_derived TINYINT NOT NULL DEFAULT 0
     COMMENT '1=origin_channel_id was inherited from a derived (worker-backfilled) source row; masked on wire';
+
+-- +migrate Down
+ALTER TABLE summary_task DROP COLUMN origin_from_derived;
