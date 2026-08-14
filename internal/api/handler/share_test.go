@@ -423,7 +423,7 @@ func TestStripUnresolvedCitationMarkers_PreservesNonCitationBrackets(t *testing.
 		{"reference-style link", "see [1][docs] for details"},
 		{"signed integer", "offset is [+5] and [-3]"},
 		{"http status", "HTTP [200] and [404] are status codes"},
-		{"unrelated numeric marker", "keep [2] because only [1] belongs to the reference"},
+		{"unrelated numeric marker", "keep [2] and [3] because neither belongs to the reference"},
 		{"fenced code block", "before\n```go\narr[0] = x\n```\nafter"},
 	}
 	for _, tc := range cases {

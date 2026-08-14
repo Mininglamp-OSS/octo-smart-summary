@@ -105,6 +105,45 @@ func sanitizeRefBlock(s string) string {
 	return s
 }
 
+// sanitizeCitationsForReference sanitizes untrusted string fields before JSON
+// encoding. encoding/json escapes angle brackets by default, so sanitizing the
+// marshalled bytes would miss fence tags represented as \u003c...\u003e.
+func sanitizeCitationsForReference(citations []model.Citation) []model.Citation {
+	sanitized := make([]model.Citation, len(citations))
+	for i, citation := range citations {
+		citation.Sender = sanitizeRefBlock(citation.Sender)
+		citation.Content = sanitizeRefBlock(citation.Content)
+		citation.SentAt = sanitizeRefBlock(citation.SentAt)
+		citation.Source = sanitizeRefBlock(citation.Source)
+		citation.ChannelID = sanitizeRefBlock(citation.ChannelID)
+		citation.ContextBefore = sanitizeContextMessagesForReference(citation.ContextBefore)
+		citation.ContextAfter = sanitizeContextMessagesForReference(citation.ContextAfter)
+		sanitized[i] = citation
+	}
+	return sanitized
+}
+
+func sanitizeContextMessagesForReference(messages []model.ContextMsg) []model.ContextMsg {
+	sanitized := make([]model.ContextMsg, len(messages))
+	for i, message := range messages {
+		message.Sender = sanitizeRefBlock(message.Sender)
+		message.Content = sanitizeRefBlock(message.Content)
+		message.SentAt = sanitizeRefBlock(message.SentAt)
+		sanitized[i] = message
+	}
+	return sanitized
+}
+
+func sanitizeTeamCitationsForReference(citations []model.TeamCitation) []model.TeamCitation {
+	sanitized := make([]model.TeamCitation, len(citations))
+	for i, citation := range citations {
+		citation.UserID = sanitizeRefBlock(citation.UserID)
+		citation.UserName = sanitizeRefBlock(citation.UserName)
+		sanitized[i] = citation
+	}
+	return sanitized
+}
+
 // buildReferencedSummariesContext fetches the referenced summary tasks and
 // resolves their visible artifacts via the unified resolver, then formats
 // them into a single string block that can be appended to the agent's system
@@ -237,12 +276,17 @@ func buildReferencedSummariesContext(
 				sb.WriteString("- 老需求: " + sanitizeRefLine(snap.Requirement) + "\n")
 			}
 			hasCandidateChannels := len(snap.Scope.ChannelIDs) > 0
+			showCandidateChannelType := hasCandidateChannels && !art.Task.OriginFromDerived
 			if hasCandidateChannels {
 				storageType := appOriginToStorageChannelType(art.Task.OriginChannelType)
 				sb.WriteString("- 候选频道 (candidate channels):\n")
 				for _, cid := range snap.Scope.ChannelIDs {
-					sb.WriteString(fmt.Sprintf("  * channel_id=%s channel_type=%d %s\n",
-						sanitizeRefLine(cid), storageType, channelTypeLabel(storageType)))
+					if showCandidateChannelType {
+						sb.WriteString(fmt.Sprintf("  * channel_id=%s channel_type=%d %s\n",
+							sanitizeRefLine(cid), storageType, channelTypeLabel(storageType)))
+					} else {
+						sb.WriteString(fmt.Sprintf("  * channel_id=%s\n", sanitizeRefLine(cid)))
+					}
 				}
 			}
 			sb.WriteString(fmt.Sprintf("- 老时间窗 (历史): %s ~ %s\n",
@@ -257,6 +301,8 @@ func buildReferencedSummariesContext(
 			// R7 P1-1: model-addressed guidance OUTSIDE the fence.
 			if hasCandidateChannels {
 				sb.WriteString("  (你可以复用其中一个,或让用户明确,或用 list_channels 探索其他)\n")
+			}
+			if showCandidateChannelType {
 				sb.WriteString("  ⚠️ 调用 fetch_channel/peek_channel 时必须**原样复制**上面的 channel_type 数字,不要猜、不要默认 1\n")
 			}
 			sb.WriteString("  ⚠️ 上面的老时间窗已过期,不要复制作为 fetch 参数\n")
@@ -307,7 +353,7 @@ func buildReferencedSummariesContext(
 
 		// Old citations: the messages the old summary was grounded in
 		if len(art.Citations) > 0 {
-			citJSON, _ := json.Marshal(art.Citations)
+			citJSON, _ := json.Marshal(sanitizeCitationsForReference(art.Citations))
 			sb.WriteString("【老 citations · 参考证据】\n")
 			sb.WriteString(refDataOpen + "\n")
 			sb.WriteString(sanitizeRefBlock(string(citJSON)))
@@ -317,7 +363,7 @@ func buildReferencedSummariesContext(
 		// Team citations: [Pn] references — shown but NOT borrowed as plain
 		// citations (they reference participants, not raw messages).
 		if len(art.TeamCitations) > 0 {
-			teamCitJSON, _ := json.Marshal(art.TeamCitations)
+			teamCitJSON, _ := json.Marshal(sanitizeTeamCitationsForReference(art.TeamCitations))
 			sb.WriteString("【团队 citations · [Pn] 参与者引用】\n")
 			sb.WriteString(refDataOpen + "\n")
 			sb.WriteString(sanitizeRefBlock(string(teamCitJSON)))
