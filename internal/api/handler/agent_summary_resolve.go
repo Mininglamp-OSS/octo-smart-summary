@@ -123,14 +123,14 @@ func (h *AgentSummaryHandler) resolveOriginChannelFromSession(
 // falls through to the 40001 error as before. Authorization is enforced by
 // the caller (canAccessTaskDB on the referenced task) — this helper must only
 // be reached for tasks the user can already read.
-func (h *AgentSummaryHandler) deriveOriginFromSummarySources(ctx context.Context, taskID int64) (string, int) {
+func (h *AgentSummaryHandler) deriveOriginFromSummarySources(ctx context.Context, taskID int64) (string, int, bool) {
 	var sources []model.SummarySource
 	if err := h.db.WithContext(ctx).
 		Where("task_id = ?", taskID).
 		Order("id ASC").
 		Find(&sources).Error; err != nil {
 		log.Printf("[resolve] query summary_source failed task_id=%d: %v", taskID, err)
-		return "", 0
+		return "", 0, false
 	}
 	for _, s := range sources {
 		if s.SourceID == "" {
@@ -146,7 +146,12 @@ func (h *AgentSummaryHandler) deriveOriginFromSummarySources(ctx context.Context
 			log.Printf("[resolve] task_id=%d has %d summary_source rows; inheriting first usable channel=%s/%d",
 				taskID, len(sources), s.SourceID, s.SourceType)
 		}
-		return s.SourceID, s.SourceType
+		// R11 Q2: report whether the winning row is DERIVED — a derived
+		// origin must be masked on the wire (owner decision 2026-08-14,
+		// option 1). tier-4 keeps reading derived rows (dropping them would
+		// dead-end auto-select refines into 40001 — the reason this feature
+		// exists); only the echo is masked.
+		return s.SourceID, s.SourceType, s.Derived
 	}
-	return "", 0
+	return "", 0, false
 }

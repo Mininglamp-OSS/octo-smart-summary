@@ -144,6 +144,11 @@ type SummaryTask struct {
 	CurrentResultID    *int64     `gorm:"column:current_result_id" json:"current_result_id"`
 	OriginChannelID    string     `gorm:"column:origin_channel_id;type:varchar(64);not null;default:'';index:idx_origin_channel" json:"origin_channel_id"`
 	OriginChannelType  int        `gorm:"column:origin_channel_type;type:tinyint;not null;default:0" json:"origin_channel_type"`
+	// R11 Q2 (PR #190): provenance flag — the origin was inherited from a
+	// DERIVED (worker-backfilled) source row via tier-3/tier-4, so it is
+	// masked on the wire (list/detail echo "", the list filter excludes the
+	// row). json:"-" so no serializer can leak it; see task.go projections.
+	OriginFromDerived  bool       `gorm:"column:origin_from_derived;type:tinyint;not null;default:0" json:"-"`
 	ProcessingDeadline *time.Time `gorm:"column:processing_deadline" json:"processing_deadline"`
 	ConfirmDeadline    *time.Time `gorm:"column:confirm_deadline" json:"confirm_deadline"`
 	ReminderSentAt     *time.Time `gorm:"column:reminder_sent_at" json:"reminder_sent_at"`

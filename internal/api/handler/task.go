@@ -77,6 +77,27 @@ func (h *TaskHandler) schedulePendingInvitationExpr(taskAlias string) string {
  AND ss.confirm_policy=1 AND sc.user_id=? AND sc.confirmed=false)`
 }
 
+// R11 Q2 (owner decision 2026-08-14, option 1): a task whose origin was
+// inherited from a DERIVED (worker-backfilled) source row carries
+// OriginFromDerived=true. List/detail projections mask such an origin to
+// ("", 0) — the viewer may not be a member of the backfilled channel, and
+// echoing it turns ?origin_channel_id= into a membership oracle. The
+// stored value stays intact for server-side consumers (none today: notify
+// always routes to the creator's DM).
+func wireOriginChannelID(t model.SummaryTask) string {
+	if t.OriginFromDerived {
+		return ""
+	}
+	return t.OriginChannelID
+}
+
+func wireOriginChannelType(t model.SummaryTask) int {
+	if t.OriginFromDerived {
+		return 0
+	}
+	return t.OriginChannelType
+}
+
 // canAccessTaskDB reports whether userID may read the task: creator or
 // explicit participant. Source-group membership alone does NOT grant access.
 //
@@ -561,7 +582,11 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 		args = append(args, "%"+s+"%", "%"+s+"%")
 	}
 	if s := c.Query("origin_channel_id"); s != "" {
-		whereSQL += " AND origin_channel_id = ?"
+		// R11 Q2: the filter must not match a masked (derived-inherited)
+		// origin — otherwise it doubles as a membership oracle ("does some
+		// visible task carry channel X as its origin?") for channels the
+		// caller is not a member of.
+		whereSQL += " AND origin_channel_id = ? AND origin_from_derived = 0"
 		args = append(args, s)
 	}
 	if s := c.Query("created_after"); s != "" {
@@ -836,8 +861,12 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			"sources":                      srcList,
 			"total_msg_count":              totalMsgCount,
 			"creator_name":                 creatorName,
-			"origin_channel_id":            t.OriginChannelID,
-			"origin_channel_type":          t.OriginChannelType,
+			// R11 Q2: mask a derived-inherited origin on the wire (owner
+			// decision 2026-08-14, option 1) — the refiner may not be a
+			// member of the backfilled channel. The value stays intact in
+			// the DB for future server-side consumers.
+			"origin_channel_id":            wireOriginChannelID(t),
+			"origin_channel_type":          wireOriginChannelType(t),
 			"created_at":                   t.CreatedAt.Format(time.RFC3339),
 			"completed_at":                 completedAt,
 			"result_is_edited":             resultIsEdited,
@@ -1066,8 +1095,11 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		"participants":        partList,
 		"result":              resultOut,
 		"error_message":       task.ErrorMessage,
-		"origin_channel_id":   task.OriginChannelID,
-		"origin_channel_type": task.OriginChannelType,
+		// R11 Q2: same wire mask as the list projection — a derived-inherited
+		// origin is never echoed (the viewer may not be a member of the
+		// backfilled channel). Server-side consumers read the DB directly.
+		"origin_channel_id":   wireOriginChannelID(task),
+		"origin_channel_type": wireOriginChannelType(task),
 		"created_at":          task.CreatedAt.Format(time.RFC3339),
 		"updated_at":          task.UpdatedAt.Format(time.RFC3339),
 	}

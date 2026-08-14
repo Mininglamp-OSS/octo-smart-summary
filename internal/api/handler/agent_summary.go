@@ -124,6 +124,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	// - non-nil and non-empty → use provided value
 	var finalChannelID string
 	var finalChannelType int
+	var finalOriginFromDerived bool
 
 	// R7 P2-3 / R9 P2-3 (PR #190): normalize referenced_task_ids at the entry
 	// point — dedup first, then REJECT if still over maxReferencedTaskIDs.
@@ -184,7 +185,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 				// on the same request correctly refuses it (same referenced task,
 				// two different answers).
 				if err := h.db.WithContext(c.Request.Context()).
-					Select("id, creator_id, origin_channel_id, origin_channel_type").
+					Select("id, creator_id, origin_channel_id, origin_channel_type, origin_from_derived").
 					Where("id = ? AND space_id = ? AND deleted_at IS NULL AND status = ?",
 						req.ReferencedTaskIDs[0], spaceID, model.StatusCompleted).
 					First(&refTask).Error; err == nil {
@@ -192,8 +193,12 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 						if refTask.OriginChannelID != "" {
 							finalChannelID = refTask.OriginChannelID
 							finalChannelType = refTask.OriginChannelType
-							log.Printf("[handler] CreateAgentSummary borrowed origin from referenced task_id=%d channel=%s/%d session=%s",
-								refTask.ID, finalChannelID, finalChannelType, req.SessionID)
+							// R11 Q2: the mask flag propagates — borrowing a
+							// masked origin keeps it masked (second-generation
+							// refines must not re-expose the channel).
+							finalOriginFromDerived = refTask.OriginFromDerived
+							log.Printf("[handler] CreateAgentSummary borrowed origin from referenced task_id=%d channel=%s/%d from_derived=%t session=%s",
+								refTask.ID, finalChannelID, finalChannelType, finalOriginFromDerived, req.SessionID)
 						} else {
 							// Tier-4 fallback: pipeline/scheduled summaries never set
 							// origin_channel_id. Derive the origin from the referenced
@@ -205,10 +210,10 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 							// several exist — multi-source tasks inherit their first
 							// channel, consistent with the tier-3 first-referenced-task
 							// precedent (see deriveOriginFromSummarySources).
-							finalChannelID, finalChannelType = h.deriveOriginFromSummarySources(c.Request.Context(), refTask.ID)
+							finalChannelID, finalChannelType, finalOriginFromDerived = h.deriveOriginFromSummarySources(c.Request.Context(), refTask.ID)
 							if finalChannelID != "" {
-								log.Printf("[handler] CreateAgentSummary derived origin from referenced task_id=%d sources channel=%s/%d session=%s",
-									refTask.ID, finalChannelID, finalChannelType, req.SessionID)
+								log.Printf("[handler] CreateAgentSummary derived origin from referenced task_id=%d sources channel=%s/%d from_derived=%t session=%s",
+									refTask.ID, finalChannelID, finalChannelType, finalOriginFromDerived, req.SessionID)
 							} else {
 								// R10: the historical-task case — channels
 								// lived only in the in-memory channelSet and
@@ -337,6 +342,9 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		TriggerType:       model.TriggerAgent,
 		OriginChannelID:   finalChannelID,
 		OriginChannelType: finalChannelType,
+		// R11 Q2: persist the provenance flag set by tier-3/tier-4; explicit
+		// and session-resolved origins keep the zero value (unmasked).
+		OriginFromDerived: finalOriginFromDerived,
 		ReferencedTaskIDs: serializeReferencedTaskIDs(req.ReferencedTaskIDs),
 	}
 
