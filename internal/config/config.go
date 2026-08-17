@@ -30,9 +30,9 @@ type Config struct {
 	OctoAPIURL string
 
 	// LLM
-	LLMApiURL         string
-	LLMApiKey         string
-	LLMModel          string
+	LLMApiURL string
+	LLMApiKey string
+	LLMModel  string
 	// LLMFallbackModels is an ordered list of model identifiers to try when
 	// the primary LLMModel exhausts its retry budget on a Chat request.
 	// Sourced from LLM_FALLBACK_MODELS as a comma-separated list. Empty by
@@ -68,6 +68,13 @@ type Config struct {
 	// POST /internal/summary-stream via X-Internal-Token. Empty preserves the
 	// existing internal-network trust model used by other internal endpoints.
 	SummaryStreamInternalToken string
+
+	// AgentSummaryV2Mode gates the SS-03+ SummaryRun/SummarySpec persistence
+	// path: "off" (default) keeps pre-SS-03 behavior, "shadow" persists runs
+	// without changing the reply, "on" is the enabled path. Read from
+	// AGENT_SUMMARY_V2_MODE; the agent package reads the same env directly via
+	// agent.SummaryV2Mode() so handler wiring needs no constructor change.
+	AgentSummaryV2Mode string
 
 	// Message table count
 	MsgTableCount int
@@ -153,16 +160,18 @@ func Load() *Config {
 
 		OctoAPIURL: envStr("OCTO_API_URL", ""),
 
-		LLMApiURL:         envStr("LLM_API_URL", ""),
-		LLMApiKey:         envStr("LLM_API_KEY", ""),
-		LLMModel:          envStr("LLM_MODEL", ""),
-		LLMFallbackModels: envStrList("LLM_FALLBACK_MODELS", nil),
-		LLMTimeout:        envInt("LLM_TIMEOUT", 180),
-		LLMMaxToken:       envInt("LLM_MAX_TOKENS", 4096),
-		LLMTemperature:    getEnvFloat("LLM_TEMPERATURE", 0.3),
-		LLMEnableThinking: envBool("LLM_ENABLE_THINKING", false),
-		APIPort:           envStr("API_PORT", "8080"),
-		APIInternalPort:   envStr("API_INTERNAL_PORT", "8081"),
+		LLMApiURL: envStr("LLM_API_URL", ""),
+		LLMApiKey: envStr("LLM_API_KEY", ""),
+		LLMModel:  envStr("LLM_MODEL", ""),
+
+		AgentSummaryV2Mode: envStr("AGENT_SUMMARY_V2_MODE", "off"),
+		LLMFallbackModels:  envStrList("LLM_FALLBACK_MODELS", nil),
+		LLMTimeout:         envInt("LLM_TIMEOUT", 180),
+		LLMMaxToken:        envInt("LLM_MAX_TOKENS", 4096),
+		LLMTemperature:     getEnvFloat("LLM_TEMPERATURE", 0.3),
+		LLMEnableThinking:  envBool("LLM_ENABLE_THINKING", false),
+		APIPort:            envStr("API_PORT", "8080"),
+		APIInternalPort:    envStr("API_INTERNAL_PORT", "8081"),
 
 		WorkerInternalPort:        envStr("WORKER_INTERNAL_PORT", "8082"),
 		WorkerListenAllInterfaces: envStr("WORKER_LISTEN_ADDR", "0.0.0.0"),

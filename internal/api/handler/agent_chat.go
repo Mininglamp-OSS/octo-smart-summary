@@ -14,7 +14,10 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryspec"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -51,6 +54,11 @@ type AgentChatHandler struct {
 	store  agentHistoryStore // 多轮记忆读写（生产为 gorm 实现，测试可注入 mock）
 	window int               // 滑窗保留的最近轮数
 
+	// runStore persists SummaryRun/SummarySpec (SS-03). Only used when
+	// AGENT_SUMMARY_V2_MODE != off; nil in the test constructor. When nil or the
+	// flag is off, the chat path is byte-identical to pre-SS-03 behavior.
+	runStore *summaryrun.Store
+
 	// test-only fields: when set, bypass dynamic runner construction
 	testRunner *agent.Runner
 	testSystem string
@@ -82,6 +90,7 @@ func NewAgentChatHandler(db *gorm.DB, llmApiURL, llmApiKey, llmModel string, llm
 		db:                db,
 		store:             newAgentMessageRepo(db),
 		window:            agent.HistoryWindow(),
+		runStore:          summaryrun.NewStore(db),
 	}
 }
 
@@ -164,6 +173,13 @@ type agentChatRequest struct {
 	Profile           string            `json:"profile,omitempty"`
 	ReferencedTaskIDs []int64           `json:"referenced_task_ids,omitempty"`
 	SelectedChannels  []selectedChannel `json:"selected_channels,omitempty"`
+
+	// SS-03 (accepted always, acted on only when AGENT_SUMMARY_V2_MODE != off).
+	// RequestID is the client-generated per-submit idempotency key; RunID lets a
+	// follow-up request continue an existing run. Both optional — a legacy
+	// request without them is handled exactly as before (never a 400).
+	RequestID string `json:"request_id,omitempty"`
+	RunID     string `json:"run_id,omitempty"`
 }
 
 type selectedChannel struct {
@@ -262,6 +278,59 @@ func truncateRunes(s string, max int) string {
 	return string(runes[:max])
 }
 
+// maybePersistSummaryRun records the SummaryRun / SummarySpec for this request
+// when AGENT_SUMMARY_V2_MODE != off (SS-03). It is best-effort and MUST NOT
+// change the reply: for SS-03 the summarization still runs through the existing
+// path, so a persistence failure only loses observability, never the answer.
+// The caller invokes this only when SummaryV2Enabled(); off never reaches here.
+//
+// A request without request_id (legacy client) or without a runStore (test
+// constructor) is a no-op — we never 400 on the missing field (checklist #10).
+func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid string, req agentChatRequest) {
+	if h.runStore == nil || req.RequestID == "" {
+		return
+	}
+
+	// UI-selected channels ⇒ closed scope; otherwise open (checklist A2 / §4.1).
+	scopePolicy := model.ScopePolicyOpen
+	if len(req.SelectedChannels) > 0 {
+		scopePolicy = model.ScopePolicyClosed
+	}
+
+	run, created, err := h.runStore.CreateOrGetRun(ctx, uid, req.SessionID, req.RequestID, scopePolicy)
+	if err != nil {
+		log.Printf("[agent] v2 create/get run failed (session=%s): %v", req.SessionID, err)
+		return
+	}
+	if !created {
+		// Idempotent replay: the run already exists (e.g. SSE downgrade reusing
+		// the same request_id). Do not re-persist or re-summarize state here.
+		return
+	}
+
+	// Minimal spec draft from the chat request. Full Planner-submitted specs
+	// arrive with the high-level tools (SS-05); here we capture the objective +
+	// any UI-selected channels so the contract is populated end to end.
+	objective := truncateRunes(req.Message, 1000)
+	draft := summaryspec.Draft{Objective: &objective}
+	for _, ch := range req.SelectedChannels {
+		draft.Channels = append(draft.Channels, summaryspec.Channel{
+			ChannelID: ch.ChannelID, Name: ch.Name, Type: ch.ChannelType,
+		})
+	}
+	spec, sources, err := summaryspec.Validate(draft, summaryspec.Options{
+		ProvidedSource: summaryspec.SourceInferred,
+		ChannelSource:  summaryspec.SourceUI,
+	})
+	if err != nil {
+		log.Printf("[agent] v2 spec invalid (session=%s): %v", req.SessionID, err)
+		return
+	}
+	if _, err := h.runStore.SaveSpec(ctx, run, run.Version, spec, sources, req.Message); err != nil {
+		log.Printf("[agent] v2 save spec failed (session=%s): %v", req.SessionID, err)
+	}
+}
+
 // Chat 处理 POST /api/v1/agent/chat：非流式一问一答，携带多轮历史。
 //
 // 流程：校验 → 取鉴权 uid → 按 profile 动态建 runner（summary 注入 uid 工具）
@@ -310,6 +379,12 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 	if uid == "" {
 		c.JSON(http.StatusUnauthorized, apiResponse{Code: 40100, Message: "missing auth context"})
 		return
+	}
+
+	// SS-03: persist the run/spec when V2 mode is enabled. Off → skipped entirely
+	// (byte-identical to pre-SS-03). Best-effort; never blocks the reply.
+	if agent.SummaryV2Enabled() {
+		h.maybePersistSummaryRun(ctx, uid, req)
 	}
 
 	// 按 profile 组装 runner（summary 场景注入 uid 工具）；测试可注入现成 runner。
@@ -558,6 +633,11 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		sink := &sseSink{w: c.Writer}
 		h.writeSSEErrorViaSink(sink, 40100, "missing auth context")
 		return
+	}
+
+	// SS-03: persist run/spec when V2 mode is enabled (see Chat). Off → skipped.
+	if agent.SummaryV2Enabled() {
+		h.maybePersistSummaryRun(ctx, uid, req)
 	}
 
 	// Build runner with OnEvent callback for SSE progress
