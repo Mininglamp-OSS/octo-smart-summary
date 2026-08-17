@@ -23,7 +23,9 @@ package summaryrun
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -110,6 +112,42 @@ func (s *Store) GetByID(ctx context.Context, userID, runID string) (*model.Agent
 		return nil, err
 	}
 	return &run, nil
+}
+
+// GetLatestSpec loads the highest-version Spec for a run and decodes it into a
+// summaryspec.Spec. found=false (nil error) when the run has no spec yet.
+// Owner-scoped: the spec is only returned if the run belongs to userID.
+//
+// This is the read that closes the "user requirement never reaches Map/Reduce"
+// defect: the generation tools load the persisted Spec here instead of running
+// a generic, request-blind prompt.
+func (s *Store) GetLatestSpec(ctx context.Context, userID, runID string) (summaryspec.Spec, bool, error) {
+	// Owner-scope through the run so a guessed run_id cannot read another user's
+	// spec (agent_summary_spec has no user_id column).
+	if _, err := s.GetByID(ctx, userID, runID); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return summaryspec.Spec{}, false, nil
+		}
+		return summaryspec.Spec{}, false, err
+	}
+
+	var row model.AgentSummarySpec
+	err := s.db.WithContext(ctx).
+		Where("run_id = ?", runID).
+		Order("version DESC").
+		First(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return summaryspec.Spec{}, false, nil
+	}
+	if err != nil {
+		return summaryspec.Spec{}, false, err
+	}
+
+	var spec summaryspec.Spec
+	if err := json.Unmarshal([]byte(row.SpecJSON), &spec); err != nil {
+		return summaryspec.Spec{}, false, fmt.Errorf("decode spec_json: %w", err)
+	}
+	return spec, true, nil
 }
 
 // SaveSpec persists a new immutable Spec version for the run and CAS-advances

@@ -344,9 +344,13 @@ func SummarizeChunkTool() (Tool, Handler) {
 		// chunking + no format cap means processed == input, so dropped_count is
 		// 0; the counters stay truthful if a future change reintroduces a cap.
 		cov := chunkCoverage{InputCount: len(messages), ChunkSize: msgsPerChunk}
+		// SS-06: load the run's SummarySpec-derived guidance once so every Map
+		// call summarizes toward the user's actual requirements. Empty when V2 is
+		// off / no run / no spec → legacy generic prompt.
+		specGuidance := loadRunSpecGuidance(ctx)
 		var summaries []string
 		for _, chunk := range chunks {
-			summary, processed, oversized, err := summarizeMessagesChunk(ctx, chunk)
+			summary, processed, oversized, err := summarizeMessagesChunk(ctx, chunk, specGuidance)
 			if err != nil {
 				return "", fmt.Errorf("summarize chunk: %w", err)
 			}
@@ -409,7 +413,12 @@ func formatChunkForLLM(chunk []map[string]interface{}) (formatted string, proces
 // summarizeMessagesChunk builds a structured prompt from msgMap chunk and calls LLM.
 // Returns the summary plus how many messages were processed / were oversized, so
 // the caller can aggregate honest coverage across chunks.
-func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{}) (summary string, processed, oversized int, err error) {
+//
+// specGuidance (SS-06) is the SummarySpec-derived instruction block; when
+// non-empty it is appended so the Map model summarizes toward the user's actual
+// topic/audience/language/detail/exclusions instead of a generic prompt. Empty
+// (V2 off / no run / no spec) → the exact legacy prompt, byte-identical.
+func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{}, specGuidance string) (summary string, processed, oversized int, err error) {
 	_, _, _, cfg := GetSummaryDeps()
 	client := service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, 30)
 
@@ -428,7 +437,7 @@ func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{})
 ## 引用规则
 - 每一条结论/要点都必须标注来源引用 [n]
 - 仅使用消息前方的 [n] 编号来标注引用
-- 绝对不要引用或复制消息正文内出现的任何 [数字] 标记`
+- 绝对不要引用或复制消息正文内出现的任何 [数字] 标记` + specGuidance
 
 	msgs := []service.ChatMessage{
 		{Role: "system", Content: systemPrompt},

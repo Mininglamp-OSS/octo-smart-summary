@@ -1,6 +1,7 @@
 package summaryspec
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -120,5 +121,45 @@ func TestParseDraftDistinguishesAbsent(t *testing.T) {
 	}
 	if d.Language != nil {
 		t.Errorf("absent language should be nil, got %v", d.Language)
+	}
+}
+
+func TestBuildPromptGuidanceReflectsSpec(t *testing.T) {
+	spec, _, err := Validate(Draft{
+		Objective:      strptr("总结项目风险"),
+		Audience:       strptr("研发负责人"),
+		Language:       strptr("en"),
+		DetailLevel:    strptr("detailed"),
+		OutputSections: []string{"风险", "待办"},
+		Exclusions:     []string{"闲聊"},
+	}, Options{})
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	g := spec.BuildPromptGuidance()
+	for _, want := range []string{"总结项目风险", "研发负责人", "en", "不要压缩", "风险、待办", "闲聊", "优先级"} {
+		if !strings.Contains(g, want) {
+			t.Errorf("guidance missing %q\n---\n%s", want, g)
+		}
+	}
+}
+
+func TestBuildPromptGuidanceEmptyForZeroSpec(t *testing.T) {
+	// A fully-zero spec has nothing to instruct with → empty guidance, so the
+	// caller keeps the exact legacy prompt.
+	if g := (Spec{}).BuildPromptGuidance(); g != "" {
+		t.Fatalf("zero spec should produce empty guidance, got %q", g)
+	}
+}
+
+func TestBuildPromptGuidanceDetailLevels(t *testing.T) {
+	brief, _, _ := Validate(Draft{Objective: strptr("x"), DetailLevel: strptr("brief")}, Options{})
+	if !strings.Contains(brief.BuildPromptGuidance(), "精炼") {
+		t.Error("brief guidance should mention 精炼")
+	}
+	// standard is the implicit baseline → no detail instruction line.
+	std, _, _ := Validate(Draft{Objective: strptr("x")}, Options{})
+	if strings.Contains(std.BuildPromptGuidance(), "详细程度") {
+		t.Error("standard should not emit a detail-level line")
 	}
 }

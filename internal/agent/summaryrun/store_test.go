@@ -164,6 +164,39 @@ func TestUpdateStatusCAS(t *testing.T) {
 	}
 }
 
+func TestGetLatestSpec(t *testing.T) {
+	db := newStoreTestDB(t)
+	if db == nil {
+		return
+	}
+	s := NewStore(db)
+	ctx := context.Background()
+
+	run, _, _ := s.CreateOrGetRun(ctx, "u1", "sess1", "req1", model.ScopePolicyClosed)
+
+	// No spec yet → found=false, no error.
+	if _, found, err := s.GetLatestSpec(ctx, "u1", run.RunID); err != nil || found {
+		t.Fatalf("pre-save: found=%v err=%v, want false/nil", found, err)
+	}
+
+	spec, src := specDraft(t) // objective 总结本周风险
+	if _, err := s.SaveSpec(ctx, run, run.Version, spec, src, "总结本周风险"); err != nil {
+		t.Fatalf("save spec: %v", err)
+	}
+
+	got, found, err := s.GetLatestSpec(ctx, "u1", run.RunID)
+	if err != nil || !found {
+		t.Fatalf("post-save: found=%v err=%v", found, err)
+	}
+	if got.Objective != spec.Objective {
+		t.Fatalf("objective = %q, want %q", got.Objective, spec.Objective)
+	}
+	// Owner-scoped: another user cannot read this run's spec.
+	if _, found, _ := s.GetLatestSpec(ctx, "attacker", run.RunID); found {
+		t.Fatal("cross-user GetLatestSpec should not find")
+	}
+}
+
 func TestGetByIDOwnerScoped(t *testing.T) {
 	db := newStoreTestDB(t)
 	if db == nil {

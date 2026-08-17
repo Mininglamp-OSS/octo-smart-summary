@@ -210,6 +210,74 @@ func (fs FieldSources) JSON() (string, error) {
 	return string(b), nil
 }
 
+// BuildPromptGuidance renders the spec into a Chinese instruction block injected
+// into the Map and Reduce prompts (SS-06), so the model that actually writes the
+// local and merged summaries sees the user's requirements — topic focus, target
+// audience, output language, detail level, required sections, exclusions, and
+// citation policy — instead of a generic, request-blind prompt.
+//
+// Returns "" for a zero spec (nothing to guide with). The block ends with a
+// priority note so these requirements override any default formatting rule in
+// the base prompt (e.g. a hardcoded length cap that would contradict
+// detail_level=detailed).
+func (s Spec) BuildPromptGuidance() string {
+	var b strings.Builder
+	b.WriteString("\n\n## 本次总结的具体要求（必须严格遵守）\n")
+	wrote := false
+	line := func(label, val string) {
+		if strings.TrimSpace(val) == "" {
+			return
+		}
+		fmt.Fprintf(&b, "- %s：%s\n", label, val)
+		wrote = true
+	}
+
+	line("总结目标", s.Objective)
+	line("主题聚焦", s.Topic)
+	line("目标受众", s.Audience)
+
+	if s.Language != "" {
+		fmt.Fprintf(&b, "- 输出语言：%s（整篇用该语言输出）\n", s.Language)
+		wrote = true
+	}
+	switch s.DetailLevel {
+	case "detailed":
+		b.WriteString("- 详细程度：detailed（展开细节，不要压缩为短条目，可保留必要的技术细节）\n")
+		wrote = true
+	case "brief":
+		b.WriteString("- 详细程度：brief（只保留最关键要点，尽量精炼）\n")
+		wrote = true
+	case "standard", "":
+		// standard is the implicit baseline; no extra instruction needed.
+	default:
+		line("详细程度", s.DetailLevel)
+	}
+	if len(s.OutputSections) > 0 {
+		fmt.Fprintf(&b, "- 必须包含章节：%s（按此结构组织输出）\n", strings.Join(s.OutputSections, "、"))
+		wrote = true
+	}
+	if len(s.Exclusions) > 0 {
+		fmt.Fprintf(&b, "- 明确排除：%s（这些内容不要出现在总结中）\n", strings.Join(s.Exclusions, "、"))
+		wrote = true
+	}
+	switch s.CitationPolicy {
+	case "every_claim":
+		b.WriteString("- 引用要求：每一条结论/要点都必须标注来源引用 [n]\n")
+		wrote = true
+	case "key_points":
+		b.WriteString("- 引用要求：关键结论需标注来源引用 [n]\n")
+		wrote = true
+	case "none":
+		// no citation requirement
+	}
+
+	if !wrote {
+		return ""
+	}
+	b.WriteString("\n以上要求优先级高于本提示词中的其它默认格式限制。")
+	return b.String()
+}
+
 // --- helpers ---
 
 func setStr(src *FieldSources, name string, v *string, def string, provided FieldSource) string {
