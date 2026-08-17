@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/gin-gonic/gin"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -97,8 +98,24 @@ func requestBotCreate(r *gin.Engine, key string, body []byte) *httptest.Response
 func TestCreateBotSummaryResponseIncludesBotIdentity(t *testing.T) {
 	t.Setenv("BOT_SUMMARY_CREATE_ENABLED", "true")
 	_, r, _ := setupBotCreateTest(t)
+	// Install a temporary name resolver and restore the default (identity)
+	// afterwards. Under test no main() runs, so without this the stub
+	// resolver echoes the uid and the creator_bot_name assertion below
+	// could never fail (review P2-3).
+	service.SetUserNameResolver(func(uid string) string {
+		if uid == "bot-1" {
+			return "Bot Display Name"
+		}
+		return uid
+	})
+	t.Cleanup(func() {
+		service.SetUserNameResolver(func(uid string) string { return uid })
+	})
 	w := requestBotCreate(r, "botname-key", botCreateBody("group-a"))
-	if w.Code != http.StatusOK {
+	// A fresh create returns 201 Created; 200 OK is reserved for idempotent
+	// replays (bot_summary_create.go:198/:219). Every sibling test in this
+	// file already expects StatusCreated for a fresh create (review P0-1).
+	if w.Code != http.StatusCreated {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
 	var resp struct {
@@ -117,11 +134,37 @@ func TestCreateBotSummaryResponseIncludesBotIdentity(t *testing.T) {
 	if resp.Data.CreatorBotID != "bot-1" {
 		t.Fatalf("creator_bot_id=%q, want bot-1", resp.Data.CreatorBotID)
 	}
-	if resp.Data.CreatorBotName == "" {
-		t.Fatalf("creator_bot_name is empty; want resolved bot name")
+	// Assert the exact resolved display name, not just non-empty: with the
+	// resolver installed above this fails if the handler stops resolving or
+	// resolves the wrong uid.
+	if resp.Data.CreatorBotName != "Bot Display Name" {
+		t.Fatalf("creator_bot_name=%q, want %q", resp.Data.CreatorBotName, "Bot Display Name")
 	}
 	if resp.Data.CreatorID != "owner" {
 		t.Fatalf("creator_id=%q, want owner (the human on whose behalf the bot acts)", resp.Data.CreatorID)
+	}
+}
+
+func TestBotCreateResponseNonBotTaskHasEmptyBotName(t *testing.T) {
+	// Non-bot tasks must not carry a bot label: the CreatorBotID guard keeps
+	// creator_bot_name empty instead of resolving a bogus name for uid ""
+	// (review P2-3 non-bot case). Install a resolver that would poison an
+	// empty uid so the assertion can actually fail if the guard is removed.
+	service.SetUserNameResolver(func(uid string) string {
+		if uid == "" {
+			return "BOGUS"
+		}
+		return uid
+	})
+	t.Cleanup(func() {
+		service.SetUserNameResolver(func(uid string) string { return uid })
+	})
+	resp := botCreateResponse(model.SummaryTask{ID: 1, TaskNo: "T-NONBOT", CreatorID: "owner"})
+	if got, _ := resp["creator_bot_id"].(string); got != "" {
+		t.Fatalf("creator_bot_id=%q, want empty for non-bot task", got)
+	}
+	if got, _ := resp["creator_bot_name"].(string); got != "" {
+		t.Fatalf("creator_bot_name=%q, want empty for non-bot task", got)
 	}
 }
 
