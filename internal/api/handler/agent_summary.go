@@ -463,6 +463,15 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			}
 		}
 		creatorPR.SetCitations(cits)
+
+		// SS-07 (core): compute + persist the finish verdict for this run. Off /
+		// no run → no-op. This records COMPLETE/PARTIAL/FAILED and coverage gaps
+		// for disclosure; it does not yet block the save (SS-07b).
+		if agent.SummaryV2Enabled() {
+			if v, gaps := h.finalizeRun(c.Request.Context(), userID, req.SessionID, content, cits); v != "" {
+				log.Printf("[handler] agent summary finish verdict=%s gaps=%d session=%s", v, len(gaps), req.SessionID)
+			}
+		}
 		// Build v1 snapshot for agent-generated summary
 		snapshot := h.buildSnapshotV1(tx, req.SessionID, userID, &task, req.Sources)
 		creatorPR.SetSnapshot(snapshot)

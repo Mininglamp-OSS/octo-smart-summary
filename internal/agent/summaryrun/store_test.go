@@ -215,3 +215,30 @@ func TestGetByIDOwnerScoped(t *testing.T) {
 		t.Fatalf("cross-user read err = %v, want RecordNotFound", err)
 	}
 }
+
+func TestFinishStatusAndLatestRunBySession(t *testing.T) {
+	db := newStoreTestDB(t)
+	if db == nil {
+		return
+	}
+	s := NewStore(db)
+	ctx := context.Background()
+
+	run, _, _ := s.CreateOrGetRun(ctx, "u1", "sess1", "req1", model.ScopePolicyClosed)
+
+	got, found, err := s.GetLatestRunBySession(ctx, "u1", "sess1")
+	if err != nil || !found || got.RunID != run.RunID {
+		t.Fatalf("GetLatestRunBySession: found=%v err=%v id=%s", found, err, got.RunID)
+	}
+	if _, found, _ := s.GetLatestRunBySession(ctx, "attacker", "sess1"); found {
+		t.Fatal("cross-user GetLatestRunBySession should not find")
+	}
+
+	if err := s.SetFinishStatus(ctx, run.RunID, model.FinishStatusPartial); err != nil {
+		t.Fatalf("SetFinishStatus: %v", err)
+	}
+	reloaded, err := s.GetByID(ctx, "u1", run.RunID)
+	if err != nil || reloaded.FinishStatus != model.FinishStatusPartial {
+		t.Fatalf("finish_status = %q (err %v), want PARTIAL", reloaded.FinishStatus, err)
+	}
+}

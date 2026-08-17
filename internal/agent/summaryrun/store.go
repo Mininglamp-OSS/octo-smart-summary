@@ -237,3 +237,34 @@ func (s *Store) UpdateStatusCAS(ctx context.Context, userID, runID string, expec
 	}
 	return nil
 }
+
+// GetLatestRunBySession returns the most recently updated run for a (user,
+// session), owner-scoped. found=false (nil error) when none exists. Used at
+// finalize time to attach the finish verdict to the run that just completed.
+func (s *Store) GetLatestRunBySession(ctx context.Context, userID, sessionID string) (*model.AgentSummaryRun, bool, error) {
+	var run model.AgentSummaryRun
+	err := s.db.WithContext(ctx).
+		Where("user_id = ? AND session_id = ?", userID, sessionID).
+		Order("updated_at DESC").
+		First(&run).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return &run, true, nil
+}
+
+// SetFinishStatus records the finish-gate verdict (COMPLETE/PARTIAL/FAILED) on a
+// run. This is a terminal write (no optimistic CAS): the verdict is computed once
+// at finalize and does not race concurrent status transitions.
+func (s *Store) SetFinishStatus(ctx context.Context, runID, finishStatus string) error {
+	res := s.db.WithContext(ctx).Model(&model.AgentSummaryRun{}).
+		Where("run_id = ?", runID).
+		Updates(map[string]interface{}{
+			"finish_status": finishStatus,
+			"updated_at":    now(),
+		})
+	return res.Error
+}

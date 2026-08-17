@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"regexp"
 	"sort"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/artifact"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/finishgate"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
@@ -201,4 +203,78 @@ func (h *AgentSummaryHandler) overrideWithRunManifest(ctx context.Context, uid, 
 	sort.Slice(out, func(i, j int) bool { return out[i].CitationIndex < out[j].CitationIndex })
 	log.Printf("[citations] session=%s run=%s using frozen manifest ordinals (%d of %d messages citable)", sessionID, run.RunID, len(out), len(msgs))
 	return out
+}
+
+var citationMarkerRE = regexp.MustCompile(`\[(\d+)\]`)
+
+// citationsValid reports whether every [n] marker in content resolves to a built
+// citation index. No markers → vacuously valid (nothing to break).
+func citationsValid(content string, cits []model.Citation) bool {
+	idxSet := make(map[int]bool, len(cits))
+	for _, c := range cits {
+		idxSet[c.Index] = true
+	}
+	for _, m := range citationMarkerRE.FindAllStringSubmatch(content, -1) {
+		var n int
+		if _, err := fmt.Sscanf(m[1], "%d", &n); err != nil {
+			continue
+		}
+		if !idxSet[n] {
+			return false
+		}
+	}
+	return true
+}
+
+// finalizeRun computes the SS-07 finish verdict (COMPLETE/PARTIAL/FAILED) for the
+// session's run and persists it. Best-effort and flag-gated by the caller: for
+// SS-07 (core) it records the verdict + gaps for disclosure; it does NOT yet
+// block the save (that, plus the SSE done contract and runner-integrated retry,
+// is SS-07b). Off / no run → no-op.
+//
+// Returns the verdict and gaps so the caller can surface them; on any lookup
+// failure it returns ("", nil) and the save proceeds unchanged.
+func (h *AgentSummaryHandler) finalizeRun(ctx context.Context, uid, sessionID, content string, cits []model.Citation) (finishgate.Verdict, []finishgate.Gap) {
+	if h.db == nil {
+		return "", nil
+	}
+	runStore := summaryrun.NewStore(h.db)
+	run, found, err := runStore.GetLatestRunBySession(ctx, uid, sessionID)
+	if err != nil || !found {
+		return "", nil
+	}
+
+	state := finishgate.RunState{
+		ScopeResolved:            run.SpecID != "",
+		SummaryGenerated:         content != "",
+		CitationValidationPassed: citationsValid(content, cits),
+	}
+
+	// Coverage facts from the frozen artifact (SS-04/05), when present.
+	artStore := artifact.NewStore(h.db)
+	if art, ok, aerr := artStore.GetLatestArtifactBySession(ctx, uid, sessionID); aerr == nil && ok {
+		state.HasUsableEvidence = art.MessageCount > 0
+		state.ChannelsFetched = art.ChannelCount
+		state.Truncated = art.Truncated
+		var failed []string
+		if art.FailedChannels != "" {
+			_ = json.Unmarshal([]byte(art.FailedChannels), &failed)
+		}
+		state.FailedChannels = failed
+	} else {
+		// No artifact (e.g. legacy path): evidence existence is implied by cits.
+		state.HasUsableEvidence = len(cits) > 0 || content != ""
+	}
+
+	// Expected channels from the run's Spec, when persisted.
+	if spec, ok, serr := runStore.GetLatestSpec(ctx, uid, run.RunID); serr == nil && ok {
+		state.ChannelsExpected = len(spec.Channels)
+	}
+
+	verdict, gaps := finishgate.Evaluate(state)
+	if err := runStore.SetFinishStatus(ctx, run.RunID, string(verdict)); err != nil {
+		log.Printf("[finish] persist finish_status failed run=%s: %v", run.RunID, err)
+	}
+	log.Printf("[finish] session=%s run=%s verdict=%s gaps=%d", sessionID, run.RunID, verdict, len(gaps))
+	return verdict, gaps
 }

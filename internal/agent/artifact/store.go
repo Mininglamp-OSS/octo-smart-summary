@@ -296,9 +296,28 @@ func (s *Store) GetFrozenManifestByRun(ctx context.Context, userID, runID string
 	return &man, entries, true, nil
 }
 
-// GetLatestBySession returns the manifest of the most RECENTLY FROZEN artifact
-// for a (user, session), plus its decoded entries. found=false (nil error)
-// when the session has no frozen artifact. Owner-scoped by user_id.
+// GetLatestArtifactBySession returns the highest-revision artifact for a
+// (user, session), owner-scoped. found=false (nil error) when none exists.
+// Used by the finish gate to read coverage facts (truncated, channel_count,
+// failed_channels) at finalize time.
+func (s *Store) GetLatestArtifactBySession(ctx context.Context, userID, sessionID string) (*model.AgentEvidenceArtifact, bool, error) {
+	var art model.AgentEvidenceArtifact
+	err := s.db.WithContext(ctx).
+		Where("user_id = ? AND session_id = ?", userID, sessionID).
+		Order("revision DESC").
+		First(&art).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return &art, true, nil
+}
+
+// GetLatestBySession returns the manifest of the highest-revision artifact for a
+// (user, session), plus its decoded entries. found=false (nil error) when the
+// session has no frozen artifact. Owner-scoped by user_id.
 //
 // This is retained as SS-08 scaffolding and for migration tests only; no
 // production path calls it. Save-time adoption is request/run scoped through
