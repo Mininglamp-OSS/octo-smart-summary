@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -25,9 +26,29 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-const defaultDocumentSummaryRequirement = "总结这份文档"
+const (
+	defaultDocumentSummaryRequirement = "总结这份文档"
+	maxDocumentSummaryRequestBytes    = 1 << 20
+	maxDocumentSourceResponseBytes    = 4 << 20
+	maxDocumentIDLen                  = 64
+	maxDocumentVersionLen             = 128
+	maxDocumentTitleRunes             = 200
+	maxDocumentChunkRunes             = 12000
+	maxDocumentPromptRunes            = 80000
+	maxDocumentCitationRunes          = 200
+	documentIdempotencyWaitTimeout    = 30 * time.Second
+	documentIdempotencyPollInterval   = 200 * time.Millisecond
+)
 
 var errDocumentSourceNotConfigured = errors.New("document summary source API is not configured")
+var errDocumentAgentIdempotencyConflict = errors.New("document agent idempotency conflict")
+
+type documentSourceError struct {
+	status  int
+	message string
+}
+
+func (e *documentSourceError) Error() string { return e.message }
 
 type documentRefReq struct {
 	DocumentID string `json:"document_id"`
@@ -74,7 +95,12 @@ func newDefaultDocumentSourceClient() documentSourceClient {
 	}
 	return &httpDocumentSourceClient{
 		baseURL: strings.TrimRight(base, "/"),
-		client:  &http.Client{Timeout: 30 * time.Second},
+		client: &http.Client{
+			Timeout: 30 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
 }
 
@@ -100,17 +126,28 @@ func (c *httpDocumentSourceClient) FetchSummarySource(ctx context.Context, space
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, &documentSourceError{status: http.StatusGatewayTimeout, message: "document source API timeout"}
+		}
+		return nil, &documentSourceError{status: http.StatusBadGateway, message: err.Error()}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("document %s is not accessible", documentID)
+		return nil, &documentSourceError{status: http.StatusBadRequest, message: fmt.Sprintf("document %s is not accessible", documentID)}
+	}
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return nil, &documentSourceError{status: http.StatusBadGateway, message: fmt.Sprintf("document source API redirected with status %d", resp.StatusCode)}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("document source API status %d", resp.StatusCode)
+		status := http.StatusBadGateway
+		if resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusGatewayTimeout {
+			status = http.StatusGatewayTimeout
+		}
+		return nil, &documentSourceError{status: status, message: fmt.Sprintf("document source API status %d", resp.StatusCode)}
 	}
 	var out documentSummarySource
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	decoder := json.NewDecoder(io.LimitReader(resp.Body, maxDocumentSourceResponseBytes))
+	if err := decoder.Decode(&out); err != nil {
 		return nil, err
 	}
 	if out.DocumentID == "" {
@@ -128,16 +165,23 @@ func (h *AgentSummaryHandler) CreateDocumentAgentSummary(c *gin.Context) {
 	userID := middleware.GetUserID(c)
 
 	var req createDocumentAgentSummaryReq
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: err.Error()})
+	decoder := json.NewDecoder(io.LimitReader(c.Request.Body, maxDocumentSummaryRequestBytes))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid or unsupported request field"})
+		return
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "request body must contain one JSON object"})
 		return
 	}
 	req.Requirement = strings.TrimSpace(req.Requirement)
 	if req.Requirement == "" {
 		req.Requirement = defaultDocumentSummaryRequirement
 	}
-	if strings.TrimSpace(req.IdempotencyKey) == "" {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "idempotency_key is required"})
+	req.IdempotencyKey = strings.TrimSpace(req.IdempotencyKey)
+	if !validBotIdempotencyKey(req.IdempotencyKey) {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "valid idempotency_key is required"})
 		return
 	}
 	if utf8.RuneCountInString(req.Requirement) > maxSummaryTopicRunes {
@@ -151,6 +195,10 @@ func (h *AgentSummaryHandler) CreateDocumentAgentSummary(c *gin.Context) {
 	}
 	if len(refs) > maxReferencedTaskIDs {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: fmt.Sprintf("too many document refs: %d (max %d)", len(refs), maxReferencedTaskIDs)})
+		return
+	}
+	if err := validateDocumentRefs(refs); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: err.Error()})
 		return
 	}
 	req.DocumentRefs = refs
@@ -167,9 +215,54 @@ func (h *AgentSummaryHandler) CreateDocumentAgentSummary(c *gin.Context) {
 		return
 	}
 	if okExisting {
-		c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok", Data: gin.H{"task_id": existing.TaskID, "status": model.StatusCompleted}})
+		if existing.TaskID > 0 {
+			h.respondDocumentIdempotentTask(c, existing.TaskID)
+			return
+		}
+		existing, okExisting, conflict, err = h.waitDocumentAgentIdempotency(c.Request.Context(), spaceID, userID, req.IdempotencyKey, requestHash)
+		if err != nil {
+			log.Printf("[handler] document agent idempotency wait failed space=%s user=%s: %v", spaceID, userID, err)
+			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "幂等检查失败"})
+			return
+		}
+		if conflict {
+			c.JSON(http.StatusConflict, apiResponse{Code: 40900, Message: "idempotency_key reused with different document summary request"})
+			return
+		}
+		if okExisting && existing.TaskID > 0 {
+			h.respondDocumentIdempotentTask(c, existing.TaskID)
+			return
+		}
+		c.JSON(http.StatusConflict, apiResponse{Code: 40901, Message: "same idempotency_key is still being processed"})
 		return
 	}
+	if err := h.claimDocumentAgentIdempotency(c.Request.Context(), spaceID, userID, req.IdempotencyKey, requestHash); err != nil {
+		if errors.Is(err, errDocumentAgentIdempotencyConflict) {
+			existing, okExisting, conflict, ferr := h.lookupDocumentAgentIdempotency(c.Request.Context(), spaceID, userID, req.IdempotencyKey, requestHash)
+			if ferr != nil {
+				c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "幂等检查失败"})
+				return
+			}
+			if conflict {
+				c.JSON(http.StatusConflict, apiResponse{Code: 40900, Message: "idempotency_key reused with different document summary request"})
+				return
+			}
+			if okExisting && existing.TaskID > 0 {
+				h.respondDocumentIdempotentTask(c, existing.TaskID)
+				return
+			}
+			c.JSON(http.StatusConflict, apiResponse{Code: 40901, Message: "same idempotency_key is still being processed"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "幂等检查失败"})
+		return
+	}
+	claimed := true
+	defer func() {
+		if claimed {
+			_ = h.releaseDocumentAgentIdempotency(context.Background(), spaceID, userID, req.IdempotencyKey)
+		}
+	}()
 
 	docClient := h.documentSourceClient()
 	if docClient == nil {
@@ -184,10 +277,17 @@ func (h *AgentSummaryHandler) CreateDocumentAgentSummary(c *gin.Context) {
 				c.JSON(http.StatusBadGateway, apiResponse{Code: 50201, Message: "document summary source API is not configured"})
 				return
 			}
+			var srcErr *documentSourceError
+			if errors.As(err, &srcErr) {
+				log.Printf("[handler] fetch document source failed doc=%s user=%s space=%s: %v", ref.DocumentID, userID, spaceID, err)
+				c.JSON(srcErr.status, apiResponse{Code: 40003, Message: "文档不可访问或尚未解析完成"})
+				return
+			}
 			log.Printf("[handler] fetch document source failed doc=%s user=%s space=%s: %v", ref.DocumentID, userID, spaceID, err)
-			c.JSON(http.StatusBadRequest, apiResponse{Code: 40003, Message: "文档不可访问或尚未解析完成"})
+			c.JSON(http.StatusBadGateway, apiResponse{Code: 50202, Message: "文档服务暂不可用"})
 			return
 		}
+		normalizeFetchedDocumentSource(doc, ref)
 		if strings.TrimSpace(doc.Content) == "" && len(doc.Chunks) == 0 {
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40004, Message: "文档没有可总结内容"})
 			return
@@ -210,9 +310,10 @@ func (h *AgentSummaryHandler) CreateDocumentAgentSummary(c *gin.Context) {
 	task, err := h.persistDocumentAgentSummary(c.Request.Context(), spaceID, userID, req, requestHash, docs, content, cits)
 	if err != nil {
 		log.Printf("[handler] persist document summary failed space=%s user=%s: %v", spaceID, userID, err)
-		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "落库失败: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "文档总结保存失败"})
 		return
 	}
+	claimed = false
 	c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok", Data: gin.H{
 		"task_id":    task.ID,
 		"task_no":    task.TaskNo,
@@ -246,6 +347,23 @@ func normalizeDocumentRefs(refs []documentRefReq) []documentRefReq {
 	return out
 }
 
+func validateDocumentRefs(refs []documentRefReq) error {
+	versionsByDoc := map[string]string{}
+	for _, ref := range refs {
+		if len(ref.DocumentID) > maxDocumentIDLen {
+			return fmt.Errorf("document_id too long: %s", ref.DocumentID)
+		}
+		if len(ref.Version) > maxDocumentVersionLen {
+			return fmt.Errorf("document version too long: %s", ref.DocumentID)
+		}
+		if existing, ok := versionsByDoc[ref.DocumentID]; ok && existing != ref.Version {
+			return fmt.Errorf("multiple versions of one document are not supported: %s", ref.DocumentID)
+		}
+		versionsByDoc[ref.DocumentID] = ref.Version
+	}
+	return nil
+}
+
 func hashDocumentAgentRequest(req createDocumentAgentSummaryReq) string {
 	body, _ := json.Marshal(struct {
 		DocumentRefs []documentRefReq `json:"document_refs"`
@@ -267,11 +385,81 @@ func (h *AgentSummaryHandler) lookupDocumentAgentIdempotency(ctx context.Context
 	return row, true, row.RequestHash != requestHash, nil
 }
 
+func (h *AgentSummaryHandler) claimDocumentAgentIdempotency(ctx context.Context, spaceID, userID, key, requestHash string) error {
+	row := model.SummaryDocumentAgentIdempotency{
+		SpaceID:        spaceID,
+		UserID:         userID,
+		IdempotencyKey: key,
+		RequestHash:    requestHash,
+		TaskID:         0,
+		CreatedAt:      timezone.Now(),
+	}
+	err := h.db.WithContext(ctx).Create(&row).Error
+	if err != nil {
+		if isDuplicateKeyError(err) {
+			return errDocumentAgentIdempotencyConflict
+		}
+		return err
+	}
+	return nil
+}
+
+func isDuplicateKeyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "duplicate") ||
+		strings.Contains(msg, "unique constraint") ||
+		strings.Contains(msg, "constraint failed")
+}
+
+func (h *AgentSummaryHandler) waitDocumentAgentIdempotency(ctx context.Context, spaceID, userID, key, requestHash string) (model.SummaryDocumentAgentIdempotency, bool, bool, error) {
+	deadline := time.NewTimer(documentIdempotencyWaitTimeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(documentIdempotencyPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return model.SummaryDocumentAgentIdempotency{}, false, false, ctx.Err()
+		case <-deadline.C:
+			row, ok, conflict, err := h.lookupDocumentAgentIdempotency(ctx, spaceID, userID, key, requestHash)
+			return row, ok, conflict, err
+		case <-ticker.C:
+			row, ok, conflict, err := h.lookupDocumentAgentIdempotency(ctx, spaceID, userID, key, requestHash)
+			if err != nil || conflict || !ok || row.TaskID > 0 {
+				return row, ok, conflict, err
+			}
+		}
+	}
+}
+
+func (h *AgentSummaryHandler) releaseDocumentAgentIdempotency(ctx context.Context, spaceID, userID, key string) error {
+	return h.db.WithContext(ctx).
+		Where("space_id = ? AND user_id = ? AND idempotency_key = ? AND task_id = 0", spaceID, userID, key).
+		Delete(&model.SummaryDocumentAgentIdempotency{}).Error
+}
+
+func (h *AgentSummaryHandler) respondDocumentIdempotentTask(c *gin.Context, taskID int64) {
+	var task model.SummaryTask
+	if err := h.db.Where("id = ?", taskID).First(&task).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "幂等任务读取失败"})
+		return
+	}
+	c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok", Data: gin.H{
+		"task_id":    task.ID,
+		"task_no":    task.TaskNo,
+		"status":     task.Status,
+		"created_at": task.CreatedAt,
+	}})
+}
+
 func (h *AgentSummaryHandler) documentSourceClient() documentSourceClient {
 	if h.documentClient != nil {
 		return h.documentClient
 	}
-	return newDefaultDocumentSourceClient()
+	return nil
 }
 
 func (h *AgentSummaryHandler) generateDocumentSummary(ctx context.Context, requirement string, docs []*documentSummarySource) (string, []model.Citation, error) {
@@ -336,12 +524,59 @@ func buildDocumentSummaryPrompt(requirement string, docs []*documentSummarySourc
 				DocumentVersion: doc.Version,
 				ChunkID:         chunk.ChunkID,
 				Page:            chunk.Page,
-				Content:         text,
+				Content:         truncateRunes(text, maxDocumentCitationRunes),
 			})
+			if utf8.RuneCountInString(b.String()) >= maxDocumentPromptRunes {
+				b.WriteString("\n[文档内容已按长度上限截断]\n")
+				break
+			}
 		}
 	}
 	b.WriteString("\n</文档数据>\n")
 	return b.String(), cits
+}
+
+func normalizeFetchedDocumentSource(doc *documentSummarySource, ref documentRefReq) {
+	doc.DocumentID = ref.DocumentID
+	doc.Version = truncateRunes(strings.TrimSpace(doc.Version), maxDocumentVersionLen)
+	if doc.Version == "" {
+		doc.Version = ref.Version
+	}
+	doc.Title = truncateRunes(strings.TrimSpace(doc.Title), maxDocumentTitleRunes)
+	doc.Content = truncateRunes(strings.TrimSpace(doc.Content), maxDocumentPromptRunes)
+	normalized := make([]documentSourceChunk, 0, len(doc.Chunks))
+	total := 0
+	for _, chunk := range doc.Chunks {
+		chunk.ChunkID = truncateRunes(strings.TrimSpace(chunk.ChunkID), maxDocumentVersionLen)
+		chunk.Title = truncateRunes(strings.TrimSpace(chunk.Title), maxDocumentTitleRunes)
+		chunk.Text = truncateRunes(strings.TrimSpace(chunk.Text), maxDocumentChunkRunes)
+		if chunk.Text == "" {
+			continue
+		}
+		total += utf8.RuneCountInString(chunk.Text)
+		if total > maxDocumentPromptRunes {
+			remaining := maxDocumentPromptRunes - (total - utf8.RuneCountInString(chunk.Text))
+			if remaining <= 0 {
+				break
+			}
+			chunk.Text = truncateRunes(chunk.Text, remaining)
+			normalized = append(normalized, chunk)
+			break
+		}
+		normalized = append(normalized, chunk)
+	}
+	doc.Chunks = normalized
+}
+
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if utf8.RuneCountInString(s) <= max {
+		return s
+	}
+	r := []rune(s)
+	return string(r[:max])
 }
 
 func sanitizeDocumentFenceText(s string) string {
@@ -373,10 +608,11 @@ func (h *AgentSummaryHandler) persistDocumentAgentSummary(ctx context.Context, s
 		}
 		for _, doc := range docs {
 			src := model.SummarySource{
-				TaskID:     task.ID,
-				SourceType: model.SourceDocument,
-				SourceID:   doc.DocumentID,
-				SourceName: doc.Title,
+				TaskID:        task.ID,
+				SourceType:    model.SourceDocument,
+				SourceID:      doc.DocumentID,
+				SourceName:    truncateRunes(doc.Title, maxDocumentTitleRunes),
+				SourceVersion: truncateRunes(doc.Version, maxDocumentVersionLen),
 			}
 			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&src).Error; err != nil {
 				return fmt.Errorf("create document summary_source: %w", err)
@@ -417,7 +653,7 @@ func (h *AgentSummaryHandler) persistDocumentAgentSummary(ctx context.Context, s
 					End:   task.TimeRangeEnd.Format("2006-01-02T15:04:05Z07:00"),
 				},
 			},
-			ToolSummary:       []string{"document_summary_source x 1"},
+			ToolSummary:       []string{fmt.Sprintf("document_summary_source x %d", len(docs))},
 			DataFreshnessNote: "document_refs 记录本次文档总结的输入文档和版本；文档内容由文档服务按权限提供",
 		})
 		if err := tx.Create(&pr).Error; err != nil {
@@ -426,16 +662,14 @@ func (h *AgentSummaryHandler) persistDocumentAgentSummary(ctx context.Context, s
 		if err := tx.Model(&participant).Update("personal_result_id", pr.ID).Error; err != nil {
 			return fmt.Errorf("link participant personal_result: %w", err)
 		}
-		idem := model.SummaryDocumentAgentIdempotency{
-			SpaceID:        spaceID,
-			UserID:         userID,
-			IdempotencyKey: req.IdempotencyKey,
-			RequestHash:    requestHash,
-			TaskID:         task.ID,
-			CreatedAt:      now,
+		res := tx.Model(&model.SummaryDocumentAgentIdempotency{}).
+			Where("space_id = ? AND user_id = ? AND idempotency_key = ? AND request_hash = ?", spaceID, userID, req.IdempotencyKey, requestHash).
+			Update("task_id", task.ID)
+		if res.Error != nil {
+			return fmt.Errorf("update document idempotency: %w", res.Error)
 		}
-		if err := tx.Create(&idem).Error; err != nil {
-			return fmt.Errorf("create document idempotency: %w", err)
+		if res.RowsAffected == 0 {
+			return fmt.Errorf("update document idempotency: %w", errDocumentAgentIdempotencyConflict)
 		}
 		return nil
 	})

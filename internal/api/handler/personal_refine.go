@@ -695,6 +695,17 @@ func (h *PersonalHandler) RegeneratePersonalSummary(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "仅已完成的任务可重新生成个人总结"})
 		return
 	}
+	var documentSourceCount int64
+	if err := h.db.Model(&model.SummarySource{}).
+		Where("task_id = ? AND source_type = ? AND derived = 0", taskID, model.SourceDocument).
+		Count(&documentSourceCount).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
+		return
+	}
+	if documentSourceCount > 0 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "文档总结暂不支持个人重新生成"})
+		return
+	}
 
 	var participant model.SummaryParticipant
 	if err := h.db.Where("task_id = ? AND user_id = ?", taskID, userID).First(&participant).Error; err != nil {

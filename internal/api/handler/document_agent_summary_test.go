@@ -7,6 +7,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
@@ -90,7 +91,7 @@ func TestCreateDocumentAgentSummary_PersistsDocumentSummary(t *testing.T) {
 	if err := db.Where("task_id = ?", task.ID).First(&src).Error; err != nil {
 		t.Fatalf("load source: %v", err)
 	}
-	if src.SourceType != model.SourceDocument || src.SourceID != "doc-1" || src.SourceName != "方案设计.md" {
+	if src.SourceType != model.SourceDocument || src.SourceID != "doc-1" || src.SourceName != "方案设计.md" || src.SourceVersion != "v1" {
 		t.Fatalf("unexpected source: %+v", src)
 	}
 	var pr model.PersonalResult
@@ -103,6 +104,79 @@ func TestCreateDocumentAgentSummary_PersistsDocumentSummary(t *testing.T) {
 	cits := pr.GetCitations()
 	if len(cits) != 1 || cits[0].Type != "document" || cits[0].DocumentID != "doc-1" || cits[0].Page != 2 {
 		t.Fatalf("unexpected citations: %+v", cits)
+	}
+}
+
+func TestCreateDocumentAgentSummary_IdempotentConcurrentReplay(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("db handle: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	llmSrv, llmURL := newDocumentSummaryLLM(t)
+	defer llmSrv.Close()
+	h := NewAgentSummaryHandler(db, nil, llmURL, "test-key", "test-model", 5, 256)
+	h.documentClient = fakeDocumentSourceClient{docs: map[string]*documentSummarySource{
+		"doc-1": {DocumentID: "doc-1", Title: "doc", Content: "content"},
+	}}
+	r := setupDocumentAgentSummaryRouter(h)
+	body := []byte(`{"document_refs":[{"document_id":"doc-1"}],"idempotency_key":"idem-race"}`)
+
+	const n = 2
+	var wg sync.WaitGroup
+	codes := make([]int, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/summaries/agent/document", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Token", "test-user")
+			req.Header.Set("X-Space-Id", "test-space")
+			r.ServeHTTP(w, req)
+			codes[i] = w.Code
+		}(i)
+	}
+	wg.Wait()
+	for i, code := range codes {
+		if code != http.StatusOK {
+			t.Fatalf("request %d expected 200, got %d", i, code)
+		}
+	}
+	var count int64
+	db.Model(&model.SummaryTask{}).Count(&count)
+	if count != 1 {
+		t.Fatalf("task count = %d, want 1", count)
+	}
+}
+
+func TestCreateDocumentAgentSummary_RejectsMultipleVersionsOfSameDocument(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	llmSrv, llmURL := newDocumentSummaryLLM(t)
+	defer llmSrv.Close()
+	h := NewAgentSummaryHandler(db, nil, llmURL, "test-key", "test-model", 5, 256)
+	h.documentClient = fakeDocumentSourceClient{docs: map[string]*documentSummarySource{
+		"doc-1": {DocumentID: "doc-1", Title: "doc", Content: "content"},
+	}}
+	r := setupDocumentAgentSummaryRouter(h)
+
+	body := []byte(`{"document_refs":[{"document_id":"doc-1","version":"v1"},{"document_id":"doc-1","version":"v2"}],"idempotency_key":"idem-multi-version"}`)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/summaries/agent/document", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Token", "test-user")
+	req.Header.Set("X-Space-Id", "test-space")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	var count int64
+	db.Model(&model.SummaryTask{}).Count(&count)
+	if count != 0 {
+		t.Fatalf("task count = %d, want 0", count)
 	}
 }
 

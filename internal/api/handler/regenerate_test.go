@@ -217,6 +217,40 @@ func TestRegenerate_ResetsAllAssociatedData(t *testing.T) {
 	}
 }
 
+func TestRegenerate_RejectsDocumentSummaryTask(t *testing.T) {
+	db := setupRegenerateDB(t)
+	h := NewTaskHandler(db, nil, "")
+	r := setupRegenerateRouter(h)
+	taskID, _, _ := seedCompletedTask(t, db)
+	if err := db.Model(&model.SummarySource{}).
+		Where("task_id = ?", taskID).
+		Updates(map[string]interface{}{
+			"source_type": model.SourceDocument,
+			"source_id":   "doc-1",
+			"source_name": "方案设计.md",
+		}).Error; err != nil {
+		t.Fatalf("seed document source: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/v1/summaries/%d/regenerate", taskID), bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Token", "creator1")
+	req.Header.Set("X-Space-Id", "space1")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	var pr model.PersonalResult
+	if err := db.Where("task_id = ?", taskID).First(&pr).Error; err != nil {
+		t.Fatalf("load personal result: %v", err)
+	}
+	if pr.Content == "" || pr.WorkerStatus != model.PersonalStatusCompleted {
+		t.Fatalf("document summary personal result was mutated: %+v", pr)
+	}
+}
+
 func TestRegenerate_OnlyCreatorAllowed(t *testing.T) {
 	db := setupRegenerateDB(t)
 	imDB, _ := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})

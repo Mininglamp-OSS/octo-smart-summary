@@ -116,6 +116,10 @@ func sanitizeCitationsForReference(citations []model.Citation) []model.Citation 
 		citation.SentAt = sanitizeRefBlock(citation.SentAt)
 		citation.Source = sanitizeRefBlock(citation.Source)
 		citation.ChannelID = sanitizeRefBlock(citation.ChannelID)
+		citation.DocumentID = sanitizeRefBlock(citation.DocumentID)
+		citation.DocumentTitle = sanitizeRefBlock(citation.DocumentTitle)
+		citation.DocumentVersion = sanitizeRefBlock(citation.DocumentVersion)
+		citation.ChunkID = sanitizeRefBlock(citation.ChunkID)
 		citation.ContextBefore = sanitizeContextMessagesForReference(citation.ContextBefore)
 		citation.ContextAfter = sanitizeContextMessagesForReference(citation.ContextAfter)
 		sanitized[i] = citation

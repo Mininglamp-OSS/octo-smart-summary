@@ -22,6 +22,8 @@ All configuration is done via environment variables.
 | `LLM_MAX_TOKENS` | Maximum tokens for LLM response | No | `4096` |
 | `LLM_TEMPERATURE` | Sampling temperature for LLM | No | `0.3` |
 | `LLM_ENABLE_THINKING` | Enable extended thinking mode | No | `false` |
+| `DOCUMENT_SUMMARY_SOURCE_API_URL` | Base URL of the ACL-aware document source service used by `POST /api/v1/summaries/agent/document`; the summary service calls `/api/documents/{document_id}/summary-source` on this origin. | Yes (Document summary) | — |
+| `DOCUMENT_SOURCE_API_URL` | Backward-compatible fallback for `DOCUMENT_SUMMARY_SOURCE_API_URL`. Prefer setting `DOCUMENT_SUMMARY_SOURCE_API_URL` explicitly. | No | — |
 | `API_PORT` | Port for the public API server | No | `8080` |
 | `API_INTERNAL_PORT` | Port for the API internal server | No | `8081` |
 | `WORKER_INTERNAL_PORT` | Port for the worker internal server | No | `8082` |

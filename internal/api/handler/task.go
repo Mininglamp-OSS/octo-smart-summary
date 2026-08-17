@@ -1321,10 +1321,19 @@ func documentSourcesFromSummarySources(sources []model.SummarySource) []gin.H {
 		}
 		docs = append(docs, gin.H{
 			"document_id": s.SourceID,
-			"title":       s.SourceName,
+			"title":       displaySourceName(s, nil),
+			"version":     s.SourceVersion,
 		})
 	}
 	return docs
+}
+
+func (h *TaskHandler) taskHasDocumentSource(taskID int64) (bool, error) {
+	var count int64
+	err := h.db.Model(&model.SummarySource{}).
+		Where("task_id = ? AND source_type = ? AND derived = 0", taskID, model.SourceDocument).
+		Count(&count).Error
+	return count > 0, err
 }
 
 // GetResult handles GET /api/v1/summaries/:id/result
@@ -1460,6 +1469,13 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 	}
 	if task.Status != model.StatusCompleted && task.Status != model.StatusFailed && task.Status != model.StatusCancelled {
 		bizErr(c, service.NewBizError(40005, "任务状态不允许此操作", http.StatusConflict))
+		return
+	}
+	if hasDocumentSource, err := h.taskHasDocumentSource(taskID); err != nil {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
+		return
+	} else if hasDocumentSource {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "文档总结暂不支持重新生成"})
 		return
 	}
 

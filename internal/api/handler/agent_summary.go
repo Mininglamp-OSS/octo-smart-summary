@@ -35,13 +35,13 @@ import (
 //     StrictSpace); accepting them from the request body would break the identity
 //     boundary the Chat handler already enforces.
 type AgentSummaryHandler struct {
-	db           *gorm.DB
-	imDB         *gorm.DB
-	llmApiURL    string
-	llmApiKey    string
-	llmModel     string
-	llmTimeout   int
-	llmMaxTokens int
+	db             *gorm.DB
+	imDB           *gorm.DB
+	llmApiURL      string
+	llmApiKey      string
+	llmModel       string
+	llmTimeout     int
+	llmMaxTokens   int
 	store          agentHistoryStore
 	documentClient documentSourceClient
 	// runnerFactory is an optional test-only hook for injecting a fake agent
@@ -64,14 +64,15 @@ type refineRunner interface {
 
 func NewAgentSummaryHandler(db, imDB *gorm.DB, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int) *AgentSummaryHandler {
 	return &AgentSummaryHandler{
-		db:           db,
-		imDB:         imDB,
-		llmApiURL:    llmApiURL,
-		llmApiKey:    llmApiKey,
-		llmModel:     llmModel,
-		llmTimeout:   llmTimeout,
-		llmMaxTokens: llmMaxTokens,
-		store:        newAgentMessageRepo(db),
+		db:             db,
+		imDB:           imDB,
+		llmApiURL:      llmApiURL,
+		llmApiKey:      llmApiKey,
+		llmModel:       llmModel,
+		llmTimeout:     llmTimeout,
+		llmMaxTokens:   llmMaxTokens,
+		store:          newAgentMessageRepo(db),
+		documentClient: newDefaultDocumentSourceClient(),
 	}
 }
 

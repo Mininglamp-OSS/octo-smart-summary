@@ -101,9 +101,9 @@ const (
 
 // Source type constants.
 const (
-	SourceGroup  = 1
-	SourceThread = 2
-	SourceDirect = 3
+	SourceGroup    = 1
+	SourceThread   = 2
+	SourceDirect   = 3
 	SourceDocument = 4
 )
 
@@ -222,6 +222,7 @@ type SummarySource struct {
 	SourceType    int    `gorm:"column:source_type;type:tinyint;not null;uniqueIndex:uk_summary_source_task_type_id" json:"source_type"`
 	SourceID      string `gorm:"column:source_id;type:varchar(64);not null;uniqueIndex:uk_summary_source_task_type_id" json:"source_id"`
 	SourceName    string `gorm:"column:source_name;type:varchar(200);not null;default:''" json:"source_name"`
+	SourceVersion string `gorm:"column:source_version;type:varchar(128);not null;default:''" json:"source_version,omitempty"`
 	ParticipantID *int64 `gorm:"column:participant_id;index:idx_participant_id" json:"participant_id"`
 	// R9 P1 (PR #190): 1 = row written by worker source backfill from the
 	// pipeline's auto-selected channels. Such rows are excluded from every
