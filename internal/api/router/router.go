@@ -165,6 +165,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	// reference-based chat flow — see CHAT-REFERENCE-BASED-DESIGN-v1.)
 	agentSummaryH := handler.NewAgentSummaryHandler(db, imDB, llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
 	v1.POST("/summaries/agent", agentSummaryH.CreateAgentSummary)
+	v1.POST("/summaries/agent/document", agentSummaryH.CreateDocumentAgentSummary)
 
 	return r
 }

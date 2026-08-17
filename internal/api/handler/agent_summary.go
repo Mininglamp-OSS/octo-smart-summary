@@ -42,7 +42,8 @@ type AgentSummaryHandler struct {
 	llmModel     string
 	llmTimeout   int
 	llmMaxTokens int
-	store        agentHistoryStore
+	store          agentHistoryStore
+	documentClient documentSourceClient
 	// runnerFactory is an optional test-only hook for injecting a fake agent
 	// runner without going through the real LLM. When nil (production path),
 	// newRunner falls back to buildRunner with handler's LLM config.

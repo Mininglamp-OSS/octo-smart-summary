@@ -1129,6 +1129,8 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		"time_range_start": task.TimeRangeStart.Format(time.RFC3339),
 		"time_range_end":   task.TimeRangeEnd.Format(time.RFC3339),
 		"sources":          srcList,
+		"source_type":      sourceTypeFromSources(sources),
+		"source_documents": documentSourcesFromSummarySources(sources),
 		"participants":     partList,
 		"result":           resultOut,
 		"error_message":    task.ErrorMessage,
@@ -1297,6 +1299,32 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 	}
 
 	ok(c, resp)
+}
+
+func sourceTypeFromSources(sources []model.SummarySource) string {
+	for _, s := range sources {
+		if s.Derived {
+			continue
+		}
+		if s.SourceType == model.SourceDocument {
+			return "document"
+		}
+	}
+	return "conversation"
+}
+
+func documentSourcesFromSummarySources(sources []model.SummarySource) []gin.H {
+	docs := make([]gin.H, 0)
+	for _, s := range sources {
+		if s.Derived || s.SourceType != model.SourceDocument {
+			continue
+		}
+		docs = append(docs, gin.H{
+			"document_id": s.SourceID,
+			"title":       s.SourceName,
+		})
+	}
+	return docs
 }
 
 // GetResult handles GET /api/v1/summaries/:id/result

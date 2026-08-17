@@ -37,6 +37,7 @@ func setupAgentSummaryTestDB(t *testing.T) *gorm.DB {
 		&model.SummaryParticipant{},
 		&model.SummaryResult{},
 		&model.PersonalResult{},
+		&model.SummaryDocumentAgentIdempotency{},
 	); err != nil {
 		t.Fatalf("failed to migrate: %v", err)
 	}

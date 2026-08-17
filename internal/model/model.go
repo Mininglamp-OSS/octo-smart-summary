@@ -104,6 +104,7 @@ const (
 	SourceGroup  = 1
 	SourceThread = 2
 	SourceDirect = 3
+	SourceDocument = 4
 )
 
 // Origin channel type constants.
@@ -186,6 +187,23 @@ type SummaryBotCreateIdempotency struct {
 
 func (SummaryBotCreateIdempotency) TableName() string { return "summary_bot_create_idempotency" }
 
+// SummaryDocumentAgentIdempotency binds one document-agent summary request key
+// to the task it created. Reusing the same key with different document refs is
+// rejected by the handler.
+type SummaryDocumentAgentIdempotency struct {
+	ID             int64     `gorm:"primaryKey;autoIncrement"`
+	SpaceID        string    `gorm:"column:space_id;type:varchar(64);not null;uniqueIndex:uk_doc_agent_idempotency"`
+	UserID         string    `gorm:"column:user_id;type:varchar(64);not null;uniqueIndex:uk_doc_agent_idempotency"`
+	IdempotencyKey string    `gorm:"column:idempotency_key;type:varchar(128);not null;uniqueIndex:uk_doc_agent_idempotency"`
+	RequestHash    string    `gorm:"column:request_hash;type:char(64);not null;default:''"`
+	TaskID         int64     `gorm:"column:task_id;not null"`
+	CreatedAt      time.Time `gorm:"column:created_at;not null"`
+}
+
+func (SummaryDocumentAgentIdempotency) TableName() string {
+	return "summary_document_agent_idempotency"
+}
+
 // EffectiveTopic keeps existing tasks compatible while new tasks persist the
 // complete summary instruction separately from the display title.
 func (t SummaryTask) EffectiveTopic() string {
@@ -262,6 +280,12 @@ type Citation struct {
 	ChannelID     string       `json:"channel_id"`
 	ChannelType   int          `json:"channel_type"`
 	MessageSeq    int64        `json:"message_seq"`
+	Type            string       `json:"type,omitempty"`
+	DocumentID      string       `json:"document_id,omitempty"`
+	DocumentTitle   string       `json:"document_title,omitempty"`
+	DocumentVersion string       `json:"document_version,omitempty"`
+	ChunkID         string       `json:"chunk_id,omitempty"`
+	Page            int          `json:"page,omitempty"`
 	ContextBefore []ContextMsg `json:"context_before,omitempty"`
 	ContextAfter  []ContextMsg `json:"context_after,omitempty"`
 }
