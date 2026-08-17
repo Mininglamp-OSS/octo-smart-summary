@@ -154,3 +154,54 @@ func TestManifestOwnerScoped(t *testing.T) {
 		t.Fatalf("cross-user manifest read err = %v, want RecordNotFound", err)
 	}
 }
+
+func TestGetLatestManifestByRun(t *testing.T) {
+	db := newArtifactTestDB(t)
+	if db == nil {
+		return
+	}
+	s := NewStore(db)
+	ctx := context.Background()
+
+	// Not frozen yet → found=false, no error (the freeze-once read contract).
+	if _, _, found, err := s.GetLatestManifestByRun(ctx, "u1", "run1"); err != nil || found {
+		t.Fatalf("pre-freeze: found=%v err=%v, want false/nil", found, err)
+	}
+
+	s.FreezeFromPool(ctx, "run1", "u1", "sess1", pool(), FreezeMeta{})
+
+	man, entries, found, err := s.GetLatestManifestByRun(ctx, "u1", "run1")
+	if err != nil || !found {
+		t.Fatalf("post-freeze: found=%v err=%v, want true/nil", found, err)
+	}
+	if man.RunID != "run1" || len(entries) != 3 {
+		t.Fatalf("manifest wrong: run=%s entries=%d", man.RunID, len(entries))
+	}
+	// Owner-scoped.
+	if _, _, found, _ := s.GetLatestManifestByRun(ctx, "attacker", "run1"); found {
+		t.Fatal("cross-user GetLatestManifestByRun should not find")
+	}
+}
+
+func TestGetLatestBySession(t *testing.T) {
+	db := newArtifactTestDB(t)
+	if db == nil {
+		return
+	}
+	s := NewStore(db)
+	ctx := context.Background()
+
+	if _, _, found, err := s.GetLatestBySession(ctx, "u1", "sess1"); err != nil || found {
+		t.Fatalf("pre-freeze session: found=%v err=%v", found, err)
+	}
+
+	s.FreezeFromPool(ctx, "run1", "u1", "sess1", pool(), FreezeMeta{})
+
+	_, entries, found, err := s.GetLatestBySession(ctx, "u1", "sess1")
+	if err != nil || !found || len(entries) != 3 {
+		t.Fatalf("session lookup: found=%v err=%v entries=%d", found, err, len(entries))
+	}
+	if _, _, found, _ := s.GetLatestBySession(ctx, "attacker", "sess1"); found {
+		t.Fatal("cross-user GetLatestBySession should not find")
+	}
+}

@@ -279,16 +279,19 @@ func truncateRunes(s string, max int) string {
 }
 
 // maybePersistSummaryRun records the SummaryRun / SummarySpec for this request
-// when AGENT_SUMMARY_V2_MODE != off (SS-03). It is best-effort and MUST NOT
-// change the reply: for SS-03 the summarization still runs through the existing
-// path, so a persistence failure only loses observability, never the answer.
-// The caller invokes this only when SummaryV2Enabled(); off never reaches here.
+// when AGENT_SUMMARY_V2_MODE != off (SS-03) and returns the resolved run_id (""
+// when there is no run to act on). The run_id is injected into the tool context
+// by the caller so the citation pass can freeze/read this run's manifest (SS-05).
+// It is best-effort and MUST NOT change the reply: for SS-03/05 the summarization
+// still runs through the existing path, so a persistence failure only loses
+// observability / citation-stability, never the answer. The caller invokes this
+// only when SummaryV2Enabled(); off never reaches here.
 //
 // A request without request_id (legacy client) or without a runStore (test
-// constructor) is a no-op — we never 400 on the missing field (checklist #10).
-func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid string, req agentChatRequest) {
+// constructor) is a no-op returning "" — we never 400 on the missing field.
+func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid string, req agentChatRequest) string {
 	if h.runStore == nil || req.RequestID == "" {
-		return
+		return ""
 	}
 
 	// UI-selected channels ⇒ closed scope; otherwise open (checklist A2 / §4.1).
@@ -300,16 +303,16 @@ func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid strin
 	run, created, err := h.runStore.CreateOrGetRun(ctx, uid, req.SessionID, req.RequestID, scopePolicy)
 	if err != nil {
 		log.Printf("[agent] v2 create/get run failed (session=%s): %v", req.SessionID, err)
-		return
+		return ""
 	}
 	if !created {
 		// Idempotent replay: the run already exists (e.g. SSE downgrade reusing
-		// the same request_id). Do not re-persist or re-summarize state here.
-		return
+		// the same request_id). Reuse its run_id; do not re-persist the spec.
+		return run.RunID
 	}
 
 	// Minimal spec draft from the chat request. Full Planner-submitted specs
-	// arrive with the high-level tools (SS-05); here we capture the objective +
+	// arrive with the high-level tools (SS-05b); here we capture the objective +
 	// any UI-selected channels so the contract is populated end to end.
 	objective := truncateRunes(req.Message, 1000)
 	draft := summaryspec.Draft{Objective: &objective}
@@ -324,11 +327,12 @@ func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid strin
 	})
 	if err != nil {
 		log.Printf("[agent] v2 spec invalid (session=%s): %v", req.SessionID, err)
-		return
+		return run.RunID
 	}
 	if _, err := h.runStore.SaveSpec(ctx, run, run.Version, spec, sources, req.Message); err != nil {
 		log.Printf("[agent] v2 save spec failed (session=%s): %v", req.SessionID, err)
 	}
+	return run.RunID
 }
 
 // Chat 处理 POST /api/v1/agent/chat：非流式一问一答，携带多轮历史。
@@ -382,9 +386,13 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 	}
 
 	// SS-03: persist the run/spec when V2 mode is enabled. Off → skipped entirely
-	// (byte-identical to pre-SS-03). Best-effort; never blocks the reply.
+	// (byte-identical to pre-SS-03). Best-effort; never blocks the reply. The
+	// returned run_id is injected into the tool context so the citation pass can
+	// freeze/read this run's manifest (SS-05).
 	if agent.SummaryV2Enabled() {
-		h.maybePersistSummaryRun(ctx, uid, req)
+		if runID := h.maybePersistSummaryRun(ctx, uid, req); runID != "" {
+			ctx = context.WithValue(ctx, agent.ContextKeyRunID, runID)
+		}
 	}
 
 	// 按 profile 组装 runner（summary 场景注入 uid 工具）；测试可注入现成 runner。
@@ -636,8 +644,11 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	}
 
 	// SS-03: persist run/spec when V2 mode is enabled (see Chat). Off → skipped.
+	// The returned run_id is injected into the tool context for the citation pass.
 	if agent.SummaryV2Enabled() {
-		h.maybePersistSummaryRun(ctx, uid, req)
+		if runID := h.maybePersistSummaryRun(ctx, uid, req); runID != "" {
+			ctx = context.WithValue(ctx, agent.ContextKeyRunID, runID)
+		}
 	}
 
 	// Build runner with OnEvent callback for SSE progress

@@ -194,6 +194,58 @@ func loadManifestTx(tx *gorm.DB, userID, artifactID string) (*model.AgentCitatio
 	return &man, nil
 }
 
+// GetLatestManifestByRun returns the highest-revision manifest for a run and its
+// decoded entries. found=false (nil error) when the run has no manifest yet —
+// the caller then freezes one. Owner-scoped by user_id.
+//
+// This is the freeze-once read: the mid-run citation pass calls it first and
+// only freezes when nothing exists, so a later evidence growth cannot spawn a
+// second revision that would renumber the citations already emitted.
+func (s *Store) GetLatestManifestByRun(ctx context.Context, userID, runID string) (*model.AgentCitationManifest, []StableID, bool, error) {
+	var man model.AgentCitationManifest
+	err := s.db.WithContext(ctx).
+		Where("run_id = ? AND user_id = ?", runID, userID).
+		Order("revision DESC").
+		First(&man).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil, false, nil
+	}
+	if err != nil {
+		return nil, nil, false, err
+	}
+	entries, err := DecodeEntries(man.Entries)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return &man, entries, true, nil
+}
+
+// GetLatestBySession returns the manifest of the highest-revision artifact for a
+// (user, session), plus its decoded entries. found=false (nil error) when the
+// session has no frozen artifact. Owner-scoped by user_id.
+//
+// Used at save time, where run_id is not yet threaded through the save contract
+// (that lands with SS-08 / WEB-03); the latest artifact for the session is the
+// one the just-completed run froze.
+func (s *Store) GetLatestBySession(ctx context.Context, userID, sessionID string) (*model.AgentCitationManifest, []StableID, bool, error) {
+	var art model.AgentEvidenceArtifact
+	err := s.db.WithContext(ctx).
+		Where("user_id = ? AND session_id = ?", userID, sessionID).
+		Order("revision DESC").
+		First(&art).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil, false, nil
+	}
+	if err != nil {
+		return nil, nil, false, err
+	}
+	man, entries, err := s.LoadManifest(ctx, userID, art.ArtifactID)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return man, entries, true, nil
+}
+
 func countChannels(entries []StableID) int {
 	seen := make(map[string]bool)
 	for _, e := range entries {

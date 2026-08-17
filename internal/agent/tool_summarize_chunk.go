@@ -186,6 +186,13 @@ func SummarizeChunkTool() (Tool, Handler) {
 			return "", fmt.Errorf("get session message pool: %w", err)
 		}
 
+		// SS-05 B1: when V2 mode is on and a run is in scope, override the just-
+		// computed indexes with the run's FROZEN manifest ordinals so the mid-run
+		// and save-time citation passes cannot drift. Off / no run → unchanged.
+		if runID, _ := ctx.Value(ContextKeyRunID).(string); SummaryV2Enabled() && runID != "" {
+			globalPool = applyFrozenManifest(ctx, uid, sessionID, runID, globalPool)
+		}
+
 		// Build a map from (channel_id, message_seq) to CitationIndex
 		citationMap := make(map[string]int)
 		for _, msg := range globalPool {

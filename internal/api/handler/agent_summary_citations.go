@@ -8,6 +8,7 @@ import (
 	"sort"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/artifact"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/worker"
@@ -18,14 +19,14 @@ import (
 // 若 content 里没有任何 [n] 标记,返回 []Citation{} (等价于 SetCitations(nil))。
 //
 // 实现策略:
-// 1. 从 agent_message_evidence 提取本 (user_id, session_id) 的所有 handle
-// 2. 每个 handle 优先走 agent.messageCache 恢复 messages (30分钟 TTL),
-//    cache miss 时 fallback 到 evidence.Evidence 的 JSON snapshot
-// 3. 合并去重 → 得到 allMessages 池
-// 4. 为每条 message 分配 CitationIndex(1-indexed, 全局唯一, 时间升序)
-// 5. 收集 nameMap: sender_uid -> sender_name
-// 6. 调 worker.BuildCitations(content, allMessages, allMessages, nameMap)
-// 7. 返回结果; 出错走 log + 返回空数组不阻塞落库(citations 是锦上添花不是必要)
+//  1. 从 agent_message_evidence 提取本 (user_id, session_id) 的所有 handle
+//  2. 每个 handle 优先走 agent.messageCache 恢复 messages (30分钟 TTL),
+//     cache miss 时 fallback 到 evidence.Evidence 的 JSON snapshot
+//  3. 合并去重 → 得到 allMessages 池
+//  4. 为每条 message 分配 CitationIndex(1-indexed, 全局唯一, 时间升序)
+//  5. 收集 nameMap: sender_uid -> sender_name
+//  6. 调 worker.BuildCitations(content, allMessages, allMessages, nameMap)
+//  7. 返回结果; 出错走 log + 返回空数组不阻塞落库(citations 是锦上添花不是必要)
 //
 // Discovery-source symmetry (#161 P1-A · yujiawei):
 // Must discover handles from agent_message_evidence — byte-identical to
@@ -135,6 +136,14 @@ func (h *AgentSummaryHandler) buildCitationsForSession(
 		allMessages[i].CitationIndex = i + 1
 	}
 
+	// SS-05 B1: when V2 mode is on, prefer the FROZEN manifest ordinals for this
+	// session (the exact numbering the mid-run summarize_chunk pass used) so a
+	// [n] marker can't point at a different message than the model intended.
+	// Off / no frozen manifest → keep the recomputed indexes above (legacy path).
+	if agent.SummaryV2Enabled() {
+		allMessages = h.overrideWithSessionManifest(ctx, uid, sessionID, allMessages)
+	}
+
 	// 5. Build nameMap
 	nameMap := make(map[string]string)
 	for _, msg := range allMessages {
@@ -150,3 +159,32 @@ func (h *AgentSummaryHandler) buildCitationsForSession(
 	return citations, nil
 }
 
+// overrideWithSessionManifest replaces recomputed CitationIndex values with the
+// ordinals frozen in the session's latest citation manifest (SS-05 B1), so the
+// save-time numbering matches what the mid-run summarize_chunk pass emitted.
+// Messages not present in the frozen manifest were fetched after the freeze and
+// are dropped from the citable set. On any miss (V2 off wrote no manifest, DB
+// error) it returns the input unchanged, falling back to the recomputed indexes.
+func (h *AgentSummaryHandler) overrideWithSessionManifest(ctx context.Context, uid, sessionID string, msgs []pipeline.Message) []pipeline.Message {
+	if h.db == nil {
+		return msgs
+	}
+	store := artifact.NewStore(h.db)
+	_, entries, found, err := store.GetLatestBySession(ctx, uid, sessionID)
+	if err != nil || !found {
+		return msgs
+	}
+	ord := artifact.OrdinalMap(entries)
+	out := make([]pipeline.Message, 0, len(msgs))
+	for _, m := range msgs {
+		idx, ok := ord[fmt.Sprintf("%s:%d", m.ChannelID, m.MessageSeq)]
+		if !ok {
+			continue
+		}
+		m.CitationIndex = idx
+		out = append(out, m)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CitationIndex < out[j].CitationIndex })
+	log.Printf("[citations] session=%s using frozen manifest ordinals (%d of %d messages citable)", sessionID, len(out), len(msgs))
+	return out
+}
