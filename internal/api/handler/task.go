@@ -803,6 +803,14 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			creatorName = service.ResolveUserName(t.CreatorID)
 		}
 
+		// Bot-created summaries (trigger_type=TriggerBot) carry the acting bot's
+		// uid in creator_bot_id; resolve its display name so the frontend can
+		// mark the card as "由 <bot> 创建".
+		creatorBotName := ""
+		if t.CreatorBotID != "" {
+			creatorBotName = service.ResolveUserName(t.CreatorBotID)
+		}
+
 		// Expose schedule_id on list items so the frontend can detect a scheduled
 		// task by its bound schedule (the authoritative signal) instead of relying
 		// on trigger_type. A manual task that later gets a scheduled-update added
@@ -856,6 +864,8 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			"trigger_type":     t.TriggerType,
 			"schedule_id":      scheduleIDOut,
 			"creator_id":       t.CreatorID,
+			"creator_bot_id":   t.CreatorBotID,
+			"creator_bot_name": creatorBotName,
 			"participants":     parts,
 			"time_range_start": t.TimeRangeStart.Format(time.RFC3339),
 			"time_range_end":   t.TimeRangeEnd.Format(time.RFC3339),
@@ -1081,6 +1091,14 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		}
 	}
 
+	// Owner + acting-bot display names, so the detail page can show
+	// "由 <bot> 代 <owner> 创建" for bot-created summaries (trigger_type=TriggerBot).
+	creatorName := service.ResolveUserName(task.CreatorID)
+	creatorBotName := ""
+	if task.CreatorBotID != "" {
+		creatorBotName = service.ResolveUserName(task.CreatorBotID)
+	}
+
 	resp := gin.H{
 		"task_id":          task.ID,
 		"task_no":          task.TaskNo,
@@ -1089,6 +1107,9 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		"summary_mode":     task.SummaryMode,
 		"status":           task.Status,
 		"creator_id":       task.CreatorID,
+		"creator_name":     creatorName,
+		"creator_bot_id":   task.CreatorBotID,
+		"creator_bot_name": creatorBotName,
 		"trigger_type":     task.TriggerType,
 		"time_range_start": task.TimeRangeStart.Format(time.RFC3339),
 		"time_range_end":   task.TimeRangeEnd.Format(time.RFC3339),

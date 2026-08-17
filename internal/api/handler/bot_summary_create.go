@@ -65,17 +65,17 @@ func canonicalBotCreateRequestHash(req createBotSummaryReq, sources []canonicalB
 		}
 	}
 	payload := struct {
-		Title            string               `json:"title"`
-		Topic            string               `json:"topic"`
-		TimeRangeStart   string               `json:"time_range_start"`
-		TimeRangeEnd     string               `json:"time_range_end"`
-		Sources          []canonicalBotSource `json:"sources"`
-		OriginChannelID  string               `json:"origin_channel_id"`
-		OriginChannelTp  int                  `json:"origin_channel_type"`
-		IncludeArchived  bool                 `json:"include_archived"`
+		Title           string               `json:"title"`
+		Topic           string               `json:"topic"`
+		TimeRangeStart  string               `json:"time_range_start"`
+		TimeRangeEnd    string               `json:"time_range_end"`
+		Sources         []canonicalBotSource `json:"sources"`
+		OriginChannelID string               `json:"origin_channel_id"`
+		OriginChannelTp int                  `json:"origin_channel_type"`
+		IncludeArchived bool                 `json:"include_archived"`
 	}{
-		Title:           strings.TrimSpace(req.Title),
-		Topic:           strings.TrimSpace(req.Topic),
+		Title: strings.TrimSpace(req.Title),
+		Topic: strings.TrimSpace(req.Topic),
 		// Round the time range to whole minutes so a normal client retry
 		// that recomputes a relative window ("summarize the last hour")
 		// replays cleanly instead of colliding on nanosecond drift. A
@@ -542,5 +542,9 @@ func (h *TaskHandler) findBotIdempotentTaskWithHash(spaceID, botID, key, request
 }
 
 func botCreateResponse(task model.SummaryTask) gin.H {
-	return gin.H{"task_id": task.ID, "task_no": task.TaskNo, "status": task.Status, "trigger_type": task.TriggerType, "creator_id": task.CreatorID, "creator_bot_id": task.CreatorBotID, "created_at": task.CreatedAt.Format(time.RFC3339)}
+	creatorBotName := ""
+	if task.CreatorBotID != "" {
+		creatorBotName = service.ResolveUserName(task.CreatorBotID)
+	}
+	return gin.H{"task_id": task.ID, "task_no": task.TaskNo, "status": task.Status, "trigger_type": task.TriggerType, "creator_id": task.CreatorID, "creator_bot_id": task.CreatorBotID, "creator_bot_name": creatorBotName, "created_at": task.CreatedAt.Format(time.RFC3339)}
 }
