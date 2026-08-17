@@ -12,6 +12,81 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 )
 
+// SS-01 止血常量（见 docs/AGENT-SUMMARY-...zh.md 缺点二）。
+//
+// 历史 bug：chunk_size 默认 500，但 formatChunkForLLM 每片只格式化前 200 条，
+// 满片时静默丢弃 300/500（60%），且工具返回值只报 chunk_count，Planner 误判
+// 已覆盖全部消息。修法：把默认值与硬上限统一收敛到 200，使
+// SplitIntoChunks 产出的每片恒 <= maxChunkSize，格式化环节不再丢消息；同时
+// 返回结构化覆盖计数让上层可识别截断/超长输入。
+//
+// 注意执行顺序纪律：本阶段只压上限 + 报计数，不引入 Token-aware 分片，也不删
+// 200 硬限制——删限制属于 SS-06（Token 分片就绪之后），提前删会把“确定性丢消息”
+// 变成“上下文溢出/请求失败”。
+const (
+	// defaultChunkSize 是未显式指定或非法 chunk_size 时的每片消息数。
+	defaultChunkSize = 200
+	// maxChunkSize 是每片消息数的硬上限，与 formatChunkForLLM 的格式化上限一致，
+	// 消除“分片 500 / 格式化 200”双上限造成的静默丢失。
+	maxChunkSize = 200
+	// oversizedMessageRunes 是单条消息被标记为“超长”的字符阈值。超长消息只
+	// 计数上报（oversized_message_count），不做静默截断——真正的按预算单独成片
+	// 属于后续 Token 分片阶段（SS-06）。
+	oversizedMessageRunes = 4000
+)
+
+// chunkCoverage 汇总 summarize_chunk 实际喂给模型的消息覆盖情况，随工具结果
+// 返回，让 Runner/Planner 能判断是否发生丢弃或截断，而不是只看到 chunk_count。
+type chunkCoverage struct {
+	InputCount            int  `json:"input_count"`
+	ProcessedCount        int  `json:"processed_count"`
+	DroppedCount          int  `json:"dropped_count"`
+	OversizedMessageCount int  `json:"oversized_message_count"`
+	Truncated             bool `json:"truncated"`
+	ChunkSize             int  `json:"chunk_size"`
+}
+
+// clampChunkSize 把请求的 chunk_size 收敛到 [1, maxChunkSize]；<=0 取默认值，
+// 超过上限截到 maxChunkSize。返回值保证 SplitIntoChunks 产出的每片 <= maxChunkSize。
+func clampChunkSize(requested int) int {
+	if requested <= 0 {
+		return defaultChunkSize
+	}
+	if requested > maxChunkSize {
+		return maxChunkSize
+	}
+	return requested
+}
+
+// ComputeCoverage reports how the CURRENT chunking path would cover inputCount
+// messages summarized at the given requested chunk_size: how many are fed to the
+// model (processed), how many are lost (dropped), and how many chunks are formed.
+//
+// It routes through the exact production seams — clampChunkSize + maxChunkSize —
+// so the SS-02 eval harness asserts the no-silent-loss invariant against real
+// logic. If anyone regresses defaultChunkSize back to 500 (or widens the format
+// cap out of step with the split size), dropped goes non-zero and eval fails.
+func ComputeCoverage(inputCount, requestedChunkSize int) (processed, dropped, chunks int) {
+	if inputCount <= 0 {
+		return 0, 0, 0
+	}
+	size := clampChunkSize(requestedChunkSize)
+	for i := 0; i < inputCount; i += size {
+		end := i + size
+		if end > inputCount {
+			end = inputCount
+		}
+		n := end - i
+		if n > maxChunkSize { // mirrors formatChunkForLLM's hard cap
+			n = maxChunkSize
+		}
+		processed += n
+		chunks++
+	}
+	dropped = inputCount - processed
+	return processed, dropped, chunks
+}
+
 // getSessionMessagePool retrieves all messages from all tool calls in the session,
 // sorts them globally by timestamp, and assigns CitationIndex.
 // This ensures the same global ordering that buildCitationsForSession will use.
@@ -139,7 +214,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 					},
 					"chunk_size": map[string]interface{}{
 						"type":        "integer",
-						"description": "每个 chunk 的消息数，<=0 使用默认 500",
+						"description": "每个 chunk 的消息数；<=0 或 >200 时取 200（硬上限）。返回值含 input_count/processed_count/dropped_count/oversized_message_count/truncated。",
 					},
 				},
 				"required": []string{"messages_handle"},
@@ -213,28 +288,37 @@ func SummarizeChunkTool() (Tool, Handler) {
 			}
 		}
 
-		chunkSize := req.ChunkSize
-		if chunkSize <= 0 {
-			chunkSize = 500
-		}
+		chunkSize := clampChunkSize(req.ChunkSize)
 
 		chunks := service.SplitIntoChunks(msgMaps, chunkSize)
 
-		// For simplicity, generate a unified summary for all chunks
-		// In production, each chunk would be summarized separately and merged
+		// Summarize each chunk and aggregate honest coverage counts. With
+		// chunkSize clamped to maxChunkSize, formatChunkForLLM never drops a
+		// message, so dropped_count is 0 on the normal path; the counters stay
+		// truthful if a future change ever reintroduces a per-chunk cap.
+		cov := chunkCoverage{InputCount: len(messages), ChunkSize: chunkSize}
 		var summaries []string
 		for _, chunk := range chunks {
-			summary, err := summarizeMessagesChunk(ctx, chunk)
+			summary, processed, oversized, err := summarizeMessagesChunk(ctx, chunk)
 			if err != nil {
 				return "", fmt.Errorf("summarize chunk: %w", err)
 			}
 			summaries = append(summaries, summary)
+			cov.ProcessedCount += processed
+			cov.OversizedMessageCount += oversized
 		}
+		cov.DroppedCount = cov.InputCount - cov.ProcessedCount
+		cov.Truncated = cov.DroppedCount > 0
 
 		combinedSummary := strings.Join(summaries, "\n\n---\n\n")
 		result := map[string]interface{}{
-			"summary":     combinedSummary,
-			"chunk_count": len(chunks),
+			"summary":                 combinedSummary,
+			"chunk_count":             len(chunks),
+			"input_count":             cov.InputCount,
+			"processed_count":         cov.ProcessedCount,
+			"dropped_count":           cov.DroppedCount,
+			"oversized_message_count": cov.OversizedMessageCount,
+			"truncated":               cov.Truncated,
 		}
 
 		// Marshal result
@@ -248,22 +332,44 @@ func SummarizeChunkTool() (Tool, Handler) {
 	return schema, handler
 }
 
-// summarizeMessagesChunk builds a structured prompt from msgMap chunk and calls LLM.
-func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{}) (string, error) {
-	_, _, _, cfg := GetSummaryDeps()
-	client := service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, 30)
-
-	// Format messages for LLM with global citation_index
-	var formatted strings.Builder
+// formatChunkForLLM renders a chunk into the "[n] sender: content" lines fed to
+// the LLM. It is a pure function (no LLM, no I/O) so coverage can be asserted
+// deterministically in tests / the eval harness without a live model.
+//
+// It returns how many messages it actually formatted (processed) and how many
+// exceeded oversizedMessageRunes (oversized). Oversized messages are counted but
+// NOT truncated — their full content is still emitted. The maxChunkSize guard is
+// a redundant safety net: with clampChunkSize upstream, chunks are always
+// <= maxChunkSize, so it never drops here; if it ever did, processed would be
+// less than len(chunk) and the caller would surface a non-zero dropped_count
+// instead of losing messages silently.
+func formatChunkForLLM(chunk []map[string]interface{}) (formatted string, processed, oversized int) {
+	var b strings.Builder
 	for i, msg := range chunk {
-		if i >= 200 { // safety limit per chunk
+		if i >= maxChunkSize {
 			break
 		}
 		sender, _ := msg["sender_name"].(string)
 		content, _ := msg["content"].(string)
 		citationIndex, _ := msg["citation_index"].(int)
-		formatted.WriteString(fmt.Sprintf("[%d] %s: %s\n", citationIndex, sender, content))
+		if len([]rune(content)) > oversizedMessageRunes {
+			oversized++
+		}
+		b.WriteString(fmt.Sprintf("[%d] %s: %s\n", citationIndex, sender, content))
+		processed++
 	}
+	return b.String(), processed, oversized
+}
+
+// summarizeMessagesChunk builds a structured prompt from msgMap chunk and calls LLM.
+// Returns the summary plus how many messages were processed / were oversized, so
+// the caller can aggregate honest coverage across chunks.
+func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{}) (summary string, processed, oversized int, err error) {
+	_, _, _, cfg := GetSummaryDeps()
+	client := service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, 30)
+
+	// Format messages for LLM with global citation_index (pure, testable).
+	formatted, processed, oversized := formatChunkForLLM(chunk)
 
 	systemPrompt := `你是专业的工作内容整理助手。请从聊天记录中提炼关键信息：
 
@@ -281,13 +387,13 @@ func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{})
 
 	msgs := []service.ChatMessage{
 		{Role: "system", Content: systemPrompt},
-		{Role: "user", Content: formatted.String()},
+		{Role: "user", Content: formatted},
 	}
 
 	content, _, err := client.Call(ctx, msgs, 0.3)
 	if err != nil {
-		return "", fmt.Errorf("call LLM: %w", err)
+		return "", processed, oversized, fmt.Errorf("call LLM: %w", err)
 	}
 
-	return strings.TrimSpace(content), nil
+	return strings.TrimSpace(content), processed, oversized, nil
 }
