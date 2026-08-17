@@ -151,7 +151,7 @@ func detailOrigin(t *testing.T, r *gin.Engine, taskID int64) (string, int) {
 // derived source row — the refiner may not be a member of that channel.
 func TestOriginFromDerived_DetailMasksDerivedInheritedOrigin(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	r := setupAgentSummaryRouter(NewAgentSummaryHandler(db, "", "", "", 0, 0))
+	r := setupAgentSummaryRouter(NewAgentSummaryHandler(db, nil, "", "", "", 0, 0))
 
 	created := seedDerivedOnlyRefTaskAndRefine(t, db, r, "ST-Q2-DETAIL", "session-q2-detail", "CH-PRIVATE-ALICE")
 
@@ -166,7 +166,7 @@ func TestOriginFromDerived_DetailMasksDerivedInheritedOrigin(t *testing.T) {
 // same mask on the list projection.
 func TestOriginFromDerived_ListMasksDerivedInheritedOrigin(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	r := setupAgentSummaryRouter(NewAgentSummaryHandler(db, "", "", "", 0, 0))
+	r := setupAgentSummaryRouter(NewAgentSummaryHandler(db, nil, "", "", "", 0, 0))
 
 	created := seedDerivedOnlyRefTaskAndRefine(t, db, r, "ST-Q2-LIST", "session-q2-list", "CH-PRIVATE-ALICE")
 
@@ -203,7 +203,7 @@ func TestOriginFromDerived_ListMasksDerivedInheritedOrigin(t *testing.T) {
 // carry channel X as its origin?" reveals X's presence without membership).
 func TestOriginFromDerived_ListFilterDoesNotMatchMaskedOrigin(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	r := setupAgentSummaryRouter(NewAgentSummaryHandler(db, "", "", "", 0, 0))
+	r := setupAgentSummaryRouter(NewAgentSummaryHandler(db, nil, "", "", "", 0, 0))
 
 	seedDerivedOnlyRefTaskAndRefine(t, db, r, "ST-Q2-FILTER", "session-q2-filter", "CH-PRIVATE-ALICE")
 
@@ -224,7 +224,7 @@ func TestOriginFromDerived_ListFilterDoesNotMatchMaskedOrigin(t *testing.T) {
 // channel either.
 func TestOriginFromDerived_FlagPropagatesThroughTier3Borrow(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	r := setupAgentSummaryRouter(NewAgentSummaryHandler(db, "", "", "", 0, 0))
+	r := setupAgentSummaryRouter(NewAgentSummaryHandler(db, nil, "", "", "", 0, 0))
 
 	first := seedDerivedOnlyRefTaskAndRefine(t, db, r, "ST-Q2-PROP", "session-q2-prop-1", "CH-PRIVATE-ALICE")
 

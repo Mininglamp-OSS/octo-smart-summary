@@ -61,7 +61,7 @@ func setupAgentSummaryRouter(h *AgentSummaryHandler) *gin.Engine {
 // behavior is unchanged (no resolve, direct validation and pass).
 func TestCreateAgentSummary_ProvidedOriginChannelDirectPass(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	// Seed: session with assistant message (deliverable content)
@@ -117,7 +117,7 @@ func TestCreateAgentSummary_ProvidedOriginChannelDirectPass(t *testing.T) {
 // and successfully creates the task with the resolved values.
 func TestCreateAgentSummary_NotProvidedResolveSuccess(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	// Seed: session with assistant message (deliverable) and fetch_channel tool call
@@ -183,7 +183,7 @@ func TestCreateAgentSummary_NotProvidedResolveSuccess(t *testing.T) {
 // returns 400 40001 with the new error message.
 func TestCreateAgentSummary_NotProvidedResolveFailure(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	// Seed: session with only assistant content, no fetch_channel tool call
@@ -233,7 +233,7 @@ func TestCreateAgentSummary_NotProvidedResolveFailure(t *testing.T) {
 // is explicitly provided as an empty string, the handler returns the old error message.
 func TestCreateAgentSummary_ExplicitlyEmptyString(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	// Seed: session with assistant content
@@ -280,7 +280,7 @@ func TestCreateAgentSummary_ExplicitlyEmptyString(t *testing.T) {
 // is out of valid range (1-3), the handler returns 400 40001 with the original message.
 func TestCreateAgentSummary_InvalidChannelType(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	// Seed: session with assistant content
