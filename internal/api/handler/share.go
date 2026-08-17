@@ -405,8 +405,11 @@ func (h *ShareHandler) Create(c *gin.Context) {
 			continue
 		}
 		visibleCount++
-		if strings.TrimSpace(source.SourceName) != "" {
-			names = append(names, source.SourceName)
+		// displaySourceName falls back to a live IM lookup for rows written
+		// before the agent path stored names (see task.go); the share
+		// snapshot is user-visible text, same as the list/detail chips.
+		if name := displaySourceName(source, h.imDB); strings.TrimSpace(name) != "" {
+			names = append(names, name)
 		}
 	}
 	var participantCount int64

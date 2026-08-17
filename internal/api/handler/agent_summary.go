@@ -36,6 +36,7 @@ import (
 //     boundary the Chat handler already enforces.
 type AgentSummaryHandler struct {
 	db           *gorm.DB
+	imDB         *gorm.DB
 	llmApiURL    string
 	llmApiKey    string
 	llmModel     string
@@ -60,9 +61,10 @@ type refineRunner interface {
 	RunWithHistory(ctx context.Context, system string, history []agent.Message, userInput string) (string, []agent.Message, error)
 }
 
-func NewAgentSummaryHandler(db *gorm.DB, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int) *AgentSummaryHandler {
+func NewAgentSummaryHandler(db, imDB *gorm.DB, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int) *AgentSummaryHandler {
 	return &AgentSummaryHandler{
 		db:           db,
+		imDB:         imDB,
 		llmApiURL:    llmApiURL,
 		llmApiKey:    llmApiKey,
 		llmModel:     llmModel,
@@ -357,10 +359,12 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 
 		// Sources: agent-produced summaries carry their own source list from
 		// the front-end (which knows the origin channel + any additional
-		// referenced channels). We do not currently resolve source names via
-		// IM DB — the deliverable already contains channel names in prose —
-		// so we store source_id only; a future PR can plumb imDB in and call
-		// ResolveSourceNameWithType if the UI wants the resolved display name.
+		// referenced channels). Source names are resolved from the IM DB the
+		// same way the instant path (CreateSummary) does, so the detail chip
+		// shows a human-readable name instead of a raw channel id; the
+		// client-supplied name is deliberately NOT trusted (the instant path
+		// drops it too — see task.go's CreateSummary). ResolveSourceNameWithType
+		// handles a nil imDB with a deterministic "来源-xxxxxxxx" fallback.
 		//
 		// R10: dedup by (source_type, source_id) — uk_summary_source_task_type_id
 		// (migration 20260814-01) would turn duplicate front-end input into a
@@ -379,6 +383,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 				TaskID:     createdTaskID,
 				SourceType: s.SourceType,
 				SourceID:   s.SourceID,
+				SourceName: service.ResolveSourceNameWithType(s.SourceID, s.SourceType, h.imDB),
 			}
 			if err := tx.Create(&src).Error; err != nil {
 				return fmt.Errorf("create summary_source: %w", err)

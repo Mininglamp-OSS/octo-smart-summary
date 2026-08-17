@@ -163,7 +163,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	// Agent summary: persists agent-generated summaries.
 	// (The old /summaries/:id/refine route was removed in favor of the
 	// reference-based chat flow — see CHAT-REFERENCE-BASED-DESIGN-v1.)
-	agentSummaryH := handler.NewAgentSummaryHandler(db, llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
+	agentSummaryH := handler.NewAgentSummaryHandler(db, imDB, llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
 	v1.POST("/summaries/agent", agentSummaryH.CreateAgentSummary)
 
 	return r

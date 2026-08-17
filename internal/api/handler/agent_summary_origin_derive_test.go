@@ -92,7 +92,7 @@ func seedPipelineRefTask(t *testing.T, h *AgentSummaryHandler, taskNo string) mo
 // rows → save succeeds with the source channel as origin.
 func TestCreateAgentSummary_DeriveOriginFromSingleSource(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	ref := seedPipelineRefTask(t, h, "ST-PIPE-001")
@@ -142,7 +142,7 @@ func TestCreateAgentSummary_DeriveOriginFromSingleSource(t *testing.T) {
 // precedent.
 func TestCreateAgentSummary_DeriveOriginMultiSourceInheritsFirst(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	ref := seedPipelineRefTask(t, h, "ST-PIPE-002")
@@ -190,7 +190,7 @@ func TestCreateAgentSummary_DeriveOriginMultiSourceInheritsFirst(t *testing.T) {
 // row wins. If nothing usable remains the save still 40001s.
 func TestCreateAgentSummary_DeriveOriginSkipsUnusableRows(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	ref := seedPipelineRefTask(t, h, "ST-PIPE-003")
@@ -240,7 +240,7 @@ func TestCreateAgentSummary_DeriveOriginSkipsUnusableRows(t *testing.T) {
 // the fail-closed contract is unchanged for genuinely origin-less summaries.
 func TestCreateAgentSummary_DeriveOriginNoSourcesStill40001(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	ref := seedPipelineRefTask(t, h, "ST-PIPE-004") // no summary_source rows
@@ -285,7 +285,7 @@ func TestCreateAgentSummary_DeriveOriginNoSourcesStill40001(t *testing.T) {
 // source channels — same authz posture as tier-3.
 func TestCreateAgentSummary_DeriveOriginNoAccessRefused(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	now := time.Now()
@@ -334,7 +334,7 @@ func TestCreateAgentSummary_DeriveOriginNoAccessRefused(t *testing.T) {
 // consulted (regression guard for the pre-existing path).
 func TestCreateAgentSummary_Tier3BorrowStillWins(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	now := time.Now()
@@ -396,7 +396,7 @@ func TestCreateAgentSummary_Tier3BorrowStillWins(t *testing.T) {
 // same as an inaccessible task.
 func TestCreateAgentSummary_OriginBorrowRefusesDeletedReferencedTask(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	now := time.Now()
@@ -449,7 +449,7 @@ func TestCreateAgentSummary_OriginBorrowRefusesDeletedReferencedTask(t *testing.
 
 func TestCreateAgentSummary_OriginBorrowRefusesNonCompletedReferencedTask(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	now := time.Now()
@@ -505,7 +505,7 @@ func TestCreateAgentSummary_OriginBorrowRefusesNonCompletedReferencedTask(t *tes
 // partial lineage.
 func TestCreateAgentSummary_OverCapReferencedTaskIDsRejected400(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	overCap := make([]int64, 0, maxReferencedTaskIDs+3)
@@ -550,7 +550,7 @@ func TestCreateAgentSummary_OverCapReferencedTaskIDsRejected400(t *testing.T) {
 // dedup-then-check posture).
 func TestCreateAgentSummary_DuplicateIDsCollapseBelowCapAccepted(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	ref := seedPipelineRefTask(t, h, "ST-PIPE-DUP-01")
@@ -594,7 +594,7 @@ func TestCreateAgentSummary_DuplicateIDsCollapseBelowCapAccepted(t *testing.T) {
 // borrowable citations the marker dangles and must be stripped before save.
 func TestCreateAgentSummary_DanglingMarkersStrippedWhenBorrowRedacted(t *testing.T) {
 	db := newFileBackedAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	now := time.Now()
@@ -670,7 +670,7 @@ func TestCreateAgentSummary_DanglingMarkersStrippedWhenBorrowRedacted(t *testing
 // happy path.
 func TestCreateAgentSummary_MarkersPreservedWhenBorrowSucceeds(t *testing.T) {
 	db := newFileBackedAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	now := time.Now()
