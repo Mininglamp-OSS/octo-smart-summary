@@ -15,23 +15,17 @@ import (
 // SS-01 止血常量（见 docs/AGENT-SUMMARY-...zh.md 缺点二）。
 //
 // 历史 bug：chunk_size 默认 500，但 formatChunkForLLM 每片只格式化前 200 条，
-// 满片时静默丢弃 300/500（60%），且工具返回值只报 chunk_count，Planner 误判
-// 已覆盖全部消息。修法：把默认值与硬上限统一收敛到 200，使
-// SplitIntoChunks 产出的每片恒 <= maxChunkSize，格式化环节不再丢消息；同时
-// 返回结构化覆盖计数让上层可识别截断/超长输入。
-//
-// 注意执行顺序纪律：本阶段只压上限 + 报计数，不引入 Token-aware 分片，也不删
-// 200 硬限制——删限制属于 SS-06（Token 分片就绪之后），提前删会把“确定性丢消息”
-// 变成“上下文溢出/请求失败”。
+// 满片时静默丢弃 300/500（60%）。SS-01 先把默认值与硬上限收敛到 200 止血；
+// SS-06b 随后引入 token-aware 分片并删除了 200 格式化上限，分片改由 token 预算
+// 约束，覆盖恒为 100%。这里的常量保留给 clampChunkSize / ComputeCoverage /
+// oversized 阈值使用。
 const (
-	// defaultChunkSize 是未显式指定或非法 chunk_size 时的每片消息数。
+	// defaultChunkSize 是估算 chunk 数时的每片消息数基准。
 	defaultChunkSize = 200
-	// maxChunkSize 是每片消息数的硬上限，与 formatChunkForLLM 的格式化上限一致，
-	// 消除“分片 500 / 格式化 200”双上限造成的静默丢失。
+	// maxChunkSize 是 clampChunkSize 的消息数上限（历史止血值，仍供其使用）。
 	maxChunkSize = 200
 	// oversizedMessageRunes 是单条消息被标记为“超长”的字符阈值。超长消息只
-	// 计数上报（oversized_message_count），不做静默截断——真正的按预算单独成片
-	// 属于后续 Token 分片阶段（SS-06）。
+	// 计数上报（oversized_message_count），不做静默截断；token 分片会让它单独成片。
 	oversizedMessageRunes = 4000
 )
 
@@ -58,33 +52,23 @@ func clampChunkSize(requested int) int {
 	return requested
 }
 
-// ComputeCoverage reports how the CURRENT chunking path would cover inputCount
-// messages summarized at the given requested chunk_size: how many are fed to the
-// model (processed), how many are lost (dropped), and how many chunks are formed.
-//
-// It routes through the exact production seams — clampChunkSize + maxChunkSize —
-// so the SS-02 eval harness asserts the no-silent-loss invariant against real
-// logic. If anyone regresses defaultChunkSize back to 500 (or widens the format
-// cap out of step with the split size), dropped goes non-zero and eval fails.
+// ComputeCoverage reports how the chunking path covers inputCount messages: how
+// many reach the model (processed), how many are lost (dropped), and how many
+// chunks form. Post-SS-06b chunking is token-aware and the format cap is gone,
+// so no message is ever dropped — processed always equals inputCount. The eval
+// harness (SS-02) asserts dropped==0 against this; a regression that reintroduced
+// a silent-drop cap would make dropped go non-zero and fail eval.
 func ComputeCoverage(inputCount, requestedChunkSize int) (processed, dropped, chunks int) {
 	if inputCount <= 0 {
 		return 0, 0, 0
 	}
-	size := clampChunkSize(requestedChunkSize)
-	for i := 0; i < inputCount; i += size {
-		end := i + size
-		if end > inputCount {
-			end = inputCount
-		}
-		n := end - i
-		if n > maxChunkSize { // mirrors formatChunkForLLM's hard cap
-			n = maxChunkSize
-		}
-		processed += n
-		chunks++
+	// requestedChunkSize, when set, only caps messages-per-chunk; it never drops.
+	size := requestedChunkSize
+	if size <= 0 {
+		size = defaultChunkSize
 	}
-	dropped = inputCount - processed
-	return processed, dropped, chunks
+	chunks = (inputCount + size - 1) / size
+	return inputCount, 0, chunks
 }
 
 // getSessionMessagePool retrieves all messages from all tool calls in the session,
@@ -214,7 +198,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 					},
 					"chunk_size": map[string]interface{}{
 						"type":        "integer",
-						"description": "每个 chunk 的消息数；<=0 或 >200 时取 200（硬上限）。返回值含 input_count/processed_count/dropped_count/oversized_message_count/truncated。",
+						"description": "可选：每片最大消息数（叠加在 token 预算之上）；<=0 表示只按 token 预算分片。返回值含 input_count/processed_count/dropped_count/oversized_message_count/truncated。",
 					},
 				},
 				"required": []string{"messages_handle"},
@@ -288,15 +272,19 @@ func SummarizeChunkTool() (Tool, Handler) {
 			}
 		}
 
-		chunkSize := clampChunkSize(req.ChunkSize)
+		// SS-06b: token-aware chunking. Each chunk is bounded by a token budget
+		// (balanced by content — defect #9's uneven-length problem) instead of a
+		// fixed message count, and the per-chunk format cap is gone, so no message
+		// is ever dropped. chunk_size, if given, is an optional per-chunk message
+		// cap layered on top of the token budget.
+		_, _, _, cfg := GetSummaryDeps()
+		budget := chunkTokenBudget(cfg)
+		chunks := splitMsgMapsByTokenBudget(msgMaps, budget, req.ChunkSize, cfg.ResolveCharsPerTokenCJK(), cfg.CharsPerTokenASCII)
 
-		chunks := service.SplitIntoChunks(msgMaps, chunkSize)
-
-		// Summarize each chunk and aggregate honest coverage counts. With
-		// chunkSize clamped to maxChunkSize, formatChunkForLLM never drops a
-		// message, so dropped_count is 0 on the normal path; the counters stay
-		// truthful if a future change ever reintroduces a per-chunk cap.
-		cov := chunkCoverage{InputCount: len(messages), ChunkSize: chunkSize}
+		// Summarize each chunk and aggregate honest coverage counts. Token
+		// chunking + no format cap means processed == input, so dropped_count is
+		// 0; the counters stay truthful if a future change reintroduces a cap.
+		cov := chunkCoverage{InputCount: len(messages), ChunkSize: req.ChunkSize}
 		var summaries []string
 		for _, chunk := range chunks {
 			summary, processed, oversized, err := summarizeMessagesChunk(ctx, chunk)
@@ -336,19 +324,15 @@ func SummarizeChunkTool() (Tool, Handler) {
 // the LLM. It is a pure function (no LLM, no I/O) so coverage can be asserted
 // deterministically in tests / the eval harness without a live model.
 //
-// It returns how many messages it actually formatted (processed) and how many
-// exceeded oversizedMessageRunes (oversized). Oversized messages are counted but
-// NOT truncated — their full content is still emitted. The maxChunkSize guard is
-// a redundant safety net: with clampChunkSize upstream, chunks are always
-// <= maxChunkSize, so it never drops here; if it ever did, processed would be
-// less than len(chunk) and the caller would surface a non-zero dropped_count
-// instead of losing messages silently.
+// It returns how many messages it formatted (processed) and how many exceeded
+// oversizedMessageRunes (oversized). Oversized messages are counted but NOT
+// truncated. SS-06b removed the per-chunk message cap: chunks are now bounded by
+// a token budget upstream (splitMsgMapsByTokenBudget), so formatting every
+// message in the chunk cannot overflow — and processed always == len(chunk),
+// i.e. no silent drop.
 func formatChunkForLLM(chunk []map[string]interface{}) (formatted string, processed, oversized int) {
 	var b strings.Builder
-	for i, msg := range chunk {
-		if i >= maxChunkSize {
-			break
-		}
+	for _, msg := range chunk {
 		sender, _ := msg["sender_name"].(string)
 		content, _ := msg["content"].(string)
 		citationIndex, _ := msg["citation_index"].(int)
