@@ -372,6 +372,12 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 	var sourceList []sourceReq
 	if len(req.Sources) > 0 {
 		sourceList = req.Sources
+		for _, s := range sourceList {
+			if !validFrontendSourceType(s.SourceType) {
+				c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "source_type must be 1, 2, or 3"})
+				return
+			}
+		}
 	}
 	// Preserve the public API contract: the cap applies to submitted entries,
 	// before duplicate rows are collapsed for persistence.
@@ -1235,6 +1241,12 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 	isCreator := task.CreatorID == userID
 	canEdit := isCreator && task.Status == model.StatusCompleted && len(participants) <= 1
 	canSchedule := isCreator
+	if hasDocumentSource, err := h.taskHasDocumentSource(taskID); err != nil {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
+		return
+	} else if hasDocumentSource {
+		canSchedule = false
+	}
 	resp["permissions"] = gin.H{
 		"can_edit":          canEdit,
 		"can_schedule":      canSchedule,

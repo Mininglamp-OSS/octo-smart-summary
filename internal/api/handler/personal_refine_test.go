@@ -30,6 +30,7 @@ func setupPersonalRefineDB(t *testing.T) *gorm.DB {
 		&model.SummaryParticipant{},
 		&model.PersonalResult{},
 		&model.PersonalResultVersion{},
+		&model.SummarySource{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

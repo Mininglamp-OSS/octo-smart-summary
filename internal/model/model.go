@@ -196,6 +196,7 @@ type SummaryDocumentAgentIdempotency struct {
 	UserID         string    `gorm:"column:user_id;type:varchar(64);not null;uniqueIndex:uk_doc_agent_idempotency"`
 	IdempotencyKey string    `gorm:"column:idempotency_key;type:varchar(128);not null;uniqueIndex:uk_doc_agent_idempotency"`
 	RequestHash    string    `gorm:"column:request_hash;type:char(64);not null;default:''"`
+	ClaimToken     string    `gorm:"column:claim_token;type:varchar(64);not null;default:''"`
 	TaskID         int64     `gorm:"column:task_id;not null"`
 	CreatedAt      time.Time `gorm:"column:created_at;not null"`
 }

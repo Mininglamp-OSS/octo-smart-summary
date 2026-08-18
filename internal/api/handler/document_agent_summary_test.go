@@ -181,7 +181,6 @@ func TestCreateDocumentAgentSummary_ReclaimsStaleIdempotencyClaim(t *testing.T) 
 		RequestHash:    "old-hash",
 		TaskID:         0,
 		CreatedAt:      stale,
-		UpdatedAt:      stale,
 	}).Error; err != nil {
 		t.Fatalf("seed stale claim: %v", err)
 	}

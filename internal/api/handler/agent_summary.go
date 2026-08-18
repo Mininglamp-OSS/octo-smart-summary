@@ -353,6 +353,12 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	}
 
 	var createdTaskID int64
+	for _, s := range req.Sources {
+		if !validFrontendSourceType(s.SourceType) {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "source_type must be 1, 2, or 3"})
+			return
+		}
+	}
 	err = h.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&task).Error; err != nil {
 			return fmt.Errorf("create summary_task: %w", err)

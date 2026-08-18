@@ -1205,6 +1205,20 @@ func (h *PersonalHandler) AddMembers(c *gin.Context) {
 		c.JSON(http.StatusForbidden, apiResponse{Code: 40003, Message: "仅创建者可添加成员"})
 		return
 	}
+	// Document-source tasks must not gain members: the Accept revive path
+	// dispatches the conversation pipeline, which cannot handle source_type=4
+	// and would produce empty results while destroying the completed state.
+	var docSourceCount int64
+	if err := h.db.Model(&model.SummarySource{}).
+		Where("task_id = ? AND source_type = ? AND derived = 0", taskID, model.SourceDocument).
+		Count(&docSourceCount).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
+		return
+	}
+	if docSourceCount > 0 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "文档总结不支持添加成员"})
+		return
+	}
 	// Reject terminal tasks: new members would be stuck Pending forever (no revive
 	// path — Accept revive CAS is WHERE status=Completed, worker CAS also misses).
 	// Only Failed/Cancelled are blocked; Pending/WaitingConfirm/Processing/Completed

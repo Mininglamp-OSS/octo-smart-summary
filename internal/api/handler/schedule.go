@@ -1532,6 +1532,18 @@ func loadTaskForTaskScope(tx *gorm.DB, spaceID, userID string, taskID int64, fea
 	if task.CreatorID != userID {
 		return model.SummaryTask{}, service.NewBizError(40004, "仅创建者可绑定定时", http.StatusForbidden)
 	}
+	// Document-source tasks must not be bound to a schedule: the scheduler
+	// replaces sources and participants, which would destroy the document
+	// provenance and personal result.
+	var docSourceCount int64
+	if err := tx.Model(&model.SummarySource{}).
+		Where("task_id = ? AND source_type = ? AND derived = 0", taskID, model.SourceDocument).
+		Count(&docSourceCount).Error; err != nil {
+		return model.SummaryTask{}, err
+	}
+	if docSourceCount > 0 {
+		return model.SummaryTask{}, service.NewBizError(40005, "文档总结不支持绑定定时", http.StatusBadRequest)
+	}
 	// Refuse binding a schedule to a multi-person task (same measure as the worker guard);
 	// otherwise the scheduler would skip it every cycle, leaving a silently dead timer.
 	// When team schedules are enabled this guard is bypassed.
