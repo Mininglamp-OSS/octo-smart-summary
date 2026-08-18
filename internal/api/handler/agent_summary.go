@@ -366,6 +366,11 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	}
 
 	var createdTaskID int64
+	// SS-11: capture the SS-07 finish verdict + gaps out of the tx closure so the
+	// success response can disclose PARTIAL / coverage gaps to the client. FAILED
+	// aborts the tx (SS-07b) and never reaches the success response.
+	var finishVerdict finishgate.Verdict
+	var finishGaps []finishgate.Gap
 	err = h.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&task).Error; err != nil {
 			return fmt.Errorf("create summary_task: %w", err)
@@ -477,6 +482,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		if agent.SummaryV2Enabled() {
 			if v, gaps := h.finalizeRun(c.Request.Context(), userID, req.SessionID, content, cits); v != "" {
 				log.Printf("[handler] agent summary finish verdict=%s gaps=%d session=%s", v, len(gaps), req.SessionID)
+				finishVerdict, finishGaps = v, gaps
 				if v == finishgate.Failed {
 					return fmt.Errorf("%w: finish verdict FAILED (%d gaps)", errFinishFailed, len(gaps))
 				}
@@ -544,15 +550,26 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 
 	// Response shape is intentionally isomorphic to POST /summaries so the
 	// front-end can consume both endpoints with the same success handler.
+	respData := gin.H{
+		"task_id":    createdTaskID,
+		"task_no":    task.TaskNo,
+		"status":     task.Status,
+		"created_at": task.CreatedAt,
+	}
+	// SS-11: disclose the SS-07 finish verdict + coverage gaps so the client can
+	// render a PARTIAL warning + gap list. Omitted (V2 off / no run) → response
+	// byte-identical to pre-SS-11. FAILED never reaches here (422 above).
+	if finishVerdict != "" {
+		respData["finish_status"] = string(finishVerdict)
+		if finishGaps == nil {
+			finishGaps = []finishgate.Gap{}
+		}
+		respData["gaps"] = finishGaps
+	}
 	c.JSON(http.StatusOK, apiResponse{
 		Code:    0,
 		Message: "ok",
-		Data: gin.H{
-			"task_id":    createdTaskID,
-			"task_no":    task.TaskNo,
-			"status":     task.Status,
-			"created_at": task.CreatedAt,
-		},
+		Data:    respData,
 	})
 }
 

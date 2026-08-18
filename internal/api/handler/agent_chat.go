@@ -591,11 +591,17 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		log.Printf("[agent] append messages error: %v", err)
 	}
 
-	c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok", Data: gin.H{
+	respData := gin.H{
 		"reply":      reply,
 		"session_id": req.SessionID,
 		"profile":    profileName,
-	}})
+	}
+	// SS-11: surface run_id (SS-03) so the client can correlate/continue the run.
+	// Empty (V2 off / no run) → omitted, keeping the legacy response byte-identical.
+	if v2RunID != "" {
+		respData["run_id"] = v2RunID
+	}
+	c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok", Data: respData})
 }
 
 // historyBubble 是只读历史接口返回的单条可展示气泡：只含 role + content，
@@ -870,7 +876,7 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	}
 
 	// Emit done event with final reply
-	h.writeSSEDoneViaSink(sink, reply, req.SessionID)
+	h.writeSSEDoneViaSink(sink, reply, req.SessionID, v2RunID)
 }
 
 // writeSSEProgressViaSink writes a progress SSE event via the provided sink.
@@ -901,10 +907,16 @@ func (h *AgentChatHandler) writeSSEProgressViaSink(sink *sseSink, phase string, 
 }
 
 // writeSSEDoneViaSink writes a done SSE event via the provided sink.
-func (h *AgentChatHandler) writeSSEDoneViaSink(sink *sseSink, reply, sessionID string) {
+func (h *AgentChatHandler) writeSSEDoneViaSink(sink *sseSink, reply, sessionID, runID string) {
 	data := map[string]interface{}{
 		"reply":      reply,
 		"session_id": sessionID,
+	}
+	// SS-11: surface run_id so the client can correlate/continue the persisted
+	// run (SS-03). Empty (V2 off / no run) → omitted, so the done frame stays
+	// byte-identical to pre-SS-11 for legacy clients.
+	if runID != "" {
+		data["run_id"] = runID
 	}
 	jsonData, err := json.Marshal(data)
 	if err != nil {
