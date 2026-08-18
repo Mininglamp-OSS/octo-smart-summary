@@ -7,11 +7,14 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/gin-gonic/gin"
 )
 
@@ -144,6 +147,63 @@ func TestCreateDocumentAgentSummary_IdempotentConcurrentReplay(t *testing.T) {
 		if code != http.StatusOK {
 			t.Fatalf("request %d expected 200, got %d", i, code)
 		}
+	}
+	var count int64
+	db.Model(&model.SummaryTask{}).Count(&count)
+	if count != 1 {
+		t.Fatalf("task count = %d, want 1", count)
+	}
+}
+
+func TestBuildDocumentSummaryPrompt_EnforcesGlobalPromptCap(t *testing.T) {
+	large := strings.Repeat("长", maxDocumentPromptRunes)
+	docs := []*documentSummarySource{
+		{DocumentID: "doc-1", Title: "doc1", Content: large},
+		{DocumentID: "doc-2", Title: "doc2", Content: large},
+	}
+
+	prompt, _ := buildDocumentSummaryPrompt(defaultDocumentSummaryRequirement, docs)
+	if got := len([]rune(prompt)); got > maxDocumentPromptRunes {
+		t.Fatalf("prompt runes = %d, want <= %d", got, maxDocumentPromptRunes)
+	}
+	if strings.Contains(prompt, "## 文档：doc2") {
+		t.Fatal("prompt kept appending later documents after the global cap")
+	}
+}
+
+func TestCreateDocumentAgentSummary_ReclaimsStaleIdempotencyClaim(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	stale := timezone.Now().Add(-documentIdempotencyClaimTTL - time.Minute)
+	if err := db.Create(&model.SummaryDocumentAgentIdempotency{
+		SpaceID:        "test-space",
+		UserID:         "test-user",
+		IdempotencyKey: "idem-stale",
+		RequestHash:    "old-hash",
+		TaskID:         0,
+		CreatedAt:      stale,
+		UpdatedAt:      stale,
+	}).Error; err != nil {
+		t.Fatalf("seed stale claim: %v", err)
+	}
+
+	llmSrv, llmURL := newDocumentSummaryLLM(t)
+	defer llmSrv.Close()
+	h := NewAgentSummaryHandler(db, nil, llmURL, "test-key", "test-model", 5, 256)
+	h.documentClient = fakeDocumentSourceClient{docs: map[string]*documentSummarySource{
+		"doc-1": {DocumentID: "doc-1", Title: "doc", Content: "content"},
+	}}
+	r := setupDocumentAgentSummaryRouter(h)
+
+	body := []byte(`{"document_refs":[{"document_id":"doc-1"}],"idempotency_key":"idem-stale"}`)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/summaries/agent/document", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Token", "test-user")
+	req.Header.Set("X-Space-Id", "test-space")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected stale claim to be reclaimed, got %d: %s", w.Code, w.Body.String())
 	}
 	var count int64
 	db.Model(&model.SummaryTask{}).Count(&count)

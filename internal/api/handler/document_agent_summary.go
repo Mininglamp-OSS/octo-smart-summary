@@ -34,10 +34,12 @@ const (
 	maxDocumentVersionLen             = 128
 	maxDocumentTitleRunes             = 200
 	maxDocumentChunkRunes             = 12000
+	maxDocumentChunks                 = 200
 	maxDocumentPromptRunes            = 80000
 	maxDocumentCitationRunes          = 200
 	documentIdempotencyWaitTimeout    = 30 * time.Second
 	documentIdempotencyPollInterval   = 200 * time.Millisecond
+	documentIdempotencyClaimTTL       = 10 * time.Minute
 )
 
 var errDocumentSourceNotConfigured = errors.New("document summary source API is not configured")
@@ -148,7 +150,7 @@ func (c *httpDocumentSourceClient) FetchSummarySource(ctx context.Context, space
 	var out documentSummarySource
 	decoder := json.NewDecoder(io.LimitReader(resp.Body, maxDocumentSourceResponseBytes))
 	if err := decoder.Decode(&out); err != nil {
-		return nil, err
+		return nil, &documentSourceError{status: http.StatusBadGateway, message: "document source API returned invalid or oversized payload"}
 	}
 	if out.DocumentID == "" {
 		out.DocumentID = documentID
@@ -203,6 +205,11 @@ func (h *AgentSummaryHandler) CreateDocumentAgentSummary(c *gin.Context) {
 	}
 	req.DocumentRefs = refs
 	requestHash := hashDocumentAgentRequest(req)
+	if err := h.cleanupStaleDocumentAgentClaim(c.Request.Context(), spaceID, userID, req.IdempotencyKey); err != nil {
+		log.Printf("[handler] document agent stale idempotency cleanup failed space=%s user=%s: %v", spaceID, userID, err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "幂等检查失败"})
+		return
+	}
 
 	existing, okExisting, conflict, err := h.lookupDocumentAgentIdempotency(c.Request.Context(), spaceID, userID, req.IdempotencyKey, requestHash)
 	if err != nil {
@@ -216,9 +223,17 @@ func (h *AgentSummaryHandler) CreateDocumentAgentSummary(c *gin.Context) {
 	}
 	if okExisting {
 		if existing.TaskID > 0 {
-			h.respondDocumentIdempotentTask(c, existing.TaskID)
-			return
+			if h.respondDocumentIdempotentTask(c, existing.TaskID) {
+				return
+			}
+			if err := h.deleteDocumentAgentIdempotency(c.Request.Context(), spaceID, userID, req.IdempotencyKey); err != nil {
+				c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "幂等检查失败"})
+				return
+			}
+			okExisting = false
 		}
+	}
+	if okExisting {
 		existing, okExisting, conflict, err = h.waitDocumentAgentIdempotency(c.Request.Context(), spaceID, userID, req.IdempotencyKey, requestHash)
 		if err != nil {
 			log.Printf("[handler] document agent idempotency wait failed space=%s user=%s: %v", spaceID, userID, err)
@@ -230,15 +245,23 @@ func (h *AgentSummaryHandler) CreateDocumentAgentSummary(c *gin.Context) {
 			return
 		}
 		if okExisting && existing.TaskID > 0 {
-			h.respondDocumentIdempotentTask(c, existing.TaskID)
-			return
+			if h.respondDocumentIdempotentTask(c, existing.TaskID) {
+				return
+			}
+			if err := h.deleteDocumentAgentIdempotency(c.Request.Context(), spaceID, userID, req.IdempotencyKey); err != nil {
+				c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "幂等检查失败"})
+				return
+			}
+			okExisting = false
 		}
+	}
+	if okExisting {
 		c.JSON(http.StatusConflict, apiResponse{Code: 40901, Message: "same idempotency_key is still being processed"})
 		return
 	}
 	if err := h.claimDocumentAgentIdempotency(c.Request.Context(), spaceID, userID, req.IdempotencyKey, requestHash); err != nil {
 		if errors.Is(err, errDocumentAgentIdempotencyConflict) {
-			existing, okExisting, conflict, ferr := h.lookupDocumentAgentIdempotency(c.Request.Context(), spaceID, userID, req.IdempotencyKey, requestHash)
+			existing, okExisting, conflict, ferr := h.waitDocumentAgentIdempotency(c.Request.Context(), spaceID, userID, req.IdempotencyKey, requestHash)
 			if ferr != nil {
 				c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "幂等检查失败"})
 				return
@@ -248,14 +271,26 @@ func (h *AgentSummaryHandler) CreateDocumentAgentSummary(c *gin.Context) {
 				return
 			}
 			if okExisting && existing.TaskID > 0 {
-				h.respondDocumentIdempotentTask(c, existing.TaskID)
+				if h.respondDocumentIdempotentTask(c, existing.TaskID) {
+					return
+				}
+				if err := h.deleteDocumentAgentIdempotency(c.Request.Context(), spaceID, userID, req.IdempotencyKey); err != nil {
+					c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "幂等检查失败"})
+					return
+				}
+			}
+			if okExisting {
+				c.JSON(http.StatusConflict, apiResponse{Code: 40901, Message: "same idempotency_key is still being processed"})
 				return
 			}
-			c.JSON(http.StatusConflict, apiResponse{Code: 40901, Message: "same idempotency_key is still being processed"})
+			if err := h.claimDocumentAgentIdempotency(c.Request.Context(), spaceID, userID, req.IdempotencyKey, requestHash); err != nil {
+				c.JSON(http.StatusConflict, apiResponse{Code: 40901, Message: "same idempotency_key is still being processed"})
+				return
+			}
+		} else {
+			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "幂等检查失败"})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "幂等检查失败"})
-		return
 	}
 	claimed := true
 	defer func() {
@@ -350,11 +385,11 @@ func normalizeDocumentRefs(refs []documentRefReq) []documentRefReq {
 func validateDocumentRefs(refs []documentRefReq) error {
 	versionsByDoc := map[string]string{}
 	for _, ref := range refs {
-		if len(ref.DocumentID) > maxDocumentIDLen {
+		if utf8.RuneCountInString(ref.DocumentID) > maxDocumentIDLen {
 			return fmt.Errorf("document_id too long: %s", ref.DocumentID)
 		}
-		if len(ref.Version) > maxDocumentVersionLen {
-			return fmt.Errorf("document version too long: %s", ref.DocumentID)
+		if utf8.RuneCountInString(ref.Version) > maxDocumentVersionLen {
+			return fmt.Errorf("document version too long: %s", ref.Version)
 		}
 		if existing, ok := versionsByDoc[ref.DocumentID]; ok && existing != ref.Version {
 			return fmt.Errorf("multiple versions of one document are not supported: %s", ref.DocumentID)
@@ -386,6 +421,9 @@ func (h *AgentSummaryHandler) lookupDocumentAgentIdempotency(ctx context.Context
 }
 
 func (h *AgentSummaryHandler) claimDocumentAgentIdempotency(ctx context.Context, spaceID, userID, key, requestHash string) error {
+	if err := h.cleanupStaleDocumentAgentClaim(ctx, spaceID, userID, key); err != nil {
+		return err
+	}
 	row := model.SummaryDocumentAgentIdempotency{
 		SpaceID:        spaceID,
 		UserID:         userID,
@@ -402,6 +440,12 @@ func (h *AgentSummaryHandler) claimDocumentAgentIdempotency(ctx context.Context,
 		return err
 	}
 	return nil
+}
+
+func (h *AgentSummaryHandler) cleanupStaleDocumentAgentClaim(ctx context.Context, spaceID, userID, key string) error {
+	return h.db.WithContext(ctx).
+		Where("space_id = ? AND user_id = ? AND idempotency_key = ? AND task_id = 0 AND created_at < ?", spaceID, userID, key, timezone.Now().Add(-documentIdempotencyClaimTTL)).
+		Delete(&model.SummaryDocumentAgentIdempotency{}).Error
 }
 
 func isDuplicateKeyError(err error) bool {
@@ -441,11 +485,20 @@ func (h *AgentSummaryHandler) releaseDocumentAgentIdempotency(ctx context.Contex
 		Delete(&model.SummaryDocumentAgentIdempotency{}).Error
 }
 
-func (h *AgentSummaryHandler) respondDocumentIdempotentTask(c *gin.Context, taskID int64) {
+func (h *AgentSummaryHandler) deleteDocumentAgentIdempotency(ctx context.Context, spaceID, userID, key string) error {
+	return h.db.WithContext(ctx).
+		Where("space_id = ? AND user_id = ? AND idempotency_key = ?", spaceID, userID, key).
+		Delete(&model.SummaryDocumentAgentIdempotency{}).Error
+}
+
+func (h *AgentSummaryHandler) respondDocumentIdempotentTask(c *gin.Context, taskID int64) bool {
 	var task model.SummaryTask
-	if err := h.db.Where("id = ?", taskID).First(&task).Error; err != nil {
+	if err := h.db.Where("id = ? AND deleted_at IS NULL", taskID).First(&task).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false
+		}
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "幂等任务读取失败"})
-		return
+		return true
 	}
 	c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok", Data: gin.H{
 		"task_id":    task.ID,
@@ -453,6 +506,7 @@ func (h *AgentSummaryHandler) respondDocumentIdempotentTask(c *gin.Context, task
 		"status":     task.Status,
 		"created_at": task.CreatedAt,
 	}})
+	return true
 }
 
 func (h *AgentSummaryHandler) documentSourceClient() documentSourceClient {
@@ -477,23 +531,61 @@ func (h *AgentSummaryHandler) generateDocumentSummary(ctx context.Context, requi
 
 func buildDocumentSummaryPrompt(requirement string, docs []*documentSummarySource) (string, []model.Citation) {
 	var b strings.Builder
-	b.WriteString("总结要求：")
-	b.WriteString(requirement)
-	b.WriteString("\n\n请输出结构清晰、可快速浏览的中文总结。涉及文档依据时使用 [n] 标注来源；不要引用不存在的编号。\n\n<文档数据>\n")
+	truncatedMarker := "\n[文档内容已按长度上限截断]\n"
+	closeFence := "\n</文档数据>\n"
+	bodyLimit := maxDocumentPromptRunes - utf8.RuneCountInString(truncatedMarker) - utf8.RuneCountInString(closeFence)
+	if bodyLimit < 1 {
+		bodyLimit = maxDocumentPromptRunes
+	}
+	used := 0
+	appendPrompt := func(s string) bool {
+		if s == "" {
+			return true
+		}
+		remaining := bodyLimit - used
+		if remaining <= 0 {
+			return false
+		}
+		runes := utf8.RuneCountInString(s)
+		if runes > remaining {
+			b.WriteString(truncateRunes(s, remaining))
+			used = bodyLimit
+			return false
+		}
+		b.WriteString(s)
+		used += runes
+		return true
+	}
+	truncated := false
+	if !appendPrompt("总结要求：") ||
+		!appendPrompt(requirement) ||
+		!appendPrompt("\n\n请输出结构清晰、可快速浏览的中文总结。涉及文档依据时使用 [n] 标注来源；不要引用不存在的编号。\n\n<文档数据>\n") {
+		truncated = true
+	}
 	cits := make([]model.Citation, 0)
+docsLoop:
 	for _, doc := range docs {
+		if truncated {
+			break
+		}
 		title := strings.TrimSpace(doc.Title)
 		if title == "" {
 			title = doc.DocumentID
 		}
-		b.WriteString("\n## 文档：")
-		b.WriteString(sanitizeDocumentFenceText(title))
-		if doc.Version != "" {
-			b.WriteString(" (version: ")
-			b.WriteString(sanitizeDocumentFenceText(doc.Version))
-			b.WriteString(")")
+		if !appendPrompt("\n## 文档：") || !appendPrompt(sanitizeDocumentFenceText(title)) {
+			truncated = true
+			break
 		}
-		b.WriteString("\n")
+		if doc.Version != "" {
+			if !appendPrompt(" (version: ") || !appendPrompt(sanitizeDocumentFenceText(doc.Version)) || !appendPrompt(")") {
+				truncated = true
+				break
+			}
+		}
+		if !appendPrompt("\n") {
+			truncated = true
+			break
+		}
 		chunks := doc.Chunks
 		if len(chunks) == 0 {
 			chunks = []documentSourceChunk{{Text: doc.Content}}
@@ -504,17 +596,26 @@ func buildDocumentSummaryPrompt(requirement string, docs []*documentSummarySourc
 				continue
 			}
 			idx := len(cits) + 1
-			b.WriteString(fmt.Sprintf("\n[%d]", idx))
+			if !appendPrompt(fmt.Sprintf("\n[%d]", idx)) {
+				truncated = true
+				break docsLoop
+			}
 			if chunk.Page > 0 {
-				b.WriteString(fmt.Sprintf(" page=%d", chunk.Page))
+				if !appendPrompt(fmt.Sprintf(" page=%d", chunk.Page)) {
+					truncated = true
+					break docsLoop
+				}
 			}
 			if chunk.Title != "" {
-				b.WriteString(" section=")
-				b.WriteString(sanitizeDocumentFenceText(chunk.Title))
+				if !appendPrompt(" section=") || !appendPrompt(sanitizeDocumentFenceText(chunk.Title)) {
+					truncated = true
+					break docsLoop
+				}
 			}
-			b.WriteString("\n")
-			b.WriteString(sanitizeDocumentFenceText(text))
-			b.WriteString("\n")
+			if !appendPrompt("\n") || !appendPrompt(sanitizeDocumentFenceText(text)) || !appendPrompt("\n") {
+				truncated = true
+				break docsLoop
+			}
 			cits = append(cits, model.Citation{
 				Index:           idx,
 				Type:            "document",
@@ -526,13 +627,12 @@ func buildDocumentSummaryPrompt(requirement string, docs []*documentSummarySourc
 				Page:            chunk.Page,
 				Content:         truncateRunes(text, maxDocumentCitationRunes),
 			})
-			if utf8.RuneCountInString(b.String()) >= maxDocumentPromptRunes {
-				b.WriteString("\n[文档内容已按长度上限截断]\n")
-				break
-			}
 		}
 	}
-	b.WriteString("\n</文档数据>\n")
+	if truncated {
+		b.WriteString(truncatedMarker)
+	}
+	b.WriteString(closeFence)
 	return b.String(), cits
 }
 
@@ -546,7 +646,10 @@ func normalizeFetchedDocumentSource(doc *documentSummarySource, ref documentRefR
 	doc.Content = truncateRunes(strings.TrimSpace(doc.Content), maxDocumentPromptRunes)
 	normalized := make([]documentSourceChunk, 0, len(doc.Chunks))
 	total := 0
-	for _, chunk := range doc.Chunks {
+	for i, chunk := range doc.Chunks {
+		if i >= maxDocumentChunks {
+			break
+		}
 		chunk.ChunkID = truncateRunes(strings.TrimSpace(chunk.ChunkID), maxDocumentVersionLen)
 		chunk.Title = truncateRunes(strings.TrimSpace(chunk.Title), maxDocumentTitleRunes)
 		chunk.Text = truncateRunes(strings.TrimSpace(chunk.Text), maxDocumentChunkRunes)
@@ -566,17 +669,6 @@ func normalizeFetchedDocumentSource(doc *documentSummarySource, ref documentRefR
 		normalized = append(normalized, chunk)
 	}
 	doc.Chunks = normalized
-}
-
-func truncateRunes(s string, max int) string {
-	if max <= 0 {
-		return ""
-	}
-	if utf8.RuneCountInString(s) <= max {
-		return s
-	}
-	r := []rune(s)
-	return string(r[:max])
 }
 
 func sanitizeDocumentFenceText(s string) string {

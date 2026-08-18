@@ -123,6 +123,8 @@ func fallbackSourceName(sourceID string, sourceType int) string {
 		suffix = "(子区)"
 	case 3:
 		suffix = "(私聊)"
+	case 4:
+		suffix = "(文档)"
 	}
 	if len(sourceID) > 8 {
 		return "来源-" + sourceID[:8] + suffix

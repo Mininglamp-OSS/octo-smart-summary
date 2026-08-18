@@ -1,6 +1,6 @@
 -- +migrate Up
 ALTER TABLE summary_source
-  ADD COLUMN source_version VARCHAR(128) NOT NULL DEFAULT '' AFTER source_name;
+  ADD COLUMN source_version VARCHAR(128) NOT NULL DEFAULT '';
 
 -- +migrate Down
 ALTER TABLE summary_source

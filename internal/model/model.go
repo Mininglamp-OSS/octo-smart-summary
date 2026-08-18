@@ -273,22 +273,22 @@ func (SummaryChunk) TableName() string { return "summary_chunk" }
 
 // Citation represents a reference from a summary back to the original message.
 type Citation struct {
-	Index         int          `json:"index"`
-	Sender        string       `json:"sender"`
-	Content       string       `json:"content"`
-	SentAt        string       `json:"sent_at"`
-	Source        string       `json:"source"`
-	ChannelID     string       `json:"channel_id"`
-	ChannelType   int          `json:"channel_type"`
-	MessageSeq    int64        `json:"message_seq"`
+	Index           int          `json:"index"`
+	Sender          string       `json:"sender"`
+	Content         string       `json:"content"`
+	SentAt          string       `json:"sent_at"`
+	Source          string       `json:"source"`
+	ChannelID       string       `json:"channel_id"`
+	ChannelType     int          `json:"channel_type"`
+	MessageSeq      int64        `json:"message_seq"`
 	Type            string       `json:"type,omitempty"`
 	DocumentID      string       `json:"document_id,omitempty"`
 	DocumentTitle   string       `json:"document_title,omitempty"`
 	DocumentVersion string       `json:"document_version,omitempty"`
 	ChunkID         string       `json:"chunk_id,omitempty"`
 	Page            int          `json:"page,omitempty"`
-	ContextBefore []ContextMsg `json:"context_before,omitempty"`
-	ContextAfter  []ContextMsg `json:"context_after,omitempty"`
+	ContextBefore   []ContextMsg `json:"context_before,omitempty"`
+	ContextAfter    []ContextMsg `json:"context_after,omitempty"`
 }
 
 // ContextMsg represents a surrounding message used as context for a citation.
