@@ -518,6 +518,16 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		}
 	}
 
+	// SS-08: inject the deterministic refine route as guidance so the model
+	// follows a decided path (rewrite/augment/extend) instead of re-guessing.
+	// v2-gated → flag-off keeps the pure-prompt summary_refine behavior
+	// byte-identical.
+	if agent.SummaryV2Enabled() && profileName == "summary_refine" {
+		route := agent.ClassifyRefine(req.Message)
+		system = system + agent.BuildRefineGuidance(route)
+		log.Printf("[agent] refine route session=%s intent=%s fetch=%t", req.SessionID, route.Intent, route.Fetch)
+	}
+
 	history = agent.TruncateHistory(history, h.window)
 
 	reply, newMsgs, err := runner.RunWithHistory(ctx, system, history, req.Message)
@@ -780,6 +790,14 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 			system = system + refContext
 			log.Printf("[agent] chat/stream session=%s loaded %d referenced tasks: %v", req.SessionID, len(loaded), loaded)
 		}
+	}
+
+	// SS-08: inject the deterministic refine route as guidance (see Chat()).
+	// v2-gated → flag-off byte-identical.
+	if agent.SummaryV2Enabled() && profileName == "summary_refine" {
+		route := agent.ClassifyRefine(req.Message)
+		system = system + agent.BuildRefineGuidance(route)
+		log.Printf("[agent] refine route session=%s intent=%s fetch=%t", req.SessionID, route.Intent, route.Fetch)
 	}
 
 	history = agent.TruncateHistory(history, h.window)
