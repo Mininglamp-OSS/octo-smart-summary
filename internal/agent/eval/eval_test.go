@@ -71,7 +71,11 @@ func TestCitationValidatorCatchesOutOfRange(t *testing.T) {
 }
 
 // TestCoverageRegressionGuard fails loudly if the chunking defaults ever regress
-// to the historical 500 (which silently dropped 300 of every 500-message chunk).
+// to a silent-drop cap. Post-PR-#196-fix-forward it drives the production
+// chain (clamp -> token splitter -> formatter) through Coverage, so the
+// assertion below is reachable: reintroducing a 200-style format cap makes
+// dropped go non-zero and turns this test red (P1-2: the guard was previously
+// arithmetic-only and could never fail).
 func TestCoverageRegressionGuard(t *testing.T) {
 	// 500 input at default chunk_size must feed all 500 to the model.
 	fake := GoldenCase{Messages: make([]GoldenMessage, 500)}

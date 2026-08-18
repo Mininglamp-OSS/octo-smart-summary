@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 )
 
 // SS-01 regression tests: prove the "chunk_size 500 / format 200" double cap no
@@ -86,43 +86,44 @@ func TestFormatChunkForLLM_OversizedCountedNotTruncated(t *testing.T) {
 	}
 }
 
-// aggregateCoverage mirrors the handler's per-chunk aggregation loop, but skips
-// the LLM call so the funnel is deterministic. Kept in the test to assert the
-// end-to-end "no messages lost across chunk boundaries" invariant.
+// aggregateCoverage drives the PRODUCTION chunking chain for the funnel:
+// clampChunkSize -> splitMsgMapsByTokenBudget -> formatChunkForLLM, exactly as
+// the handler does (default config, no LLM call). PR #196 review P1-3: the
+// previous version of this helper exercised service.SplitIntoChunks — a
+// count-based splitter with zero production callers — so it validated a dead
+// path. The SS-02 no-silent-loss guarantee must hold for the splitter the
+// handler actually runs.
 func aggregateCoverage(t *testing.T, inputCount, requestedChunkSize int) chunkCoverage {
 	t.Helper()
 	msgMaps := makeMsgMaps(inputCount)
 	size := clampChunkSize(requestedChunkSize)
-	chunks := service.SplitIntoChunks(msgMaps, size)
+	processed, dropped, _ := ProbeChunkCoverageDefault(msgMaps, requestedChunkSize)
 
 	cov := chunkCoverage{InputCount: inputCount, ChunkSize: size}
-	for _, chunk := range chunks {
-		_, processed, oversized := formatChunkForLLM(chunk)
-		cov.ProcessedCount += processed
-		cov.OversizedMessageCount += oversized
-	}
-	cov.DroppedCount = cov.InputCount - cov.ProcessedCount
-	cov.Truncated = cov.DroppedCount > 0
+	cov.ProcessedCount = processed
+	cov.DroppedCount = dropped
+	cov.Truncated = dropped > 0
 	return cov
 }
 
 func TestCoverage_NoSilentLoss(t *testing.T) {
 	// The historical bug: 500 input, default chunk_size 500 -> 3 chunks were NOT
 	// produced; a single 500-chunk was formatted to only its first 200, losing
-	// 300 (60%). With SS-01, default clamps to 200 -> chunks [200,200,100],
-	// every message processed. Note: this exercises the legacy count-based
-	// splitter; the production token splitter gets its own end-to-end coverage
-	// in the fix-forward commits (PR #196 review P1-3).
+	// 300 (60%). SS-01 clamped the default to 200; SS-06b then switched to
+	// token-budget chunking. This now drives the production token splitter
+	// (PR #196 review P1-3) and asserts that the funnel stays honest under the
+	// default budget regardless of the requested chunk_size.
 	cases := []struct {
-		name       string
-		input      int
-		requested  int
-		wantChunks int
+		name      string
+		input     int
+		requested int
 	}{
-		{"201 default", 201, 0, 2},
-		{"500 default", 500, 0, 3},
-		{"over-backstop request clamped", 500, 5000, 1}, // clamp -> 500 -> single chunk, zero loss
-		{"below-limit request honored", 150, 50, 3},
+		{"201 default", 201, 0},
+		{"500 default", 500, 0},
+		{"over-backstop request clamped", 500, 5000}, // clamp -> 500 -> zero loss
+		{"below-limit request honored", 150, 50},
+		{"5000 requested", 1200, 5000}, // backstop must cap, not lose
+		{"large default", 12345, 0},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -136,9 +137,16 @@ func TestCoverage_NoSilentLoss(t *testing.T) {
 			if cov.Truncated {
 				t.Fatal("truncated = true, want false when nothing dropped")
 			}
+			// And every chunk the production splitter emitted respects the
+			// hard backstop — the bound the handler depends on.
 			msgMaps := makeMsgMaps(c.input)
-			if got := len(service.SplitIntoChunks(msgMaps, cov.ChunkSize)); got != c.wantChunks {
-				t.Fatalf("chunk count = %d, want %d", got, c.wantChunks)
+			cfg := config.Config{}
+			for i, chunk := range splitMsgMapsByTokenBudget(msgMaps,
+				chunkTokenBudget(cfg), cov.ChunkSize,
+				cfg.ResolveCharsPerTokenCJK(), cfg.CharsPerTokenASCII) {
+				if len(chunk) > hardMessageBackstop {
+					t.Fatalf("chunk %d has %d messages > backstop %d", i, len(chunk), hardMessageBackstop)
+				}
 			}
 		})
 	}

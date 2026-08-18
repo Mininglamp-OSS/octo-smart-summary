@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
@@ -55,23 +56,37 @@ func clampChunkSize(requested int) int {
 	return requested
 }
 
-// ComputeCoverage reports how the chunking path covers inputCount messages: how
-// many reach the model (processed), how many are lost (dropped), and how many
-// chunks form. Post-SS-06b chunking is token-aware and the format cap is gone,
-// so no message is ever dropped — processed always equals inputCount. The eval
-// harness (SS-02) asserts dropped==0 against this; a regression that reintroduced
-// a silent-drop cap would make dropped go non-zero and fail eval.
-func ComputeCoverage(inputCount, requestedChunkSize int) (processed, dropped, chunks int) {
-	if inputCount <= 0 {
+// ProbeChunkCoverage drives the PRODUCTION chunking path — clampChunkSize ->
+// splitMsgMapsByTokenBudget -> formatChunkForLLM — over msgMaps without any
+// LLM call, and reports the coverage funnel the model would actually receive:
+// processed = lines the formatter really emitted, dropped = input − processed,
+// chunks = number of chunks the splitter produced for the given budget and
+// ratios. The eval gate (SS-02) calls this, so a silent-drop cap reintroduced
+// ANYWHERE in the chain makes dropped go non-zero and fails the gate.
+//
+// Replaces the arithmetic-only ComputeCoverage, which returned a hardcoded
+// dropped=0 and never touched the splitter or formatter — a guard that
+// cannot fail is worse than no guard (PR #196 review P1-2).
+func ProbeChunkCoverage(msgMaps []map[string]interface{}, requestedChunkSize, budget, cjkRatio, asciiRatio int) (processed, dropped, chunks int) {
+	if len(msgMaps) == 0 {
 		return 0, 0, 0
 	}
-	// requestedChunkSize, when set, only caps messages-per-chunk; it never drops.
-	size := requestedChunkSize
-	if size <= 0 {
-		size = defaultChunkSize
+	size := clampChunkSize(requestedChunkSize)
+	chunked := splitMsgMapsByTokenBudget(msgMaps, budget, size, cjkRatio, asciiRatio)
+	for _, c := range chunked {
+		_, p, _ := formatChunkForLLM(c)
+		processed += p
 	}
-	chunks = (inputCount + size - 1) / size
-	return inputCount, 0, chunks
+	return processed, len(msgMaps) - processed, len(chunked)
+}
+
+// ProbeChunkCoverageDefault runs ProbeChunkCoverage with the standard
+// deployment defaults (Map budget = defaultMapMaxTokens − system-prompt
+// reserve; CJK 1 char/token, ASCII 4 chars/token). Gates that must not depend
+// on injected deps — the eval harness, CI — probe through this.
+func ProbeChunkCoverageDefault(msgMaps []map[string]interface{}, requestedChunkSize int) (processed, dropped, chunks int) {
+	cfg := config.Config{CharsPerTokenCJK: 1, CharsPerTokenASCII: 4}
+	return ProbeChunkCoverage(msgMaps, requestedChunkSize, chunkTokenBudget(cfg), cfg.ResolveCharsPerTokenCJK(), cfg.CharsPerTokenASCII)
 }
 
 // getSessionMessagePool retrieves all messages from all tool calls in the session,

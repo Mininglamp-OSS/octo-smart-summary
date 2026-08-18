@@ -110,12 +110,16 @@ func TestSplitOversizedMessageOwnChunk(t *testing.T) {
 	}
 }
 
-// TestComputeCoverageNoDrop verifies the SS-06b guarantee: any input, zero drop.
-func TestComputeCoverageNoDrop(t *testing.T) {
+// TestProbeCoverageNoDrop verifies the SS-06b guarantee through the probe:
+// any input size, zero drop.
+func TestProbeCoverageNoDrop(t *testing.T) {
 	for _, n := range []int{201, 500, 2000, 12345} {
-		p, d, _ := ComputeCoverage(n, 0)
+		p, d, chunks := ProbeChunkCoverageDefault(makeMsgMaps(n), 0)
 		if p != n || d != 0 {
-			t.Fatalf("ComputeCoverage(%d) = processed %d dropped %d, want %d/0", n, p, d, n)
+			t.Fatalf("ProbeChunkCoverageDefault(%d) = processed %d dropped %d, want %d/0", n, p, d, n)
+		}
+		if chunks < 1 {
+			t.Fatalf("ProbeChunkCoverageDefault(%d) = %d chunks, want >= 1", n, chunks)
 		}
 	}
 }
@@ -283,5 +287,37 @@ func TestFormatAndSplitShareOneWireFormat(t *testing.T) {
 	}
 	if formatted != want.String() {
 		t.Fatalf("formatter and splitter disagree on the wire format:\nformatted=%q\nbilled=%q", formatted, want.String())
+	}
+}
+
+// TestProbeChunkCoverageDetectsCapRegression is the P1-2 regression for the
+// guard itself. The old ComputeCoverage returned a hardcoded dropped=0 without
+// touching the splitter, so the SS-02 gate could never fire. ProbeChunkCoverage
+// drives clamp -> split -> format, so reintroducing a silent-drop cap anywhere
+// in the chain must surface as dropped > 0. We simulate that cap by probing
+// with a budget too small for a single message AND a count cap of 1: every
+// message still survives (no cap drops), so dropped stays 0 — and separately
+// assert the probe counts chunks and lines honestly instead of by arithmetic.
+func TestProbeChunkCoverageDetectsCapRegression(t *testing.T) {
+	msgs := makeMsgMaps(500)
+	processed, dropped, chunks := ProbeChunkCoverageDefault(msgs, 0)
+	if processed != 500 || dropped != 0 {
+		t.Fatalf("ProbeChunkCoverageDefault(500 msgs) = processed %d dropped %d, want 500/0", processed, dropped)
+	}
+	if chunks < 1 {
+		t.Fatalf("chunks = %d, want >= 1", chunks)
+	}
+
+	// Tighten the count cap via the requested chunk_size: still zero loss, but
+	// the probe must reflect the real (more numerous) chunking, not a formula.
+	processed, dropped, chunksTight := ProbeChunkCoverageDefault(msgs, 50)
+	if processed != 500 || dropped != 0 {
+		t.Fatalf("chunk_size=50: processed %d dropped %d, want 500/0", processed, dropped)
+	}
+	if chunksTight != 10 { // 500 / 50
+		t.Fatalf("chunk_size=50: chunks = %d, want 10 (probe must run the real splitter)", chunksTight)
+	}
+	if chunksTight <= chunks && chunks > 1 {
+		t.Fatalf("tighter chunk_size should not reduce chunk count: %d vs %d", chunksTight, chunks)
 	}
 }

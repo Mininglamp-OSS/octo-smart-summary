@@ -78,8 +78,10 @@ func LoadGoldenCases(dir string) ([]GoldenCase, error) {
 }
 
 // CoverageMetric reports the data-coverage funnel for a case: how many snapshot
-// messages the current chunking path actually feeds to the model. Computed via
-// agent.ComputeCoverage so it validates production logic, not a copy.
+// messages the current chunking path actually feeds to the model. Computed by
+// driving the production chunking chain (clamp -> token splitter -> formatter)
+// over msgMaps built from the case's messages, so it validates the shipped
+// path end-to-end (PR #196 review P1-2).
 type CoverageMetric struct {
 	InputCount     int  `json:"input_count"`
 	ProcessedCount int  `json:"processed_count"`
@@ -90,7 +92,15 @@ type CoverageMetric struct {
 
 // Coverage runs the funnel for a case at the default chunk_size (0 → default).
 func Coverage(gc GoldenCase) CoverageMetric {
-	processed, dropped, chunks := agent.ComputeCoverage(len(gc.Messages), 0)
+	msgMaps := make([]map[string]interface{}, len(gc.Messages))
+	for i, m := range gc.Messages {
+		msgMaps[i] = map[string]interface{}{
+			"sender_name":    m.SenderName,
+			"content":        m.Content,
+			"citation_index": i + 1,
+		}
+	}
+	processed, dropped, chunks := agent.ProbeChunkCoverageDefault(msgMaps, 0)
 	return CoverageMetric{
 		InputCount:     len(gc.Messages),
 		ProcessedCount: processed,
