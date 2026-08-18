@@ -120,7 +120,7 @@ func FetchChannelTool() (Tool, Handler) {
 			maxPerChannel = cfg.MaxMessagesPerChannel
 		}
 
-		messages, err := pipeline.FetchMessagesFromChannel(ctx, req.ChannelID, req.ChannelType, timeStart.Unix(), timeEnd.Unix(), imDB, cfg.MsgTableCount, uid, maxPerChannel)
+		messages, coverage, err := pipeline.FetchMessagesFromChannelWithCoverage(ctx, req.ChannelID, req.ChannelType, timeStart.Unix(), timeEnd.Unix(), imDB, cfg.MsgTableCount, uid, maxPerChannel)
 		if err != nil {
 			return "", fmt.Errorf("fetch messages: %w", err)
 		}
@@ -150,6 +150,23 @@ func FetchChannelTool() (Tool, Handler) {
 			"total":           len(messages),
 			"messages_handle": handle,
 			"channel_id":      req.ChannelID,
+		}
+		// 缺点八: surface honest coverage so the Planner can tell "this channel
+		// had exactly N messages" apart from "we hit the cap, more may exist".
+		// Gated so flag-off returns the exact legacy 3-key result.
+		if SummaryV2Enabled() {
+			result["returned_count"] = coverage.Returned
+			result["requested_max"] = coverage.RequestedMax
+			result["truncated"] = coverage.Truncated
+			// has_more mirrors truncated for this window query: a hit cap means
+			// older in-window messages remain unread.
+			result["has_more"] = coverage.Truncated
+			if coverage.Returned > 0 {
+				result["actual_time_range"] = map[string]interface{}{
+					"first": time.Unix(coverage.FirstTS, 0).Format(time.RFC3339),
+					"last":  time.Unix(coverage.LastTS, 0).Format(time.RFC3339),
+				}
+			}
 		}
 		data, err := json.Marshal(result)
 		if err != nil {
