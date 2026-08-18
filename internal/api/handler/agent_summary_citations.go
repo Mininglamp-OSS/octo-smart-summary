@@ -250,6 +250,12 @@ func (h *AgentSummaryHandler) finalizeRun(ctx context.Context, uid, sessionID, c
 		CitationValidationPassed: citationsValid(content, cits),
 	}
 
+	// SS-07b: a run marked failed by the tool-error hook (a fatal tool error
+	// occurred mid-run) forces a FAILED verdict (defect #5).
+	if run.Status == model.RunStatusFailed {
+		state.CriticalToolErrors = append(state.CriticalToolErrors, "fatal tool error during run")
+	}
+
 	// Coverage facts from the frozen artifact (SS-04/05), when present.
 	artStore := artifact.NewStore(h.db)
 	if art, ok, aerr := artStore.GetLatestArtifactBySession(ctx, uid, sessionID); aerr == nil && ok {

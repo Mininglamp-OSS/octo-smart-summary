@@ -340,6 +340,27 @@ func truncateRunes(s string, max int) string {
 	return string(runes[:max])
 }
 
+// attachToolErrorHook installs the SS-07b runner hook that marks the run failed
+// when a fatal tool error occurs mid-run, so the finish gate returns FAILED at
+// save time (defect #5). No-op when there is no run or no store. The hook runs
+// concurrently from the tool worker pool, so it uses a fresh context (the
+// request context may already be canceled by the very error being reported) and
+// relies on SetStatus being a plain idempotent UPDATE.
+func (h *AgentChatHandler) attachToolErrorHook(runner *agent.Runner, runID string) {
+	if runner == nil || runID == "" || h.runStore == nil {
+		return
+	}
+	store := h.runStore
+	runner.OnToolError = func(_ string, env agent.ToolErrorEnvelope) {
+		if !env.Fatal {
+			return
+		}
+		if err := store.SetStatus(context.Background(), runID, model.RunStatusFailed); err != nil {
+			log.Printf("[agent] v2 mark run failed (run=%s): %v", runID, err)
+		}
+	}
+}
+
 // maybePersistSummaryRun records the SummaryRun / SummarySpec for this request
 // when AGENT_SUMMARY_V2_MODE != off (SS-03) and returns the resolved run_id (""
 // when there is no run to act on). The run_id is injected into the tool context
@@ -459,9 +480,10 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 	// (byte-identical to pre-SS-03). Best-effort; never blocks the reply. The
 	// returned run_id is injected into the tool context so the citation pass can
 	// freeze/read this run's manifest (SS-05).
+	var v2RunID string
 	if agent.SummaryV2Enabled() {
-		if runID := h.maybePersistSummaryRun(ctx, uid, req); runID != "" {
-			ctx = context.WithValue(ctx, agent.ContextKeyRunID, runID)
+		if v2RunID = h.maybePersistSummaryRun(ctx, uid, req); v2RunID != "" {
+			ctx = context.WithValue(ctx, agent.ContextKeyRunID, v2RunID)
 		}
 	}
 
@@ -481,6 +503,9 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		}
 	}
 	ctx, system = applySelectedChannelContext(ctx, system, req.SelectedChannels)
+
+	// SS-07b: fatal tool errors mark the run failed → finish gate FAILED at save.
+	h.attachToolErrorHook(runner, v2RunID)
 
 	// 读多轮历史并滑窗截断。owner-scoped：只加载当前 uid 归属的记录，
 	// 跨用户猜到相同 session_id 也只会得到空历史（SUM-158 blocker 1）。
@@ -728,9 +753,10 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 
 	// SS-03: persist run/spec when V2 mode is enabled (see Chat). Off → skipped.
 	// The returned run_id is injected into the tool context for the citation pass.
+	var v2RunID string
 	if agent.SummaryV2Enabled() {
-		if runID := h.maybePersistSummaryRun(ctx, uid, req); runID != "" {
-			ctx = context.WithValue(ctx, agent.ContextKeyRunID, runID)
+		if v2RunID = h.maybePersistSummaryRun(ctx, uid, req); v2RunID != "" {
+			ctx = context.WithValue(ctx, agent.ContextKeyRunID, v2RunID)
 		}
 	}
 
@@ -751,6 +777,9 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		}
 	}
 	ctx, system = applySelectedChannelContext(ctx, system, req.SelectedChannels)
+
+	// SS-07b: fatal tool errors mark the run failed → finish gate FAILED at save.
+	h.attachToolErrorHook(runner, v2RunID)
 
 	// Create per-request SSE sink for thread-safe concurrent writes
 	sink := &sseSink{w: c.Writer}

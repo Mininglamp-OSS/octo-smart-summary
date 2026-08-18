@@ -242,3 +242,21 @@ func TestFinishStatusAndLatestRunBySession(t *testing.T) {
 		t.Fatalf("finish_status = %q (err %v), want PARTIAL", reloaded.FinishStatus, err)
 	}
 }
+
+func TestSetStatus(t *testing.T) {
+	db := newStoreTestDB(t)
+	if db == nil {
+		return
+	}
+	s := NewStore(db)
+	ctx := context.Background()
+	run, _, _ := s.CreateOrGetRun(ctx, "u1", "sess1", "req1", model.ScopePolicyClosed)
+
+	if err := s.SetStatus(ctx, run.RunID, model.RunStatusFailed); err != nil {
+		t.Fatalf("SetStatus: %v", err)
+	}
+	got, _ := s.GetByID(ctx, "u1", run.RunID)
+	if got.Status != model.RunStatusFailed {
+		t.Fatalf("status = %q, want failed", got.Status)
+	}
+}

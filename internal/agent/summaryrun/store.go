@@ -256,6 +256,16 @@ func (s *Store) GetLatestRunBySession(ctx context.Context, userID, sessionID str
 	return &run, true, nil
 }
 
+// SetStatus force-sets the run's task-flow status without an optimistic version
+// check. Used by the SS-07b tool-error hook to mark a run failed when a fatal
+// tool error occurs mid-run (called concurrently from the tool worker pool, so
+// it must not depend on a read-modify-write of Version).
+func (s *Store) SetStatus(ctx context.Context, runID, status string) error {
+	return s.db.WithContext(ctx).Model(&model.AgentSummaryRun{}).
+		Where("run_id = ?", runID).
+		Updates(map[string]interface{}{"status": status, "updated_at": now()}).Error
+}
+
 // SetFinishStatus records the finish-gate verdict (COMPLETE/PARTIAL/FAILED) on a
 // run. This is a terminal write (no optimistic CAS): the verdict is computed once
 // at finalize and does not race concurrent status transitions.

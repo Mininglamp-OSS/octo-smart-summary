@@ -39,6 +39,11 @@ type Runner struct {
 	pool    *Pool
 	policy  Policy
 	OnEvent func(Event) // Optional callback for progress events; nil-safe
+	// OnToolError is an optional hook (SS-07b) called when a tool returns an
+	// error. It receives the tool name and the classified envelope so the
+	// handler can record fatal failures against the run (→ finish gate FAILED).
+	// Nil-safe; must be goroutine-safe (runTools calls it from the worker pool).
+	OnToolError func(toolName string, env ToolErrorEnvelope)
 }
 
 func NewRunner(client chatter, reg *Registry, pool *Pool, policy Policy) *Runner {
@@ -231,7 +236,19 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 			}
 
 			if err != nil {
-				results[i] = "错误: " + err.Error()
+				// SS-07b: structured error envelope when V2 is on so the planner
+				// can tell retryable from fatal (defect #5); off → the exact legacy
+				// "错误: <text>" string, byte-identical. Fatal failures are surfaced
+				// to the finish gate via OnToolError.
+				if SummaryV2Enabled() {
+					env := classifyToolError(tc.Function.Name, err)
+					results[i] = env.JSON()
+					if r.OnToolError != nil {
+						r.OnToolError(tc.Function.Name, env)
+					}
+				} else {
+					results[i] = "错误: " + err.Error()
+				}
 				return
 			}
 			results[i] = out

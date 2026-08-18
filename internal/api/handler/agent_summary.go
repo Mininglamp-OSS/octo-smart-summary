@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/finishgate"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
@@ -18,6 +19,11 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
+
+// errFinishFailed is the sentinel used to roll back the save transaction when
+// the SS-07 finish gate returns FAILED (§8.3: a FAILED run has no saveable
+// product). The handler maps it to HTTP 422 instead of the generic 500.
+var errFinishFailed = errors.New("finish verdict FAILED")
 
 // AgentSummaryHandler persists the deliverable produced by the agent
 // conversational entry (POST /api/v1/summaries/agent).
@@ -464,12 +470,16 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		}
 		creatorPR.SetCitations(cits)
 
-		// SS-07 (core): compute + persist the finish verdict for this run. Off /
-		// no run → no-op. This records COMPLETE/PARTIAL/FAILED and coverage gaps
-		// for disclosure; it does not yet block the save (SS-07b).
+		// SS-07 core + SS-07b: compute + persist the finish verdict. It records
+		// COMPLETE/PARTIAL/FAILED and coverage gaps for disclosure, and (SS-07b)
+		// a FAILED verdict aborts the transaction so no COMPLETE product is saved
+		// (§8.3). Off / no run → no-op.
 		if agent.SummaryV2Enabled() {
 			if v, gaps := h.finalizeRun(c.Request.Context(), userID, req.SessionID, content, cits); v != "" {
 				log.Printf("[handler] agent summary finish verdict=%s gaps=%d session=%s", v, len(gaps), req.SessionID)
+				if v == finishgate.Failed {
+					return fmt.Errorf("%w: finish verdict FAILED (%d gaps)", errFinishFailed, len(gaps))
+				}
 			}
 		}
 		// Build v1 snapshot for agent-generated summary
@@ -520,6 +530,11 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	})
 	if err != nil {
 		log.Printf("[handler] CreateAgentSummary tx failed space=%s user=%s session=%s: %v", spaceID, userID, req.SessionID, err)
+		if errors.Is(err, errFinishFailed) {
+			// SS-07b / §8.3: a FAILED run yields no saveable product.
+			c.JSON(http.StatusUnprocessableEntity, apiResponse{Code: 42200, Message: "总结未通过完成校验（FAILED），未保存: " + err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "落库失败: " + err.Error()})
 		return
 	}
