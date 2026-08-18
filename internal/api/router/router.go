@@ -165,6 +165,9 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	// reference-based chat flow — see CHAT-REFERENCE-BASED-DESIGN-v1.)
 	agentSummaryH := handler.NewAgentSummaryHandler(db, imDB, llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
 	v1.POST("/summaries/agent", agentSummaryH.CreateAgentSummary)
+	// Document "AI 速览": ephemeral streaming quick-glance, never persisted. See
+	// handler/document_preview.go.
+	v1.POST("/summaries/document/preview", agentSummaryH.StreamDocumentPreview)
 
 	return r
 }
