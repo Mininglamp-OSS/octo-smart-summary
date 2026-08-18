@@ -34,7 +34,6 @@ type GoldenMessage struct {
 // GoldenExpectations are the fixed, human-authored expectations for a case.
 type GoldenExpectations struct {
 	MessageCount     int      `json:"message_count"`
-	Channels         []string `json:"channels"`
 	RequiredSections []string `json:"required_sections"`
 	Language         string   `json:"language"`
 }
@@ -45,8 +44,6 @@ type GoldenExpectations struct {
 // SampleSummary for the model's actual answer and reuses the same metrics.
 type GoldenCase struct {
 	Name          string             `json:"name"`
-	Description   string             `json:"description"`
-	UserRequest   string             `json:"user_request"`
 	Messages      []GoldenMessage    `json:"messages"`
 	Expected      GoldenExpectations `json:"expected"`
 	SampleSummary string             `json:"sample_summary"`
