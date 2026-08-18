@@ -19,10 +19,10 @@ func TestClampChunkSize(t *testing.T) {
 	}{
 		{"zero -> default", 0, defaultChunkSize},
 		{"negative -> default", -1, defaultChunkSize},
-		{"over max -> clamped", 500, maxChunkSize},
-		{"just over max -> clamped", maxChunkSize + 1, maxChunkSize},
-		{"at max -> kept", maxChunkSize, maxChunkSize},
-		{"below max -> kept", 50, 50},
+		{"way over backstop -> clamped", 5000, hardMessageBackstop},
+		{"over backstop -> clamped", hardMessageBackstop + 1, hardMessageBackstop},
+		{"at backstop -> kept", hardMessageBackstop, hardMessageBackstop},
+		{"below backstop -> kept", 50, 50},
 		{"one -> kept", 1, 1},
 	}
 	for _, c := range cases {
@@ -48,18 +48,18 @@ func makeMsgMaps(n int) []map[string]interface{} {
 	return msgs
 }
 
-func TestFormatChunkForLLM_NoSilentDropAt200(t *testing.T) {
-	chunk := makeMsgMaps(maxChunkSize) // exactly a full chunk
+func TestFormatChunkForLLM_NoSilentDropAtFullChunk(t *testing.T) {
+	chunk := makeMsgMaps(defaultChunkSize) // exactly a full default chunk
 	formatted, processed, oversized := formatChunkForLLM(chunk)
 
-	if processed != maxChunkSize {
-		t.Fatalf("processed = %d, want %d (a full 200-chunk must not drop)", processed, maxChunkSize)
+	if processed != defaultChunkSize {
+		t.Fatalf("processed = %d, want %d (a full default chunk must not drop)", processed, defaultChunkSize)
 	}
 	if oversized != 0 {
 		t.Fatalf("oversized = %d, want 0", oversized)
 	}
-	// Every citation marker [1]..[200] must be present.
-	for i := 1; i <= maxChunkSize; i++ {
+	// Every citation marker [1]..[defaultChunkSize] must be present.
+	for i := 1; i <= defaultChunkSize; i++ {
 		if !strings.Contains(formatted, fmt.Sprintf("[%d] ", i)) {
 			t.Fatalf("formatted output missing citation marker [%d]", i)
 		}
@@ -110,7 +110,9 @@ func TestCoverage_NoSilentLoss(t *testing.T) {
 	// The historical bug: 500 input, default chunk_size 500 -> 3 chunks were NOT
 	// produced; a single 500-chunk was formatted to only its first 200, losing
 	// 300 (60%). With SS-01, default clamps to 200 -> chunks [200,200,100],
-	// every message processed.
+	// every message processed. Note: this exercises the legacy count-based
+	// splitter; the production token splitter gets its own end-to-end coverage
+	// in the fix-forward commits (PR #196 review P1-3).
 	cases := []struct {
 		name       string
 		input      int
@@ -119,7 +121,7 @@ func TestCoverage_NoSilentLoss(t *testing.T) {
 	}{
 		{"201 default", 201, 0, 2},
 		{"500 default", 500, 0, 3},
-		{"500 with oversized request clamped", 500, 500, 3},
+		{"over-backstop request clamped", 500, 5000, 1}, // clamp -> 500 -> single chunk, zero loss
 		{"below-limit request honored", 150, 50, 3},
 	}
 	for _, c := range cases {

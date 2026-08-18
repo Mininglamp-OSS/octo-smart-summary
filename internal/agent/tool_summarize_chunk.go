@@ -12,20 +12,21 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 )
 
-// SS-01 止血常量（见 docs/AGENT-SUMMARY-...zh.md 缺点二）。
+// SS-01 止血常量。
 //
 // 历史 bug：chunk_size 默认 500，但 formatChunkForLLM 每片只格式化前 200 条，
 // 满片时静默丢弃 300/500（60%）。SS-01 先把默认值与硬上限收敛到 200 止血；
 // SS-06b 随后引入 token-aware 分片并删除了 200 格式化上限，分片改由 token 预算
-// 约束，覆盖恒为 100%。这里的常量保留给 clampChunkSize / ComputeCoverage /
-// oversized 阈值使用。
+// （按渲染行计费）+ hardMessageBackstop 双重约束，覆盖恒为 100%。
 const (
-	// defaultChunkSize 是估算 chunk 数时的每片消息数基准。
+	// defaultChunkSize 是 chunk_size 缺省（<=0）时使用的每片消息数基准，
+	// 与 SS-01 止血值一致。
 	defaultChunkSize = 200
-	// maxChunkSize 是 clampChunkSize 的消息数上限（历史止血值，仍供其使用）。
-	maxChunkSize = 200
 	// oversizedMessageRunes 是单条消息被标记为“超长”的字符阈值。超长消息只
-	// 计数上报（oversized_message_count），不做静默截断；token 分片会让它单独成片。
+	// 计数上报（oversized_message_count），不做静默截断——“永不丢消息、永不
+	// 切断单条消息”是 SS-06b 的刻意取舍（PR #196 review P2-3）：超过整片预算
+	// 的消息单独成片。阈值只服务于可观测性上报，与分片预算
+	// （ResolveMapMaxTokens 量级）无关。
 	oversizedMessageRunes = 4000
 )
 
@@ -40,14 +41,16 @@ type chunkCoverage struct {
 	ChunkSize             int  `json:"chunk_size"`
 }
 
-// clampChunkSize 把请求的 chunk_size 收敛到 [1, maxChunkSize]；<=0 取默认值，
-// 超过上限截到 maxChunkSize。返回值保证 SplitIntoChunks 产出的每片 <= maxChunkSize。
+// clampChunkSize 把请求的 chunk_size 收敛到 [1, hardMessageBackstop]；<=0 取
+// defaultChunkSize，超过上限截到 hardMessageBackstop。chunk_size 是模型给的
+// 工具参数，未经验证的值不得原样影响出站请求规模（PR #196 review P1-1）；
+// 返回值即 splitMsgMapsByTokenBudget 的 maxMsgs，保证每片消息数有硬上限。
 func clampChunkSize(requested int) int {
 	if requested <= 0 {
 		return defaultChunkSize
 	}
-	if requested > maxChunkSize {
-		return maxChunkSize
+	if requested > hardMessageBackstop {
+		return hardMessageBackstop
 	}
 	return requested
 }
@@ -198,7 +201,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 					},
 					"chunk_size": map[string]interface{}{
 						"type":        "integer",
-						"description": "可选：每片最大消息数（叠加在 token 预算之上）；<=0 表示只按 token 预算分片。返回值含 input_count/processed_count/dropped_count/oversized_message_count/truncated。",
+						"description": fmt.Sprintf("可选：每片最大消息数（叠加在 token 预算之上，取值收敛到 [1, %d]，<=0 按 %d）；分片同时受 token 预算与消息数双重约束。返回值含 input_count/processed_count/dropped_count/oversized_message_count/truncated。", hardMessageBackstop, defaultChunkSize),
 					},
 				},
 				"required": []string{"messages_handle"},
@@ -235,7 +238,9 @@ func SummarizeChunkTool() (Tool, Handler) {
 		}
 
 		if len(messages) == 0 {
-			return "{\"summary\":\"无可总结内容\",\"chunk_count\":0}", nil
+			// Same result shape as the normal path (PR #196 review P2-5):
+			// the planner must see one stable contract on both branches.
+			return `{"summary":"无可总结内容","chunk_count":0,"input_count":0,"processed_count":0,"dropped_count":0,"oversized_message_count":0,"truncated":false}`, nil
 		}
 
 		// Get the global message pool for the session and pre-assign CitationIndex.
@@ -260,7 +265,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 			}
 		}
 
-		// Convert to map format for SplitIntoChunks
+		// Convert to map format for the token-budget splitter.
 		msgMaps := make([]map[string]interface{}, len(messages))
 		for i, msg := range messages {
 			msgMaps[i] = map[string]interface{}{
@@ -273,18 +278,21 @@ func SummarizeChunkTool() (Tool, Handler) {
 		}
 
 		// SS-06b: token-aware chunking. Each chunk is bounded by a token budget
-		// (balanced by content — defect #9's uneven-length problem) instead of a
-		// fixed message count, and the per-chunk format cap is gone, so no message
-		// is ever dropped. chunk_size, if given, is an optional per-chunk message
-		// cap layered on top of the token budget.
+		// that bills the RENDERED prompt lines (balanced by content — defect
+		// #9's uneven-length problem) instead of a fixed message count, and the
+		// per-chunk format cap is gone, so no message is ever dropped.
+		// chunk_size is clamped to [1, hardMessageBackstop] before use
+		// (PR #196 review P1-1): it is a model-supplied argument, and the
+		// schema documents a bound the handler must actually enforce.
 		_, _, _, cfg := GetSummaryDeps()
 		budget := chunkTokenBudget(cfg)
-		chunks := splitMsgMapsByTokenBudget(msgMaps, budget, req.ChunkSize, cfg.ResolveCharsPerTokenCJK(), cfg.CharsPerTokenASCII)
+		msgsPerChunk := clampChunkSize(req.ChunkSize)
+		chunks := splitMsgMapsByTokenBudget(msgMaps, budget, msgsPerChunk, cfg.ResolveCharsPerTokenCJK(), cfg.CharsPerTokenASCII)
 
 		// Summarize each chunk and aggregate honest coverage counts. Token
 		// chunking + no format cap means processed == input, so dropped_count is
 		// 0; the counters stay truthful if a future change reintroduces a cap.
-		cov := chunkCoverage{InputCount: len(messages), ChunkSize: req.ChunkSize}
+		cov := chunkCoverage{InputCount: len(messages), ChunkSize: msgsPerChunk}
 		var summaries []string
 		for _, chunk := range chunks {
 			summary, processed, oversized, err := summarizeMessagesChunk(ctx, chunk)
@@ -307,6 +315,9 @@ func SummarizeChunkTool() (Tool, Handler) {
 			"dropped_count":           cov.DroppedCount,
 			"oversized_message_count": cov.OversizedMessageCount,
 			"truncated":               cov.Truncated,
+			// chunk_size is now emitted (PR #196 review P2-5): it is the
+			// clamped value actually applied, not the raw model request.
+			"chunk_size": cov.ChunkSize,
 		}
 
 		// Marshal result
@@ -326,20 +337,19 @@ func SummarizeChunkTool() (Tool, Handler) {
 //
 // It returns how many messages it formatted (processed) and how many exceeded
 // oversizedMessageRunes (oversized). Oversized messages are counted but NOT
-// truncated. SS-06b removed the per-chunk message cap: chunks are now bounded by
-// a token budget upstream (splitMsgMapsByTokenBudget), so formatting every
-// message in the chunk cannot overflow — and processed always == len(chunk),
-// i.e. no silent drop.
+// truncated. SS-06b removed the per-chunk message cap: chunks are bounded by a
+// token budget upstream (splitMsgMapsByTokenBudget), which bills these exact
+// rendered lines via renderMessageLine (PR #196 review P0-1) — so formatting
+// every message in the chunk cannot overflow the budget, and processed always
+// == len(chunk), i.e. no silent drop.
 func formatChunkForLLM(chunk []map[string]interface{}) (formatted string, processed, oversized int) {
 	var b strings.Builder
 	for _, msg := range chunk {
-		sender, _ := msg["sender_name"].(string)
 		content, _ := msg["content"].(string)
-		citationIndex, _ := msg["citation_index"].(int)
 		if len([]rune(content)) > oversizedMessageRunes {
 			oversized++
 		}
-		b.WriteString(fmt.Sprintf("[%d] %s: %s\n", citationIndex, sender, content))
+		b.WriteString(renderMessageLine(msg))
 		processed++
 	}
 	return b.String(), processed, oversized
