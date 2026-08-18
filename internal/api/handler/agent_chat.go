@@ -25,6 +25,56 @@ import (
 // agentChatProfile 是未显式指定 profile 时的默认场景（提示词 + 工具名单在 internal/agent/profile.go 配）。
 const agentChatProfile = "chat"
 
+// resolveChatProfile picks the effective profile for a chat request and reports
+// whether the request is self-contradictory (缺点十三: Profile 静默降级).
+//
+// The `chat` profile carries only time tools — it cannot read chat messages. A
+// request that ships selected_channels or referenced_task_ids but omits (or
+// under-specifies) a profile would therefore run under `chat` and return a
+// confident summary backed by ZERO chat evidence, with nothing signalling the
+// downgrade to the caller.
+//
+// Under AGENT_SUMMARY_V2_MODE != off this:
+//   - auto-upgrades an empty profile to match the payload — a request that
+//     references a prior task (and selects no channels) becomes `summary_refine`,
+//     any request carrying channels becomes `summary`;
+//   - rejects an EXPLICIT `chat` that contradicts a data-bearing payload, so a
+//     mis-wired caller gets a 400 instead of a data-less answer.
+//
+// Flag off → byte-identical legacy behavior: an empty profile becomes `chat`
+// and no request is ever rejected on this basis. `conflict` is always false.
+func resolveChatProfile(reqProfile string, hasChannels, hasReferences bool) (profile string, conflict bool) {
+	if !agent.SummaryV2Enabled() {
+		if reqProfile == "" {
+			return agentChatProfile, false
+		}
+		return reqProfile, false
+	}
+
+	// v2: match the profile to the payload rather than silently defaulting.
+	if reqProfile == "" {
+		switch {
+		case hasReferences && !hasChannels:
+			// Pure refine signal: a referenced task with no fresh channel scope.
+			return "summary_refine", false
+		case hasChannels:
+			// Any channel scope (with or without a reference) is a fresh summary;
+			// referenced context is injected into the prompt regardless of profile.
+			return "summary", false
+		default:
+			return agentChatProfile, false
+		}
+	}
+
+	// Explicit profile: reject a data-less `chat` that contradicts a payload which
+	// clearly wants chat data. Non-chat profiles already carry the data tools, so
+	// they are left untouched.
+	if reqProfile == agentChatProfile && (hasChannels || hasReferences) {
+		return reqProfile, true
+	}
+	return reqProfile, false
+}
+
 // maxMessageLen 是单条用户 message 的最大字符数（rune），超长直接 400，避免超长入参打爆上游。
 const maxMessageLen = 8192
 
@@ -368,9 +418,10 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		return
 	}
 
-	profileName := req.Profile
-	if profileName == "" {
-		profileName = agentChatProfile // default profile
+	profileName, profileConflict := resolveChatProfile(req.Profile, len(req.SelectedChannels) > 0, len(req.ReferencedTaskIDs) > 0)
+	if profileConflict {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "profile 'chat' 与 selected_channels/referenced_task_ids 冲突：chat 场景无法读取聊天消息，请改用 summary 或省略 profile"})
+		return
 	}
 
 	// Inject session_id into context for tool handlers (evidence persistence, Stage 3 Blocker C).
@@ -586,21 +637,6 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		return
 	}
 
-	// R5 yj P1-2 / R5 ms P2-4 / R5 jx non-blocking #1:
-	// dedup-then-check at the binding layer, BEFORE the SSE header flush
-	// at :510. The earlier revision placed this check ~80 lines below the
-	// flush and returned a JSON body — but by that point response headers
-	// are already committed (Content-Type: text/event-stream + status 200),
-	// as the file's own comment at :524-526 notes, so the client parser
-	// receives an unframed JSON blob in the middle of the event stream.
-	// Every other error path in ChatStream after the flush already honours
-	// this invariant via writeSSEErrorViaSink{,WithDetail} (:527, :543,
-	// :570, :597). Moving the size check UP satisfies the invariant and
-	// also skips the wasted runner build / history load when the request
-	// is invalid.
-	//
-	// R5 yj P2-6: use apiResponse envelope (Code/Message) like the four
-	// preceding pre-flush errors in this handler, not gin.H{"error":...}.
 	dedupedReferencedIDs := dedupReferencedTaskIDs(req.ReferencedTaskIDs)
 	if len(dedupedReferencedIDs) > maxReferencedTaskIDs {
 		c.JSON(http.StatusBadRequest, apiResponse{
@@ -610,9 +646,12 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		return
 	}
 
-	profileName := req.Profile
-	if profileName == "" {
-		profileName = agentChatProfile
+	profileName, profileConflict := resolveChatProfile(req.Profile, len(req.SelectedChannels) > 0, len(req.ReferencedTaskIDs) > 0)
+	if profileConflict {
+		// SSE headers are not sent yet at this point, so a plain 400 is safe and
+		// consistent with the validation errors above.
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "profile 'chat' 与 selected_channels/referenced_task_ids 冲突：chat 场景无法读取聊天消息，请改用 summary 或省略 profile"})
+		return
 	}
 
 	// Set SSE headers
