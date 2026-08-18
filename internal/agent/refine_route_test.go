@@ -56,6 +56,36 @@ func TestExtendBeatsAugment(t *testing.T) {
 	}
 }
 
+// TestHardNoFetch verifies SS-08b: only a CONFIDENT rewrite (explicit keyword)
+// is safe to strip fetch tools; the ambiguous fallback and the fetch paths are
+// never HardNoFetch.
+func TestHardNoFetch(t *testing.T) {
+	cases := []struct {
+		instruction string
+		wantIntent  RefineIntent
+		wantHard    bool
+	}{
+		{"翻译成英文", RefineRewrite, true},   // explicit rewrite keyword
+		{"精简一下", RefineRewrite, true},    // explicit
+		{"总结里说了什么", RefineRewrite, true}, // explicit Q&A
+		{"随便改改", RefineRewrite, false},   // ambiguous fallback → keep tools
+		{"", RefineRewrite, false},       // empty fallback → keep tools
+		{"补全遗漏", RefineAugment, false},   // augment must keep fetch
+		{"最新进展", RefineExtend, false},    // extend must keep fetch
+	}
+	for _, tc := range cases {
+		got := ClassifyRefine(tc.instruction)
+		if got.Intent != tc.wantIntent || got.HardNoFetch != tc.wantHard {
+			t.Errorf("ClassifyRefine(%q) intent=%s hardNoFetch=%t, want intent=%s hardNoFetch=%t",
+				tc.instruction, got.Intent, got.HardNoFetch, tc.wantIntent, tc.wantHard)
+		}
+		// Safety invariant: HardNoFetch implies no fetch.
+		if got.HardNoFetch && got.Fetch {
+			t.Errorf("ClassifyRefine(%q): HardNoFetch must imply !Fetch", tc.instruction)
+		}
+	}
+}
+
 // TestBuildRefineGuidance checks each route yields a non-empty block that names
 // its route and respects the reuse-time-range rule.
 func TestBuildRefineGuidance(t *testing.T) {

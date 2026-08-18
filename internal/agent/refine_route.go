@@ -42,6 +42,13 @@ type RefineRoute struct {
 	// ReuseCitations reports whether the old summary's citations carry over
 	// unchanged (rewrite path, where no new data is pulled).
 	ReuseCitations bool
+	// HardNoFetch reports that this is a CONFIDENT rewrite (an explicit rewrite
+	// keyword matched, not the ambiguous fallback), so the caller may safely
+	// build the runner without any data-fetching tools — enforcing "纯格式零
+	// fetch" in code rather than only advising it in the prompt (SS-08b). The
+	// ambiguous fallback keeps Fetch=false but HardNoFetch=false, so its tools
+	// stay available and a mis-read is recoverable.
+	HardNoFetch bool
 }
 
 // Keyword sets are checked in priority order extend > augment > rewrite: a
@@ -59,6 +66,16 @@ var (
 		"更详细", "详细些", "详细点", "展开", "细化", "更全面", "全面些",
 		"重新分析", "换个角度", "深入", "再挖", "更完整", "完整些",
 	}
+	// refineRewriteKeywords mark a CONFIDENT pure-text request (translate,
+	// condense, polish, re-layout, or Q&A over the old summary). Matching one of
+	// these — as opposed to falling through to the default — is what lets SS-08b
+	// safely strip the fetch tools (HardNoFetch).
+	refineRewriteKeywords = []string{
+		"翻译", "英文", "中文", "精简", "简化", "缩短", "压缩", "删减",
+		"润色", "排版", "格式", "改语气", "语气", "重新组织", "重组",
+		"摘要", "提炼", "换成", "改写成", "说了什么", "说了啥", "什么意思",
+		"讲了什么", "总结里", "只保留", "去掉", "删掉",
+	}
 )
 
 // ClassifyRefine classifies a refine instruction into an explicit route.
@@ -72,8 +89,15 @@ func ClassifyRefine(instruction string) RefineRoute {
 		return RefineRoute{Intent: RefineExtend, Fetch: true, ReuseTimeRange: false, ReuseCitations: false}
 	case containsAny(s, refineAugmentKeywords):
 		return RefineRoute{Intent: RefineAugment, Fetch: true, ReuseTimeRange: true, ReuseCitations: false}
+	case containsAny(s, refineRewriteKeywords):
+		// Confident rewrite: an explicit pure-text keyword matched, so it is safe
+		// to strip the fetch tools (HardNoFetch) — 纯格式零 fetch.
+		return RefineRoute{Intent: RefineRewrite, Fetch: false, ReuseTimeRange: false, ReuseCitations: true, HardNoFetch: true}
 	default:
-		return RefineRoute{Intent: RefineRewrite, Fetch: false, ReuseTimeRange: false, ReuseCitations: true}
+		// Ambiguous fallback: still the rewrite path (cheapest, no fetch by
+		// default) but NOT HardNoFetch — keep the tools available so a mis-read
+		// can still recover by fetching.
+		return RefineRoute{Intent: RefineRewrite, Fetch: false, ReuseTimeRange: false, ReuseCitations: true, HardNoFetch: false}
 	}
 }
 

@@ -151,8 +151,10 @@ func NewAgentChatHandler(db *gorm.DB, llmApiURL, llmApiKey, llmModel string, llm
 }
 
 // buildRunnerForProfile constructs a runner for the given profile name.
-// If uid is non-empty and profile is "summary", it will be injected into tool handlers.
-func (h *AgentChatHandler) buildRunnerForProfile(profileName, uid, sessionID string) (*agent.Runner, string, error) {
+// If uid is non-empty and profile is "summary"/"summary_refine", it is injected
+// into tool handlers. refineNoFetch (SS-08b) restricts a summary_refine runner
+// to a fetch-free toolset for a confident rewrite (纯格式零 fetch).
+func (h *AgentChatHandler) buildRunnerForProfile(profileName, uid, sessionID string, refineNoFetch bool) (*agent.Runner, string, error) {
 	profile, err := agent.GetProfile(profileName)
 	if err != nil {
 		return nil, "", fmt.Errorf("load profile %q: %w", profileName, err)
@@ -163,9 +165,14 @@ func (h *AgentChatHandler) buildRunnerForProfile(profileName, uid, sessionID str
 	}
 
 	var reg *agent.Registry
-	if (profileName == "summary" || profileName == "summary_refine") && uid != "" {
+	switch {
+	case profileName == "summary_refine" && uid != "" && refineNoFetch:
+		// SS-08b: confident rewrite → no data-fetching tools, so the flow
+		// physically cannot pull new messages.
+		reg, err = h.buildRegistryWithUID(uid, sessionID, refineRewriteToolNames)
+	case (profileName == "summary" || profileName == "summary_refine") && uid != "":
 		reg, err = h.buildSummaryRegistryWithUID(uid, sessionID)
-	} else {
+	default:
 		reg, err = agent.BuildRegistry(profile.Tools)
 	}
 	if err != nil {
@@ -178,34 +185,39 @@ func (h *AgentChatHandler) buildRunnerForProfile(profileName, uid, sessionID str
 	return runner, system, nil
 }
 
-// buildSummaryRegistryWithUID builds a summary registry with uid injected into tool handlers.
+// defaultSummaryToolNames is the full summary/summary_refine toolset.
+var defaultSummaryToolNames = []string{
+	"get_current_time", "extract_time_range",
+	"list_channels", "narrow_channels_by_topic", "find_shared_channels",
+	"peek_channel", "fetch_channel", "search_messages",
+	"filter_relevant", "summarize_chunk", "merge_summaries",
+}
+
+// refineRewriteToolNames (SS-08b) is the restricted set for a confident rewrite:
+// the data-discovery/fetch tools (list/narrow/find/peek/fetch/search/filter) are
+// dropped, leaving only time + local summarize/merge, so a pure rewrite cannot
+// fetch new data. Citations are preserved via borrowCitationsFromReference.
+var refineRewriteToolNames = []string{
+	"get_current_time", "extract_time_range",
+	"summarize_chunk", "merge_summaries",
+}
+
+// buildSummaryRegistryWithUID builds the full summary registry with uid injected.
 func (h *AgentChatHandler) buildSummaryRegistryWithUID(uid, sessionID string) (*agent.Registry, error) {
+	return h.buildRegistryWithUID(uid, sessionID, defaultSummaryToolNames)
+}
+
+// buildRegistryWithUID registers the named tools with uid + sessionID injected
+// into each handler's context. Injecting into the time tools too is harmless
+// (they ignore it) and keeps one code path.
+func (h *AgentChatHandler) buildRegistryWithUID(uid, sessionID string, toolNames []string) (*agent.Registry, error) {
 	reg := agent.NewRegistry()
-
-	// Non-summary tools (no uid injection needed)
-	for _, name := range []string{"get_current_time", "extract_time_range"} {
-		factory, ok := agent.GetToolFactory(name)
-		if !ok {
-			return nil, fmt.Errorf("unknown tool %q", name)
-		}
-		schema, handler := factory()
-		reg.Register(schema, handler)
-	}
-
-	// Summary tools: wrap handlers to inject uid via context
-	summaryTools := []string{
-		"list_channels", "narrow_channels_by_topic", "find_shared_channels",
-		"peek_channel", "fetch_channel", "search_messages",
-		"filter_relevant", "summarize_chunk", "merge_summaries",
-	}
-	for _, name := range summaryTools {
+	for _, name := range toolNames {
 		factory, ok := agent.GetToolFactory(name)
 		if !ok {
 			return nil, fmt.Errorf("unknown tool %q", name)
 		}
 		schema, origHandler := factory()
-
-		// Wrap handler to inject uid and sessionID into context
 		wrappedHandler := func(ctx context.Context, args json.RawMessage) (string, error) {
 			ctx = context.WithValue(ctx, agent.ContextKeyUID, uid)
 			ctx = context.WithValue(ctx, agent.ContextKeySessionID, sessionID)
@@ -213,7 +225,6 @@ func (h *AgentChatHandler) buildSummaryRegistryWithUID(uid, sessionID string) (*
 		}
 		reg.Register(schema, wrappedHandler)
 	}
-
 	return reg, nil
 }
 
@@ -464,6 +475,15 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		return
 	}
 
+	// SS-08/08b: classify the refine route once (v2 + summary_refine only) so the
+	// runner's toolset (08b: a confident rewrite drops the fetch tools) and the
+	// injected guidance (08) share one decision.
+	refineActive := agent.SummaryV2Enabled() && profileName == "summary_refine"
+	var refineRoute agent.RefineRoute
+	if refineActive {
+		refineRoute = agent.ClassifyRefine(req.Message)
+	}
+
 	// Inject session_id into context for tool handlers (evidence persistence, Stage 3 Blocker C).
 	ctx := context.WithValue(c.Request.Context(), agent.ContextKeySessionID, req.SessionID)
 
@@ -495,7 +515,7 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		runner = h.testRunner
 		system = h.testSystem
 	} else {
-		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID)
+		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID, refineActive && refineRoute.HardNoFetch)
 		if err != nil {
 			log.Printf("[agent] build runner for profile %q: %v", profileName, err)
 			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "failed to initialize agent", Detail: safeErrorDetail(err)})
@@ -546,11 +566,10 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 	// SS-08: inject the deterministic refine route as guidance so the model
 	// follows a decided path (rewrite/augment/extend) instead of re-guessing.
 	// v2-gated → flag-off keeps the pure-prompt summary_refine behavior
-	// byte-identical.
-	if agent.SummaryV2Enabled() && profileName == "summary_refine" {
-		route := agent.ClassifyRefine(req.Message)
-		system = system + agent.BuildRefineGuidance(route)
-		log.Printf("[agent] refine route session=%s intent=%s fetch=%t", req.SessionID, route.Intent, route.Fetch)
+	// byte-identical. Route was classified once above.
+	if refineActive {
+		system = system + agent.BuildRefineGuidance(refineRoute)
+		log.Printf("[agent] refine route session=%s intent=%s fetch=%t hardNoFetch=%t", req.SessionID, refineRoute.Intent, refineRoute.Fetch, refineRoute.HardNoFetch)
 	}
 
 	history = agent.TruncateHistory(history, h.window)
@@ -723,6 +742,13 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		return
 	}
 
+	// SS-08/08b: classify the refine route once (see Chat()).
+	refineActive := agent.SummaryV2Enabled() && profileName == "summary_refine"
+	var refineRoute agent.RefineRoute
+	if refineActive {
+		refineRoute = agent.ClassifyRefine(req.Message)
+	}
+
 	// Set SSE headers
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
@@ -768,7 +794,7 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		runner = h.testRunner
 		system = h.testSystem
 	} else {
-		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID)
+		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID, refineActive && refineRoute.HardNoFetch)
 		if err != nil {
 			log.Printf("[agent] build runner for profile %q: %v", profileName, err)
 			sink := &sseSink{w: c.Writer}
@@ -822,11 +848,10 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	}
 
 	// SS-08: inject the deterministic refine route as guidance (see Chat()).
-	// v2-gated → flag-off byte-identical.
-	if agent.SummaryV2Enabled() && profileName == "summary_refine" {
-		route := agent.ClassifyRefine(req.Message)
-		system = system + agent.BuildRefineGuidance(route)
-		log.Printf("[agent] refine route session=%s intent=%s fetch=%t", req.SessionID, route.Intent, route.Fetch)
+	// v2-gated → flag-off byte-identical. Route was classified once above.
+	if refineActive {
+		system = system + agent.BuildRefineGuidance(refineRoute)
+		log.Printf("[agent] refine route session=%s intent=%s fetch=%t hardNoFetch=%t", req.SessionID, refineRoute.Intent, refineRoute.Fetch, refineRoute.HardNoFetch)
 	}
 
 	history = agent.TruncateHistory(history, h.window)
