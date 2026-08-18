@@ -43,6 +43,9 @@ type AgentSummaryHandler struct {
 	llmTimeout   int
 	llmMaxTokens int
 	store        agentHistoryStore
+	// documentClient fetches summarize-ready document content (see document_source.go).
+	// Used by the document AI 速览 preview and the persisted agent document summary.
+	documentClient documentSourceClient
 	// runnerFactory is an optional test-only hook for injecting a fake agent
 	// runner without going through the real LLM. When nil (production path),
 	// newRunner falls back to buildRunner with handler's LLM config.
@@ -63,14 +66,15 @@ type refineRunner interface {
 
 func NewAgentSummaryHandler(db, imDB *gorm.DB, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int) *AgentSummaryHandler {
 	return &AgentSummaryHandler{
-		db:           db,
-		imDB:         imDB,
-		llmApiURL:    llmApiURL,
-		llmApiKey:    llmApiKey,
-		llmModel:     llmModel,
-		llmTimeout:   llmTimeout,
-		llmMaxTokens: llmMaxTokens,
-		store:        newAgentMessageRepo(db),
+		db:             db,
+		imDB:           imDB,
+		llmApiURL:      llmApiURL,
+		llmApiKey:      llmApiKey,
+		llmModel:       llmModel,
+		llmTimeout:     llmTimeout,
+		llmMaxTokens:   llmMaxTokens,
+		store:          newAgentMessageRepo(db),
+		documentClient: newDefaultDocumentSourceClient(),
 	}
 }
 
