@@ -120,7 +120,7 @@ func TestCoverage_NoSilentLoss(t *testing.T) {
 	}{
 		{"201 default", 201, 0},
 		{"500 default", 500, 0},
-		{"over-backstop request clamped", 500, 5000}, // clamp -> 500 -> zero loss
+		{"over-backstop request clamped", 500, 5000}, // clamp -> 200 -> zero loss
 		{"below-limit request honored", 150, 50},
 		{"5000 requested", 1200, 5000}, // backstop must cap, not lose
 		{"large default", 12345, 0},

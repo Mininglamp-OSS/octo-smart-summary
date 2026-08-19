@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"log"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 )
@@ -26,8 +27,30 @@ const (
 	// budget and the chunk_size hint, so degenerate estimates (e.g. empty
 	// content, which renders to a cheap framing-only line) can never pack an
 	// unbounded number of messages into one chunk (PR #196 review P0-2).
-	// 500 matches the historical pre-SS-01 default chunk size.
-	hardMessageBackstop = 500
+	//
+	// 200 restores EXACTLY the bound main relied on: the pre-SS-06b formatter
+	// hard-capped every chunk at 200 messages unconditionally. Round-3 review
+	// (yujiawei, review 4960791240) measured with an exact tiktoken tokenizer
+	// that estimateTokens under-bills structural ASCII ~1.9× (real BPE ≈ 2
+	// chars/token vs the 4 chars/token estimate), so a budget-bound chunk at
+	// backstop 500 could carry ~1.9× its nominal budget in REAL tokens —
+	// reachable via the model-settable chunk_size ∈ [201, 500], a route main
+	// did not have. Capping at 200 closes that route; the default path
+	// (chunk_size unset → 200) is unchanged. The fix is NOT a denser ASCII
+	// ratio: that would re-diverge from internal/tokenizer/estimate.go
+	// (undoing the P2-1 parity fix) and ~4× Map-call counts for ASCII traffic.
+	hardMessageBackstop = 200
+	// minSaneMapMaxTokens mirrors the worker-path guard
+	// (internal/worker/personal_processor.go: resolved MapMaxTokens < 10000 →
+	// default, loudly). A resolved Map budget below this is treated as a
+	// degenerate operator setting: MAP_MAX_TOKENS just above the system-prompt
+	// reserve (e.g. 801) leaves a usable budget of ~1 token and splits one
+	// message per chunk — a 100k-message invocation becomes 100k sequential
+	// LLM calls (round-3 review, MAP_MAX_TOKENS 800→801 cliff; yujiawei P2-4).
+	minSaneMapMaxTokens = 10000
+	// fallbackMapMaxTokens is the loud fallback for a degenerate setting.
+	// Mirrors config.defaultMapMaxTokens (unexported there).
+	fallbackMapMaxTokens = 100000
 )
 
 // estimateTokens is a pure, cgo-free token estimate matching the tokenizer's
@@ -81,11 +104,26 @@ func renderMessageLine(m map[string]interface{}) string {
 }
 
 // chunkTokenBudget resolves the per-chunk token budget from config (the Map
-// budget minus a system-prompt reserve). The minChunkTokenBudget fallback
-// applies only when the subtraction leaves nothing usable, so a conservative
-// operator setting is never silently overridden (PR #196 review P2-2).
+// budget minus a system-prompt reserve).
+//
+// Cliff guard (round-3 review, yujiawei P2-4, review 4960791240): a resolved
+// Map budget just above the reserve — e.g. MAP_MAX_TOKENS=801 → usable budget
+// 1 token — splits one message per chunk, turning a 100k-message invocation
+// into 100k sequential LLM calls. The worker path already guards exactly this
+// (internal/worker/personal_processor.go: `if maxTokens < 10000 { ... using
+// default 100000 }`); yujiawei: "That precedent makes the case for adding
+// one." This guard mirrors it: below minSaneMapMaxTokens, fall back LOUDLY to
+// the global default. NOTE: this supersedes the round-1 P2-2 expectation that
+// a low-but-positive setting like MAP_MAX_TOKENS=1500 must be preserved (700
+// usable) — round-3's cliff finding takes precedence, and the fallback is
+// logged, not silent.
 func chunkTokenBudget(cfg config.Config) int {
-	budget := cfg.ResolveMapMaxTokens() - mapSystemPromptReserve
+	mapMax := cfg.ResolveMapMaxTokens()
+	if mapMax < minSaneMapMaxTokens {
+		log.Printf("[config] resolved MapMaxTokens=%d below sane floor %d, using default %d (agent Map path)", mapMax, minSaneMapMaxTokens, fallbackMapMaxTokens)
+		mapMax = fallbackMapMaxTokens
+	}
+	budget := mapMax - mapSystemPromptReserve
 	if budget < 1 {
 		budget = minChunkTokenBudget
 	}

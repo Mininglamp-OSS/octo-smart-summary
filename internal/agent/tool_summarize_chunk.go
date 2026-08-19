@@ -80,13 +80,31 @@ func ProbeChunkCoverage(msgMaps []map[string]interface{}, requestedChunkSize, bu
 	return processed, len(msgMaps) - processed, len(chunked)
 }
 
-// ProbeChunkCoverageDefault runs ProbeChunkCoverage with the standard
-// deployment defaults (Map budget = defaultMapMaxTokens − system-prompt
-// reserve; CJK 1 char/token, ASCII 4 chars/token). Gates that must not depend
-// on injected deps — the eval harness, CI — probe through this.
+// ProbeChunkCoverageDefault runs ProbeChunkCoverage across BOTH ratio sets the
+// deployment can resolve — cjk=1 (generic models) and cjk=2 (the ratio
+// ResolveCharsPerTokenCJK picks for qwen/deepseek/kimi when the env var is
+// unset) — and reports the worst case. Round-3 review (yujiawei, review
+// 4960791240): the gate previously pinned CharsPerTokenCJK: 1 only, so it
+// never exercised the production ratio; "a gate that probed the production
+// ratio ... would have caught it." The no-drop assertion is ratio-independent,
+// so processed/dropped agree across ratios; chunks reports the maximum (the
+// worst fan-out). Gates that must not depend on injected deps — the eval
+// harness, CI — probe through this.
 func ProbeChunkCoverageDefault(msgMaps []map[string]interface{}, requestedChunkSize int) (processed, dropped, chunks int) {
-	cfg := config.Config{CharsPerTokenCJK: 1, CharsPerTokenASCII: 4}
-	return ProbeChunkCoverage(msgMaps, requestedChunkSize, chunkTokenBudget(cfg), cfg.ResolveCharsPerTokenCJK(), cfg.CharsPerTokenASCII)
+	for _, cjk := range []int{1, 2} {
+		cfg := config.Config{CharsPerTokenCJK: cjk, CharsPerTokenASCII: 4}
+		p, d, c := ProbeChunkCoverage(msgMaps, requestedChunkSize, chunkTokenBudget(cfg), cfg.ResolveCharsPerTokenCJK(), cfg.CharsPerTokenASCII)
+		if p < processed || processed == 0 {
+			processed = p
+		}
+		if d > dropped {
+			dropped = d
+		}
+		if c > chunks {
+			chunks = c
+		}
+	}
+	return processed, dropped, chunks
 }
 
 // getSessionMessagePool retrieves all messages from all tool calls in the session,
@@ -216,7 +234,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 					},
 					"chunk_size": map[string]interface{}{
 						"type":        "integer",
-						"description": fmt.Sprintf("可选：每片最大消息数（叠加在 token 预算之上，取值收敛到 [1, %d]，<=0 按 %d）；分片同时受 token 预算与消息数双重约束。返回值含 input_count/processed_count/dropped_count/oversized_message_count/truncated。", hardMessageBackstop, defaultChunkSize),
+						"description": fmt.Sprintf("可选：每片最大消息数（叠加在 token 预算之上，取值收敛到 [1, %d]，<=0 按 %d）；分片同时受 token 预算与消息数双重约束。返回值含 input_count/processed_count/dropped_count/oversized_message_count/truncated/chunk_size。", hardMessageBackstop, defaultChunkSize),
 					},
 				},
 				"required": []string{"messages_handle"},
@@ -253,9 +271,10 @@ func SummarizeChunkTool() (Tool, Handler) {
 		}
 
 		if len(messages) == 0 {
-			// Same result shape as the normal path (PR #196 review P2-5):
-			// the planner must see one stable contract on both branches.
-			return `{"summary":"无可总结内容","chunk_count":0,"input_count":0,"processed_count":0,"dropped_count":0,"oversized_message_count":0,"truncated":false}`, nil
+			// Same result shape as the normal path (PR #196 review P2-5,
+			// closed in round-3): the planner must see one stable contract on
+			// both branches, so the empty branch carries chunk_size too.
+			return `{"summary":"无可总结内容","chunk_count":0,"input_count":0,"processed_count":0,"dropped_count":0,"oversized_message_count":0,"truncated":false,"chunk_size":0}`, nil
 		}
 
 		// Get the global message pool for the session and pre-assign CitationIndex.

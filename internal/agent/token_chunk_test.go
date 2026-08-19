@@ -178,9 +178,9 @@ func TestSplitBillsRenderedLine_BudgetSweep(t *testing.T) {
 	for _, budget := range []int{5000, 20000, 99200, 299200} {
 		t.Run(fmt.Sprintf("budget_%d", budget), func(t *testing.T) {
 			chunks := splitMsgMapsByTokenBudget(msgs, budget, 0, cjkRatio, asciiRatio)
-			// Token budget is the binding constraint here (2-rune content is
-			// far below the 500-msg backstop cost), so rendered prompts must
-			// fit the budget in EVERY chunk.
+			// With the round-3 backstop (200) the COUNT cap binds for these
+			// ~3-token messages at every swept budget; the rendered-prompt
+			// fit assertion below is what the P0-1 regression locks in.
 			assertChunksBounded(t, chunks, len(msgs), budget, cjkRatio, asciiRatio, true)
 			// At head 38e6027 chunk 0 held budget-many messages (99,200 at the
 			// default budget); with rendered-line billing it must hold far less.
@@ -205,21 +205,20 @@ func TestSplitEmptyContentBackstop(t *testing.T) {
 			"citation_index": i + 1,
 		}
 	}
-	// budget=99200: framing cost (~1750-2125 tok per 500 lines) is far below
-	// the budget, so the BACKSTOP binds -> exactly 50000/500 = 100 chunks.
+	// budget=99200: framing cost (~850 tok per 200 lines) is far below the
+	// budget, so the BACKSTOP binds -> exactly 50000/200 = 250 chunks.
 	chunks := splitMsgMapsByTokenBudget(msgs, 99200, 0, 2, 4)
 	assertChunksBounded(t, chunks, len(msgs), 99200, 2, 4, false)
-	if len(chunks) != 100 {
-		t.Fatalf("budget 99200: 50k empty messages → %d chunks, want 100 (backstop 500)", len(chunks))
+	if len(chunks) != 250 {
+		t.Fatalf("budget 99200: 50k empty messages → %d chunks, want 250 (backstop %d)", len(chunks), hardMessageBackstop)
 	}
-	// budget=2000: framing cost of 500 lines with 5-digit citation indices
-	// (~2125 tok) EXCEEDS the budget, so the token budget binds and the
-	// backstop is never reached — the split must only get tighter, never
-	// looser than the backstop.
+	// budget=2000: the framing of a full 200-line backstop chunk (~850 tok)
+	// still fits the budget, so the backstop binds here too — the split must
+	// never get LOOSER than the backstop, and no chunk may exceed it.
 	chunks = splitMsgMapsByTokenBudget(msgs, 2000, 0, 2, 4)
 	assertChunksBounded(t, chunks, len(msgs), 2000, 2, 4, false)
-	if len(chunks) < 100 {
-		t.Fatalf("budget 2000: %d chunks < 100 — budget did not tighten the split", len(chunks))
+	if len(chunks) != 250 {
+		t.Fatalf("budget 2000: %d chunks, want 250 (backstop %d binds)", len(chunks), hardMessageBackstop)
 	}
 }
 
@@ -231,8 +230,8 @@ func TestSplitBackstopCapsMaxMsgs(t *testing.T) {
 	// Huge budget so only the message cap can bite.
 	for _, maxMsgs := range []int{0, 5000} {
 		chunks := splitMsgMapsByTokenBudget(msgs, 10_000_000, maxMsgs, 2, 4)
-		if len(chunks) != 3 { // 500 + 500 + 200
-			t.Fatalf("maxMsgs=%d: got %d chunks, want 3 (backstop must cap at %d)", maxMsgs, len(chunks), hardMessageBackstop)
+		if len(chunks) != 6 { // 200 × 6 (backstop)
+			t.Fatalf("maxMsgs=%d: got %d chunks, want 6 (backstop must cap at %d)", maxMsgs, len(chunks), hardMessageBackstop)
 		}
 		for i, c := range chunks {
 			if len(c) > hardMessageBackstop {
@@ -247,18 +246,87 @@ func TestSplitBackstopCapsMaxMsgs(t *testing.T) {
 	}
 }
 
-// TestChunkTokenBudgetRespectsLowConfig is the P2-2 regression: the floor must
-// only rescue a non-positive remainder, never enlarge a deliberately low
-// operator setting (MAP_MAX_TOKENS=1500 → 700 usable, not 2000).
-func TestChunkTokenBudgetRespectsLowConfig(t *testing.T) {
+// asciiHeavyMsgs builds n messages shaped like structural ASCII traffic
+// (JSON/log dumps) — the exact content class round-3 review (yujiawei, review
+// 4960791240) measured the estimator under-billing ~1.9× against a real BPE
+// tokenizer. Each message is ~1.1 KB of punctuation-dense ASCII.
+func asciiHeavyMsgs(n int) []map[string]interface{} {
+	line := strings.Repeat(`{"k":"v","n":12345,"flag":true,"x":null},`, 28) // ~1.1 KB
+	msgs := make([]map[string]interface{}, n)
+	for i := range msgs {
+		msgs[i] = map[string]interface{}{
+			"content":        line,
+			"sender_name":    "svc",
+			"citation_index": i + 1,
+		}
+	}
+	return msgs
+}
+
+// TestSplitClosesChunkSize201to500Route is the round-3 P1 regression. On main
+// the formatter hard-capped every chunk at 200 messages unconditionally, so a
+// planner-supplied chunk_size could never grow a chunk past 200. When the
+// backstop was 500, a model-settable chunk_size ∈ [201, 500] could pack a
+// budget-bound chunk with ~1.9× its nominal budget in REAL tokens on
+// ASCII-heavy content (the estimator's measured under-billing). Lowering the
+// backstop to 200 restores main's bound and closes that route. This test
+// proves it deterministically: even when the planner requests chunk_size=500
+// over ASCII-heavy traffic, no chunk may exceed 200 messages and nothing is
+// lost. (No cgo — bounds the message count, which is what the fix enforces;
+// the real-token bound itself is asserted by the reviewer's tiktoken probe.)
+func TestSplitClosesChunkSize201to500Route(t *testing.T) {
+	msgs := asciiHeavyMsgs(600)
+	// Default budget path: huge budget so only the count cap can bite.
+	for _, requested := range []int{201, 343, 500, 5000} {
+		size := clampChunkSize(requested)
+		if size > hardMessageBackstop {
+			t.Fatalf("clampChunkSize(%d) = %d exceeds backstop %d — the route is not closed at the clamp", requested, size, hardMessageBackstop)
+		}
+		chunks := splitMsgMapsByTokenBudget(msgs, 10_000_000, size, 1, 4)
+		total := 0
+		for i, c := range chunks {
+			total += len(c)
+			if len(c) > hardMessageBackstop {
+				t.Fatalf("chunk_size=%d: chunk %d has %d messages > backstop %d — the [201,500] route is open", requested, i, len(c), hardMessageBackstop)
+			}
+		}
+		if total != len(msgs) {
+			t.Fatalf("chunk_size=%d: messages lost: total=%d want %d", requested, total, len(msgs))
+		}
+	}
+	// And through the default path (chunk_size unset → 200) the bound holds.
+	chunks := splitMsgMapsByTokenBudget(msgs, 10_000_000, clampChunkSize(0), 1, 4)
+	for i, c := range chunks {
+		if len(c) > defaultChunkSize {
+			t.Fatalf("default path: chunk %d has %d messages > %d", i, len(c), defaultChunkSize)
+		}
+	}
+}
+
+// TestChunkTokenBudgetCliffGuard is round-3's cliff guard (yujiawei P2-4,
+// review 4960791240): a resolved Map budget in the cliff band
+// [mapSystemPromptReserve+1, minSaneMapMaxTokens) — e.g. MAP_MAX_TOKENS=801 →
+// usable budget 1 token — splits one message per chunk, turning a 100k-message
+// invocation into 100k sequential LLM calls. The guard mirrors the worker-path
+// precedent @yujiawei cited (internal/worker/personal_processor.go:
+// `if maxTokens < 10000 { ... using default 100000 }`, logged loudly) and
+// SUPERSEDES the round-1 P2-2 expectation that a low-but-positive setting
+// (MAP_MAX_TOKENS=1500 → 700 usable) must be preserved: round-3's cliff
+// finding takes precedence, and the fallback is logged, not silent.
+func TestChunkTokenBudgetCliffGuard(t *testing.T) {
+	defaultBudget := fallbackMapMaxTokens - mapSystemPromptReserve
 	cases := []struct {
 		name       string
 		mapMax     int
 		wantBudget int
 	}{
-		{"low config preserved", 1500, 1500 - mapSystemPromptReserve},
-		{"zero config -> default", 0, 100000 - mapSystemPromptReserve},
-		{"sub-reserve config -> floor", 500, minChunkTokenBudget},
+		{"zero config -> global default", 0, defaultBudget},
+		{"cliff 801 -> loud fallback", 801, defaultBudget},
+		{"low positive 1500 -> loud fallback", 1500, defaultBudget},
+		{"sub-reserve 500 -> loud fallback", 500, defaultBudget},
+		{"just below floor -> loud fallback", minSaneMapMaxTokens - 1, defaultBudget},
+		{"at floor preserved", minSaneMapMaxTokens, minSaneMapMaxTokens - mapSystemPromptReserve},
+		{"healthy explicit preserved", 50000, 50000 - mapSystemPromptReserve},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
