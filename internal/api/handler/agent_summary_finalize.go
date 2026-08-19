@@ -90,12 +90,14 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 	}
 
 	// One active Finalize Run per session (docs §3.4): reject if a finalize task
-	// for this session is still Processing.
+	// for this session is not yet terminal (Pending before the poller claims it,
+	// Processing while the worker runs).
 	var inflight int64
 	if err := h.db.WithContext(c.Request.Context()).
 		Model(&model.SummaryTask{}).
-		Where("creator_id = ? AND agent_session_id = ? AND trigger_type = ? AND status = ?",
-			userID, req.SessionID, model.TriggerAgentFinalize, model.StatusProcessing).
+		Where("creator_id = ? AND agent_session_id = ? AND trigger_type = ? AND status IN ?",
+			userID, req.SessionID, model.TriggerAgentFinalize,
+			[]int{model.StatusPending, model.StatusProcessing}).
 		Count(&inflight).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "check in-flight finalize failed"})
 		return
@@ -150,14 +152,17 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 
 	now := timezone.Now()
 	task := model.SummaryTask{
-		SpaceID:           spaceID,
-		CreatorID:         userID,
-		Title:             title,
-		Topic:             title,
-		SummaryMode:       model.ModeByPerson,
-		TimeRangeStart:    now,
-		TimeRangeEnd:      now,
-		Status:            model.StatusProcessing,
+		SpaceID:        spaceID,
+		CreatorID:      userID,
+		Title:          title,
+		Topic:          title,
+		SummaryMode:    model.ModeByPerson,
+		TimeRangeStart: now,
+		TimeRangeEnd:   now,
+		// Pending so the worker POLLER claims it (Pending→Processing→dispatch);
+		// AgentSummaryHandler has no workerTriggerURL for the HTTP fast-path, and
+		// the poller is the reliable async pickup either way.
+		Status:            model.StatusPending,
 		TriggerType:       model.TriggerAgentFinalize,
 		OriginChannelID:   originID,
 		OriginChannelType: originType,
@@ -210,7 +215,7 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 			TaskID:           createdTaskID,
 			ParticipantRefID: creatorP.ID,
 			UserID:           userID,
-			WorkerStatus:     model.PersonalStatusProcessing,
+			WorkerStatus:     model.PersonalStatusPending,
 			CreatedAt:        now,
 			UpdatedAt:        now,
 		}
