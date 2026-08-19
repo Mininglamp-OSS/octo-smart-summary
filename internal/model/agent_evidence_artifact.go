@@ -32,9 +32,15 @@ type AgentEvidenceArtifact struct {
 	ChannelCount int `gorm:"column:channel_count;not null;default:0" json:"channel_count"`
 
 	// ActualTimeRange / FailedChannels are JSON (evolving shape → checklist A1).
+	// RESERVED in this stage: the only production freeze passes an empty
+	// FreezeMeta, so these are always {"start":0,"end":0} / [] in real rows.
+	// FetchCoverage computes the facts a few frames up the stack but does not
+	// reach the freeze path yet; a later stage plumbs it through. Do not read
+	// zeros here as "the window started at epoch".
 	ActualTimeRange string `gorm:"column:actual_time_range;type:json;not null" json:"actual_time_range"`
 	FailedChannels  string `gorm:"column:failed_channels;type:json;not null" json:"failed_channels"`
-	Truncated       bool   `gorm:"column:truncated;not null;default:false" json:"truncated"`
+	// Truncated: same reservation as ActualTimeRange (always false today).
+	Truncated bool `gorm:"column:truncated;not null;default:false" json:"truncated"`
 
 	CreatedAt time.Time `gorm:"column:created_at;not null;index:idx_artifact_user_session,priority:3" json:"created_at"`
 }
