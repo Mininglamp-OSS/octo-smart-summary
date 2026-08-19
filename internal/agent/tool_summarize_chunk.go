@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 
@@ -189,7 +190,9 @@ func SummarizeChunkTool() (Tool, Handler) {
 		// SS-05 B1: when V2 mode is on and a run is in scope, override the just-
 		// computed indexes with the run's FROZEN manifest ordinals so the mid-run
 		// and save-time citation passes cannot drift. Off / no run → unchanged.
-		if runID, _ := ctx.Value(ContextKeyRunID).(string); SummaryV2Enabled() && runID != "" {
+		runID, _ := ctx.Value(ContextKeyRunID).(string)
+		v2 := SummaryV2Enabled() && runID != ""
+		if v2 {
 			globalPool = applyFrozenManifest(ctx, uid, sessionID, runID, globalPool)
 		}
 
@@ -200,12 +203,19 @@ func SummarizeChunkTool() (Tool, Handler) {
 			citationMap[key] = msg.CitationIndex
 		}
 
-		// Apply the global CitationIndex to our messages
-		for i := range messages {
-			key := fmt.Sprintf("%s:%d", messages[i].ChannelID, messages[i].MessageSeq)
-			if idx, found := citationMap[key]; found {
-				messages[i].CitationIndex = idx
-			}
+		// Apply the global CitationIndex to our messages. Under V2 the pool
+		// is the FROZEN manifest, so a message fetched AFTER the freeze is not
+		// in the map — it must not reach the model with its zero CitationIndex
+		// (the model would be told to cite message [0]): drop it from the
+		// chunk input instead and count the drop. On the legacy path every
+		// cached message is in the pool, so this never fires there.
+		messages, manifestMisses := assignCitationIndexes(messages, citationMap, v2)
+		if manifestMisses > 0 {
+			log.Printf("[summarize_chunk] session=%s run=%s: dropped %d message(s) fetched after the citation manifest was frozen (not citable under it)",
+				sessionID, runID, manifestMisses)
+		}
+		if len(messages) == 0 {
+			return "{\"summary\":\"无可总结内容\",\"chunk_count\":0}", nil
 		}
 
 		// Convert to map format for SplitIntoChunks
@@ -297,4 +307,37 @@ func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{})
 	}
 
 	return strings.TrimSpace(content), nil
+}
+
+// assignCitationIndexes overlays the pre-assigned CitationIndex from the
+// session pool (or, under V2, the run's FROZEN manifest) onto each message.
+//
+// v2 semantics: any message not present in citationMap was fetched after the
+// manifest was frozen and is not citable under it. It is DROPPED (not handed
+// to the model with the Go zero CitationIndex) and counted. The frozen
+// manifest is the single source of truth for ordinals within the run.
+//
+// Legacy semantics (v2=false): the pool is the full session, so every cached
+// message is present in the map; a miss keeps the message with whatever index
+// it already had — the historical behavior, kept byte-identical.
+//
+// Returns the kept messages (same backing array, resliced) and the number of
+// dropped manifest-misses.
+func assignCitationIndexes(messages []pipeline.Message, citationMap map[string]int, v2 bool) ([]pipeline.Message, int) {
+	manifestMisses := 0
+	kept := messages[:0]
+	for i := range messages {
+		key := fmt.Sprintf("%s:%d", messages[i].ChannelID, messages[i].MessageSeq)
+		if idx, found := citationMap[key]; found {
+			messages[i].CitationIndex = idx
+			kept = append(kept, messages[i])
+			continue
+		}
+		if v2 {
+			manifestMisses++
+			continue
+		}
+		kept = append(kept, messages[i])
+	}
+	return kept, manifestMisses
 }
