@@ -245,9 +245,10 @@ func normalizeFetchedDocumentSource(doc *documentSummarySource, ref documentRefR
 
 	rawContent := strings.TrimSpace(doc.Content)
 	doc.Content = truncateRunes(rawContent, maxDocumentPromptRunes)
-	if utf8.RuneCountInString(rawContent) > maxDocumentPromptRunes {
-		doc.Truncated = true
-	}
+	// The content field is only rendered when no chunks survive (see
+	// buildDocumentPreviewPrompt). Defer flagging its truncation until we know that,
+	// so the marker never claims a cut the model never saw.
+	contentTruncated := utf8.RuneCountInString(rawContent) > maxDocumentPromptRunes
 
 	normalized := make([]documentSourceChunk, 0, len(doc.Chunks))
 	total := 0
@@ -283,4 +284,7 @@ func normalizeFetchedDocumentSource(doc *documentSummarySource, ref documentRefR
 		kept++
 	}
 	doc.Chunks = normalized
+	if len(normalized) == 0 && contentTruncated {
+		doc.Truncated = true
+	}
 }

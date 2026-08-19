@@ -86,8 +86,8 @@ func TestBuildDocumentPreviewPrompt_FenceInjectionNeutralized(t *testing.T) {
 
 func TestBuildDocumentPreviewPrompt_UpstreamTruncatedMarker(t *testing.T) {
 	// Small content that fits the budget, but the source was already capped upstream
-	// (doc.Truncated). The marker must still be emitted so the model is not told the
-	// document is complete.
+	// (doc.Truncated). The marker must be emitted AND the retained content must still
+	// reach the model — upstream truncation must not blank the body.
 	doc := &documentSummarySource{
 		DocumentID: "d1",
 		Title:      "被上游截断的文档",
@@ -97,6 +97,13 @@ func TestBuildDocumentPreviewPrompt_UpstreamTruncatedMarker(t *testing.T) {
 	got := buildDocumentPreviewPrompt(doc)
 	if !strings.Contains(got, "[文档内容已按长度上限截断]") {
 		t.Error("upstream-truncated doc must carry the truncation marker even within budget")
+	}
+	if !strings.Contains(got, "只喂到了前面一小部分") {
+		t.Error("retained content must still be present alongside the marker (regression guard)")
+	}
+	// General lower bound: the prompt must contain more than just instruction + scaffold.
+	if utf8.RuneCountInString(got) <= utf8.RuneCountInString(documentPreviewInstruction)+50 {
+		t.Errorf("prompt suspiciously short (%d runes) — body likely dropped", utf8.RuneCountInString(got))
 	}
 }
 

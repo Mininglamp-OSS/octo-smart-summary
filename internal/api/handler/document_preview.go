@@ -227,21 +227,24 @@ func buildDocumentPreviewPrompt(doc *documentSummarySource) string {
 	if title == "" {
 		title = doc.DocumentID
 	}
-	// Carry an upstream cap (chunk-count / per-chunk / total) into the marker even
-	// when the local budget is not exhausted.
-	truncated := doc.Truncated
+	// budgetExhausted = the local rune budget ran out mid-append (stop appending).
+	// It is separate from doc.Truncated (the source was already capped upstream):
+	// upstream truncation must NOT stop us from appending the retained content —
+	// it only forces the marker. Conflating the two drops the whole body for any
+	// long document, which is exactly the primary preview case.
+	budgetExhausted := false
 	if !appendBody("## 文档：") || !appendBody(sanitizeDocumentFenceText(title)) {
-		truncated = true
+		budgetExhausted = true
 	}
-	if !truncated && doc.Version != "" {
+	if !budgetExhausted && doc.Version != "" {
 		if !appendBody(" (version: ") || !appendBody(sanitizeDocumentFenceText(doc.Version)) || !appendBody(")") {
-			truncated = true
+			budgetExhausted = true
 		}
 	}
-	if !truncated && !appendBody("\n") {
-		truncated = true
+	if !budgetExhausted && !appendBody("\n") {
+		budgetExhausted = true
 	}
-	if !truncated {
+	if !budgetExhausted {
 		chunks := doc.Chunks
 		if len(chunks) == 0 {
 			chunks = []documentSourceChunk{{Text: doc.Content}}
@@ -252,12 +255,12 @@ func buildDocumentPreviewPrompt(doc *documentSummarySource) string {
 				continue
 			}
 			if !appendBody(sanitizeDocumentFenceText(text)) || !appendBody("\n") {
-				truncated = true
+				budgetExhausted = true
 				break
 			}
 		}
 	}
-	if truncated {
+	if doc.Truncated || budgetExhausted {
 		b.WriteString(truncatedMarker)
 	}
 	b.WriteString(closeFence)

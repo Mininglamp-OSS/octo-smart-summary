@@ -66,6 +66,15 @@ func TestNormalizeFetchedDocumentSource_ContentAndChunkCaps(t *testing.T) {
 	if !doc.Truncated {
 		t.Error("Truncated flag should be set when caps drop content")
 	}
+	// Regression guard (round-3 P0): a capped doc must still carry its retained
+	// content into the prompt, not just the marker.
+	prompt := buildDocumentPreviewPrompt(doc)
+	if !strings.Contains(prompt, "[文档内容已按长度上限截断]") {
+		t.Error("capped doc should carry the truncation marker in the prompt")
+	}
+	if utf8.RuneCountInString(prompt) < maxDocumentChunkRunes {
+		t.Errorf("retained ~%d-rune chunk missing from prompt: only %d runes", maxDocumentChunkRunes, utf8.RuneCountInString(prompt))
+	}
 }
 
 func TestNormalizeFetchedDocumentSource_BlankChunksDoNotConsumeCap(t *testing.T) {
