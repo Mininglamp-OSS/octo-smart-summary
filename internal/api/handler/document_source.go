@@ -254,7 +254,10 @@ func normalizeFetchedDocumentSource(doc *documentSummarySource, ref documentRefR
 	total := 0
 	kept := 0
 	for _, chunk := range doc.Chunks {
-		chunk.ChunkID = truncateRunes(strings.TrimSpace(chunk.ChunkID), maxDocumentVersionLen)
+		// ChunkID/Page are carried for the wire contract only — nothing downstream reads
+		// them, so they are deliberately not normalized. Title IS rendered into the
+		// prompt (see buildDocumentPreviewPrompt), so it is clamped like any other
+		// untrusted, model-visible string.
 		chunk.Title = truncateRunes(strings.TrimSpace(chunk.Title), maxDocumentTitleRunes)
 		trimmed := strings.TrimSpace(chunk.Text)
 		if trimmed == "" {

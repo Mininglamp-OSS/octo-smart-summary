@@ -14,7 +14,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -98,9 +97,17 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 	userID := middleware.GetUserID(c)
 
 	var req documentPreviewReq
-	decoder := json.NewDecoder(io.LimitReader(c.Request.Body, documentPreviewMaxRequestBytes))
+	// MaxBytesReader (not io.LimitReader) so an over-cap body is reported as such:
+	// silently truncating it would surface as a bogus "invalid request field" 40000,
+	// which is actively misleading now that the body carries the document text.
+	decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, documentPreviewMaxRequestBytes))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			c.JSON(http.StatusRequestEntityTooLarge, apiResponse{Code: 40007, Message: "文档内容过大，请改用文档引用方式"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid or unsupported request field"})
 		return
 	}
@@ -220,7 +227,7 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
-		log.Printf("[handler] preview stream failed doc=%s user=%s space=%s: %v", ref.DocumentID, userID, spaceID, err)
+		log.Printf("[handler] preview stream failed doc=%q user=%s space=%s: %v", ref.DocumentID, userID, spaceID, err)
 		_ = writeSSE(w, "error", previewEvent{Type: "error", Content: "文档速览生成失败"})
 		w.Flush()
 		return
@@ -235,7 +242,10 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 // the truncation marker is emitted when the budget runs out OR when the source was
 // already capped upstream (doc.Truncated, set by normalizeFetchedDocumentSource).
 func buildDocumentPreviewPrompt(doc *documentSummarySource) string {
-	var b strings.Builder
+	// The body is assembled separately from the instruction so the final,
+	// post-concatenation sanitize pass below can run over the untrusted text ONLY:
+	// the fixed instruction legitimately contains the real opening <文档数据> fence.
+	var body strings.Builder
 	truncatedMarker := "\n[文档内容已按长度上限截断]\n"
 	closeFence := "\n</文档数据>\n"
 	bodyLimit := maxDocumentPromptRunes -
@@ -256,16 +266,14 @@ func buildDocumentPreviewPrompt(doc *documentSummarySource) string {
 		}
 		runes := utf8.RuneCountInString(s)
 		if runes > remaining {
-			b.WriteString(truncateRunes(s, remaining))
+			body.WriteString(truncateRunes(s, remaining))
 			used = bodyLimit
 			return false
 		}
-		b.WriteString(s)
+		body.WriteString(s)
 		used += runes
 		return true
 	}
-
-	b.WriteString(documentPreviewInstruction)
 
 	title := strings.TrimSpace(doc.Title)
 	if title == "" {
@@ -298,12 +306,31 @@ func buildDocumentPreviewPrompt(doc *documentSummarySource) string {
 			if text == "" {
 				continue
 			}
+			// Section title (when the document service supplies one) is rendered so the
+			// model can honour the instruction's "建议细读第X部分"; it is untrusted text and
+			// goes through the same sanitize + budget path as the chunk body.
+			if sectionTitle := strings.TrimSpace(chunk.Title); sectionTitle != "" {
+				if !appendBody("### ") || !appendBody(sanitizeDocumentFenceText(sectionTitle)) || !appendBody("\n") {
+					budgetExhausted = true
+					break
+				}
+			}
 			if !appendBody(sanitizeDocumentFenceText(text)) || !appendBody("\n") {
 				budgetExhausted = true
 				break
 			}
 		}
 	}
+
+	var b strings.Builder
+	b.WriteString(documentPreviewInstruction)
+	// Final sanitize pass over the ASSEMBLED body. Per-unit sanitization above cannot
+	// see a fence tag split across two units (chunk N ending in "</文档数据", chunk N+1
+	// starting with ">"), which the whitespace-tolerant docFenceTagPattern would then
+	// match after joining — putting attacker text outside the fence. This pass only
+	// ever shortens the text (the placeholder is never longer than the tag it
+	// replaces), so the rune budget computed above still holds.
+	b.WriteString(sanitizeDocumentFenceText(body.String()))
 	if doc.Truncated || budgetExhausted {
 		b.WriteString(truncatedMarker)
 	}
