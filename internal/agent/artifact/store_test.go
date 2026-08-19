@@ -40,6 +40,50 @@ func pool() []pipeline.Message {
 	}
 }
 
+// issue A fix: the finish gate must read the artifact for the SAME run as the
+// Spec. A session can hold multiple runs (one per submit); reading by session
+// grabs whichever run's artifact is latest, mismatching the Spec's channel
+// count → false PARTIAL. GetLatestArtifactByRun keeps both from one run.
+func TestGetLatestArtifactByRunIsolatesRuns(t *testing.T) {
+	db := newArtifactTestDB(t)
+	if db == nil {
+		return
+	}
+	s := NewStore(db)
+	ctx := context.Background()
+
+	// Same session, two runs: runOne fetched 1 channel, runFull fetched 2.
+	poolOne := []pipeline.Message{{ChannelID: "a", MessageSeq: 1, Timestamp: 10}}
+	poolTwo := []pipeline.Message{{ChannelID: "a", MessageSeq: 1, Timestamp: 10}, {ChannelID: "b", MessageSeq: 2, Timestamp: 20}}
+	if _, _, _, err := s.FreezeFromPool(ctx, "runOne", "u1", "sess1", poolOne, FreezeMeta{}); err != nil {
+		t.Fatalf("freeze runOne: %v", err)
+	}
+	if _, _, _, err := s.FreezeFromPool(ctx, "runFull", "u1", "sess1", poolTwo, FreezeMeta{}); err != nil {
+		t.Fatalf("freeze runFull: %v", err)
+	}
+
+	// By-run returns each run's OWN artifact, regardless of freeze order.
+	full, ok, err := s.GetLatestArtifactByRun(ctx, "u1", "runFull")
+	if err != nil || !ok {
+		t.Fatalf("byRun runFull: ok=%v err=%v", ok, err)
+	}
+	if full.ChannelCount != 2 {
+		t.Errorf("runFull channel_count = %d, want 2", full.ChannelCount)
+	}
+	one, ok, err := s.GetLatestArtifactByRun(ctx, "u1", "runOne")
+	if err != nil || !ok {
+		t.Fatalf("byRun runOne: ok=%v err=%v", ok, err)
+	}
+	if one.ChannelCount != 1 {
+		t.Errorf("runOne channel_count = %d, want 1", one.ChannelCount)
+	}
+
+	// Missing run → found=false, nil error.
+	if _, ok, err := s.GetLatestArtifactByRun(ctx, "u1", "nope"); err != nil || ok {
+		t.Errorf("missing run should be not-found: ok=%v err=%v", ok, err)
+	}
+}
+
 func TestFreezeFromPoolIdempotent(t *testing.T) {
 	db := newArtifactTestDB(t)
 	if db == nil {

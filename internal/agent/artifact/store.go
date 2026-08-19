@@ -296,6 +296,31 @@ func (s *Store) GetFrozenManifestByRun(ctx context.Context, userID, runID string
 	return &man, entries, true, nil
 }
 
+// GetLatestArtifactByRun returns the highest-revision artifact for a
+// (user, run), owner-scoped. found=false (nil error) when none exists.
+//
+// The finish gate MUST use this run-scoped read (not the session-scoped one):
+// a chat session can hold multiple runs (one per submit / request_id), each
+// freezing its own artifact. Reading by session returns "whichever run's
+// artifact is latest", which may belong to a different run than the one whose
+// Spec the gate is comparing against — producing a spurious channel-count
+// mismatch (false PARTIAL). Keying the artifact read to the same run_id as the
+// Spec keeps both sides of the coverage comparison from the same run.
+func (s *Store) GetLatestArtifactByRun(ctx context.Context, userID, runID string) (*model.AgentEvidenceArtifact, bool, error) {
+	var art model.AgentEvidenceArtifact
+	err := s.db.WithContext(ctx).
+		Where("user_id = ? AND run_id = ?", userID, runID).
+		Order("revision DESC").
+		First(&art).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return &art, true, nil
+}
+
 // GetLatestArtifactBySession returns the highest-revision artifact for a
 // (user, session), owner-scoped. found=false (nil error) when none exists.
 // Used by the finish gate to read coverage facts (truncated, channel_count,

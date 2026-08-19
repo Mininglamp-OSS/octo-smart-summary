@@ -257,8 +257,12 @@ func (h *AgentSummaryHandler) finalizeRun(ctx context.Context, uid, sessionID, c
 	}
 
 	// Coverage facts from the frozen artifact (SS-04/05), when present.
+	// Run-scoped read (issue A fix): a session can hold multiple runs (one per
+	// submit/request_id), each with its own artifact. Reading by session would
+	// grab a different run's artifact and mismatch this run's Spec channel count
+	// → false PARTIAL. Key the artifact to the same run as the Spec below.
 	artStore := artifact.NewStore(h.db)
-	if art, ok, aerr := artStore.GetLatestArtifactBySession(ctx, uid, sessionID); aerr == nil && ok {
+	if art, ok, aerr := artStore.GetLatestArtifactByRun(ctx, uid, run.RunID); aerr == nil && ok {
 		state.HasUsableEvidence = art.MessageCount > 0
 		state.ChannelsFetched = art.ChannelCount
 		state.Truncated = art.Truncated
