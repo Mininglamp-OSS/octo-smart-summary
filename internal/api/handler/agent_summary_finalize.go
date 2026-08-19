@@ -6,12 +6,12 @@ package handler
 // Unlike CreateAgentSummary (synchronous, copies one already-produced assistant
 // reply into the deliverable), this endpoint:
 //
-//   - creates a Task(TriggerAgentFinalize, status=Processing) + a creator
-//     PersonalResult(Processing) and returns 202 immediately — NO LLM call in
+//   - creates a Task(TriggerAgentFinalize, status=Pending) + a creator
+//     PersonalResult(Pending) and returns 202 immediately — NO LLM call in
 //     the request path;
-//   - the worker poller then claims it and runs executeAgentFinalize, which
-//     CONSOLIDATES the session's already-usable assistant replies into one body
-//     (see internal/worker/agent_finalize.go).
+//   - the worker poller then claims it (Pending→Processing) and runs
+//     executeAgentFinalize, which CONSOLIDATES the session's already-usable
+//     assistant replies into one body (see internal/worker/agent_finalize.go).
 //
 // Safety is reused verbatim from SUM-BE2 (agent_summary_save.go): the
 // Idempotency-Key preflight + canonical request-hash give same-body replay /
@@ -71,23 +71,31 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 		return
 	}
 
-	// The session must have usable assistant content to consolidate — reject
-	// early with a clear error instead of enqueuing a task that will fail in the
-	// worker. Also implicitly rejects a still-generating session that has not
-	// produced any assistant reply yet.
-	var replyCount int64
+	// The session must have usable assistant content to consolidate, AND we
+	// FREEZE the input here at save time: capture the current max assistant
+	// message id as an upper bound (docs §3.4 — freeze the revision). The worker
+	// only merges messages id <= this bound, so replies produced AFTER the user
+	// clicked save can never contaminate this deliverable (stable, idempotent
+	// output). Stored on task.AgentMessageID (BE2's audit column, repurposed as
+	// the finalize freeze bound).
+	var frozen struct {
+		Cnt   int64
+		MaxID int64
+	}
 	if err := h.db.WithContext(c.Request.Context()).
 		Model(&model.AgentMessage{}).
+		Select("COUNT(*) AS cnt, COALESCE(MAX(id),0) AS max_id").
 		Where("user_id = ? AND session_id = ? AND role = ? AND tool_calls IS NULL AND content <> ''",
 			userID, req.SessionID, "assistant").
-		Count(&replyCount).Error; err != nil {
+		Scan(&frozen).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "check session content failed"})
 		return
 	}
-	if replyCount == 0 {
+	if frozen.Cnt == 0 {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40004, Message: "本次会话还没有可定稿的内容"})
 		return
 	}
+	frozenMessageID := frozen.MaxID
 
 	// One active Finalize Run per session (docs §3.4): reject if a finalize task
 	// for this session is not yet terminal (Pending before the poller claims it,
@@ -168,7 +176,10 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 		OriginChannelType: originType,
 		ReferencedTaskIDs: serializeReferencedTaskIDs(req.ReferencedTaskIDs),
 		AgentSessionID:    req.SessionID,
-		SnapshotVersion:   req.ExpectedSessionRevision,
+		// Freeze bound (see above): worker merges only assistant messages with
+		// id <= this, so post-save replies never leak into the deliverable.
+		AgentMessageID:  frozenMessageID,
+		SnapshotVersion: req.ExpectedSessionRevision,
 	}
 
 	var createdTaskID int64

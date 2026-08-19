@@ -32,15 +32,20 @@ func (p *Processor) executeAgentFinalize(ctx context.Context, task model.Summary
 	}
 
 	// 1. Gather the whole session's usable assistant replies — the already-formed
-	// summary fragments — in chronological order. Tool-call wrappers and empty
-	// placeholders are excluded (mirrors loadAgentMessageForSave's trusted filter
-	// minus the single-id constraint), so process noise never reaches the merge.
-	var replies []model.AgentMessage
-	if err := p.db.WithContext(ctx).
+	// summary fragments — in chronological order, BOUNDED by the freeze point the
+	// handler captured (task.AgentMessageID = max assistant id at save time). This
+	// is the §3.4 revision freeze: replies produced after the user clicked save
+	// (id > bound) are excluded, so the deliverable is stable and idempotent.
+	// Tool-call wrappers and empty placeholders are excluded (mirrors
+	// loadAgentMessageForSave's trusted filter), so process noise never merges.
+	q := p.db.WithContext(ctx).
 		Where("user_id = ? AND session_id = ? AND role = ? AND tool_calls IS NULL AND content <> ''",
-			userID, sessionID, "assistant").
-		Order("created_at ASC").
-		Find(&replies).Error; err != nil {
+			userID, sessionID, "assistant")
+	if task.AgentMessageID > 0 {
+		q = q.Where("id <= ?", task.AgentMessageID)
+	}
+	var replies []model.AgentMessage
+	if err := q.Order("created_at ASC").Find(&replies).Error; err != nil {
 		return "", nil, 0, 0, modelVer, fmt.Errorf("load session assistant replies: %w", err)
 	}
 	if len(replies) == 0 {
