@@ -475,17 +475,16 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		}
 		creatorPR.SetCitations(cits)
 
-		// SS-07 core + SS-07b: compute + persist the finish verdict. It records
-		// COMPLETE/PARTIAL/FAILED and coverage gaps for disclosure, and (SS-07b)
-		// a FAILED verdict aborts the transaction so no COMPLETE product is saved
-		// (§8.3). Off / no run → no-op.
+		// SS-07: compute + persist the finish verdict as an INTERNAL quality
+		// signal only. finalizeRun records COMPLETE/PARTIAL/FAILED + gaps to the
+		// run row for later offline analysis / a future repair loop — it does NOT
+		// gate the user. The save always proceeds regardless of the verdict
+		// (product call: never block a save on the quality gate; optimize later).
+		// Off / no run → no-op.
 		if agent.SummaryV2Enabled() {
 			if v, gaps := h.finalizeRun(c.Request.Context(), userID, req.SessionID, content, cits); v != "" {
-				log.Printf("[handler] agent summary finish verdict=%s gaps=%d session=%s", v, len(gaps), req.SessionID)
+				log.Printf("[handler] agent summary finish verdict=%s gaps=%d session=%s (recorded, non-blocking)", v, len(gaps), req.SessionID)
 				finishVerdict, finishGaps = v, gaps
-				if v == finishgate.Failed {
-					return fmt.Errorf("%w: finish verdict FAILED (%d gaps)", errFinishFailed, len(gaps))
-				}
 			}
 		}
 		// Build v1 snapshot for agent-generated summary
