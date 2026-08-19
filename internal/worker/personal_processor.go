@@ -312,8 +312,23 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 		return ensureStream().Delta(delta)
 	}
 
-	// Execute pipeline
-	content, citations, msgCount, totalTokens, modelVer, err := p.executePersonalPipeline(ctx, task, participant.UserID, reportStage, streamDelta)
+	// Execute pipeline. Session-Finalize v0 (TriggerAgentFinalize) swaps the
+	// slow fetch+Map-Reduce core for a single consolidation over the agent's
+	// already-produced replies; everything else on this path (status CAS,
+	// persist, failure handling) is shared.
+	var (
+		content     string
+		citations   []model.Citation
+		msgCount    int
+		totalTokens int
+		modelVer    string
+		err         error
+	)
+	if task.TriggerType == model.TriggerAgentFinalize {
+		content, citations, msgCount, totalTokens, modelVer, err = p.executeAgentFinalize(ctx, task, participant.UserID)
+	} else {
+		content, citations, msgCount, totalTokens, modelVer, err = p.executePersonalPipeline(ctx, task, participant.UserID, reportStage, streamDelta)
+	}
 	if err != nil {
 		log.Printf("[personal-worker] pipeline error task=%d user=%s: %v", taskID, participant.UserID, err)
 		finishStreamError("summary generation failed")

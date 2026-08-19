@@ -78,6 +78,12 @@ const (
 	// TriggerBot marks a traditional asynchronous summary created by a
 	// personal bot acting with its human owner's permissions.
 	TriggerBot = 4
+	// TriggerAgentFinalize marks a Session-Finalize v0 task: an async summary
+	// whose body is CONSOLIDATED from the agent conversation's already-produced
+	// assistant replies (not re-fetched/re-summarized). Born status=Processing
+	// and completed by the worker via executeAgentFinalize; distinct from the
+	// legacy synchronous TriggerAgent path.
+	TriggerAgentFinalize = 5
 )
 
 // Scheduled multi-participant confirm policy constants (summary_schedule.confirm_policy).
