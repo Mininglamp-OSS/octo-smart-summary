@@ -160,6 +160,7 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 
 	now := timezone.Now()
 	task := model.SummaryTask{
+		TaskNo:         service.GenerateTaskNo(),
 		SpaceID:        spaceID,
 		CreatorID:      userID,
 		Title:          title,
