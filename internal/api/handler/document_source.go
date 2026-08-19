@@ -4,10 +4,10 @@ package handler
 //
 // The client that fetches a document's summarize-ready content from the document
 // service, plus the request/response shapes, fence sanitization, and chunk
-// normalization that any document-summarizing handler builds on. This is the
-// common substrate under both the ephemeral AI 速览 preview (document_preview.go)
-// and the persisted agent document summary — kept in its own file so neither
-// depends on the other.
+// normalization that any document-summarizing handler builds on. Today the sole
+// consumer is the ephemeral AI 速览 preview (document_preview.go); it lives in its
+// own file so a future persisted document-summary path can reuse it rather than
+// redefine these symbols.
 
 import (
 	"context"
@@ -55,6 +55,10 @@ type documentSummarySource struct {
 	Version    string                `json:"version"`
 	Content    string                `json:"content"`
 	Chunks     []documentSourceChunk `json:"chunks,omitempty"`
+	// Truncated is set by normalizeFetchedDocumentSource when any size cap
+	// (chunk count, per-chunk runes, or total runes) dropped document content,
+	// so the prompt builder can surface the truncation marker. Not wire data.
+	Truncated bool `json:"-"`
 }
 
 type documentSourceChunk struct {
@@ -201,29 +205,31 @@ func validateDocumentRefs(refs []documentRefReq) error {
 }
 
 // sanitizeDocumentFenceText neutralizes untrusted document text that could close
-// the <文档数据> fence early: full-width angle/slash folding, invisible character
-// stripping, then structural regex matching with a non-empty placeholder.
+// the <文档数据> fence early: full-width / small-form / CJK angle-and-slash
+// folding, invisible-character stripping, then structural regex matching (tolerating
+// repeated slashes) with a non-empty placeholder.
+//
+// NOTE: this intentionally duplicates the <引用数据> guard in
+// agent_reference_context.go; centralizing both onto one tag-parameterized helper
+// is a worthwhile follow-up but out of scope for this change.
 var (
 	docFenceInvisiblePattern = regexp.MustCompile(`[\p{Cf}\x{00ad}]`)
-	docFenceTagPattern       = regexp.MustCompile(`<[\s\p{Zs}]*/?[\s\p{Zs}]*文档数据[\s\p{Zs}]*>`)
+	docFenceTagPattern       = regexp.MustCompile(`<[\s\p{Zs}]*/*[\s\p{Zs}]*文档数据[\s\p{Zs}]*>`)
+	// Fold full-width (＜＞／), small-form (﹤﹥), and CJK (〈〉) angle brackets/solidus to
+	// ASCII, and collapse control + line-separator chars, before structural matching.
+	docFenceReplacer = strings.NewReplacer(
+		"＜", "<", "＞", ">", "／", "/",
+		"〈", "<", "〉", ">",
+		"﹤", "<", "﹥", ">",
+		"\r", " ", "\t", " ", "\x00", " ", "\v", " ", "\f", " ",
+		"\u0085", " ", "\u2028", " ", "\u2029", " ",
+	)
 )
 
 const docFencePlaceholder = "[文档数据]"
 
 func sanitizeDocumentFenceText(s string) string {
-	s = strings.NewReplacer(
-		"＜", "<",
-		"＞", ">",
-		"／", "/",
-		"\r", " ",
-		"\t", " ",
-		"\x00", " ",
-		"\v", " ",
-		"\f", " ",
-		"", " ",
-		" ", " ",
-		" ", " ",
-	).Replace(s)
+	s = docFenceReplacer.Replace(s)
 	s = docFenceInvisiblePattern.ReplaceAllString(s, "")
 	s = docFenceTagPattern.ReplaceAllString(s, docFencePlaceholder)
 	return strings.TrimSpace(s)
@@ -236,22 +242,36 @@ func normalizeFetchedDocumentSource(doc *documentSummarySource, ref documentRefR
 		doc.Version = ref.Version
 	}
 	doc.Title = truncateRunes(strings.TrimSpace(doc.Title), maxDocumentTitleRunes)
-	doc.Content = truncateRunes(strings.TrimSpace(doc.Content), maxDocumentPromptRunes)
+
+	rawContent := strings.TrimSpace(doc.Content)
+	doc.Content = truncateRunes(rawContent, maxDocumentPromptRunes)
+	if utf8.RuneCountInString(rawContent) > maxDocumentPromptRunes {
+		doc.Truncated = true
+	}
+
 	normalized := make([]documentSourceChunk, 0, len(doc.Chunks))
 	total := 0
-	for i, chunk := range doc.Chunks {
-		if i >= maxDocumentChunks {
-			break
-		}
+	kept := 0
+	for _, chunk := range doc.Chunks {
 		chunk.ChunkID = truncateRunes(strings.TrimSpace(chunk.ChunkID), maxDocumentVersionLen)
 		chunk.Title = truncateRunes(strings.TrimSpace(chunk.Title), maxDocumentTitleRunes)
-		chunk.Text = truncateRunes(strings.TrimSpace(chunk.Text), maxDocumentChunkRunes)
-		if chunk.Text == "" {
+		trimmed := strings.TrimSpace(chunk.Text)
+		if trimmed == "" {
+			// Blank chunks are dropped and must NOT consume the count cap.
 			continue
 		}
+		if kept >= maxDocumentChunks {
+			doc.Truncated = true
+			break
+		}
+		if utf8.RuneCountInString(trimmed) > maxDocumentChunkRunes {
+			doc.Truncated = true
+		}
+		chunk.Text = truncateRunes(trimmed, maxDocumentChunkRunes)
 		total += utf8.RuneCountInString(chunk.Text)
 		if total > maxDocumentPromptRunes {
 			remaining := maxDocumentPromptRunes - (total - utf8.RuneCountInString(chunk.Text))
+			doc.Truncated = true
 			if remaining <= 0 {
 				break
 			}
@@ -260,6 +280,7 @@ func normalizeFetchedDocumentSource(doc *documentSummarySource, ref documentRefR
 			break
 		}
 		normalized = append(normalized, chunk)
+		kept++
 	}
 	doc.Chunks = normalized
 }

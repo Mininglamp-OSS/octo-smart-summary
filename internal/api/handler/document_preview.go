@@ -59,7 +59,7 @@ type documentPreviewReq struct {
 	Version    string `json:"version,omitempty"`
 }
 
-// previewEvent is the SSE payload shape. type ∈ {"delta","done","error"}.
+// previewEvent is the SSE payload shape. type ∈ {"start","delta","done","error"}.
 type previewEvent struct {
 	Type    string `json:"type"`
 	Content string `json:"content,omitempty"`
@@ -82,7 +82,7 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 		return
 	}
 
-	// Reuse the persisted path's ref normalization + validation for a single doc.
+	// Normalize + validate the single document ref (shared helpers in document_source.go).
 	refs := normalizeDocumentRefs([]documentRefReq{{
 		DocumentID: strings.TrimSpace(req.DocumentID),
 		Version:    strings.TrimSpace(req.Version),
@@ -114,17 +114,20 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 	defer fetchCancel()
 	doc, err := docClient.FetchSummarySource(fetchCtx, spaceID, userID, ref.DocumentID, ref.Version, c.Request.Header)
 	if err != nil {
-		if errors.Is(err, errDocumentSourceNotConfigured) {
-			c.JSON(http.StatusBadGateway, apiResponse{Code: 50201, Message: "document summary source API is not configured"})
-			return
-		}
+		log.Printf("[handler] preview fetch source failed doc=%q user=%s space=%s: %v", ref.DocumentID, userID, spaceID, err)
 		var srcErr *documentSourceError
 		if errors.As(err, &srcErr) {
-			log.Printf("[handler] preview fetch source failed doc=%s user=%s space=%s: %v", ref.DocumentID, userID, spaceID, err)
-			c.JSON(srcErr.status, apiResponse{Code: 40003, Message: "文档不可访问或尚未解析完成"})
+			// Map the upstream class faithfully: 4xx (403/404) is a document/permission
+			// condition the user can act on → 40003; 5xx / timeout / refused redirect /
+			// oversized payload is a service outage → 50202, so an infra failure is not
+			// misattributed to the document itself.
+			if srcErr.status >= http.StatusInternalServerError {
+				c.JSON(srcErr.status, apiResponse{Code: 50202, Message: "文档服务暂不可用"})
+			} else {
+				c.JSON(srcErr.status, apiResponse{Code: 40003, Message: "文档不可访问或尚未解析完成"})
+			}
 			return
 		}
-		log.Printf("[handler] preview fetch source failed doc=%s user=%s space=%s: %v", ref.DocumentID, userID, spaceID, err)
 		c.JSON(http.StatusBadGateway, apiResponse{Code: 50202, Message: "文档服务暂不可用"})
 		return
 	}
@@ -147,9 +150,16 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 	w.WriteHeader(http.StatusOK)
 	w.Flush()
 
+	// Emit an immediate start frame so proxies/clients see bytes before the first
+	// token: the fetch→first-token gap can otherwise exceed a proxy read timeout.
+	_ = writeSSE(w, "start", previewEvent{Type: "start"})
+	w.Flush()
+
 	genCtx, genCancel := context.WithTimeout(c.Request.Context(), documentPreviewGenTimeout)
 	defer genCancel()
 
+	// enableThinking=false: 速览 optimizes for latency (a "few seconds" glance), so
+	// thinking mode is intentionally off here regardless of the global LLM_ENABLE_THINKING.
 	client := service.NewLLMClient(h.llmApiURL, h.llmApiKey, h.llmModel, h.llmTimeout, h.llmMaxTokens, false, 30)
 	messages := []service.ChatMessage{
 		{Role: "system", Content: documentPreviewSystemPrompt},
@@ -175,9 +185,11 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 	w.Flush()
 }
 
-// buildDocumentPreviewPrompt mirrors buildDocumentSummaryPrompt but for a single
-// document, with NO [n] citations and the fixed 速览 instruction. Document text is
-// fence-sanitized (sanitizeDocumentFenceText) and budgeted under maxDocumentPromptRunes.
+// buildDocumentPreviewPrompt builds the 速览 user message for a single document,
+// with NO [n] citations and the fixed 速览 instruction. Document text is
+// fence-sanitized (sanitizeDocumentFenceText) and budgeted under maxDocumentPromptRunes;
+// the truncation marker is emitted when the budget runs out OR when the source was
+// already capped upstream (doc.Truncated, set by normalizeFetchedDocumentSource).
 func buildDocumentPreviewPrompt(doc *documentSummarySource) string {
 	var b strings.Builder
 	truncatedMarker := "\n[文档内容已按长度上限截断]\n"
@@ -215,7 +227,9 @@ func buildDocumentPreviewPrompt(doc *documentSummarySource) string {
 	if title == "" {
 		title = doc.DocumentID
 	}
-	truncated := false
+	// Carry an upstream cap (chunk-count / per-chunk / total) into the marker even
+	// when the local budget is not exhausted.
+	truncated := doc.Truncated
 	if !appendBody("## 文档：") || !appendBody(sanitizeDocumentFenceText(title)) {
 		truncated = true
 	}

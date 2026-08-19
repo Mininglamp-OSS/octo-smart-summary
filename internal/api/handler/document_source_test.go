@@ -1,6 +1,10 @@
 package handler
 
 import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -16,6 +20,9 @@ func TestSanitizeDocumentFenceText(t *testing.T) {
 		{"closing fence neutralized", "</文档数据>", docFencePlaceholder},
 		{"opening fence neutralized", "<文档数据>", docFencePlaceholder},
 		{"full-width angle/slash folded", "＜/文档数据＞", docFencePlaceholder},
+		{"cjk angle brackets folded", "〈/文档数据〉", docFencePlaceholder},
+		{"small-form brackets folded", "﹤/文档数据﹥", docFencePlaceholder},
+		{"repeated fullwidth solidus folded", "</／文档数据>", docFencePlaceholder},
 		{"spaced fence still matched", "<  文档数据 >", docFencePlaceholder},
 		{"zero-width inside fence stripped", "<文​档数据>", docFencePlaceholder},
 	}
@@ -55,6 +62,99 @@ func TestNormalizeFetchedDocumentSource_ContentAndChunkCaps(t *testing.T) {
 	}
 	if doc.Version != "v2" {
 		t.Errorf("Version fallback failed: got %q", doc.Version)
+	}
+	if !doc.Truncated {
+		t.Error("Truncated flag should be set when caps drop content")
+	}
+}
+
+func TestNormalizeFetchedDocumentSource_BlankChunksDoNotConsumeCap(t *testing.T) {
+	doc := &documentSummarySource{}
+	for i := 0; i < maxDocumentChunks; i++ {
+		doc.Chunks = append(doc.Chunks, documentSourceChunk{Text: "   "}) // blank
+	}
+	doc.Chunks = append(doc.Chunks, documentSourceChunk{Text: "真正有内容的一段"})
+
+	normalizeFetchedDocumentSource(doc, documentRefReq{DocumentID: "d1"})
+
+	if len(doc.Chunks) != 1 {
+		t.Fatalf("expected the one real chunk to survive, got %d chunks", len(doc.Chunks))
+	}
+	if doc.Chunks[0].Text != "真正有内容的一段" {
+		t.Errorf("real chunk dropped; got %q", doc.Chunks[0].Text)
+	}
+}
+
+func TestFetchSummarySource_HTTPBoundary(t *testing.T) {
+	var gotToken, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotToken = r.Header.Get("Token")
+		gotAuth = r.Header.Get("Authorization")
+		switch r.URL.Query().Get("version") {
+		case "redirect":
+			w.Header().Set("Location", "https://evil.example/x")
+			w.WriteHeader(http.StatusFound) // 302
+		case "forbidden":
+			w.WriteHeader(http.StatusForbidden) // 403
+		case "notfound":
+			w.WriteHeader(http.StatusNotFound) // 404
+		case "big":
+			w.WriteHeader(http.StatusOK)
+			// Emit > 4 MiB of non-JSON so the LimitReader decode fails.
+			chunk := strings.Repeat("x", 1<<16)
+			for i := 0; i < 80; i++ {
+				_, _ = w.Write([]byte(chunk))
+			}
+		default:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"document_id":"d1","title":"t","version":"v","content":"c"}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := &httpDocumentSourceClient{
+		baseURL: srv.URL,
+		client: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}},
+	}
+	hdr := http.Header{}
+	hdr.Set("Token", "tok-123")
+	hdr.Set("Authorization", "bf_should_not_forward")
+
+	statusOf := func(version string) int {
+		_, err := c.FetchSummarySource(context.Background(), "sp", "u", "d1", version, hdr)
+		var se *documentSourceError
+		if err != nil && errors.As(err, &se) {
+			return se.status
+		}
+		if err != nil {
+			t.Fatalf("unexpected non-documentSourceError: %v", err)
+		}
+		return 200
+	}
+
+	if s := statusOf("redirect"); s != http.StatusBadGateway {
+		t.Errorf("302 should map to 502, got %d", s)
+	}
+	if s := statusOf("forbidden"); s != http.StatusBadRequest {
+		t.Errorf("403 should map to 400, got %d", s)
+	}
+	if s := statusOf("notfound"); s != http.StatusBadRequest {
+		t.Errorf("404 should map to 400, got %d", s)
+	}
+	if s := statusOf("big"); s != http.StatusBadGateway {
+		t.Errorf("oversized payload should map to 502, got %d", s)
+	}
+	// The happy path forwards Token and never Authorization.
+	if _, err := c.FetchSummarySource(context.Background(), "sp", "u", "d1", "", hdr); err != nil {
+		t.Fatalf("happy path failed: %v", err)
+	}
+	if gotToken != "tok-123" {
+		t.Errorf("Token not forwarded: got %q", gotToken)
+	}
+	if gotAuth != "" {
+		t.Errorf("Authorization must not be forwarded, upstream saw %q", gotAuth)
 	}
 }
 

@@ -44,7 +44,7 @@ type AgentSummaryHandler struct {
 	llmMaxTokens int
 	store        agentHistoryStore
 	// documentClient fetches summarize-ready document content (see document_source.go).
-	// Used by the document AI 速览 preview and the persisted agent document summary.
+	// Used by the document AI 速览 preview.
 	documentClient documentSourceClient
 	// runnerFactory is an optional test-only hook for injecting a fake agent
 	// runner without going through the real LLM. When nil (production path),

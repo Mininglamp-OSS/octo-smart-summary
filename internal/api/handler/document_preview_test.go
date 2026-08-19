@@ -84,6 +84,22 @@ func TestBuildDocumentPreviewPrompt_FenceInjectionNeutralized(t *testing.T) {
 	}
 }
 
+func TestBuildDocumentPreviewPrompt_UpstreamTruncatedMarker(t *testing.T) {
+	// Small content that fits the budget, but the source was already capped upstream
+	// (doc.Truncated). The marker must still be emitted so the model is not told the
+	// document is complete.
+	doc := &documentSummarySource{
+		DocumentID: "d1",
+		Title:      "被上游截断的文档",
+		Content:    "只喂到了前面一小部分。",
+		Truncated:  true,
+	}
+	got := buildDocumentPreviewPrompt(doc)
+	if !strings.Contains(got, "[文档内容已按长度上限截断]") {
+		t.Error("upstream-truncated doc must carry the truncation marker even within budget")
+	}
+}
+
 // --- handler pre-stream error paths (no LLM call reached) ---
 
 type fakeDocClient struct {
@@ -138,10 +154,28 @@ func TestStreamDocumentPreview_ErrorPaths(t *testing.T) {
 			t.Errorf("want app code 50201, got %d", code)
 		}
 	})
-	t.Run("fetch source error", func(t *testing.T) {
+	t.Run("fetch source 4xx maps to 40003", func(t *testing.T) {
 		dc := fakeDocClient{err: &documentSourceError{status: http.StatusBadRequest, message: "no access"}}
 		if _, code := runPreview(t, withLLM(dc), `{"document_id":"d1"}`); code != 40003 {
 			t.Errorf("want app code 40003, got %d", code)
+		}
+	})
+	t.Run("fetch source 404 maps to 40003", func(t *testing.T) {
+		dc := fakeDocClient{err: &documentSourceError{status: http.StatusNotFound, message: "gone"}}
+		if _, code := runPreview(t, withLLM(dc), `{"document_id":"d1"}`); code != 40003 {
+			t.Errorf("want app code 40003, got %d", code)
+		}
+	})
+	t.Run("fetch source 5xx maps to 50202", func(t *testing.T) {
+		dc := fakeDocClient{err: &documentSourceError{status: http.StatusBadGateway, message: "upstream down"}}
+		if status, code := runPreview(t, withLLM(dc), `{"document_id":"d1"}`); code != 50202 || status != http.StatusBadGateway {
+			t.Errorf("want http 502 + app code 50202, got http %d code %d", status, code)
+		}
+	})
+	t.Run("fetch source 504 maps to 50202", func(t *testing.T) {
+		dc := fakeDocClient{err: &documentSourceError{status: http.StatusGatewayTimeout, message: "timeout"}}
+		if _, code := runPreview(t, withLLM(dc), `{"document_id":"d1"}`); code != 50202 {
+			t.Errorf("want app code 50202, got %d", code)
 		}
 	})
 	t.Run("empty document", func(t *testing.T) {
