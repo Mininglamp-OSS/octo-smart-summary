@@ -3,12 +3,20 @@
 // Two correctness guarantees live here, both enforced at the database layer
 // rather than in application logic:
 //
-//   - Idempotency: CreateOrGetRun relies on UNIQUE(user_id, session_id,
-//     request_id). A retried submit (e.g. an SSE stream that failed and
-//     downgraded to the non-streaming endpoint reusing the same request_id)
-//     reuses the existing run instead of re-fetching and re-summarizing. We
-//     INSERT and let the unique key reject duplicates — never "SELECT then
-//     INSERT", which races.
+//   - Run-row idempotency: CreateOrGetRun relies on UNIQUE(user_id,
+//     session_id, request_id). A retried submit (e.g. an SSE stream that
+//     failed and downgraded to the non-streaming endpoint reusing the same
+//     request_id) gets back the SAME run row instead of creating a second
+//     one, and its spec is not re-persisted. We INSERT and let the unique
+//     key reject duplicates — never "SELECT then INSERT", which races.
+//
+//     Scope, stated plainly: the dedup is at the run-row level only. A
+//     replay still re-runs the answer path (fetch + summarize) in this
+//     stage — skipping the work on replay is deferred. And because the
+//     replay reuses the original run's frozen citation manifest, evidence
+//     that appeared after the first attempt is not citable under the
+//     replayed answer and is dropped from the chunk input.
+//
 //   - Serialized updates: run mutations go through an optimistic compare-and-swap
 //     on Version, so two concurrent requests cannot fork run state.
 package summaryrun

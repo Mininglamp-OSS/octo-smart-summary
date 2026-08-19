@@ -26,16 +26,19 @@ const (
 	ScopePolicyOpen   = "open"
 )
 
-// AgentSummaryRun is the persistent, resumable state for one agent-summary run
-// (SS-03). It replaces the previous "request-scoped, thrown away when the
-// context dies" model: identity + progress now live in the DB so runs can be
-// deduplicated, serialized, and resumed.
+// AgentSummaryRun is the persistent state for one agent-summary run (SS-03).
+// It replaces the previous "request-scoped, thrown away when the context
+// dies" model: identity + progress now live in the DB so runs can be
+// deduplicated and observed across requests. (Resume is not implemented yet;
+// a replay re-runs the answer path.)
 //
 // Idempotency: UNIQUE(user_id, session_id, request_id) makes CreateOrGetRun a
-// DB-level guard — a retried request (e.g. SSE stream failure downgrading to the
-// non-streaming endpoint) reuses the same run instead of re-fetching and
-// re-summarizing. Concurrency: Version is an optimistic lock; run updates go
-// through a compare-and-swap so two concurrent requests cannot fork run state.
+// DB-level guard — a retried request (e.g. SSE stream failure downgrading to
+// the non-streaming endpoint) reuses the same run row and does not re-persist
+// its spec. The dedup is at the run-row level: the replay still re-runs the
+// answer path in this stage (skipping the work is deferred). Concurrency:
+// Version is an optimistic lock; run updates go through a compare-and-swap so
+// two concurrent requests cannot fork run state.
 type AgentSummaryRun struct {
 	RunID     string `gorm:"column:run_id;type:varchar(64);not null;primaryKey" json:"run_id"`
 	UserID    string `gorm:"column:user_id;type:varchar(64);not null;uniqueIndex:uk_run_request,priority:1;index:idx_run_user_session,priority:1" json:"user_id"`

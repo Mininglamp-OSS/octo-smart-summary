@@ -3,12 +3,16 @@
 --
 -- Before SS-03, agent-summary run state lived only in context.Context + an
 -- in-process cache and was thrown away when the request ended. That made runs
--- impossible to deduplicate, serialize, or resume, and left the "same request
--- replayed after an SSE downgrade" path re-fetching and re-summarizing.
+-- impossible to deduplicate, serialize, or resume.
 --
--- These two tables move that state into MySQL as a versioned, idempotent,
--- resumable contract. Shipped dark behind AGENT_SUMMARY_V2_MODE (default off);
--- later stages (SS-05+) make the tools read the persisted Spec.
+-- These two tables move that state into MySQL as a versioned contract with
+-- run-row idempotency: UNIQUE(user_id, session_id, request_id) makes a
+-- retried submit reuse the same run row instead of creating a second one.
+-- The dedup is at the run-row level — a replay still re-runs the answer
+-- path (fetch + summarize) in this stage, and reuses the original run's
+-- frozen citation manifest. Shipped dark behind AGENT_SUMMARY_V2_MODE
+-- (default off); later stages (SS-05+) make the tools read the persisted
+-- Spec.
 --
 -- Migration is serialized by the existing GET_LOCK('smart_summary_migration')
 -- in internal/db/migrate.go, so no separate migration job is needed.

@@ -225,11 +225,11 @@ type agentChatRequest struct {
 	SelectedChannels  []selectedChannel `json:"selected_channels,omitempty"`
 
 	// SS-03 (accepted always, acted on only when AGENT_SUMMARY_V2_MODE != off).
-	// RequestID is the client-generated per-submit idempotency key; RunID lets a
-	// follow-up request continue an existing run. Both optional — a legacy
-	// request without them is handled exactly as before (never a 400).
+	// RequestID is the client-generated per-submit idempotency key. Optional —
+	// a legacy request without it is handled exactly as before (never a 400).
+	// Run-continuation via an explicit run_id is deferred to SS-05b; no such
+	// field is accepted until it is actually wired.
 	RequestID string `json:"request_id,omitempty"`
-	RunID     string `json:"run_id,omitempty"`
 }
 
 type selectedChannel struct {
@@ -637,6 +637,15 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		return
 	}
 
+	// The referenced_task_ids size check must sit BEFORE the SSE header flush
+	// below: once the headers are committed (Content-Type: text/event-stream +
+	// status 200), a JSON error body would arrive at the client parser as an
+	// unframed blob in the middle of the event stream. Every post-flush error
+	// path in ChatStream honours the SSE invariant via
+	// writeSSEErrorViaSink{,WithDetail}; pre-flush validation errors use plain
+	// c.JSON with the apiResponse envelope (Code/Message), like the checks
+	// above. Keeping the check here also skips the wasted runner build /
+	// history load when the request is invalid.
 	dedupedReferencedIDs := dedupReferencedTaskIDs(req.ReferencedTaskIDs)
 	if len(dedupedReferencedIDs) > maxReferencedTaskIDs {
 		c.JSON(http.StatusBadRequest, apiResponse{
