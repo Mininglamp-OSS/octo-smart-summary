@@ -56,8 +56,15 @@ func classifyToolError(toolName string, err error) ToolErrorEnvelope {
 		strings.Contains(low, "access denied") || strings.Contains(low, "identity") ||
 		strings.Contains(low, "unauthor") || strings.Contains(low, "forbidden"):
 		env.ErrorCode, env.Retryable, env.Fatal = "PERMISSION_DENIED", false, true
-	case strings.Contains(low, "parse args") || strings.Contains(low, "invalid") || strings.Contains(low, "required"):
-		env.ErrorCode, env.Retryable, env.Fatal = "INVALID_ARGUMENT", false, false
+	case strings.Contains(low, "parse args") || strings.Contains(low, "cannot parse") ||
+		strings.Contains(low, "parsing time") || strings.Contains(low, "invalid") ||
+		strings.Contains(low, "required"):
+		// A bad tool argument (e.g. the model sent an empty time_start, so
+		// time.Parse fails with "cannot parse ...") is the agent's own mistake,
+		// not a fatal system failure. Retryable so the agent fixes and re-calls;
+		// NON-fatal so one arg slip does not mark the whole run failed and block
+		// saving an otherwise-good summary (issue C).
+		env.ErrorCode, env.Retryable, env.Fatal = "INVALID_ARGUMENT", true, false
 	case strings.Contains(low, "persist evidence") || strings.Contains(low, "evidence"):
 		env.ErrorCode, env.Retryable, env.Fatal = "EVIDENCE_WRITE_FAILED", false, true
 	default:
