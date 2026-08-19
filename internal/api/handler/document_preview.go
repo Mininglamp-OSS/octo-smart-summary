@@ -163,6 +163,14 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 		defer fetchCancel()
 		fetched, err := docClient.FetchSummarySource(fetchCtx, spaceID, userID, ref.DocumentID, ref.Version, c.Request.Header)
 		if err != nil {
+			// A caller that navigated away cancels c.Request.Context(), which surfaces here
+			// as a plain transport error and would otherwise be reported as 50202 "文档服务
+			// 暂不可用" — inflating the document-service outage signal with events the
+			// document service had nothing to do with. On a "preview fires when you open the
+			// document" front end this is routine, not exceptional.
+			if errors.Is(c.Request.Context().Err(), context.Canceled) {
+				return
+			}
 			log.Printf("[handler] preview fetch source failed doc=%q user=%s space=%s: %v", ref.DocumentID, userID, spaceID, err)
 			var srcErr *documentSourceError
 			if errors.As(err, &srcErr) {
@@ -183,7 +191,11 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 		doc = fetched
 	}
 	normalizeFetchedDocumentSource(doc, ref)
-	if strings.TrimSpace(doc.Content) == "" && len(doc.Chunks) == 0 {
+	// Emptiness is judged on the SANITIZED text: content consisting only of a fence
+	// tag (e.g. "<文档数据>") used to clear this gate and bill a completion for a
+	// document whose whole body collapses to a placeholder, while a caller with
+	// genuinely empty content got a clean 40004.
+	if documentPreviewHasNoContent(doc) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40004, Message: "文档没有可总结内容"})
 		return
 	}
@@ -227,6 +239,11 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
+		// Same rationale as the fetch path: a disconnected client is not a generation
+		// failure, and the error frame would be written to a socket nobody reads.
+		if errors.Is(c.Request.Context().Err(), context.Canceled) {
+			return
+		}
 		log.Printf("[handler] preview stream failed doc=%q user=%s space=%s: %v", ref.DocumentID, userID, spaceID, err)
 		_ = writeSSE(w, "error", previewEvent{Type: "error", Content: "文档速览生成失败"})
 		w.Flush()

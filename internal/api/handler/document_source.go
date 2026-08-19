@@ -193,6 +193,14 @@ func validateDocumentRefs(refs []documentRefReq) error {
 		if utf8.RuneCountInString(ref.DocumentID) > maxDocumentIDLen {
 			return fmt.Errorf("document_id too long: %s", ref.DocumentID)
 		}
+		// url.PathEscape leaves "." and ".." untouched (both are unreserved), so a bare
+		// dot-segment reaches the document service as GET /api/documents/../summary-source
+		// and any normalizing intermediary collapses it to /api/summary-source — a
+		// single-segment climb carrying the caller's own token. Every other dangerous
+		// character is already percent-encoded, so rejecting the two dot-segments closes it.
+		if ref.DocumentID == "." || ref.DocumentID == ".." {
+			return fmt.Errorf("document_id must not be a path segment: %s", ref.DocumentID)
+		}
 		if utf8.RuneCountInString(ref.Version) > maxDocumentVersionLen {
 			return fmt.Errorf("document version too long: %s", ref.Version)
 		}
@@ -207,14 +215,24 @@ func validateDocumentRefs(refs []documentRefReq) error {
 // sanitizeDocumentFenceText neutralizes untrusted document text that could close
 // the <文档数据> fence early: full-width / small-form / CJK angle-and-slash
 // folding, invisible-character stripping, then structural regex matching (tolerating
-// repeated slashes) with a non-empty placeholder.
+// repeated slashes and trailing attribute-ish junk) with a non-empty placeholder.
+//
+// Known gap: the *unclosed* form (`</文档数据 INJECT` with no `>`) still reaches the
+// model. Widening the pattern further cannot close it — that would require
+// neutralizing a bare `<` followed by the tag name, which is a different rule.
 //
 // NOTE: this intentionally duplicates the <引用数据> guard in
 // agent_reference_context.go; centralizing both onto one tag-parameterized helper
 // is a worthwhile follow-up but out of scope for this change.
 var (
 	docFenceInvisiblePattern = regexp.MustCompile(`[\p{Cf}\x{00ad}]`)
-	docFenceTagPattern       = regexp.MustCompile(`<[\s\p{Zs}]*/*[\s\p{Zs}]*文档数据[\s\p{Zs}]*>`)
+	// The trailing [^>]{0,64} accepts attribute-bearing closers (`</文档数据 attr=x>`,
+	// `</文档数据/>`), which a whitespace-only tail rejected and therefore emitted
+	// verbatim into the prompt. The bound is deliberate: an unbounded tail would let a
+	// stray `<文档数据` swallow everything up to some distant unrelated `>`.
+	// Budget invariant preserved: the shortest match is still `<文档数据>` (6 runes),
+	// equal to docFencePlaceholder, so sanitizing can only ever shorten the text.
+	docFenceTagPattern = regexp.MustCompile(`<[\s\p{Zs}]*/*[\s\p{Zs}]*文档数据[^>]{0,64}>`)
 	// Fold full-width (＜＞／), small-form (﹤﹥), and CJK (〈〉) angle brackets/solidus to
 	// ASCII, and collapse control + line-separator chars, before structural matching.
 	docFenceReplacer = strings.NewReplacer(
@@ -290,4 +308,26 @@ func normalizeFetchedDocumentSource(doc *documentSummarySource, ref documentRefR
 	if len(normalized) == 0 && contentTruncated {
 		doc.Truncated = true
 	}
+}
+
+// documentPreviewHasNoContent reports whether a normalized document has anything
+// left to summarize once fence tags are discounted. It cannot reuse
+// sanitizeDocumentFenceText, whose placeholder is deliberately non-empty (that is
+// what keeps an injected tag visible to the model as neutralized text); measuring
+// emptiness needs the tags removed outright. Without this, a body consisting solely
+// of "<文档数据>" clears the gate and bills a completion for an empty document,
+// while a caller sending "" gets a clean 40004.
+func documentPreviewHasNoContent(doc *documentSummarySource) bool {
+	for _, chunk := range doc.Chunks {
+		if documentTextWithoutFenceTags(chunk.Text) != "" {
+			return false
+		}
+	}
+	return documentTextWithoutFenceTags(doc.Content) == ""
+}
+
+func documentTextWithoutFenceTags(s string) string {
+	s = docFenceReplacer.Replace(s)
+	s = docFenceInvisiblePattern.ReplaceAllString(s, "")
+	return strings.TrimSpace(docFenceTagPattern.ReplaceAllString(s, ""))
 }

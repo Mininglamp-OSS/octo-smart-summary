@@ -120,6 +120,19 @@ func (f fakeDocClient) FetchSummarySource(_ context.Context, _, _, _, _ string, 
 
 func runPreview(t *testing.T, h *AgentSummaryHandler, body string) (int, int) {
 	t.Helper()
+	w := runPreviewRecorder(t, h, body)
+	var resp struct {
+		Code int `json:"code"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	return w.Code, resp.Code
+}
+
+// runPreviewRecorder exposes the raw recorder so tests can assert on the SSE wire
+// format. runPreview only ever looked at the JSON error envelope, which meant a
+// handler that streamed no frames at all still passed.
+func runPreviewRecorder(t *testing.T, h *AgentSummaryHandler, body string) *httptest.ResponseRecorder {
+	t.Helper()
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -128,11 +141,7 @@ func runPreview(t *testing.T, h *AgentSummaryHandler, body string) (int, int) {
 	c.Set("space_id", "sp")
 	c.Set("user_id", "u")
 	h.StreamDocumentPreview(c)
-	var resp struct {
-		Code int `json:"code"`
-	}
-	_ = json.Unmarshal(w.Body.Bytes(), &resp)
-	return w.Code, resp.Code
+	return w
 }
 
 func TestStreamDocumentPreview_ErrorPaths(t *testing.T) {
@@ -320,9 +329,9 @@ func TestStreamDocumentPreview_InlineContentReachesTheModel(t *testing.T) {
 
 	const canary = "ARBITRARY-CANARY-9182 第三章 交付计划"
 	const titleCanary = "标题金丝雀-4471"
-	status, code := runPreview(t, h, `{"document_id":"d1","title":"`+titleCanary+`","content":"`+canary+`"}`)
-	if status != http.StatusOK || code != 0 {
-		t.Fatalf("inline preview should stream, got http %d app code %d", status, code)
+	w := runPreviewRecorder(t, h, `{"document_id":"d1","title":"`+titleCanary+`","content":"`+canary+`"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("inline preview should stream, got http %d body %q", w.Code, w.Body.String())
 	}
 	// The caller's content must be what gets summarized — not a constant, not the
 	// fetched document, not nothing.
@@ -336,6 +345,22 @@ func TestStreamDocumentPreview_InlineContentReachesTheModel(t *testing.T) {
 	// caller-controlled title to maxDocumentTitleRunes).
 	if !strings.HasSuffix(prompt, "\n</文档数据>\n") {
 		t.Error("prompt sent to the model must close the data fence")
+	}
+
+	// The SSE frame sequence IS this endpoint's wire contract with the front end.
+	// Without these assertions a handler that returned a bare 200 with no frames at
+	// all would still pass the suite.
+	body := w.Body.String()
+	for _, frame := range []string{"event: start", "event: delta", "event: done"} {
+		if !strings.Contains(body, frame) {
+			t.Errorf("missing SSE frame %q in response: %q", frame, body)
+		}
+	}
+	if strings.Index(body, "event: start") > strings.Index(body, "event: done") {
+		t.Error("SSE frames out of order: start must precede done")
+	}
+	if !strings.Contains(body, `"content":"ok"`) {
+		t.Errorf("model delta not forwarded to the client: %q", body)
 	}
 }
 
@@ -425,5 +450,19 @@ func TestBuildDocumentPreviewPrompt_ChunkTitlesReachTheModel(t *testing.T) {
 	}
 	if !strings.Contains(got, "交付分三个阶段") {
 		t.Error("chunk body missing")
+	}
+}
+
+func TestStreamDocumentPreview_FenceOnlyContentIsRejected(t *testing.T) {
+	// Content that is nothing but a fence tag sanitizes down to a placeholder, so the
+	// model would receive an empty document — and the caller would be billed for the
+	// completion — while a caller sending "" gets a clean 40004.
+	h := &AgentSummaryHandler{llmApiURL: "http://127.0.0.1:1", llmModel: "m"}
+	body, err := json.Marshal(map[string]string{"document_id": "d1", "content": "<文档数据>"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, code := runPreview(t, h, string(body)); code != 40004 || status != http.StatusBadRequest {
+		t.Errorf("fence-only content should be rejected as empty (400/40004), got http %d code %d", status, code)
 	}
 }
