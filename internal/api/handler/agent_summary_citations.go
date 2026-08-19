@@ -9,6 +9,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/artifact"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/worker"
@@ -44,6 +45,7 @@ func (h *AgentSummaryHandler) buildCitationsForSession(
 	sessionID string,
 	content string,
 	uid string,
+	requestID string,
 ) ([]model.Citation, error) {
 	// 1. Discover handles from agent_message_evidence — must stay symmetric
 	// with getSessionMessagePool in tool_summarize_chunk.go. Rows are written
@@ -136,12 +138,17 @@ func (h *AgentSummaryHandler) buildCitationsForSession(
 		allMessages[i].CitationIndex = i + 1
 	}
 
-	// SS-05 B1: when V2 mode is on, prefer the FROZEN manifest ordinals for this
-	// session (the exact numbering the mid-run summarize_chunk pass used) so a
-	// [n] marker can't point at a different message than the model intended.
-	// Off / no frozen manifest → keep the recomputed indexes above (legacy path).
-	if agent.SummaryV2Enabled() {
-		allMessages = h.overrideWithSessionManifest(ctx, uid, sessionID, allMessages)
+	// SS-05 B1: when V2 mode is on, prefer FROZEN manifest ordinals so a [n]
+	// marker can't point at a different message than the model intended.
+	//
+	// The gate is keyed to THIS request, not to the flag alone: only a request
+	// that carries the request_id of a run that actually froze a manifest may
+	// adopt frozen ordinals. A request without request_id (any legacy client)
+	// froze nothing and recomputed above — adopting an earlier run's manifest
+	// here would renumber/drop its citations deterministically. No request_id
+	// → keep the recomputed indexes (legacy path), never a partial override.
+	if agent.SummaryV2Enabled() && requestID != "" {
+		allMessages = h.overrideWithRunManifest(ctx, uid, sessionID, requestID, allMessages)
 	}
 
 	// 5. Build nameMap
@@ -159,18 +166,25 @@ func (h *AgentSummaryHandler) buildCitationsForSession(
 	return citations, nil
 }
 
-// overrideWithSessionManifest replaces recomputed CitationIndex values with the
-// ordinals frozen in the session's latest citation manifest (SS-05 B1), so the
-// save-time numbering matches what the mid-run summarize_chunk pass emitted.
-// Messages not present in the frozen manifest were fetched after the freeze and
-// are dropped from the citable set. On any miss (V2 off wrote no manifest, DB
-// error) it returns the input unchanged, falling back to the recomputed indexes.
-func (h *AgentSummaryHandler) overrideWithSessionManifest(ctx context.Context, uid, sessionID string, msgs []pipeline.Message) []pipeline.Message {
+// overrideWithRunManifest replaces recomputed CitationIndex values with the
+// ordinals frozen by THIS request's run (SS-05 B1), so the save-time numbering
+// matches what the mid-run summarize_chunk pass emitted. Messages not present
+// in the frozen manifest were fetched after the freeze and are dropped from
+// the citable set.
+//
+// On any miss — unknown request_id (the run never existed: V2 off at chat
+// time, or a replay), no manifest frozen by that run, or a DB error — it
+// returns the input unchanged and keeps the recomputed indexes. The fallback
+// is always the full legacy recompute, never a partial override.
+func (h *AgentSummaryHandler) overrideWithRunManifest(ctx context.Context, uid, sessionID, requestID string, msgs []pipeline.Message) []pipeline.Message {
 	if h.db == nil {
 		return msgs
 	}
-	store := artifact.NewStore(h.db)
-	_, entries, found, err := store.GetLatestBySession(ctx, uid, sessionID)
+	run, err := summaryrun.NewStore(h.db).GetByRequest(ctx, uid, sessionID, requestID)
+	if err != nil {
+		return msgs
+	}
+	_, entries, found, err := artifact.NewStore(h.db).GetLatestManifestByRun(ctx, uid, run.RunID)
 	if err != nil || !found {
 		return msgs
 	}
@@ -185,6 +199,6 @@ func (h *AgentSummaryHandler) overrideWithSessionManifest(ctx context.Context, u
 		out = append(out, m)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CitationIndex < out[j].CitationIndex })
-	log.Printf("[citations] session=%s using frozen manifest ordinals (%d of %d messages citable)", sessionID, len(out), len(msgs))
+	log.Printf("[citations] session=%s run=%s using frozen manifest ordinals (%d of %d messages citable)", sessionID, run.RunID, len(out), len(msgs))
 	return out
 }

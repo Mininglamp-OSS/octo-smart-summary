@@ -90,10 +90,18 @@ func (s *Store) FreezeFromPool(ctx context.Context, runID, userID, sessionID str
 		}
 
 		// New content → new revision (max existing + 1, computed in-tx).
+		// Owner-scoped like every other read in this store, and a LOCKING
+		// read: under MySQL REPEATABLE READ a plain consistent read would use
+		// the transaction snapshot, so two concurrent freezers could both see
+		// the same max and allocate the same revision; FOR UPDATE reads the
+		// latest committed row and serializes the allocation per run.
+		// uk_artifact_run_rev is the schema backstop if the lock is ever
+		// bypassed.
 		var maxRev struct{ Max *int }
 		if err := tx.Model(&model.AgentEvidenceArtifact{}).
+			Clauses(clause.Locking{Strength: "UPDATE"}).
 			Select("MAX(revision) as max").
-			Where("run_id = ?", runID).
+			Where("run_id = ? AND user_id = ?", runID, userID).
 			Scan(&maxRev).Error; err != nil {
 			return err
 		}
@@ -103,53 +111,95 @@ func (s *Store) FreezeFromPool(ctx context.Context, runID, userID, sessionID str
 		}
 
 		ts := now()
-		art := &model.AgentEvidenceArtifact{
-			ArtifactID:      uuid.NewString(),
-			RunID:           runID,
-			UserID:          userID,
-			SessionID:       sessionID,
-			Revision:        revision,
-			ContentHash:     hash,
-			MessageCount:    len(entries),
-			ChannelCount:    channelCount,
-			ActualTimeRange: string(timeRangeJSON),
-			FailedChannels:  string(failedJSON),
-			Truncated:       meta.Truncated,
-			CreatedAt:       ts,
-		}
-		// Guard against a concurrent freezer racing the same content_hash.
-		res := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(art)
-		if res.Error != nil {
-			return res.Error
-		}
-		if res.RowsAffected == 0 {
-			// Lost the race: another tx inserted this content first. Reload it.
-			var winner model.AgentEvidenceArtifact
-			if err := tx.Where("run_id = ? AND content_hash = ?", runID, hash).First(&winner).Error; err != nil {
-				return err
-			}
-			m, err := loadManifestTx(tx, userID, winner.ArtifactID)
-			if err != nil {
-				return err
-			}
-			artifact, manifest, created = &winner, m, false
-			return nil
-		}
 
-		man := &model.AgentCitationManifest{
-			ManifestID: uuid.NewString(),
-			ArtifactID: art.ArtifactID,
-			RunID:      runID,
-			UserID:     userID,
-			Revision:   revision,
-			Entries:    entriesJSON,
-			EntryCount: len(entries),
-			CreatedAt:  ts,
+		// Insert the artifact, retrying on a lost REVISION race. Two distinct
+		// losers are possible with OnConflict{DoNothing} (any unique key →
+		// RowsAffected 0):
+		//   (a) another tx froze the SAME content first → adopt its row;
+		//   (b) another tx froze DIFFERENT content and claimed our revision
+		//       (uk_artifact_run_rev rejected us) → re-read max and retry.
+		// Without the retry, case (b) would surface as a spurious freeze error.
+		const revisionRetries = 3
+		won := false
+		for attempt := 0; attempt <= revisionRetries; attempt++ {
+			art := &model.AgentEvidenceArtifact{
+				ArtifactID:      uuid.NewString(),
+				RunID:           runID,
+				UserID:          userID,
+				SessionID:       sessionID,
+				Revision:        revision,
+				ContentHash:     hash,
+				MessageCount:    len(entries),
+				ChannelCount:    channelCount,
+				ActualTimeRange: string(timeRangeJSON),
+				FailedChannels:  string(failedJSON),
+				Truncated:       meta.Truncated,
+				CreatedAt:       ts,
+			}
+			res := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(art)
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected > 0 {
+				man := &model.AgentCitationManifest{
+					ManifestID: uuid.NewString(),
+					ArtifactID: art.ArtifactID,
+					RunID:      runID,
+					UserID:     userID,
+					Revision:   revision,
+					Entries:    entriesJSON,
+					EntryCount: len(entries),
+					CreatedAt:  ts,
+				}
+				if err := tx.Create(man).Error; err != nil {
+					return err
+				}
+				artifact, manifest, created = art, man, true
+				won = true
+				break
+			}
+
+			// Lost a race. Locking read for the recovery: under REPEATABLE
+			// READ a plain First would reuse the transaction snapshot taken
+			// before the winner committed and return ErrRecordNotFound,
+			// making the freeze fail silently.
+			var winner model.AgentEvidenceArtifact
+			werr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("run_id = ? AND content_hash = ?", runID, hash).
+				First(&winner).Error
+			if werr == nil {
+				m, err := loadManifestTx(tx, userID, winner.ArtifactID)
+				if err != nil {
+					return err
+				}
+				artifact, manifest, created = &winner, m, false
+				return nil
+			}
+			if !errors.Is(werr, gorm.ErrRecordNotFound) {
+				return werr
+			}
+			// Case (b): revision race — someone else owns our revision with
+			// different content. Re-read the max (locking, so the retry sees
+			// the newly committed row) and try the next revision.
+			if attempt == revisionRetries {
+				break
+			}
+			var nextMax struct{ Max *int }
+			if err := tx.Model(&model.AgentEvidenceArtifact{}).
+				Clauses(clause.Locking{Strength: "UPDATE"}).
+				Select("MAX(revision) as max").
+				Where("run_id = ? AND user_id = ?", runID, userID).
+				Scan(&nextMax).Error; err != nil {
+				return err
+			}
+			revision = 1
+			if nextMax.Max != nil {
+				revision = *nextMax.Max + 1
+			}
 		}
-		if err := tx.Create(man).Error; err != nil {
-			return err
+		if !won {
+			return fmt.Errorf("freeze: lost revision race for run %s after %d retries", runID, revisionRetries)
 		}
-		artifact, manifest, created = art, man, true
 		return nil
 	})
 	if err != nil {
@@ -220,18 +270,26 @@ func (s *Store) GetLatestManifestByRun(ctx context.Context, userID, runID string
 	return &man, entries, true, nil
 }
 
-// GetLatestBySession returns the manifest of the highest-revision artifact for a
-// (user, session), plus its decoded entries. found=false (nil error) when the
-// session has no frozen artifact. Owner-scoped by user_id.
+// GetLatestBySession returns the manifest of the most RECENTLY FROZEN artifact
+// for a (user, session), plus its decoded entries. found=false (nil error)
+// when the session has no frozen artifact. Owner-scoped by user_id.
 //
-// Used at save time, where run_id is not yet threaded through the save contract
-// (that lands with SS-08 / WEB-03); the latest artifact for the session is the
-// one the just-completed run froze.
+// Ordering is created_at DESC with artifact_id as a deterministic tiebreaker.
+// The previous revision DESC ordering was wrong: revision is allocated PER RUN
+// (max+1 scoped by run_id in FreezeFromPool), so every run's first freeze is
+// revision 1 — in any session with ≥2 runs the old ordering tied at rev 1 and
+// picked an arbitrary run's manifest, and an old run that re-fetched (rev ≥2)
+// deterministically beat the just-completed run.
+//
+// Callers must still prove the manifest belongs to THEIR request: the
+// save-time path resolves the run via request_id and reads
+// GetLatestManifestByRun instead, because a request that froze nothing must
+// not adopt an earlier run's manifest.
 func (s *Store) GetLatestBySession(ctx context.Context, userID, sessionID string) (*model.AgentCitationManifest, []StableID, bool, error) {
 	var art model.AgentEvidenceArtifact
 	err := s.db.WithContext(ctx).
 		Where("user_id = ? AND session_id = ?", userID, sessionID).
-		Order("revision DESC").
+		Order("created_at DESC, artifact_id DESC").
 		First(&art).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil, false, nil

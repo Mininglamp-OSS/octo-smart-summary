@@ -176,9 +176,12 @@ func (s *Store) SaveSpec(ctx context.Context, run *model.AgentSummaryRun, expect
 }
 
 // UpdateStatusCAS advances the run status under an optimistic version check.
-func (s *Store) UpdateStatusCAS(ctx context.Context, runID string, expectedVersion int, status string) error {
+// Owner-scoped by user_id to match every other read in this store — run_id
+// is a server UUID so this is defense-in-depth, but the asymmetry would
+// otherwise be copied by the next writer.
+func (s *Store) UpdateStatusCAS(ctx context.Context, userID, runID string, expectedVersion int, status string) error {
 	res := s.db.WithContext(ctx).Model(&model.AgentSummaryRun{}).
-		Where("run_id = ? AND version = ?", runID, expectedVersion).
+		Where("run_id = ? AND user_id = ? AND version = ?", runID, userID, expectedVersion).
 		Updates(map[string]interface{}{
 			"status":     status,
 			"version":    expectedVersion + 1,

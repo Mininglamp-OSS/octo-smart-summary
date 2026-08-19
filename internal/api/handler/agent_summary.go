@@ -88,6 +88,11 @@ type createAgentSummaryReq struct {
 	// 前端在保存时把首轮引用的 task IDs 透传过来,后端记录到 SummaryTask
 	// (方便日后做衍生关系追溯),不影响本次生成的 content/citations。
 	ReferencedTaskIDs []int64 `json:"referenced_task_ids,omitempty"`
+	// RequestID 可选:生成被保存内容的 agent chat 轮次的 request_id
+	// (SS-03 idempotency key)。传了它,save 时 citations 就能解析出该轮
+	// freeze 的 manifest、用运行中模型看到的编号;缺省/未知 → 与 legacy
+	// 逐字节一致的重算路径,绝不报错(never a 400)。
+	RequestID string `json:"request_id,omitempty"`
 }
 
 // CreateAgentSummary handles POST /api/v1/summaries/agent.
@@ -417,7 +422,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			UpdatedAt:        now,
 		}
 		// Build citations from session tool traces (fallback to empty array on error)
-		cits, cerr := h.buildCitationsForSession(c.Request.Context(), req.SessionID, content, userID)
+		cits, cerr := h.buildCitationsForSession(c.Request.Context(), req.SessionID, content, userID, req.RequestID)
 		if cerr != nil {
 			log.Printf("[handler] buildCitationsForSession failed session=%s: %v (fallback to empty)", req.SessionID, cerr)
 			cits = nil

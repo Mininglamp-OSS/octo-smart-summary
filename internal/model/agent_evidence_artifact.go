@@ -14,10 +14,17 @@ import "time"
 // fetches yielding the same messages converge on one artifact.
 type AgentEvidenceArtifact struct {
 	ArtifactID string `gorm:"column:artifact_id;type:varchar(64);not null;primaryKey" json:"artifact_id"`
-	RunID      string `gorm:"column:run_id;type:varchar(64);not null;uniqueIndex:uk_artifact_hash,priority:1;index:idx_artifact_run_rev,priority:1" json:"run_id"`
-	UserID     string `gorm:"column:user_id;type:varchar(64);not null" json:"user_id"`
-	SessionID  string `gorm:"column:session_id;type:varchar(128);not null;default:''" json:"session_id"`
-	Revision   int    `gorm:"column:revision;not null;index:idx_artifact_run_rev,priority:2" json:"revision"`
+	RunID      string `gorm:"column:run_id;type:varchar(64);not null;uniqueIndex:uk_artifact_hash,priority:1;uniqueIndex:uk_artifact_run_rev,priority:1" json:"run_id"`
+	// UserID is part of idx_artifact_user_session so the save-time
+	// session-scoped lookup (GetLatestBySession) is index-backed.
+	UserID    string `gorm:"column:user_id;type:varchar(64);not null;index:idx_artifact_user_session,priority:1" json:"user_id"`
+	SessionID string `gorm:"column:session_id;type:varchar(128);not null;default:'';index:idx_artifact_user_session,priority:2" json:"session_id"`
+	// Revision is UNIQUE per run (uk_artifact_run_rev). It is allocated as
+	// max+1 under a LOCKING read in FreezeFromPool, which serializes the
+	// allocation; this constraint is the schema backstop if the lock is ever
+	// bypassed. The table is empty when this ships, so the constraint is
+	// free now and would need a dedup migration if added later.
+	Revision int `gorm:"column:revision;not null;uniqueIndex:uk_artifact_run_rev,priority:2" json:"revision"`
 
 	ContentHash string `gorm:"column:content_hash;type:char(64);not null;uniqueIndex:uk_artifact_hash,priority:2" json:"content_hash"`
 
@@ -29,7 +36,7 @@ type AgentEvidenceArtifact struct {
 	FailedChannels  string `gorm:"column:failed_channels;type:json;not null" json:"failed_channels"`
 	Truncated       bool   `gorm:"column:truncated;not null;default:false" json:"truncated"`
 
-	CreatedAt time.Time `gorm:"column:created_at;not null" json:"created_at"`
+	CreatedAt time.Time `gorm:"column:created_at;not null;index:idx_artifact_user_session,priority:3" json:"created_at"`
 }
 
 func (AgentEvidenceArtifact) TableName() string { return "agent_evidence_artifact" }

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -203,5 +204,74 @@ func TestGetLatestBySession(t *testing.T) {
 	}
 	if _, _, found, _ := s.GetLatestBySession(ctx, "attacker", "sess1"); found {
 		t.Fatal("cross-user GetLatestBySession should not find")
+	}
+}
+
+// TestGetLatestBySessionMultiRun: revision is allocated PER RUN, so two runs
+// in one session both freeze at revision 1 and the old revision-DESC ordering
+// tied between them arbitrarily — and an older run that re-fetched (rev 2)
+// deterministically beat the just-completed run. The fixed ordering
+// (created_at DESC, artifact_id DESC) must always return the most recently
+// FROZEN manifest.
+func TestGetLatestBySessionMultiRun(t *testing.T) {
+	db := newArtifactTestDB(t)
+	if db == nil {
+		return
+	}
+	s := NewStore(db)
+	ctx := context.Background()
+
+	// Pin the clock so the ordering assertion does not depend on wall time.
+	oldNow := now
+	defer func() { now = oldNow }()
+	base := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
+	tick := 0
+	now = func() time.Time { tick++; return base.Add(time.Duration(tick) * time.Second) }
+
+	// Turn 1: run A freezes its pool → revision 1 (created_at T1).
+	poolA := []pipeline.Message{
+		{ChannelID: "a", MessageSeq: 1, Timestamp: 10},
+		{ChannelID: "b", MessageSeq: 2, Timestamp: 20},
+	}
+	_, _, _, err := s.FreezeFromPool(ctx, "runA", "u1", "sess1", poolA, FreezeMeta{})
+	if err != nil {
+		t.Fatalf("freeze A: %v", err)
+	}
+
+	// Run A re-fetches a CHANGED pool → revision 2 (created_at T2). Without
+	// the fix this row is the revision-DESC winner forever, even after a
+	// newer run freezes.
+	poolA2 := append([]pipeline.Message{}, poolA...)
+	poolA2 = append(poolA2, pipeline.Message{ChannelID: "c", MessageSeq: 9, Timestamp: 25})
+	_, _, _, err = s.FreezeFromPool(ctx, "runA", "u1", "sess1", poolA2, FreezeMeta{})
+	if err != nil {
+		t.Fatalf("freeze A2: %v", err)
+	}
+
+	// Turn 2: run B freezes its pool → ALSO revision 1, but newest by
+	// created_at (T3).
+	poolB := []pipeline.Message{
+		{ChannelID: "a", MessageSeq: 1, Timestamp: 10},
+		{ChannelID: "b", MessageSeq: 2, Timestamp: 20},
+		{ChannelID: "d", MessageSeq: 4, Timestamp: 40},
+		{ChannelID: "e", MessageSeq: 5, Timestamp: 50},
+	}
+	_, manB, _, err := s.FreezeFromPool(ctx, "runB", "u1", "sess1", poolB, FreezeMeta{})
+	if err != nil {
+		t.Fatalf("freeze B: %v", err)
+	}
+	if manB.Revision != 1 {
+		t.Fatalf("run B first freeze should be revision 1, got %d", manB.Revision)
+	}
+
+	man, entries, found, err := s.GetLatestBySession(ctx, "u1", "sess1")
+	if err != nil || !found {
+		t.Fatalf("session lookup: found=%v err=%v", found, err)
+	}
+	if man.ArtifactID != manB.ArtifactID {
+		t.Fatalf("session lookup returned artifact %s (rev %d), want run B's %s — the just-frozen manifest must win over run A's higher revision", man.ArtifactID, man.Revision, manB.ArtifactID)
+	}
+	if len(entries) != 4 {
+		t.Fatalf("entries = %d, want run B's 4-message pool", len(entries))
 	}
 }

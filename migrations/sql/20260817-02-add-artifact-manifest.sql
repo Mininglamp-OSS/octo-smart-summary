@@ -28,7 +28,17 @@ CREATE TABLE `agent_evidence_artifact` (
     `created_at`        DATETIME(3)  NOT NULL,
     PRIMARY KEY (`artifact_id`),
     UNIQUE KEY `uk_artifact_hash` (`run_id`, `content_hash`),
-    KEY `idx_artifact_run_rev` (`run_id`, `revision`)
+    -- Revision is allocated as max+1 under a LOCKING read that serializes the
+    -- allocation; this constraint is the schema backstop so two concurrent
+    -- freezes of DIFFERENT content for one run can never land the same
+    -- revision and make revision-ordered reads non-deterministic. The table
+    -- is brand new and empty, so the constraint is free now and would need
+    -- a dedup migration after deployment.
+    UNIQUE KEY `uk_artifact_run_rev` (`run_id`, `revision`),
+    -- Supports GetLatestBySession's (user_id, session_id) filter + created_at
+    -- ordering — without it the query is a full scan plus filesort on every
+    -- save once V2 is on.
+    KEY `idx_artifact_user_session` (`user_id`, `session_id`, `created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `agent_citation_manifest` (

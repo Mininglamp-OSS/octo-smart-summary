@@ -34,17 +34,24 @@ func applyFrozenManifest(ctx context.Context, uid, sessionID, runID string, pool
 	}
 	store := artifact.NewStore(db)
 
+	// Fast path: the run already froze a manifest — read it.
 	_, entries, found, err := store.GetLatestManifestByRun(ctx, uid, runID)
 	if err != nil {
 		return pool
 	}
 	if !found {
-		// First citation pass for this run: freeze the current pool.
-		if _, _, _, ferr := store.FreezeFromPool(ctx, runID, uid, sessionID, pool, artifact.FreezeMeta{}); ferr != nil {
+		// First citation pass for this run: freeze the current pool and use
+		// the manifest FreezeFromPool returns — the definitive one, whether it
+		// was created here or won a conflict race. Re-querying by
+		// revision-order after the freeze would re-open a race: another
+		// writer could land a higher revision in between, and this pass would
+		// apply THAT manifest's ordinals to its own pool.
+		_, man, _, ferr := store.FreezeFromPool(ctx, runID, uid, sessionID, pool, artifact.FreezeMeta{})
+		if ferr != nil {
 			return pool
 		}
-		_, entries, found, err = store.GetLatestManifestByRun(ctx, uid, runID)
-		if err != nil || !found {
+		entries, err = artifact.DecodeEntries(man.Entries)
+		if err != nil {
 			return pool
 		}
 	}

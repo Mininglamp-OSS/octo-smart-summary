@@ -128,12 +128,16 @@ func TestUpdateStatusCAS(t *testing.T) {
 
 	run, _, _ := s.CreateOrGetRun(ctx, "u1", "sess1", "req1", model.ScopePolicyClosed)
 
-	if err := s.UpdateStatusCAS(ctx, run.RunID, run.Version, model.RunStatusFinished); err != nil {
+	if err := s.UpdateStatusCAS(ctx, "u1", run.RunID, run.Version, model.RunStatusFinished); err != nil {
 		t.Fatalf("cas update: %v", err)
 	}
 	// Same (now stale) version must fail — proves no lost-update.
-	if err := s.UpdateStatusCAS(ctx, run.RunID, run.Version, model.RunStatusFailed); !errors.Is(err, ErrConcurrentUpdate) {
+	if err := s.UpdateStatusCAS(ctx, "u1", run.RunID, run.Version, model.RunStatusFailed); !errors.Is(err, ErrConcurrentUpdate) {
 		t.Fatalf("stale cas err = %v, want ErrConcurrentUpdate", err)
+	}
+	// Owner scope: a guessed run_id from another user must not update.
+	if err := s.UpdateStatusCAS(ctx, "attacker", run.RunID, run.Version, model.RunStatusFailed); err == nil {
+		t.Fatal("cross-user UpdateStatusCAS must not succeed")
 	}
 }
 
