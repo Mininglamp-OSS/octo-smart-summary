@@ -129,13 +129,27 @@ func (c *httpDocumentSourceClient) FetchSummarySource(ctx context.Context, space
 		return nil, &documentSourceError{status: http.StatusBadGateway, message: err.Error()}
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound {
-		return nil, &documentSourceError{status: http.StatusBadRequest, message: fmt.Sprintf("document %s is not accessible", documentID)}
+	// 401 joins 403/404: the document service rejected the forwarded Token, which is
+	// a credential condition on this document, not an outage. Reporting it as "文档服务
+	// 暂不可用" told the user to wait for something that will never resolve itself.
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound {
+		return nil, &documentSourceError{status: http.StatusBadRequest, message: fmt.Sprintf("document %s is not accessible (upstream %d)", documentID, resp.StatusCode)}
+	}
+	// Upstream throttling is passed through as throttling. Folding it into the 502
+	// outage class inflates the document-service failure signal with load events —
+	// the same signal the client-disconnect branch in document_preview.go exists to
+	// keep honest — and hides the retry semantics from the caller.
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, &documentSourceError{status: http.StatusTooManyRequests, message: "document source API is rate limiting"}
 	}
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 		return nil, &documentSourceError{status: http.StatusBadGateway, message: fmt.Sprintf("document source API redirected with status %d", resp.StatusCode)}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Remaining 4xx (400/409/422/…) mean this service and the document service
+		// disagree about the contract. That is our bug, not the user's document and not
+		// a credential problem, so it stays in the 502 class where an operator will see
+		// it; the real upstream status is carried in the message for the log.
 		status := http.StatusBadGateway
 		if resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusGatewayTimeout {
 			status = http.StatusGatewayTimeout
@@ -213,26 +227,52 @@ func validateDocumentRefs(refs []documentRefReq) error {
 }
 
 // sanitizeDocumentFenceText neutralizes untrusted document text that could close
-// the <文档数据> fence early: full-width / small-form / CJK angle-and-slash
-// folding, invisible-character stripping, then structural regex matching (tolerating
-// repeated slashes and trailing attribute-ish junk) with a non-empty placeholder.
+// the <文档数据> fence early: full-width / small-form / CJK angle-and-slash folding,
+// invisible-character stripping, then two structural passes.
 //
-// Known gap: the *unclosed* form (`</文档数据 INJECT` with no `>`) still reaches the
-// model. Widening the pattern further cannot close it — that would require
-// neutralizing a bare `<` followed by the tag name, which is a different rule.
+// Two passes, in this order:
+//
+//  1. docFenceTagPattern — the full, well-formed tag. Folds to the readable
+//     [文档数据] placeholder, and is what lets documentTextWithoutFenceTags strip a
+//     fence-only body to the empty string.
+//  2. docFenceHeadPattern — the tag *head* alone, with no closing `>` required.
+//
+// Pass 2 is what makes this convergent. Rounds 4–7 each widened pass 1's tail to
+// cover one more well-formed shape (attributes, self-closing, repeated solidus)
+// and each left a longer variant reachable: any bound on the tail is a bound the
+// attacker picks, and no bound at all lets a stray `<文档数据` swallow the document
+// up to a distant unrelated `>`. Neutralizing the head sidesteps the tail
+// entirely — once the leading `<` is gone the remainder is inert text, whatever
+// its shape — so the overlong, unclosed, and not-yet-imagined forms all collapse
+// together rather than one per round.
+//
+// Budget invariant (relied on by buildDocumentPreviewPrompt's post-assembly pass):
+// both passes can only ever shorten the text. Pass 1's shortest match is
+// `<文档数据>` (6 runes) against a 6-rune placeholder; pass 2's is `<文档数据`
+// (5 runes) against a 4-rune placeholder.
 //
 // NOTE: this intentionally duplicates the <引用数据> guard in
-// agent_reference_context.go; centralizing both onto one tag-parameterized helper
-// is a worthwhile follow-up but out of scope for this change.
+// agent_reference_context.go, and the two have now *diverged* — that one accepts
+// neither an attribute tail nor repeated solidus. Centralizing both onto one
+// tag-parameterized helper, with a fuzz target over the tag grammar, is the agreed
+// next change; it is a cross-feature refactor and stays out of this PR.
 var (
 	docFenceInvisiblePattern = regexp.MustCompile(`[\p{Cf}\x{00ad}]`)
-	// The trailing [^>]{0,64} accepts attribute-bearing closers (`</文档数据 attr=x>`,
-	// `</文档数据/>`), which a whitespace-only tail rejected and therefore emitted
-	// verbatim into the prompt. The bound is deliberate: an unbounded tail would let a
-	// stray `<文档数据` swallow everything up to some distant unrelated `>`.
-	// Budget invariant preserved: the shortest match is still `<文档数据>` (6 runes),
-	// equal to docFencePlaceholder, so sanitizing can only ever shorten the text.
-	docFenceTagPattern = regexp.MustCompile(`<[\s\p{Zs}]*/*[\s\p{Zs}]*文档数据[^>]{0,64}>`)
+	// Pass 1: well-formed tag. The optional tail must *start* with whitespace or a
+	// solidus, i.e. real attribute/self-closing syntax — so `<文档数据格式说明>` and
+	// `x < 文档数据量 > 1000` (prose that merely contains the tag name) are left alone
+	// instead of being collapsed into the placeholder. Anything this pass declines is
+	// still caught by pass 2, so declining costs no containment.
+	docFenceTagPattern = regexp.MustCompile(`<[\s\p{Zs}]*/*[\s\p{Zs}]*文档数据(?:[\s\p{Zs}/][^>]{0,64})?>`)
+	// Pass 2: tag head, no `>` required, but the tag name must be followed by a real
+	// tag boundary (whitespace, solidus, `>`, or end of text). That boundary is what
+	// keeps prose intact: `<文档数据格式说明>` is a different word, not a fence, and
+	// `</文档数据X` is not a well-formed closer for this tag either — the threat is a
+	// tag the model reads as closing the fence, which requires the boundary. Runs
+	// after pass 1 so ordinary tags still render as the nicer [文档数据]; substituting
+	// this for pass 1 would break the fence-only emptiness gate (`<文档数据>` would
+	// strip to `>`, not to "").
+	docFenceHeadPattern = regexp.MustCompile(`<[\s\p{Zs}]*/*[\s\p{Zs}]*文档数据([\s\p{Zs}/>]|$)`)
 	// Fold full-width (＜＞／), small-form (﹤﹥), and CJK (〈〉) angle brackets/solidus to
 	// ASCII, and collapse control + line-separator chars, before structural matching.
 	docFenceReplacer = strings.NewReplacer(
@@ -246,10 +286,20 @@ var (
 
 const docFencePlaceholder = "[文档数据]"
 
+// docFenceHeadPlaceholder is deliberately 4 runes — shorter than the 5-rune
+// shortest head match (`<文档数据` at end of text) — so pass 2 keeps the "sanitizing
+// only ever shortens" property structurally true, with no budget-reservation
+// arithmetic anywhere. The boundary character is preserved via ${1}, so the
+// replacement is always exactly one rune shorter than what it replaced.
+const docFenceHeadPlaceholder = "文档数据"
+
 func sanitizeDocumentFenceText(s string) string {
 	s = docFenceReplacer.Replace(s)
 	s = docFenceInvisiblePattern.ReplaceAllString(s, "")
 	s = docFenceTagPattern.ReplaceAllString(s, docFencePlaceholder)
+	// Head pass runs second, over whatever pass 1 declined: overlong tails, unclosed
+	// forms, and anything else that is not a well-formed tag.
+	s = docFenceHeadPattern.ReplaceAllString(s, docFenceHeadPlaceholder+"${1}")
 	return strings.TrimSpace(s)
 }
 
@@ -317,11 +367,20 @@ func normalizeFetchedDocumentSource(doc *documentSummarySource, ref documentRefR
 // emptiness needs the tags removed outright. Without this, a body consisting solely
 // of "<文档数据>" clears the gate and bills a completion for an empty document,
 // while a caller sending "" gets a clean 40004.
+//
+// The chunks-else-content precedence mirrors buildDocumentPreviewPrompt exactly:
+// the builder renders doc.Content ONLY when there are no chunks. Judging the union
+// instead would let a doc with fence-only chunks plus real content clear this gate
+// and then bill a completion on a body the model never receives — the mirror of
+// the case this gate was added to prevent.
 func documentPreviewHasNoContent(doc *documentSummarySource) bool {
-	for _, chunk := range doc.Chunks {
-		if documentTextWithoutFenceTags(chunk.Text) != "" {
-			return false
+	if len(doc.Chunks) > 0 {
+		for _, chunk := range doc.Chunks {
+			if documentTextWithoutFenceTags(chunk.Text) != "" {
+				return false
+			}
 		}
+		return true
 	}
 	return documentTextWithoutFenceTags(doc.Content) == ""
 }
@@ -329,5 +388,6 @@ func documentPreviewHasNoContent(doc *documentSummarySource) bool {
 func documentTextWithoutFenceTags(s string) string {
 	s = docFenceReplacer.Replace(s)
 	s = docFenceInvisiblePattern.ReplaceAllString(s, "")
-	return strings.TrimSpace(docFenceTagPattern.ReplaceAllString(s, ""))
+	s = docFenceTagPattern.ReplaceAllString(s, "")
+	return strings.TrimSpace(docFenceHeadPattern.ReplaceAllString(s, "${1}"))
 }

@@ -112,6 +112,14 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 		return
 	}
 	if err := ensureJSONEOF(decoder); err != nil {
+		// Same cap, second read: a valid object followed by megabytes of junk trips
+		// MaxBytesReader here rather than in Decode, and must report as over-cap too
+		// instead of as a malformed body.
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			c.JSON(http.StatusRequestEntityTooLarge, apiResponse{Code: 40007, Message: "文档内容过大，请改用文档引用方式"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "request body must contain one JSON object"})
 		return
 	}
@@ -168,19 +176,28 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 			// 暂不可用" — inflating the document-service outage signal with events the
 			// document service had nothing to do with. On a "preview fires when you open the
 			// document" front end this is routine, not exceptional.
+			//
+			// Suppress the response, not the record: a genuine upstream 5xx arriving in the
+			// same window as a disconnect must still be visible, or the very signal this
+			// branch protects gets holes punched in it. Marked so it is filterable.
 			if errors.Is(c.Request.Context().Err(), context.Canceled) {
+				log.Printf("[handler] preview fetch source aborted (client disconnected) doc=%q user=%s space=%s: %v", ref.DocumentID, userID, spaceID, err)
 				return
 			}
 			log.Printf("[handler] preview fetch source failed doc=%q user=%s space=%s: %v", ref.DocumentID, userID, spaceID, err)
 			var srcErr *documentSourceError
 			if errors.As(err, &srcErr) {
-				// Map the upstream class faithfully: 4xx (403/404) is a document/permission
-				// condition the user can act on → 40003; 5xx / timeout / refused redirect /
-				// oversized payload is a service outage → 50202, so an infra failure is not
-				// misattributed to the document itself.
-				if srcErr.status >= http.StatusInternalServerError {
+				// Map the upstream class faithfully: 401/403/404 is a document/permission
+				// condition the user can act on → 40003; 429 is upstream throttling, which is
+				// neither → 42901 with the status passed through so the client can back off;
+				// 5xx / timeout / refused redirect / oversized payload is a service outage →
+				// 50202, so an infra failure is not misattributed to the document itself.
+				switch {
+				case srcErr.status == http.StatusTooManyRequests:
+					c.JSON(srcErr.status, apiResponse{Code: 42901, Message: "文档服务繁忙，请稍后重试"})
+				case srcErr.status >= http.StatusInternalServerError:
 					c.JSON(srcErr.status, apiResponse{Code: 50202, Message: "文档服务暂不可用"})
-				} else {
+				default:
 					c.JSON(srcErr.status, apiResponse{Code: 40003, Message: "文档不可访问或尚未解析完成"})
 				}
 				return
@@ -240,8 +257,10 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 	})
 	if err != nil {
 		// Same rationale as the fetch path: a disconnected client is not a generation
-		// failure, and the error frame would be written to a socket nobody reads.
+		// failure, and the error frame would be written to a socket nobody reads. The
+		// record is kept for the same reason as above.
 		if errors.Is(c.Request.Context().Err(), context.Canceled) {
+			log.Printf("[handler] preview stream aborted (client disconnected) doc=%q user=%s space=%s: %v", ref.DocumentID, userID, spaceID, err)
 			return
 		}
 		log.Printf("[handler] preview stream failed doc=%q user=%s space=%s: %v", ref.DocumentID, userID, spaceID, err)
