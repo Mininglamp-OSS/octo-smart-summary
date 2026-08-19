@@ -27,7 +27,13 @@ import (
 )
 
 const (
-	documentPreviewMaxRequestBytes = 1 << 16
+	// documentPreviewMaxRequestBytes bounds the request body. The inline-content
+	// path (see documentPreviewReq.Content) carries the document text itself, so the
+	// cap must clear maxDocumentPromptRunes worth of UTF-8: 80k runes of CJK is ~240KB.
+	// 1MiB leaves headroom for JSON escaping without letting the body be unbounded —
+	// anything past the rune budget is truncated in normalizeFetchedDocumentSource
+	// anyway, so a larger cap would only buy wasted transfer.
+	documentPreviewMaxRequestBytes = 1 << 20
 	documentPreviewFetchTimeout    = 30 * time.Second
 	documentPreviewGenTimeout      = 60 * time.Second
 	documentPreviewTemperature     = 0.2
@@ -54,9 +60,30 @@ const documentPreviewInstruction = `请为下面的文档生成一份"AI 速览"
 <文档数据>
 `
 
+// documentPreviewReq accepts the preview target two ways:
+//
+//   - inline (Content non-empty): the caller supplies the document text directly.
+//     Used by the online-document 速览, where the editor already holds the full body
+//     in memory. No document-service round trip, so DOCUMENT_SUMMARY_SOURCE_API_URL
+//     is not required. This grants no new read access: the caller can only submit
+//     text it can already see, and the result is streamed straight back to it.
+//
+//   - by reference (Content empty): the document text is fetched from the document
+//     service via documentSourceClient. Required for sources the client cannot
+//     render itself — uploaded PDF/Word attachments, whose text only exists after
+//     server-side parsing — and for authorization on those.
+//
+// DocumentID is required either way: it is the log/正文 correlation key.
 type documentPreviewReq struct {
 	DocumentID string `json:"document_id"`
 	Version    string `json:"version,omitempty"`
+	// Title is only read on the inline path; on the fetch path the document
+	// service is authoritative for it.
+	Title string `json:"title,omitempty"`
+	// Content is the inline document body (plain text or Markdown). Non-empty
+	// selects the inline path. Treated strictly as untrusted data: it is
+	// fence-sanitized and rune-budgeted exactly like fetched content.
+	Content string `json:"content,omitempty"`
 }
 
 // previewEvent is the SSE payload shape. type ∈ {"start","delta","done","error"}.
@@ -101,35 +128,52 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, apiResponse{Code: 50301, Message: "LLM 未配置"})
 		return
 	}
-	docClient := h.documentSourceClient()
-	if docClient == nil {
-		c.JSON(http.StatusBadGateway, apiResponse{Code: 50201, Message: "document summary source API is not configured"})
-		return
-	}
 
-	// Fetch synchronously inside the request: the source client forwards only the
-	// user's Token header (never Authorization) and refuses redirects — see
-	// httpDocumentSourceClient in document_source.go.
-	fetchCtx, fetchCancel := context.WithTimeout(c.Request.Context(), documentPreviewFetchTimeout)
-	defer fetchCancel()
-	doc, err := docClient.FetchSummarySource(fetchCtx, spaceID, userID, ref.DocumentID, ref.Version, c.Request.Header)
-	if err != nil {
-		log.Printf("[handler] preview fetch source failed doc=%q user=%s space=%s: %v", ref.DocumentID, userID, spaceID, err)
-		var srcErr *documentSourceError
-		if errors.As(err, &srcErr) {
-			// Map the upstream class faithfully: 4xx (403/404) is a document/permission
-			// condition the user can act on → 40003; 5xx / timeout / refused redirect /
-			// oversized payload is a service outage → 50202, so an infra failure is not
-			// misattributed to the document itself.
-			if srcErr.status >= http.StatusInternalServerError {
-				c.JSON(srcErr.status, apiResponse{Code: 50202, Message: "文档服务暂不可用"})
-			} else {
-				c.JSON(srcErr.status, apiResponse{Code: 40003, Message: "文档不可访问或尚未解析完成"})
-			}
+	inlineContent := strings.TrimSpace(req.Content)
+	var doc *documentSummarySource
+	if inlineContent != "" {
+		// Inline path: no document-service dependency, no fetch timeout. The body is
+		// still funnelled through normalizeFetchedDocumentSource so the rune budget,
+		// title/version clamping, and the Truncated flag behave identically to fetched
+		// content — the prompt builder cannot tell the two paths apart.
+		doc = &documentSummarySource{
+			DocumentID: ref.DocumentID,
+			Title:      req.Title,
+			Version:    ref.Version,
+			Content:    inlineContent,
+		}
+	} else {
+		docClient := h.documentSourceClient()
+		if docClient == nil {
+			c.JSON(http.StatusBadGateway, apiResponse{Code: 50201, Message: "document summary source API is not configured"})
 			return
 		}
-		c.JSON(http.StatusBadGateway, apiResponse{Code: 50202, Message: "文档服务暂不可用"})
-		return
+
+		// Fetch synchronously inside the request: the source client forwards only the
+		// user's Token header (never Authorization) and refuses redirects — see
+		// httpDocumentSourceClient in document_source.go.
+		fetchCtx, fetchCancel := context.WithTimeout(c.Request.Context(), documentPreviewFetchTimeout)
+		defer fetchCancel()
+		fetched, err := docClient.FetchSummarySource(fetchCtx, spaceID, userID, ref.DocumentID, ref.Version, c.Request.Header)
+		if err != nil {
+			log.Printf("[handler] preview fetch source failed doc=%q user=%s space=%s: %v", ref.DocumentID, userID, spaceID, err)
+			var srcErr *documentSourceError
+			if errors.As(err, &srcErr) {
+				// Map the upstream class faithfully: 4xx (403/404) is a document/permission
+				// condition the user can act on → 40003; 5xx / timeout / refused redirect /
+				// oversized payload is a service outage → 50202, so an infra failure is not
+				// misattributed to the document itself.
+				if srcErr.status >= http.StatusInternalServerError {
+					c.JSON(srcErr.status, apiResponse{Code: 50202, Message: "文档服务暂不可用"})
+				} else {
+					c.JSON(srcErr.status, apiResponse{Code: 40003, Message: "文档不可访问或尚未解析完成"})
+				}
+				return
+			}
+			c.JSON(http.StatusBadGateway, apiResponse{Code: 50202, Message: "文档服务暂不可用"})
+			return
+		}
+		doc = fetched
 	}
 	normalizeFetchedDocumentSource(doc, ref)
 	if strings.TrimSpace(doc.Content) == "" && len(doc.Chunks) == 0 {
@@ -165,7 +209,7 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 		{Role: "system", Content: documentPreviewSystemPrompt},
 		{Role: "user", Content: prompt},
 	}
-	_, _, err = client.CallStream(genCtx, messages, documentPreviewTemperature, func(delta string) error {
+	_, _, err := client.CallStream(genCtx, messages, documentPreviewTemperature, func(delta string) error {
 		if delta == "" {
 			return nil
 		}
