@@ -3,9 +3,8 @@ package handler
 // Document "AI 速览" (quick preview): an ephemeral, streaming quick-glance over a
 // single document. Deliberately NOT a deliverable — it never writes a
 // SummaryTask/SummarySource, has no idempotency/claim machinery, and carries no
-// [n] citations. Contrast with CreateDocumentAgentSummary (the persisted "沉淀"
-// path in document_agent_summary.go), which this handler intentionally reuses the
-// fetch client, chunk normalization, and fence sanitization from.
+// [n] citations. It reuses the shared document-source client, chunk normalization,
+// and fence sanitization from document_source.go.
 //
 // The generation is a single synchronous LLM completion (service.LLMClient.
 // CallStream) — no agent runner, no tools, no retrieval. Streamed to the client
@@ -110,7 +109,7 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 
 	// Fetch synchronously inside the request: the source client forwards only the
 	// user's Token header (never Authorization) and refuses redirects — see
-	// httpDocumentSourceClient in document_agent_summary.go.
+	// httpDocumentSourceClient in document_source.go.
 	fetchCtx, fetchCancel := context.WithTimeout(c.Request.Context(), documentPreviewFetchTimeout)
 	defer fetchCancel()
 	doc, err := docClient.FetchSummarySource(fetchCtx, spaceID, userID, ref.DocumentID, ref.Version, c.Request.Header)

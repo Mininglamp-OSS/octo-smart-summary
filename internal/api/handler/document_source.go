@@ -155,10 +155,7 @@ func (c *httpDocumentSourceClient) FetchSummarySource(ctx context.Context, space
 // documentSourceClient returns the handler's configured document-source client
 // (nil when DOCUMENT_SOURCE_API_URL is unset).
 func (h *AgentSummaryHandler) documentSourceClient() documentSourceClient {
-	if h.documentClient != nil {
-		return h.documentClient
-	}
-	return nil
+	return h.documentClient
 }
 
 func normalizeDocumentRefs(refs []documentRefReq) []documentRefReq {
