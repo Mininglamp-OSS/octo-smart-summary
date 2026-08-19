@@ -82,6 +82,13 @@ const maxMessageLen = 8192
 // 既防注入/异常键，也与 DB varchar(128) 对齐。
 var sessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
+// requestIDPattern 约束客户端生成的 request_id（V2 幂等键，可选）。与
+// session_id 同字符集、同 1..128 长——它流入 uk_run_request 的 VARCHAR(128)
+// 列。不加门时超长值会被 INSERT IGNORE 静默截到 128 字符插入，两个共享
+// 128 前缀的不同 request_id 会撞唯一键、后者静默沿用前者的 run。可选字段：
+// 空值（legacy 请求）直接放行，仅非空时才校验。
+var requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
 // AgentChatHandler 提供非流式一问一答对话入口，复用 internal/agent 底座。
 //
 // 融合两条能力：
@@ -417,6 +424,12 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "session_id 非法"})
 		return
 	}
+	// request_id 可选；非空时必须过 requestIDPattern，否则超长值会被
+	// INSERT IGNORE 静默截断并撞 uk_run_request。
+	if req.RequestID != "" && !requestIDPattern.MatchString(req.RequestID) {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "request_id 非法"})
+		return
+	}
 
 	profileName, profileConflict := resolveChatProfile(req.Profile, len(req.SelectedChannels) > 0, len(req.ReferencedTaskIDs) > 0)
 	if profileConflict {
@@ -634,6 +647,12 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	}
 	if !sessionIDPattern.MatchString(req.SessionID) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "session_id 非法"})
+		return
+	}
+	// request_id 可选；非空时必须过 requestIDPattern，否则超长值会被
+	// INSERT IGNORE 静默截断并撞 uk_run_request。
+	if req.RequestID != "" && !requestIDPattern.MatchString(req.RequestID) {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "request_id 非法"})
 		return
 	}
 

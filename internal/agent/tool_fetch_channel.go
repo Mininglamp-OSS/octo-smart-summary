@@ -158,8 +158,8 @@ func FetchChannelTool() (Tool, Handler) {
 			result["returned_count"] = coverage.Returned
 			result["requested_max"] = coverage.RequestedMax
 			result["truncated"] = coverage.Truncated
-			// has_more mirrors truncated for this window query: a hit cap means
-			// older in-window messages remain unread.
+			// has_more mirrors truncated: the +1 probe makes it exact — true
+			// iff the window held more than the cap, not "cap-or-exactly-cap".
 			result["has_more"] = coverage.Truncated
 			if coverage.Returned > 0 {
 				result["actual_time_range"] = map[string]interface{}{

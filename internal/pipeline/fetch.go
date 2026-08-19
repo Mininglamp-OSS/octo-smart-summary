@@ -449,14 +449,15 @@ type FetchCoverage struct {
 	// <=0 default and the safety-limit clamp).
 	RequestedMax int
 	// RowsScanned is how many rows the LIMIT query returned before text
-	// extraction. Because the query is `LIMIT RequestedMax`, RowsScanned ==
-	// RequestedMax is the reliable "cap hit" signal.
+	// extraction (after the probe row, if any, is dropped).
 	RowsScanned int
 	// Returned is how many text messages were returned (RowsScanned minus rows
 	// that carried no extractable text).
 	Returned int
-	// Truncated reports the cap was hit, so older messages in the window may
-	// exist beyond what was returned.
+	// Truncated reports the cap was hit, i.e. the probe found one more row
+	// beyond the cap — older messages in the window exist beyond what was
+	// returned. False when the window held exactly RequestedMax or fewer
+	// messages.
 	Truncated bool
 	// FirstTS / LastTS are the actual timestamps of the first/last returned
 	// message (ascending). Zero when nothing was returned.
@@ -500,12 +501,22 @@ func FetchMessagesFromChannelWithCoverage(ctx context.Context, channelID string,
 
 	var allRows []msgRow
 
+	// Fetch effectiveMax+1 rows so Truncated can tell "exactly effectiveMax
+	// messages exist in the window" apart from "the cap cut the window off":
+	// with LIMIT effectiveMax alone both return effectiveMax rows and the cap
+	// hit was indistinguishable from a fully-covered window (false has_more).
+	// The probe row is dropped before building messages, so Returned is capped
+	// at effectiveMax exactly as before.
 	query := fmt.Sprintf(
 		"SELECT message_seq, from_uid, channel_id, `timestamp`, payload FROM `%s` WHERE channel_id = ? AND channel_type = ? AND `timestamp` BETWEEN ? AND ? AND is_deleted = 0 ORDER BY message_seq DESC LIMIT ?",
 		table,
 	)
-	if err := imDB.WithContext(ctx).Raw(query, channelID, channelType, startTS, endTS, effectiveMax).Scan(&allRows).Error; err != nil {
+	if err := imDB.WithContext(ctx).Raw(query, channelID, channelType, startTS, endTS, effectiveMax+1).Scan(&allRows).Error; err != nil {
 		return nil, FetchCoverage{}, fmt.Errorf("fetch messages from %s: %w", table, err)
+	}
+	truncated := len(allRows) > effectiveMax
+	if len(allRows) > effectiveMax {
+		allRows = allRows[:effectiveMax]
 	}
 	for i, j := 0, len(allRows)-1; i < j; i, j = i+1, j-1 {
 		allRows[i], allRows[j] = allRows[j], allRows[i]
@@ -531,7 +542,7 @@ func FetchMessagesFromChannelWithCoverage(ctx context.Context, channelID string,
 		RequestedMax: effectiveMax,
 		RowsScanned:  len(allRows),
 		Returned:     len(messages),
-		Truncated:    len(allRows) >= effectiveMax,
+		Truncated:    truncated,
 	}
 	if len(messages) > 0 {
 		cov.FirstTS = messages[0].Timestamp

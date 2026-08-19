@@ -19,6 +19,8 @@ func TestSampleIndices(t *testing.T) {
 		{"n>k head+tail included, evenly spaced", 9, 5, []int{0, 2, 4, 6, 8}},
 		{"n=10 k=5", 10, 5, []int{0, 2, 4, 6, 9}},
 		{"n=100 k=5 spans full range", 100, 5, []int{0, 24, 49, 74, 99}},
+		{"k=1 single slot takes head", 10, 1, []int{0}},
+		{"n=1 k=1", 1, 1, []int{0}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -27,7 +29,8 @@ func TestSampleIndices(t *testing.T) {
 				t.Errorf("sampleIndices(%d,%d) = %v, want %v", tc.n, tc.k, got, tc.want)
 			}
 			// Invariants for the n>k case: first and last always present, distinct, in range.
-			if tc.n > tc.k && len(got) > 0 {
+			// k==1 intentionally returns head-only, so the tail invariant is skipped there.
+			if tc.n > tc.k && tc.k > 1 && len(got) > 0 {
 				if got[0] != 0 {
 					t.Errorf("head not included: %v", got)
 				}

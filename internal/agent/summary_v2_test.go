@@ -1,12 +1,11 @@
 package agent
 
 import (
-	"os"
 	"testing"
 )
 
 func TestSummaryV2ModeDefaultOff(t *testing.T) {
-	os.Unsetenv("AGENT_SUMMARY_V2_MODE")
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "") // "" ≡ unset: normalizer maps to off
 	if got := SummaryV2Mode(); got != V2ModeOff {
 		t.Fatalf("default mode = %q, want off", got)
 	}

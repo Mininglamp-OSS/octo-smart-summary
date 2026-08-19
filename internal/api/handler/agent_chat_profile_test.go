@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"os"
 	"testing"
 )
 
@@ -46,12 +45,9 @@ func TestResolveChatProfile(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.mode == "" {
-				os.Unsetenv("AGENT_SUMMARY_V2_MODE")
-			} else {
-				os.Setenv("AGENT_SUMMARY_V2_MODE", tc.mode)
-			}
-			t.Cleanup(func() { os.Unsetenv("AGENT_SUMMARY_V2_MODE") })
+			// t.Setenv restores any pre-existing value (CI runs -shuffle=on
+			// -race); "" ≡ unset here — the normalizer maps both to off.
+			t.Setenv("AGENT_SUMMARY_V2_MODE", tc.mode)
 
 			gotProfile, gotConflict := resolveChatProfile(tc.reqProfile, tc.hasChannels, tc.hasRefs)
 			if gotProfile != tc.wantProfile || gotConflict != tc.wantConflict {

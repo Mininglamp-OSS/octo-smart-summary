@@ -7,6 +7,32 @@ import (
 	"strings"
 )
 
+// Agent-summary V2 rollout modes + normalizer live here (not in internal/agent)
+// because agent already imports config for other wiring; putting the
+// normalizer in agent would create an import cycle. Both read paths of
+// AGENT_SUMMARY_V2_MODE (the config field and agent.SummaryV2Mode) go through
+// one function so they can never disagree on case, whitespace, or unknown
+// values.
+const (
+	AgentSummaryV2Off    = "off"
+	AgentSummaryV2Shadow = "shadow"
+	AgentSummaryV2On     = "on"
+)
+
+// NormalizeAgentSummaryV2Mode trims and lowercases the raw env value, mapping
+// "shadow"/"on" to themselves and everything else (unset, empty, unknown) to
+// "off" — fail safe, never fail into the new path.
+func NormalizeAgentSummaryV2Mode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case AgentSummaryV2Shadow:
+		return AgentSummaryV2Shadow
+	case AgentSummaryV2On:
+		return AgentSummaryV2On
+	default:
+		return AgentSummaryV2Off
+	}
+}
+
 func getEnvFloat(key string, defaultVal float64) float64 {
 	v := os.Getenv(key)
 	if v == "" {
@@ -72,8 +98,9 @@ type Config struct {
 	// AgentSummaryV2Mode gates the SS-03+ SummaryRun/SummarySpec persistence
 	// path: "off" (default) keeps pre-SS-03 behavior, "shadow" persists runs
 	// without changing the reply, "on" is the enabled path. Read from
-	// AGENT_SUMMARY_V2_MODE; the agent package reads the same env directly via
-	// agent.SummaryV2Mode() so handler wiring needs no constructor change.
+	// AGENT_SUMMARY_V2_MODE and normalized through NormalizeAgentSummaryV2Mode
+	// — the same function agent.SummaryV2Mode() uses, so the two read paths
+	// can never disagree on case/whitespace/unknown values.
 	AgentSummaryV2Mode string
 
 	// Message table count
@@ -164,7 +191,7 @@ func Load() *Config {
 		LLMApiKey: envStr("LLM_API_KEY", ""),
 		LLMModel:  envStr("LLM_MODEL", ""),
 
-		AgentSummaryV2Mode: envStr("AGENT_SUMMARY_V2_MODE", "off"),
+		AgentSummaryV2Mode: NormalizeAgentSummaryV2Mode(os.Getenv("AGENT_SUMMARY_V2_MODE")),
 		LLMFallbackModels:  envStrList("LLM_FALLBACK_MODELS", nil),
 		LLMTimeout:         envInt("LLM_TIMEOUT", 180),
 		LLMMaxToken:        envInt("LLM_MAX_TOKENS", 4096),

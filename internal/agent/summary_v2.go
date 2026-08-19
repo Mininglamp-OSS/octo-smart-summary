@@ -2,7 +2,8 @@ package agent
 
 import (
 	"os"
-	"strings"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 )
 
 // SS-03 rollout flag. AGENT_SUMMARY_V2_MODE gates the SummaryRun / SummarySpec
@@ -18,30 +19,22 @@ import (
 //
 // Kept as an env reader mirroring HistoryWindow() so wiring it in needs no change
 // to NewAgentChatHandler's signature or router.go — off therefore stays a true
-// no-op. config.Config also surfaces the value (AgentSummaryV2Mode) so DEP-01 /
-// CONFIGURATION.md have a documented home; both read the same env var.
+// no-op. config.Config surfaces the same value (AgentSummaryV2Mode); both read
+// paths go through config.NormalizeAgentSummaryV2Mode so they can never disagree.
 const (
-	V2ModeOff    = "off"
-	V2ModeShadow = "shadow"
-	V2ModeOn     = "on"
+	V2ModeOff    = config.AgentSummaryV2Off
+	V2ModeShadow = config.AgentSummaryV2Shadow
+	V2ModeOn     = config.AgentSummaryV2On
 
 	// DefaultSummaryV2Mode is the safe default: the new path is dark until an
 	// operator explicitly opts in.
 	DefaultSummaryV2Mode = V2ModeOff
 )
 
-// SummaryV2Mode reads AGENT_SUMMARY_V2_MODE, normalizing case/whitespace and
-// falling back to off for unset or unrecognized values (fail safe, never fail
-// into the new path).
+// SummaryV2Mode reads AGENT_SUMMARY_V2_MODE and normalizes it through the
+// single shared normalizer (fail safe, never fail into the new path).
 func SummaryV2Mode() string {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("AGENT_SUMMARY_V2_MODE"))) {
-	case V2ModeShadow:
-		return V2ModeShadow
-	case V2ModeOn:
-		return V2ModeOn
-	default:
-		return V2ModeOff
-	}
+	return config.NormalizeAgentSummaryV2Mode(os.Getenv("AGENT_SUMMARY_V2_MODE"))
 }
 
 // SummaryV2Enabled reports whether any non-off mode is active.
