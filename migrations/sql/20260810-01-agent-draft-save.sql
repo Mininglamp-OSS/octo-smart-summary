@@ -27,7 +27,7 @@ ALTER TABLE summary_task
     ADD COLUMN agent_message_id BIGINT NOT NULL DEFAULT 0
     COMMENT 'agent_message.id of the assistant reply saved as this summary; 0 for non-agent tasks (SUM-BE2)',
     ADD COLUMN snapshot_version INT NOT NULL DEFAULT 0
-    COMMENT 'snapshot version the client confirmed on save; matches personal_result.snapshot_json.snapshot_version (SUM-BE2)';
+    COMMENT 'client-declared snapshot version confirmed on save; 0 denotes the legacy save path (SUM-BE2)';
 
 CREATE INDEX idx_summary_task_agent_session
     ON summary_task (agent_session_id);

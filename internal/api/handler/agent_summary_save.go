@@ -36,6 +36,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // errAgentSaveIdempotencyConflict signals that the transaction detected a
@@ -157,19 +158,10 @@ func canonicalAgentSaveRequestHash(userID string, req createAgentSummaryReq) str
 	}
 	sort.Slice(participants, func(i, j int) bool { return participants[i].UserID < participants[j].UserID })
 
-	refCopy := append([]int64(nil), req.ReferencedTaskIDs...)
-	sort.Slice(refCopy, func(i, j int) bool { return refCopy[i] < refCopy[j] })
-	// De-dup adjacent equal ids after sort.
-	if len(refCopy) > 1 {
-		w := 1
-		for i := 1; i < len(refCopy); i++ {
-			if refCopy[i] != refCopy[i-1] {
-				refCopy[w] = refCopy[i]
-				w++
-			}
-		}
-		refCopy = refCopy[:w]
-	}
+	// ReferencedTaskIDs are order-sensitive: element 0 is the origin/citation
+	// inheritance source. Preserve first-occurrence order while removing
+	// duplicates, matching the normalization performed at handler entry.
+	refCopy := dedupReferencedTaskIDs(req.ReferencedTaskIDs)
 
 	originProvided := req.OriginChannelID != nil
 	originID := ""
@@ -215,6 +207,27 @@ func canonicalAgentSaveRequestHash(userID string, req createAgentSummaryReq) str
 	}
 	sum := sha256.Sum256(buf)
 	return hex.EncodeToString(sum[:])
+}
+
+// createAgentSaveIdempotencyBinding inserts the unique save binding and then
+// reads the tuple back to determine whether this transaction won. Do not use
+// RowsAffected for this decision: GORM maps DoNothing to a MySQL no-op update,
+// and clientFoundRows=true reports that conflict as one affected row.
+func createAgentSaveIdempotencyBinding(tx *gorm.DB, binding *model.SummaryAgentSaveIdempotency) error {
+	if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(binding).Error; err != nil {
+		return fmt.Errorf("create agent save idempotency: %w", err)
+	}
+
+	var persisted model.SummaryAgentSaveIdempotency
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("space_id = ? AND user_id = ? AND idempotency_key = ?", binding.SpaceID, binding.UserID, binding.IdempotencyKey).
+		First(&persisted).Error; err != nil {
+		return fmt.Errorf("read back agent save idempotency: %w", err)
+	}
+	if persisted.TaskID != binding.TaskID {
+		return errAgentSaveIdempotencyConflict
+	}
+	return nil
 }
 
 // findAgentSaveIdempotentTaskWithHash mirrors

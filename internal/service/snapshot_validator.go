@@ -152,32 +152,18 @@ func ValidatePersonalWorkflow(
 	return nil
 }
 
-// ValidateScheduledWorkflow is called by handler.CreateSchedule. The deep
-// recurrence / anchor / run-time / day-of-week / day-of-month / time-range-
-// type checks stay in the existing service.ValidateInterval* / ValidateRunTime
-// / ValidateScheduleAnchors / ValidateTimeRangeType helpers — this function
-// runs the shared base cap and the "recurrence must be non-empty" invariant
-// (design section 4.1: Schedule payload must be actually delivered, not
-// zero-filled by an accidental patch).
-//
-// scope carries channel ids (from req.Sources) and time range (from
-// req.TimeRange or the schedule's time_range_type). Handlers build it once
-// and pass it in — same model.SnapshotScope as the other paths.
-func ValidateScheduledWorkflow(
-	actor, title string,
-	scope model.SnapshotScope,
-) *BizError {
+// ValidateScheduledWorkflow is called by handler.CreateSchedule. It enforces
+// the shared actor and title gates. Deep recurrence / anchor / run-time /
+// day-of-week / day-of-month / time-range-type checks remain in the existing
+// ValidateInterval* / ValidateRunTime / ValidateScheduleAnchors /
+// ValidateTimeRangeType helpers called immediately afterwards.
+func ValidateScheduledWorkflow(actor, title string) *BizError {
 	if err := requireActor(actor); err != nil {
 		return err
 	}
 	if err := validateTitleAndTopic(title, ""); err != nil {
 		return err
 	}
-	// Non-blocking: an entirely empty scope on a schedule is legal in this
-	// repo (Layer 3 auto-narrow picks channels at run time), so we do NOT
-	// insist on a channel/time signal here — the design allows it for
-	// scheduled runs whose scope is intentionally template-shaped.
-	_ = scope
 	return nil
 }
 

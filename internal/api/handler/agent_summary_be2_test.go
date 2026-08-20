@@ -12,6 +12,7 @@ package handler
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -222,9 +223,6 @@ func TestCreateAgentSummary_BE2_MessageIDWithoutVersion_400(t *testing.T) {
 
 func TestCreateAgentSummary_BE2_IdempotencyReplaysSameTask(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	if err := db.AutoMigrate(&model.SummaryAgentSaveIdempotency{}); err != nil {
-		t.Fatalf("migrate idempotency table: %v", err)
-	}
 	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
@@ -281,11 +279,92 @@ func TestCreateAgentSummary_BE2_IdempotencyReplaysSameTask(t *testing.T) {
 	}
 }
 
+func TestCreateAgentSaveIdempotencyBinding_DetectsConflictByReadBack(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	winner := model.SummaryAgentSaveIdempotency{
+		SpaceID: "test-space", UserID: "test-user", IdempotencyKey: "same-key",
+		RequestHash: "winner-hash", TaskID: 101, CreatedAt: time.Now(),
+	}
+	if err := db.Create(&winner).Error; err != nil {
+		t.Fatalf("seed winner binding: %v", err)
+	}
+
+	loser := model.SummaryAgentSaveIdempotency{
+		SpaceID: "test-space", UserID: "test-user", IdempotencyKey: "same-key",
+		RequestHash: "loser-hash", TaskID: 202, CreatedAt: time.Now(),
+	}
+	err := db.Transaction(func(tx *gorm.DB) error {
+		return createAgentSaveIdempotencyBinding(tx, &loser)
+	})
+	if !errors.Is(err, errAgentSaveIdempotencyConflict) {
+		t.Fatalf("conflicting binding must lose after tuple read-back, got %v", err)
+	}
+
+	var persisted model.SummaryAgentSaveIdempotency
+	if err := db.Where("space_id = ? AND user_id = ? AND idempotency_key = ?", "test-space", "test-user", "same-key").First(&persisted).Error; err != nil {
+		t.Fatalf("read persisted binding: %v", err)
+	}
+	if persisted.TaskID != winner.TaskID || persisted.RequestHash != winner.RequestHash {
+		t.Fatalf("winner binding changed: task=%d hash=%q", persisted.TaskID, persisted.RequestHash)
+	}
+}
+
+func TestCreateAgentSummary_BE2_OverlappingRetryReplaysAfterDraftDisappears(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	r := setupAgentSummaryRouter(h)
+	msg := seedAssistantMessage(t, db, "test-user", "sess-overlap", "final answer")
+
+	now := time.Now()
+	winner := model.SummaryTask{
+		TaskNo: "ST-overlap-winner", SpaceID: "test-space", CreatorID: "test-user",
+		Title: "Weekly", Topic: "Weekly", SummaryMode: model.ModeByPerson,
+		TimeRangeStart: now, TimeRangeEnd: now, Status: model.StatusCompleted,
+		TriggerType: model.TriggerAgent, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := db.Create(&winner).Error; err != nil {
+		t.Fatalf("seed winner task: %v", err)
+	}
+
+	origin := "chan-1"
+	req := createAgentSummaryReq{
+		SessionID: "sess-overlap", OriginChannelID: &origin, OriginChannelType: 1,
+		Title: "Weekly", AgentMessageID: msg.ID, SnapshotVersion: 1,
+	}
+	var hookErr error
+	h.beforeDraftLoad = func() {
+		h.beforeDraftLoad = nil
+		hookErr = db.Create(&model.SummaryAgentSaveIdempotency{
+			SpaceID: "test-space", UserID: "test-user", IdempotencyKey: "idem-overlap",
+			RequestHash: canonicalAgentSaveRequestHash("test-user", req),
+			TaskID:      winner.ID, CreatedAt: now,
+		}).Error
+		if hookErr == nil {
+			hookErr = db.Delete(&model.AgentMessage{}, msg.ID).Error
+		}
+	}
+
+	w := doAgentSave(t, r, map[string]interface{}{
+		"session_id": "sess-overlap", "origin_channel_id": origin,
+		"origin_channel_type": 1, "title": "Weekly",
+		"agent_message_id": msg.ID, "snapshot_version": 1,
+	}, map[string]string{"Idempotency-Key": "idem-overlap"})
+	if hookErr != nil {
+		t.Fatalf("install concurrent winner state: %v", hookErr)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("overlapping retry must replay instead of 40004, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	data := resp["data"].(map[string]interface{})
+	if data["task_id"] != float64(winner.ID) || data["replayed"] != true {
+		t.Fatalf("unexpected replay response: %s", w.Body.String())
+	}
+}
+
 func TestCreateAgentSummary_BE2_IdempotencyMismatch409(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	if err := db.AutoMigrate(&model.SummaryAgentSaveIdempotency{}); err != nil {
-		t.Fatalf("migrate idempotency table: %v", err)
-	}
 	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
@@ -334,13 +413,13 @@ func TestCreateAgentSummary_BE2_IdempotencyMismatch409(t *testing.T) {
 	if r2["data"].(map[string]interface{})["task_id"] != originalTaskID {
 		t.Errorf("409 must echo the original task_id, got %v", r2["data"])
 	}
+	if r2["data"].(map[string]interface{})["reason"] != "request_mismatch" {
+		t.Errorf("409 must expose a machine-readable reason, got %v", r2["data"])
+	}
 }
 
 func TestCreateAgentSummary_BE2_ParticipantChangeConflictsBeforeDraftRead(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	if err := db.AutoMigrate(&model.SummaryAgentSaveIdempotency{}); err != nil {
-		t.Fatalf("migrate idempotency table: %v", err)
-	}
 	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 	msg := seedAssistantMessage(t, db, "test-user", "sess-participants", "final answer")
@@ -365,9 +444,6 @@ func TestCreateAgentSummary_BE2_ParticipantChangeConflictsBeforeDraftRead(t *tes
 
 func TestCreateAgentSummary_BE2_DeletedTaskIsNotReplayed(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	if err := db.AutoMigrate(&model.SummaryAgentSaveIdempotency{}); err != nil {
-		t.Fatalf("migrate idempotency table: %v", err)
-	}
 	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 	msg := seedAssistantMessage(t, db, "test-user", "sess-deleted", "final answer")
@@ -395,6 +471,11 @@ func TestCreateAgentSummary_BE2_DeletedTaskIsNotReplayed(t *testing.T) {
 	}
 	if bytes.Contains(w2.Body.Bytes(), []byte(`"replayed":true`)) {
 		t.Fatalf("deleted task must not be replayed: %s", w2.Body.String())
+	}
+	var resp map[string]interface{}
+	_ = json.Unmarshal(w2.Body.Bytes(), &resp)
+	if resp["data"].(map[string]interface{})["reason"] != "deleted_summary" {
+		t.Errorf("deleted-task conflict must expose a machine-readable reason: %s", w2.Body.String())
 	}
 }
 

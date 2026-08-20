@@ -495,17 +495,13 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		return
 	}
 
-	// SUM-BE1 (revised per SUM-9): call the shared validator with the ACTUAL
-	// model.SnapshotScope + the recurrence primitives the deep schedule
-	// checks below consume. No parallel DTO. Deep recurrence / anchor /
-	// run-time / day-of-week / day-of-month / time-range-type checks still
-	// run below via service.ValidateInterval* etc. — the shared validator
-	// only widens the top of the funnel with actor + title cap + "at least
-	// one of cron_expr / interval_days / interval_months" presence.
+	// SUM-BE1 (revised per SUM-9): the shared schedule validator owns the
+	// actor/title gates. Deep recurrence / anchor / run-time / day-of-week /
+	// day-of-month / time-range-type checks still run below via the existing
+	// service validators.
 	if bizE := service.ValidateScheduledWorkflow(
 		userID,
 		req.Title,
-		scheduleScopeFromReq(req),
 	); bizE != nil {
 		bizErr(c, bizE)
 		return

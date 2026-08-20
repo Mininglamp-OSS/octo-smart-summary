@@ -17,7 +17,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 // AgentSummaryHandler persists the deliverable produced by the agent
@@ -53,6 +52,9 @@ type AgentSummaryHandler struct {
 	// Not exposed via NewAgentSummaryHandler — tests assign this field
 	// directly using same-package access.
 	runnerFactory func(profile, uid string) (refineRunner, string, error)
+	// beforeDraftLoad is a test-only synchronization hook used to exercise
+	// the race where another request commits after idempotency preflight.
+	beforeDraftLoad func()
 }
 
 // refineRunner is the minimal subset of *agent.Runner used by RefineAgentSummary.
@@ -198,35 +200,8 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "idempotency check failed"})
 			return
 		}
-		if stale {
-			c.JSON(http.StatusConflict, apiResponse{
-				Code:    40009,
-				Message: "idempotency key is bound to a deleted summary",
-				Data:    gin.H{"task_id": existing.ID},
-			})
-			return
-		}
-		if ok && mismatched {
-			c.JSON(http.StatusConflict, apiResponse{
-				Code:    40009,
-				Message: "idempotency key already bound to a different agent save request",
-				Data:    gin.H{"task_id": existing.ID, "task_no": existing.TaskNo},
-			})
-			return
-		}
 		if ok {
-			log.Printf("[handler] CreateAgentSummary idempotency replay space=%s user=%s key=%s task_id=%d", spaceID, userID, idempotencyKey, existing.ID)
-			c.JSON(http.StatusOK, apiResponse{
-				Code:    0,
-				Message: "ok",
-				Data: gin.H{
-					"task_id":    existing.ID,
-					"task_no":    existing.TaskNo,
-					"status":     existing.Status,
-					"created_at": existing.CreatedAt,
-					"replayed":   true,
-				},
-			})
+			writeAgentSaveIdempotencyResponse(c, existing, mismatched, stale)
 			return
 		}
 	}
@@ -375,9 +350,29 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	// attacker cannot probe whether a specific message id exists (matches
 	// the legacy loader's owner-scope 404 discipline, SUM-158
 	// blocker 1).
+	if h.beforeDraftLoad != nil {
+		h.beforeDraftLoad()
+	}
 	draftMsg, err := loadAgentMessageForSave(h.db.WithContext(c.Request.Context()), req.SessionID, userID, req.AgentMessageID)
 	if err != nil {
 		if errors.Is(err, errNoAgentOutput) {
+			// A concurrent winner may have committed after our preflight and
+			// deleted the shared draft. Re-check the durable binding before
+			// reporting a missing output so an overlapping retry still replays.
+			if idempotencyKey != "" {
+				existing, mismatched, ok, stale, ferr := findAgentSaveIdempotentTaskWithHash(
+					c.Request.Context(), h.db, spaceID, userID, idempotencyKey, requestHash,
+				)
+				if ferr != nil {
+					log.Printf("[handler] CreateAgentSummary idempotency retry lookup failed space=%s user=%s key=%s: %v", spaceID, userID, idempotencyKey, ferr)
+					c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "idempotency check failed"})
+					return
+				}
+				if ok {
+					writeAgentSaveIdempotencyResponse(c, existing, mismatched, stale)
+					return
+				}
+			}
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40004, Message: "session 无有效产出,请先在对话中生成总结再保存"})
 			return
 		}
@@ -549,7 +544,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			UpdatedAt:        now,
 		}
 		// Build citations from session tool traces (fallback to empty array on error)
-		cits, cerr := h.buildCitationsForSession(c.Request.Context(), req.SessionID, content, userID, req.RequestID)
+		cits, cerr := h.buildCitationsForSessionWithDB(c.Request.Context(), tx, req.SessionID, content, userID, req.RequestID)
 		if cerr != nil {
 			log.Printf("[handler] buildCitationsForSession failed session=%s: %v (fallback to empty)", req.SessionID, cerr)
 			cits = nil
@@ -621,9 +616,9 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		// same transaction that created the task. Same-body retries replay
 		// via the preflight above; different-body retries hit the preflight
 		// 409. A concurrent duplicate hitting Create with the same tuple
-		// loses the UNIQUE race, RowsAffected == 0 fires
-		// errAgentSaveIdempotencyConflict, and the outer handler re-reads the
-		// binding to decide replay vs mismatch.
+		// loses the UNIQUE race; a locked read-back identifies the winner
+		// without relying on MySQL's DSN-sensitive RowsAffected value. The
+		// outer handler then re-reads the binding to decide replay vs mismatch.
 		if idempotencyKey != "" {
 			binding := model.SummaryAgentSaveIdempotency{
 				SpaceID:        spaceID,
@@ -633,12 +628,8 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 				TaskID:         task.ID,
 				CreatedAt:      now,
 			}
-			insert := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&binding)
-			if insert.Error != nil {
-				return fmt.Errorf("create agent save idempotency: %w", insert.Error)
-			}
-			if insert.RowsAffected == 0 {
-				return errAgentSaveIdempotencyConflict
+			if err := createAgentSaveIdempotencyBinding(tx, &binding); err != nil {
+				return err
 			}
 		}
 
@@ -670,33 +661,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "idempotency race resolution failed"})
 			return
 		}
-		if stale {
-			c.JSON(http.StatusConflict, apiResponse{
-				Code:    40009,
-				Message: "idempotency key is bound to a deleted summary",
-				Data:    gin.H{"task_id": existing.ID},
-			})
-			return
-		}
-		if mismatched {
-			c.JSON(http.StatusConflict, apiResponse{
-				Code:    40009,
-				Message: "idempotency key already bound to a different agent save request",
-				Data:    gin.H{"task_id": existing.ID, "task_no": existing.TaskNo},
-			})
-			return
-		}
-		c.JSON(http.StatusOK, apiResponse{
-			Code:    0,
-			Message: "ok",
-			Data: gin.H{
-				"task_id":    existing.ID,
-				"task_no":    existing.TaskNo,
-				"status":     existing.Status,
-				"created_at": existing.CreatedAt,
-				"replayed":   true,
-			},
-		})
+		writeAgentSaveIdempotencyResponse(c, existing, mismatched, stale)
 		return
 	}
 	if err != nil {
@@ -718,6 +683,47 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			"task_no":    task.TaskNo,
 			"status":     task.Status,
 			"created_at": task.CreatedAt,
+		},
+	})
+}
+
+func writeAgentSaveIdempotencyResponse(c *gin.Context, task model.SummaryTask, mismatched, stale bool) {
+	if stale {
+		c.JSON(http.StatusConflict, apiResponse{
+			Code:    40009,
+			Message: "idempotency key is bound to a deleted summary",
+			Data: gin.H{
+				"task_id":         task.ID,
+				"task_no":         task.TaskNo,
+				"reason":          "deleted_summary",
+				"recovery_action": "start_new_summary",
+			},
+		})
+		return
+	}
+	if mismatched {
+		c.JSON(http.StatusConflict, apiResponse{
+			Code:    40009,
+			Message: "idempotency key already bound to a different agent save request; open the existing summary to edit it",
+			Data: gin.H{
+				"task_id":         task.ID,
+				"task_no":         task.TaskNo,
+				"reason":          "request_mismatch",
+				"recovery_action": "open_existing_summary",
+			},
+		})
+		return
+	}
+	log.Printf("[handler] CreateAgentSummary idempotency replay task_id=%d", task.ID)
+	c.JSON(http.StatusOK, apiResponse{
+		Code:    0,
+		Message: "ok",
+		Data: gin.H{
+			"task_id":    task.ID,
+			"task_no":    task.TaskNo,
+			"status":     task.Status,
+			"created_at": task.CreatedAt,
+			"replayed":   true,
 		},
 	})
 }

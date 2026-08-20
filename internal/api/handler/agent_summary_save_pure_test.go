@@ -40,9 +40,9 @@ func TestValidAgentSaveIdempotencyKey(t *testing.T) {
 	}
 }
 
-func TestCanonicalAgentSaveRequestHash_StableAcrossOrdering(t *testing.T) {
-	// Same semantic body, different source/reference ORDER — must hash the
-	// same (client retry with re-sorted maps must replay, not 409).
+func TestCanonicalAgentSaveRequestHash_StableAcrossSetLikeOrdering(t *testing.T) {
+	// Sources and participants are set-like, while referenced task order is
+	// preserved because the first task drives origin/citation inheritance.
 	origin := "chan-1"
 	a := canonicalAgentSaveRequestHash("u1", createAgentSummaryReq{
 		SessionID: "sess-abc", Title: "Weekly", OriginChannelID: &origin, OriginChannelType: 1,
@@ -56,10 +56,27 @@ func TestCanonicalAgentSaveRequestHash_StableAcrossOrdering(t *testing.T) {
 		AgentMessageID: 42, SnapshotVersion: 1,
 		Sources:           []sourceReq{{SourceType: 1, SourceID: "s2"}, {SourceType: 1, SourceID: "s1"}, {SourceType: 1, SourceID: "s1", SourceName: "ignored"}},
 		Participants:      []participantReq{{UserID: "u2", UserName: "U2"}, {UserID: "u3", UserName: "U3"}, {UserID: "u2", UserName: "ignored duplicate"}},
-		ReferencedTaskIDs: []int64{5, 3, 7, 3},
+		ReferencedTaskIDs: []int64{7, 3, 5, 3},
 	})
 	if a != b {
-		t.Fatalf("hash should be order+dedup invariant, got a=%s b=%s", a, b)
+		t.Fatalf("hash should normalize set-like fields and duplicate refs, got a=%s b=%s", a, b)
+	}
+}
+
+func TestCanonicalAgentSaveRequestHash_ReferencedTaskOrderMatters(t *testing.T) {
+	origin := "chan-1"
+	a := canonicalAgentSaveRequestHash("u1", createAgentSummaryReq{
+		SessionID: "sess-abc", OriginChannelID: &origin, OriginChannelType: 1,
+		AgentMessageID: 42, SnapshotVersion: 1,
+		ReferencedTaskIDs: []int64{7, 3},
+	})
+	b := canonicalAgentSaveRequestHash("u1", createAgentSummaryReq{
+		SessionID: "sess-abc", OriginChannelID: &origin, OriginChannelType: 1,
+		AgentMessageID: 42, SnapshotVersion: 1,
+		ReferencedTaskIDs: []int64{3, 7},
+	})
+	if a == b {
+		t.Fatal("reordering referenced tasks must change the hash because element 0 drives inheritance")
 	}
 }
 

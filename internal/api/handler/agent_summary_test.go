@@ -32,11 +32,13 @@ func setupAgentSummaryTestDB(t *testing.T) *gorm.DB {
 	// Auto-migrate all tables needed by CreateAgentSummary
 	if err := db.AutoMigrate(
 		&model.AgentMessage{},
+		&model.AgentMessageEvidence{},
 		&model.SummaryTask{},
 		&model.SummarySource{},
 		&model.SummaryParticipant{},
 		&model.SummaryResult{},
 		&model.PersonalResult{},
+		&model.SummaryAgentSaveIdempotency{},
 	); err != nil {
 		t.Fatalf("failed to migrate: %v", err)
 	}

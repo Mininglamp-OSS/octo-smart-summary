@@ -36,7 +36,6 @@ func TestValidatePersonalWorkflow_ActorRequired(t *testing.T) {
 func TestValidateScheduledWorkflow_ActorRequired(t *testing.T) {
 	err := ValidateScheduledWorkflow(
 		"", "daily",
-		model.SnapshotScope{},
 	)
 	if err == nil || err.Code != 40100 {
 		t.Fatalf("expected 40100 for empty actor on schedule, got %v", err)
@@ -245,7 +244,6 @@ func TestValidatePersonalWorkflow_NoTimeRangeSpanCapWhenAbsent(t *testing.T) {
 func TestValidateScheduledWorkflow_TitleCapEnforced(t *testing.T) {
 	err := ValidateScheduledWorkflow(
 		"u1", strings.Repeat("总", MaxSummaryTitleRunes+1),
-		model.SnapshotScope{},
 	)
 	if err == nil || err.Code != 40001 || err.Message != "title 不能超过 2300 字符" {
 		t.Fatalf("expected 40001 title over cap, got %v", err)
