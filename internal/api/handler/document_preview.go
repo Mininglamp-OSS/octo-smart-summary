@@ -238,7 +238,15 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 
 	// Emit an immediate start frame so proxies/clients see bytes before the first
 	// token: the fetch→first-token gap can otherwise exceed a proxy read timeout.
-	_ = writeSSE(w, "start", previewEvent{Type: "start"})
+	//
+	// This write's error is checked, unlike the later ones: it is the first byte sent,
+	// so a failure here means the socket is already gone and the completion below would
+	// be bought for a stream nobody can read. The later writes are best-effort because
+	// by then the cost has already been incurred.
+	if err := writeSSE(w, "start", previewEvent{Type: "start"}); err != nil {
+		log.Printf("[handler] preview start frame failed, skipping generation doc=%q user=%q space=%q: %v", ref.DocumentID, userID, spaceID, err)
+		return
+	}
 	w.Flush()
 
 	genCtx, genCancel := context.WithTimeout(c.Request.Context(), documentPreviewGenTimeout)

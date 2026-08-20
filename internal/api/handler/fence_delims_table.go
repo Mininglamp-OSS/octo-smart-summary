@@ -5,14 +5,18 @@ package handler
 
 // fenceDelimiterFolds maps angle-bracket and solidus homoglyphs onto their
 // ASCII structural equivalent, as strings.NewReplacer pairs.
-// Derived from Unicode properties; 27 entries.
+// Derived from Unicode properties; 31 entries.
 var fenceDelimiterFolds = []string{
+	"‹", "<", // U+2039 SINGLE LEFT-POINTING ANGLE QUOTATION MARK [name]
+	"›", ">", // U+203A SINGLE RIGHT-POINTING ANGLE QUOTATION MARK [name]
 	"⁄", "/", // U+2044 FRACTION SLASH [name]
 	"∕", "/", // U+2215 DIVISION SLASH [name]
 	"〈", "<", // U+2329 LEFT-POINTING ANGLE BRACKET [name]
 	"〉", ">", // U+232A RIGHT-POINTING ANGLE BRACKET [name]
 	"❬", "<", // U+276C MEDIUM LEFT-POINTING ANGLE BRACKET ORNAMENT [name]
 	"❭", ">", // U+276D MEDIUM RIGHT-POINTING ANGLE BRACKET ORNAMENT [name]
+	"❮", "<", // U+276E HEAVY LEFT-POINTING ANGLE QUOTATION MARK ORNAMENT [name]
+	"❯", ">", // U+276F HEAVY RIGHT-POINTING ANGLE QUOTATION MARK ORNAMENT [name]
 	"❰", "<", // U+2770 HEAVY LEFT-POINTING ANGLE BRACKET ORNAMENT [name]
 	"❱", ">", // U+2771 HEAVY RIGHT-POINTING ANGLE BRACKET ORNAMENT [name]
 	"⟨", "<", // U+27E8 MATHEMATICAL LEFT ANGLE BRACKET [name]

@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -667,6 +668,54 @@ func TestStreamDocumentPreview_ThrottlingPropagatesRetryAfter(t *testing.T) {
 			t.Errorf("Retry-After = %q, want it absent rather than invented", got)
 		}
 	})
+}
+
+// failingWriter is a gin ResponseWriter whose Write always fails, standing in for a
+// client that disconnected between the header flush and the first frame.
+type failingWriter struct {
+	gin.ResponseWriter
+	writes int
+}
+
+func (f *failingWriter) Write(b []byte) (int, error) {
+	f.writes++
+	return 0, errors.New("broken pipe")
+}
+
+func (f *failingWriter) WriteString(s string) (int, error) { return f.Write([]byte(s)) }
+
+func TestStreamDocumentPreview_StartFrameFailureSkipsGeneration(t *testing.T) {
+	// The start frame is the first byte on the wire. If it cannot be written, the
+	// socket is already gone and requesting a completion buys tokens for a stream
+	// nobody can read. The fake gateway records whether it was called, so "no
+	// completion was purchased" is observed rather than inferred.
+	var llmCalled bool
+	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		llmCalled = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer llm.Close()
+
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	fw := &failingWriter{ResponseWriter: c.Writer}
+	c.Writer = fw
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/summaries/document/preview",
+		strings.NewReader(`{"document_id":"d1","content":"真实正文"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("space_id", "sp")
+	c.Set("user_id", "u")
+
+	h := &AgentSummaryHandler{llmApiURL: llm.URL, llmModel: "m"}
+	h.StreamDocumentPreview(c)
+
+	if llmCalled {
+		t.Error("a completion was requested even though the start frame could not be written")
+	}
+	if fw.writes == 0 {
+		t.Error("the start frame was never attempted, so this test proves nothing")
+	}
 }
 
 func TestStreamDocumentPreview_HandlerMapsDocumentConditionTo40003(t *testing.T) {

@@ -53,22 +53,48 @@ import (
 // unicode.IsLetter/unicode.IsDigit pair.
 const fenceWordClass = `\p{L}\p{Nd}`
 
-// fenceIgnorableClass matches runes that occupy no visual width and can therefore
-// be inserted INSIDE a tag name to break the literal rune run that structural
-// matching depends on: format controls (Cf — zero-width space/joiner), non-spacing
-// marks (Mn — variation selectors U+FE00–FE0F and U+E0100+, the combining grapheme
-// joiner U+034F, combining accents), enclosing marks (Me), and the soft hyphen.
+// fenceIgnorableClass matches runes that can be inserted INSIDE a tag name to break
+// the literal rune run that structural matching depends on, without changing how a
+// model reads the token:
+//
+//   - zero-width runes — format controls (Cf), non-spacing marks (Mn: variation
+//     selectors U+FE00–FE0F and U+E0100+, the combining grapheme joiner U+034F,
+//     combining accents), enclosing marks (Me), and the soft hyphen;
+//   - SEPARATORS — whitespace (Z: space, U+3000 ideographic space, line/paragraph
+//     separators) and C0/C1 controls (Cc, which is what carries a bare `\n`).
+//
+// The separator half closes the round-11 finding: `</文 档数据>`, `</文\u3000档数据>`
+// and `</文\n档数据>` used to reach the model verbatim, and the last of those is
+// reachable without any effort at all, because chunks are joined with `\n` — an
+// attacker only has to split the tag across a chunk boundary. These tag names are
+// CJK, which has no word spacing, so a separator between two of their runes is not
+// a token boundary the way it would be in Latin prose: `</文 档数据>` reads as the
+// same closing fence. Matching MORE here is the safe direction; the cost is that a
+// body which spells the tag name out with separators between every rune (a table
+// row `| 文 | 档 | 数 | 据 |`) is neutralized when a `<` precedes it.
 //
 // This class is applied ONLY between the runes of a tag name, never globally.
 // A global \p{Mn} strip would corrupt legitimate decomposed text elsewhere in the
 // document (café, Việt) — the document body is content to be summarized, not
 // syntax, so it must survive byte-identical.
-const fenceIgnorableClass = `[\p{Cf}\p{Mn}\p{Me}\x{00AD}]*`
+//
+// Deliberate residual: \p{Mc} (spacing combining marks, e.g. U+0903) is NOT here.
+// Those marks render visibly, so `</文ः档数据>` is a visibly different tag name, the
+// same residual class as `<文档数据格式说明>`. Kept as a decision, not an oversight.
+const fenceIgnorableClass = `[\p{Cf}\p{Mn}\p{Me}\p{Z}\p{Cc}\x{00AD}]*`
 
 // fenceGlobalInvisiblePattern is the pre-pass strip. It stays limited to Cf and the
 // soft hyphen for the reason above: those have no legitimate rendering role in
 // prose, whereas Mn/Me do.
+//
+// U+200D ZERO WIDTH JOINER is carved out (see fenceGlobalInvisibleKeep): it is the
+// one Cf rune with a load-bearing rendering role — stripping it globally split
+// family emoji into their components and broke Devanagari conjuncts in the text
+// being summarized. Carving it out costs no containment, because the tag-name
+// ignorable class (which includes all of Cf) still neutralizes `</\u200d\u6587\u6863\u6570\u636e>`.
 var fenceGlobalInvisiblePattern = regexp.MustCompile(`[\p{Cf}\x{00AD}]`)
+
+const fenceGlobalInvisibleKeep = "\u200d"
 
 // fenceControlFolds collapse separators that would otherwise let a tag straddle a
 // line/record boundary invisibly.
@@ -116,13 +142,34 @@ func newFenceGuard(tagName string) *fenceGuard {
 	// as the allow-list `[\s\p{Zs}]*/*[\s\p{Zs}]*`. Fuzzing found the mirror bypass —
 	// `<"文档数据>`, `<.文档数据>`, `<!文档数据>`, `<:文档数据>` all shipped verbatim.
 	//
-	// The prefix is either empty or ends in a non-letter/digit. That is the same
-	// different-token rule the tail uses, applied to the other side: what decides
-	// whether the name is its own token is the rune ADJACENT to it, not whether some
-	// digit appears earlier. So `<0文档数据` stays prose (the name continues `0`),
-	// while `<0/文档数据>` is a tag (the name is a separate token after `/`).
+	// Round 11 shipped `(?:[^>]*[^\p{L}\p{Nd}>])?` and got the direction wrong in the
+	// other axis: `[^>]*` crosses arbitrary prose, newlines included, so a single `<`
+	// anywhere in a body swallowed everything up to the next mention of the tag name
+	// and replaced it with a 4–6 rune placeholder, with no truncation marker.
+	// `当 x < y 时，文档数据 会被丢弃。` lost its middle; a 41-section document lost 39
+	// sections; the same regression landed on the already-shipped <引用数据> path.
+	// Over-neutralizing is the safe direction for injection but NOT for a summarizer:
+	// it silently corrupts the very text the product exists to summarize.
+	//
+	// Two rules keep both failure modes closed at once:
+	//
+	//  1. The prefix carries no bare word run. It may cross a word run ONLY when that
+	//     run is terminated by a solidus, i.e. markup shape rather than prose
+	//     (`<0/文档数据>`, found by fuzzing in round 10). That is a rule, not a count,
+	//     so unlike round 6's `{0,64}` tail there is nothing for an attacker to pad past,
+	//     and unlike round 11's `[^>]*` it cannot walk into ordinary prose: `<` followed
+	//     by `y 时，` never reaches the tag name, because `y` is not closed by a `/`.
+	//  2. What the guard may therefore delete is bounded to the tag's OWN syntactic
+	//     prefix — delimiter noise plus solidus-terminated tokens directly in front of
+	//     the tag name, as in `<//文档数据>` or `<0/文档数据>`. It can no longer reach
+	//     the sentence, paragraph, or section around the tag, which is the property
+	//     round 11 lost. `TestFenceGuardDeletionIsBounded` pins it.
+	//
+	// Adjacency still decides token identity, which is what keeps prose intact:
+	// `<0文档数据` stays prose (`0` continues the name), while `<0/文档数据>` is a tag.
 	// Excluding `>` throughout stops a stray `<` reaching across an already-closed tag.
-	const fencePrefix = `(?:[^>]*[^` + fenceWordClass + `>])?`
+	const fenceDelimNoise = `[^` + fenceWordClass + `>]*`
+	const fencePrefix = `(?:` + fenceDelimNoise + `[` + fenceWordClass + `]+/)*` + fenceDelimNoise
 
 	return &fenceGuard{
 		tagName: tagName,
@@ -147,7 +194,12 @@ func newFenceGuard(tagName string) *fenceGuard {
 // out so neutralize and strip share exactly one normalization path.
 func (g *fenceGuard) normalize(s string) string {
 	s = fenceDelimiterReplacer.Replace(s)
-	return fenceGlobalInvisiblePattern.ReplaceAllString(s, "")
+	return fenceGlobalInvisiblePattern.ReplaceAllStringFunc(s, func(m string) string {
+		if m == fenceGlobalInvisibleKeep {
+			return m
+		}
+		return ""
+	})
 }
 
 // neutralize replaces forged fence tags with a NON-EMPTY placeholder.
@@ -162,20 +214,42 @@ func (g *fenceGuard) normalize(s string) string {
 // pass 2's shortest match `<tagName` is 1 rune longer and maps to tagName itself
 // with the boundary rune preserved. Ignorables and folded delimiters only ever make
 // a match longer while the replacement stays fixed.
+//
+// Both passes run to a FIXPOINT. Preserving the boundary rune is what keeps prose
+// intact, but the boundary rune can itself be a `<`, and then the replacement sits
+// next to it as a fresh tag: FuzzFenceGuard found `<文档数据<文档数据`, where one pass
+// leaves `文档数据<文档数据` — an intact tag, and a violation of idempotence too. Looping
+// is the structural answer rather than another pattern edit: it terminates because
+// every rewrite strictly shortens the text (the same invariant the prompt budget
+// already depends on), and it makes idempotence hold by construction instead of by
+// argument.
 func (g *fenceGuard) neutralize(s string) string {
-	s = g.normalize(s)
-	s = g.tagPattern.ReplaceAllString(s, g.placeholder)
-	// Head pass runs second, over whatever pass 1 declined, so ordinary well-formed
-	// tags still render as the nicer [tagName].
-	s = g.headPattern.ReplaceAllString(s, g.headPlaceholder+"${1}")
-	return strings.TrimSpace(s)
+	return strings.TrimSpace(g.rewriteToFixpoint(g.normalize(s), g.placeholder, g.headPlaceholder))
 }
 
 // strip removes fence tags OUTRIGHT. Used only to measure whether a document has
 // any real content left; it must not be used on model-bound text, where the
 // non-empty placeholder of neutralize is what preserves the injection's visibility.
 func (g *fenceGuard) strip(s string) string {
-	s = g.normalize(s)
-	s = g.tagPattern.ReplaceAllString(s, "")
-	return strings.TrimSpace(g.headPattern.ReplaceAllString(s, "${1}"))
+	return strings.TrimSpace(g.rewriteToFixpoint(g.normalize(s), "", ""))
+}
+
+func (g *fenceGuard) rewriteToFixpoint(s, tagReplacement, headReplacement string) string {
+	// Each iteration removes at least the leading `<` of some match, so the rune count
+	// bounds the iteration count; the cap is belt-and-braces against a future edit that
+	// breaks the shortening property, and is never reached today.
+	for i := 0; i <= len(s); i++ {
+		if !strings.ContainsRune(s, '<') {
+			return s
+		}
+		next := g.tagPattern.ReplaceAllString(s, tagReplacement)
+		// Head pass runs second, over whatever pass 1 declined, so ordinary well-formed
+		// tags still render as the nicer [tagName].
+		next = g.headPattern.ReplaceAllString(next, headReplacement+"${1}")
+		if next == s {
+			return s
+		}
+		s = next
+	}
+	return s
 }

@@ -25,6 +25,12 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
 		c.Header("Access-Control-Allow-Headers", "Content-Type,Authorization,Token,X-Space-Id,Accept,Accept-Language,Idempotency-Key")
+		// Without this, a cross-origin browser client can read only the CORS-safelisted
+		// response headers. Retry-After is what /summaries/document/preview returns
+		// alongside 429 to say HOW LONG to back off; unexposed, the front-end gets the
+		// status but not the advice, which is the difference between a contract and a
+		// suggestion.
+		c.Header("Access-Control-Expose-Headers", "Retry-After")
 		if c.Request.Method == http.MethodOptions {
 			c.AbortWithStatus(http.StatusNoContent)
 			return

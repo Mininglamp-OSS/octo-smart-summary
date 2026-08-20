@@ -199,6 +199,11 @@ func (c *httpDocumentSourceClient) FetchSummarySource(ctx context.Context, space
 // upstream header, so it is re-emitted only in the two forms RFC 9110 defines —
 // delta-seconds or an HTTP-date — and dropped otherwise. Nothing downstream has to
 // reason about header splitting or about a client parsing garbage.
+//
+// The ceiling applies to BOTH forms. Checking it only on delta-seconds would make
+// the cap a formatting detail: the same "come back in a century" instruction just
+// has to be written as a date to sail past it, and a past date is the mirror case
+// of the negative delta-seconds already rejected.
 func sanitizeRetryAfter(v string) string {
 	v = strings.TrimSpace(v)
 	if v == "" || len(v) > 64 {
@@ -211,6 +216,10 @@ func sanitizeRetryAfter(v string) string {
 		return strconv.Itoa(secs)
 	}
 	if t, err := http.ParseTime(v); err == nil {
+		delta := time.Until(t)
+		if delta < 0 || delta > maxRetryAfterSeconds*time.Second {
+			return ""
+		}
 		return t.UTC().Format(http.TimeFormat)
 	}
 	return ""

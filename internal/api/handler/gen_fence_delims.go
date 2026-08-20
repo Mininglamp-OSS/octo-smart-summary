@@ -16,6 +16,11 @@
 //	B. The Unicode NAME marks r as an angle-bracket or solidus homoglyph, with
 //	   composite/decorated forms excluded (they do not read as a bare delimiter),
 //	   and REVERSE SOLIDUS excluded (a distinct character, not a fence delimiter).
+//
+// "ANGLE QUOTATION MARK" counts as an angle bracket for rule B: U+2039/U+203A
+// (‹›) and U+276E/U+276F (❮❯) are named as quotation marks but render as bare
+// angle brackets, so a reader — and a model — sees `‹/文档数据›` as the fence.
+// DOUBLE ANGLE forms («») stay excluded: two chevrons do not read as one bracket.
 package main
 
 import (
@@ -65,7 +70,7 @@ func main() {
 			continue
 		}
 
-		isAngle := strings.Contains(name, "ANGLE BRACKET")
+		isAngle := strings.Contains(name, "ANGLE BRACKET") || strings.Contains(name, "ANGLE QUOTATION MARK")
 		isSolidus := strings.Contains(name, "SOLIDUS") || strings.Contains(name, "SLASH")
 		if !isAngle && !isSolidus {
 			continue
