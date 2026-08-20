@@ -54,6 +54,15 @@ type contextKeySessionID struct{}
 // ContextKeySessionID is exported for use by handler to inject session_id into context.
 var ContextKeySessionID = contextKeySessionID{}
 
+// ContextKeyRunID carries the SummaryRun id (SS-03) into tool handlers when
+// AGENT_SUMMARY_V2_MODE != off. Empty / absent when V2 is off or the request
+// has no run — tools then take the pre-SS-05 recompute path. Used by the
+// citation pass to freeze/read the run's manifest (SS-05 B1).
+type contextKeyRunID struct{}
+
+// ContextKeyRunID is exported for the handler to inject run_id into context.
+var ContextKeyRunID = contextKeyRunID{}
+
 // ContextKeyAllowedArchivedChannels carries the archived thread IDs explicitly
 // selected by the user for this request. Tool handlers still resolve channel
 // membership through GetUserChannels; this value only scopes which archived

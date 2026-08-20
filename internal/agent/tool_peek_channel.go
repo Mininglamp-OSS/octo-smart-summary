@@ -139,12 +139,27 @@ func PeekChannelTool() (Tool, Handler) {
 		}
 
 		const sampleSize = 5
-		var sampled []map[string]interface{}
-		limit := sampleSize
-		if len(messages) < limit {
-			limit = len(messages)
+		// 缺点八: peek used to always show the FIRST 5 messages, so a long channel's
+		// middle and tail were invisible and the Planner could misjudge relevance.
+		// Under v2, sample head/middle/tail so the sample spans the whole window.
+		// Flag-off keeps the exact legacy first-5 behavior (byte-identical result).
+		useHeadMiddleTail := SummaryV2Enabled()
+		var idxs []int
+		if useHeadMiddleTail {
+			idxs = sampleIndices(len(messages), sampleSize)
+		} else {
+			limit := sampleSize
+			if len(messages) < limit {
+				limit = len(messages)
+			}
+			idxs = make([]int, limit)
+			for i := range idxs {
+				idxs[i] = i
+			}
 		}
-		for i := 0; i < limit; i++ {
+
+		var sampled []map[string]interface{}
+		for _, i := range idxs {
 			msg := messages[i]
 			sampled = append(sampled, map[string]interface{}{
 				"sender_name": msg.SenderName,
@@ -158,7 +173,15 @@ func PeekChannelTool() (Tool, Handler) {
 			"sample_size":     len(sampled),
 			"messages":        sampled,
 			"messages_handle": handle,
-			"truncated":       len(messages) > sampleSize,
+		}
+		if useHeadMiddleTail {
+			result["sampling"] = "head_middle_tail"
+			// Unlike fetch_channel.truncated (per-channel cap hit), this means
+			// only that peek returned a sample rather than every message.
+			result["sample_truncated"] = len(messages) > sampleSize
+		} else {
+			// Flag-off keeps the exact legacy result key.
+			result["truncated"] = len(messages) > sampleSize
 		}
 		data, err := json.Marshal(result)
 		if err != nil {
@@ -168,4 +191,39 @@ func PeekChannelTool() (Tool, Handler) {
 	}
 
 	return schema, handler
+}
+
+// sampleIndices returns up to k distinct indices into a slice of length n,
+// evenly spaced and always including the first and last element, giving
+// head/middle/tail coverage instead of just the head. Returns every index when
+// n <= k, and nil for empty/degenerate input.
+func sampleIndices(n, k int) []int {
+	if n <= 0 || k <= 0 {
+		return nil
+	}
+	if n <= k {
+		idx := make([]int, n)
+		for i := range idx {
+			idx[i] = i
+		}
+		return idx
+	}
+	if k == 1 {
+		// One slot: take the head. Also guards the i*(n-1)/(k-1) division
+		// below against k-1 == 0 (unreachable today with const sampleSize=5,
+		// but the guard costs one line).
+		return []int{0}
+	}
+	idx := make([]int, 0, k)
+	seen := make(map[int]bool, k)
+	for i := 0; i < k; i++ {
+		// Even spacing across [0, n-1] inclusive: i=0 → 0 (head),
+		// i=k-1 → n-1 (tail), the rest spread through the middle.
+		p := i * (n - 1) / (k - 1)
+		if !seen[p] {
+			seen[p] = true
+			idx = append(idx, p)
+		}
+	}
+	return idx
 }

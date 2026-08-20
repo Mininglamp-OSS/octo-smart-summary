@@ -25,6 +25,7 @@
 ## 注意事项
 - 涉及相对时间时，先调用 `get_current_time`，再用 `extract_time_range` 解析精确时间。
 - 每次 `fetch_channel` 或 `peek_channel` 都会返回 `messages_handle`，后续操作需用此 handle 从缓存读取。
+- `peek_channel.sample_truncated=true` 只表示预览做了采样；`fetch_channel.truncated=true` / `has_more=true` 表示抓取命中条数上限、仍可能有更多消息。不要混淆这两类覆盖信号。
 - 不要重复抓取同一频道的消息；如需多次分析，复用已有的 `messages_handle`。
 - 用中文输出。不编造无法从聊天记录中确认的信息。
 - 结论先行、分层清晰、控制篇幅。

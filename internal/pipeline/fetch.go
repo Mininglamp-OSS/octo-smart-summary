@@ -436,13 +436,47 @@ func NarrowByTopic(ctx context.Context, topic string, candidates []ChannelInfo, 
 // selfUID is used to normalize DM channel IDs to the storage format.
 // maxPerChannel: <=0 means fetch up to maxSafetyLimit; >0 = fetch latest N.
 func FetchMessagesFromChannel(ctx context.Context, channelID string, channelType int, startTS, endTS int64, imDB *gorm.DB, tableCount int, selfUID string, maxPerChannel int) ([]Message, error) {
+	msgs, _, err := FetchMessagesFromChannelWithCoverage(ctx, channelID, channelType, startTS, endTS, imDB, tableCount, selfUID, maxPerChannel)
+	return msgs, err
+}
+
+// FetchCoverage describes how completely a single-channel fetch covered the
+// requested window (缺点八: fetch/peek 覆盖不透明). It lets a caller tell "this
+// channel had exactly N messages" apart from "we hit the cap and there may be
+// more", instead of guessing from a bare count.
+type FetchCoverage struct {
+	// RequestedMax is the effective per-channel cap actually applied (after the
+	// <=0 default and the safety-limit clamp).
+	RequestedMax int
+	// RowsScanned is how many rows the LIMIT query returned before text
+	// extraction (after the probe row, if any, is dropped).
+	RowsScanned int
+	// Returned is how many text messages were returned (RowsScanned minus rows
+	// that carried no extractable text).
+	Returned int
+	// Truncated reports the cap was hit, i.e. the probe found one more row
+	// beyond the cap — older messages in the window exist beyond what was
+	// returned. False when the window held exactly RequestedMax or fewer
+	// messages.
+	Truncated bool
+	// FirstTS / LastTS are the actual timestamps of the first/last returned
+	// message (ascending). Zero when nothing was returned.
+	FirstTS int64
+	LastTS  int64
+}
+
+// FetchMessagesFromChannelWithCoverage is FetchMessagesFromChannel plus an
+// honest coverage report. The message slice is byte-identical to the legacy
+// function (which now delegates here), so existing callers are unaffected; only
+// callers that want the coverage read the second return value.
+func FetchMessagesFromChannelWithCoverage(ctx context.Context, channelID string, channelType int, startTS, endTS int64, imDB *gorm.DB, tableCount int, selfUID string, maxPerChannel int) ([]Message, FetchCoverage, error) {
 	if imDB == nil {
-		return nil, fmt.Errorf("IM database not available")
+		return nil, FetchCoverage{}, fmt.Errorf("IM database not available")
 	}
 	channelID = NormalizeDMChannelID(channelID, selfUID, channelType)
 	table := MessageTable(channelID, tableCount)
 	if !isValidMessageTable(table, tableCount) {
-		return nil, fmt.Errorf("invalid table name: %s", table)
+		return nil, FetchCoverage{}, fmt.Errorf("invalid table name: %s", table)
 	}
 
 	// Use package-level configurable limit
@@ -467,12 +501,22 @@ func FetchMessagesFromChannel(ctx context.Context, channelID string, channelType
 
 	var allRows []msgRow
 
+	// Fetch effectiveMax+1 rows so Truncated can tell "exactly effectiveMax
+	// messages exist in the window" apart from "the cap cut the window off":
+	// with LIMIT effectiveMax alone both return effectiveMax rows and the cap
+	// hit was indistinguishable from a fully-covered window (false has_more).
+	// The probe row is dropped before building messages, so Returned is capped
+	// at effectiveMax exactly as before.
 	query := fmt.Sprintf(
 		"SELECT message_seq, from_uid, channel_id, `timestamp`, payload FROM `%s` WHERE channel_id = ? AND channel_type = ? AND `timestamp` BETWEEN ? AND ? AND is_deleted = 0 ORDER BY message_seq DESC LIMIT ?",
 		table,
 	)
-	if err := imDB.WithContext(ctx).Raw(query, channelID, channelType, startTS, endTS, effectiveMax).Scan(&allRows).Error; err != nil {
-		return nil, fmt.Errorf("fetch messages from %s: %w", table, err)
+	if err := imDB.WithContext(ctx).Raw(query, channelID, channelType, startTS, endTS, effectiveMax+1).Scan(&allRows).Error; err != nil {
+		return nil, FetchCoverage{}, fmt.Errorf("fetch messages from %s: %w", table, err)
+	}
+	truncated := len(allRows) > effectiveMax
+	if len(allRows) > effectiveMax {
+		allRows = allRows[:effectiveMax]
 	}
 	for i, j := 0, len(allRows)-1; i < j; i, j = i+1, j-1 {
 		allRows[i], allRows[j] = allRows[j], allRows[i]
@@ -494,9 +538,20 @@ func FetchMessagesFromChannel(ctx context.Context, channelID string, channelType
 		})
 	}
 
-	log.Printf("[pipeline-personal] FetchMessagesFromChannel %s: %d rows fetched (maxPerChannel=%d)",
-		channelID, len(messages), maxPerChannel)
-	return messages, nil
+	cov := FetchCoverage{
+		RequestedMax: effectiveMax,
+		RowsScanned:  len(allRows),
+		Returned:     len(messages),
+		Truncated:    truncated,
+	}
+	if len(messages) > 0 {
+		cov.FirstTS = messages[0].Timestamp
+		cov.LastTS = messages[len(messages)-1].Timestamp
+	}
+
+	log.Printf("[pipeline-personal] FetchMessagesFromChannel %s: %d rows fetched (maxPerChannel=%d, truncated=%t)",
+		channelID, len(messages), maxPerChannel, cov.Truncated)
+	return messages, cov, nil
 }
 
 func fetchMessagesByBackend(ctx context.Context, backend string, octoClient octoSearchClient, candidates []ChannelInfo, creatorUID string, startTS, endTS int64, imDB *gorm.DB, tableCount int, maxPerChannel int, fetchConcurrency int, octoSearchPollSec int) ([]Message, error) {

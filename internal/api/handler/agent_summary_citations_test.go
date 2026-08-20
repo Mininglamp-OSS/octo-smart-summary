@@ -77,9 +77,9 @@ func TestBuildCitationsForSession_WithMarkersAndMessages(t *testing.T) {
 	content, _ := json.Marshal(toolReturn)
 	msg := model.AgentMessage{
 		UserID: "test-user", SessionID: "session-1",
-		Role:      "tool",
-		Content:   string(content),
-		Name:      "fetch_channel",
+		Role:    "tool",
+		Content: string(content),
+		Name:    "fetch_channel",
 	}
 	db.Create(&msg)
 	// #161 P1-A (yujiawei): buildCitationsForSession now discovers handles
@@ -89,8 +89,8 @@ func TestBuildCitationsForSession_WithMarkersAndMessages(t *testing.T) {
 	h := &AgentSummaryHandler{db: db}
 
 	// Test: content with [1][2] markers should produce 2 citations
-	contentWithMarker := "Alice said hello [1] and Bob replied [2]."
-	cits, err := h.buildCitationsForSession(context.Background(), "session-1", contentWithMarker, "test-user")
+	contentWithMarkers := "Alice said hello [1] and Bob replied [2]."
+	cits, err := h.buildCitationsForSession(context.Background(), "session-1", contentWithMarkers, "test-user", "")
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
 	}
@@ -145,9 +145,9 @@ func TestBuildCitationsForSession_NoMarkers(t *testing.T) {
 	content, _ := json.Marshal(toolReturn)
 	msg := model.AgentMessage{
 		UserID: "test-user", SessionID: "session-1",
-		Role:      "tool",
-		Content:   string(content),
-		Name:      "fetch_channel",
+		Role:    "tool",
+		Content: string(content),
+		Name:    "fetch_channel",
 	}
 	db.Create(&msg)
 	// #161 P1-A: seed evidence for the new discovery source.
@@ -157,7 +157,7 @@ func TestBuildCitationsForSession_NoMarkers(t *testing.T) {
 
 	// Test: content without [n] markers should return empty array
 	contentNoMarkers := "This is a summary without any citation markers."
-	cits, err := h.buildCitationsForSession(context.Background(), "session-1", contentNoMarkers, "test-user")
+	cits, err := h.buildCitationsForSession(context.Background(), "session-1", contentNoMarkers, "test-user", "")
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
 	}
@@ -184,13 +184,13 @@ func TestBuildCitationsForSession_EmptyToolTrace(t *testing.T) {
 	content, _ := json.Marshal(toolReturn)
 	msg := model.AgentMessage{
 		UserID: "test-user", SessionID: "session-1",
-		Role:      "tool",
-		Content:   string(content),
-		Name:      "fetch_channel",
+		Role:    "tool",
+		Content: string(content),
+		Name:    "fetch_channel",
 	}
 	db.Create(&msg)
 
-	cits, err := h.buildCitationsForSession(context.Background(), "session-1", "Some content [1]", "test-user")
+	cits, err := h.buildCitationsForSession(context.Background(), "session-1", "Some content [1]", "test-user", "")
 	if err != nil {
 		t.Errorf("expected no error on cache miss, got %v", err)
 	}
@@ -199,7 +199,7 @@ func TestBuildCitationsForSession_EmptyToolTrace(t *testing.T) {
 	}
 
 	// Scenario 2: session 下没有任何 tool message
-	cits2, err2 := h.buildCitationsForSession(context.Background(), "no-such-session", "Content [1]", "test-user")
+	cits2, err2 := h.buildCitationsForSession(context.Background(), "no-such-session", "Content [1]", "test-user", "")
 	if err2 != nil {
 		t.Errorf("expected no error when no tool messages, got %v", err2)
 	}
@@ -227,7 +227,7 @@ func TestBuildCitationsForSession_DBQueryError(t *testing.T) {
 	h := &AgentSummaryHandler{db: db}
 
 	// Test: DB query error should return err != nil
-	cits, err := h.buildCitationsForSession(context.Background(), "session-1", "Some content [1]", "test-user")
+	cits, err := h.buildCitationsForSession(context.Background(), "session-1", "Some content [1]", "test-user", "")
 
 	// buildCitationsForSession DOES return error when DB query fails
 	// (agent_summary_citations.go:41-44)
@@ -298,9 +298,9 @@ func TestBuildCitationsForSession_PeekChannelMultipleMessages(t *testing.T) {
 	content, _ := json.Marshal(toolReturn)
 	msg := model.AgentMessage{
 		UserID: "test-user", SessionID: "session-1",
-		Role:      "tool",
-		Content:   string(content),
-		Name:      "peek_channel",
+		Role:    "tool",
+		Content: string(content),
+		Name:    "peek_channel",
 	}
 	db.Create(&msg)
 	// #161 P1-A: seed evidence for the new discovery source.
@@ -310,7 +310,7 @@ func TestBuildCitationsForSession_PeekChannelMultipleMessages(t *testing.T) {
 
 	// Test: all 3 messages should be recovered from cache via handle
 	contentWithMarkers := "Alice [1], Bob [2], and Charlie [3] all spoke."
-	cits, err := h.buildCitationsForSession(context.Background(), "session-1", contentWithMarkers, "test-user")
+	cits, err := h.buildCitationsForSession(context.Background(), "session-1", contentWithMarkers, "test-user", "")
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
 	}

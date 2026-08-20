@@ -14,7 +14,10 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryspec"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -22,12 +25,68 @@ import (
 // agentChatProfile 是未显式指定 profile 时的默认场景（提示词 + 工具名单在 internal/agent/profile.go 配）。
 const agentChatProfile = "chat"
 
+// resolveChatProfile picks the effective profile for a chat request and reports
+// whether the request is self-contradictory (缺点十三: Profile 静默降级).
+//
+// The `chat` profile carries only time tools — it cannot read chat messages. A
+// request that ships selected_channels or referenced_task_ids but omits (or
+// under-specifies) a profile would therefore run under `chat` and return a
+// confident summary backed by ZERO chat evidence, with nothing signalling the
+// downgrade to the caller.
+//
+// Under AGENT_SUMMARY_V2_MODE != off this:
+//   - auto-upgrades an empty profile to match the payload — a request that
+//     references a prior task (and selects no channels) becomes `summary_refine`,
+//     any request carrying channels becomes `summary`;
+//   - rejects an EXPLICIT `chat` that contradicts a data-bearing payload, so a
+//     mis-wired caller gets a 400 instead of a data-less answer.
+//
+// Flag off → byte-identical legacy behavior: an empty profile becomes `chat`
+// and no request is ever rejected on this basis. `conflict` is always false.
+func resolveChatProfile(reqProfile string, hasChannels, hasReferences bool) (profile string, conflict bool) {
+	if !agent.SummaryV2Enabled() {
+		if reqProfile == "" {
+			return agentChatProfile, false
+		}
+		return reqProfile, false
+	}
+
+	// v2: match the profile to the payload rather than silently defaulting.
+	if reqProfile == "" {
+		switch {
+		case hasReferences && !hasChannels:
+			// Pure refine signal: a referenced task with no fresh channel scope.
+			return "summary_refine", false
+		case hasChannels:
+			// Any channel scope (with or without a reference) is a fresh summary;
+			// referenced context is injected into the prompt regardless of profile.
+			return "summary", false
+		default:
+			return agentChatProfile, false
+		}
+	}
+
+	// Explicit profile: reject a data-less `chat` that contradicts a payload which
+	// clearly wants chat data. Non-chat profiles already carry the data tools, so
+	// they are left untouched.
+	if reqProfile == agentChatProfile && (hasChannels || hasReferences) {
+		return reqProfile, true
+	}
+	return reqProfile, false
+}
+
 // maxMessageLen 是单条用户 message 的最大字符数（rune），超长直接 400，避免超长入参打爆上游。
 const maxMessageLen = 8192
 
 // sessionIDPattern 约束前端生成的 session_id：仅字母数字下划线连字符、1..128 长。
 // 既防注入/异常键，也与 DB varchar(128) 对齐。
 var sessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
+// requestIDPattern 约束客户端生成的 request_id（V2 幂等键，可选）。与
+// session_id 同字符集、同 1..128 长——它流入 uk_run_request 的 VARCHAR(128)
+// 唯一键；严格模式 MySQL 会拒绝超长值。仅 V2 开启时校验，flag-off
+// 接受并忽略该新字段，以保持旧请求路径兼容。
+var requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 // AgentChatHandler 提供非流式一问一答对话入口，复用 internal/agent 底座。
 //
@@ -50,6 +109,11 @@ type AgentChatHandler struct {
 	db     *gorm.DB          // 用于 fetch 引用总结的产物 + 快照(见 CHAT-REFERENCE-BASED-DESIGN-v1)
 	store  agentHistoryStore // 多轮记忆读写（生产为 gorm 实现，测试可注入 mock）
 	window int               // 滑窗保留的最近轮数
+
+	// runStore persists SummaryRun/SummarySpec (SS-03). Only used when
+	// AGENT_SUMMARY_V2_MODE != off; nil in the test constructor. When nil or the
+	// flag is off, the chat path is byte-identical to pre-SS-03 behavior.
+	runStore *summaryrun.Store
 
 	// test-only fields: when set, bypass dynamic runner construction
 	testRunner *agent.Runner
@@ -82,6 +146,7 @@ func NewAgentChatHandler(db *gorm.DB, llmApiURL, llmApiKey, llmModel string, llm
 		db:                db,
 		store:             newAgentMessageRepo(db),
 		window:            agent.HistoryWindow(),
+		runStore:          summaryrun.NewStore(db),
 	}
 }
 
@@ -164,6 +229,13 @@ type agentChatRequest struct {
 	Profile           string            `json:"profile,omitempty"`
 	ReferencedTaskIDs []int64           `json:"referenced_task_ids,omitempty"`
 	SelectedChannels  []selectedChannel `json:"selected_channels,omitempty"`
+
+	// SS-03 (accepted always, acted on only when AGENT_SUMMARY_V2_MODE != off).
+	// RequestID is the client-generated per-submit idempotency key. Optional —
+	// a legacy request without it is handled exactly as before (never a 400).
+	// Run-continuation via an explicit run_id is deferred to SS-05b; no such
+	// field is accepted until it is actually wired.
+	RequestID string `json:"request_id,omitempty"`
 }
 
 type selectedChannel struct {
@@ -179,13 +251,31 @@ const maxSelectedChannels = 50
 // behavior and archived-thread discovery. The context value is not an authz
 // bypass: every channel tool still resolves membership through GetUserChannels.
 func applySelectedChannelContext(ctx context.Context, system string, selected []selectedChannel) (context.Context, string) {
-	if len(selected) == 0 {
+	normalized := normalizeSelectedChannels(selected)
+	if len(normalized) == 0 {
 		return ctx, system
 	}
 
+	allowedArchived := make(map[string]bool)
+	for _, ch := range normalized {
+		// Do not trust the client-provided is_archived bit for access decisions.
+		// Scope every selected thread ID through WithSelectedThreads; the DB
+		// query itself decides whether it is archived and whether uid is a member.
+		if ch.ChannelType == "thread" {
+			allowedArchived[ch.ChannelID] = true
+		}
+	}
+	if len(allowedArchived) > 0 {
+		ctx = context.WithValue(ctx, agent.ContextKeyAllowedArchivedChannels, allowedArchived)
+	}
+	return ctx, system + buildSelectedChannelsPrompt(normalized)
+}
+
+// normalizeSelectedChannels is the single normalization contract shared by
+// runtime prompt injection and persisted SummarySpec construction.
+func normalizeSelectedChannels(selected []selectedChannel) []selectedChannel {
 	normalized := make([]selectedChannel, 0, min(len(selected), maxSelectedChannels))
 	seen := make(map[string]bool, len(selected))
-	allowedArchived := make(map[string]bool)
 	for _, ch := range selected {
 		ch.ChannelID = truncateRunes(strings.TrimSpace(ch.ChannelID), 512)
 		if ch.ChannelID == "" || seen[ch.ChannelID] || len(normalized) >= maxSelectedChannels {
@@ -202,20 +292,8 @@ func applySelectedChannelContext(ctx context.Context, system string, selected []
 			continue
 		}
 		normalized = append(normalized, ch)
-		// Do not trust the client-provided is_archived bit for access decisions.
-		// Scope every selected thread ID through WithSelectedThreads; the DB
-		// query itself decides whether it is archived and whether uid is a member.
-		if ch.ChannelType == "thread" {
-			allowedArchived[ch.ChannelID] = true
-		}
 	}
-	if len(normalized) == 0 {
-		return ctx, system
-	}
-	if len(allowedArchived) > 0 {
-		ctx = context.WithValue(ctx, agent.ContextKeyAllowedArchivedChannels, allowedArchived)
-	}
-	return ctx, system + buildSelectedChannelsPrompt(normalized)
+	return normalized
 }
 
 func buildSelectedChannelsPrompt(selected []selectedChannel) string {
@@ -262,6 +340,64 @@ func truncateRunes(s string, max int) string {
 	return string(runes[:max])
 }
 
+// maybePersistSummaryRun records the SummaryRun / SummarySpec for this request
+// when AGENT_SUMMARY_V2_MODE != off (SS-03) and returns the resolved run_id (""
+// when there is no run to act on). The run_id is injected into the tool context
+// by the caller so the citation pass can freeze/read this run's manifest (SS-05).
+// It is best-effort and MUST NOT change the reply: for SS-03/05 the summarization
+// still runs through the existing path, so a persistence failure only loses
+// observability / citation-stability, never the answer. The caller invokes this
+// only when SummaryV2Enabled(); off never reaches here.
+//
+// A request without request_id (legacy client) or without a runStore (test
+// constructor) is a no-op returning "" — we never 400 on the missing field.
+func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid string, req agentChatRequest) string {
+	if h.runStore == nil || req.RequestID == "" {
+		return ""
+	}
+
+	normalizedChannels := normalizeSelectedChannels(req.SelectedChannels)
+	// Valid UI-selected channels ⇒ closed scope; otherwise open (checklist A2 / §4.1).
+	scopePolicy := model.ScopePolicyOpen
+	if len(normalizedChannels) > 0 {
+		scopePolicy = model.ScopePolicyClosed
+	}
+
+	run, created, err := h.runStore.CreateOrGetRun(ctx, uid, req.SessionID, req.RequestID, scopePolicy)
+	if err != nil {
+		log.Printf("[agent] v2 create/get run failed (session=%s): %v", req.SessionID, err)
+		return ""
+	}
+	if !created {
+		// Idempotent replay: the run already exists (e.g. SSE downgrade reusing
+		// the same request_id). Reuse its run_id; do not re-persist the spec.
+		return run.RunID
+	}
+
+	// Minimal spec draft from the chat request. Full Planner-submitted specs
+	// arrive with the high-level tools (SS-05b); here we capture the objective +
+	// any UI-selected channels so the contract is populated end to end.
+	objective := truncateRunes(req.Message, 1000)
+	draft := summaryspec.Draft{Objective: &objective}
+	for _, ch := range normalizedChannels {
+		draft.Channels = append(draft.Channels, summaryspec.Channel{
+			ChannelID: ch.ChannelID, Name: ch.Name, Type: ch.ChannelType,
+		})
+	}
+	spec, sources, err := summaryspec.Validate(draft, summaryspec.Options{
+		ProvidedSource: summaryspec.SourceInferred,
+		ChannelSource:  summaryspec.SourceUI,
+	})
+	if err != nil {
+		log.Printf("[agent] v2 spec invalid (session=%s): %v", req.SessionID, err)
+		return run.RunID
+	}
+	if _, err := h.runStore.SaveSpec(ctx, run, run.Version, spec, sources, req.Message); err != nil {
+		log.Printf("[agent] v2 save spec failed (session=%s): %v", req.SessionID, err)
+	}
+	return run.RunID
+}
+
 // Chat 处理 POST /api/v1/agent/chat：非流式一问一答，携带多轮历史。
 //
 // 流程：校验 → 取鉴权 uid → 按 profile 动态建 runner（summary 注入 uid 工具）
@@ -294,10 +430,17 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "session_id 非法"})
 		return
 	}
+	// V2 开启时 request_id 非空必须匹配持久化列约束；flag-off 接受并
+	// 忽略这一新字段，保持 merge-base 的请求行为。
+	if agent.SummaryV2Enabled() && req.RequestID != "" && !requestIDPattern.MatchString(req.RequestID) {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "request_id 非法"})
+		return
+	}
 
-	profileName := req.Profile
-	if profileName == "" {
-		profileName = agentChatProfile // default profile
+	profileName, profileConflict := resolveChatProfile(req.Profile, len(req.SelectedChannels) > 0, len(req.ReferencedTaskIDs) > 0)
+	if profileConflict {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "profile 'chat' 与 selected_channels/referenced_task_ids 冲突：chat 场景无法读取聊天消息，请改用 summary 或省略 profile"})
+		return
 	}
 
 	// Inject session_id into context for tool handlers (evidence persistence, Stage 3 Blocker C).
@@ -310,6 +453,16 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 	if uid == "" {
 		c.JSON(http.StatusUnauthorized, apiResponse{Code: 40100, Message: "missing auth context"})
 		return
+	}
+
+	// SS-03: persist the run/spec when V2 mode is enabled. Off → skipped entirely
+	// (byte-identical to pre-SS-03). Best-effort; never blocks the reply. The
+	// returned run_id is injected into the tool context so the citation pass can
+	// freeze/read this run's manifest (SS-05).
+	if agent.SummaryV2Enabled() {
+		if runID := h.maybePersistSummaryRun(ctx, uid, req); runID != "" {
+			ctx = context.WithValue(ctx, agent.ContextKeyRunID, runID)
+		}
 	}
 
 	// 按 profile 组装 runner（summary 场景注入 uid 工具）；测试可注入现成 runner。
@@ -502,22 +655,22 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "session_id 非法"})
 		return
 	}
+	// V2 开启时 request_id 非空必须匹配持久化列约束；flag-off 接受并
+	// 忽略这一新字段，保持 merge-base 的请求行为。
+	if agent.SummaryV2Enabled() && req.RequestID != "" && !requestIDPattern.MatchString(req.RequestID) {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "request_id 非法"})
+		return
+	}
 
-	// R5 yj P1-2 / R5 ms P2-4 / R5 jx non-blocking #1:
-	// dedup-then-check at the binding layer, BEFORE the SSE header flush
-	// at :510. The earlier revision placed this check ~80 lines below the
-	// flush and returned a JSON body — but by that point response headers
-	// are already committed (Content-Type: text/event-stream + status 200),
-	// as the file's own comment at :524-526 notes, so the client parser
-	// receives an unframed JSON blob in the middle of the event stream.
-	// Every other error path in ChatStream after the flush already honours
-	// this invariant via writeSSEErrorViaSink{,WithDetail} (:527, :543,
-	// :570, :597). Moving the size check UP satisfies the invariant and
-	// also skips the wasted runner build / history load when the request
-	// is invalid.
-	//
-	// R5 yj P2-6: use apiResponse envelope (Code/Message) like the four
-	// preceding pre-flush errors in this handler, not gin.H{"error":...}.
+	// The referenced_task_ids size check must sit BEFORE the SSE header flush
+	// below: once the headers are committed (Content-Type: text/event-stream +
+	// status 200), a JSON error body would arrive at the client parser as an
+	// unframed blob in the middle of the event stream. Every post-flush error
+	// path in ChatStream honours the SSE invariant via
+	// writeSSEErrorViaSink{,WithDetail}; pre-flush validation errors use plain
+	// c.JSON with the apiResponse envelope (Code/Message), like the checks
+	// above. Keeping the check here also skips the wasted runner build /
+	// history load when the request is invalid.
 	dedupedReferencedIDs := dedupReferencedTaskIDs(req.ReferencedTaskIDs)
 	if len(dedupedReferencedIDs) > maxReferencedTaskIDs {
 		c.JSON(http.StatusBadRequest, apiResponse{
@@ -527,9 +680,12 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		return
 	}
 
-	profileName := req.Profile
-	if profileName == "" {
-		profileName = agentChatProfile
+	profileName, profileConflict := resolveChatProfile(req.Profile, len(req.SelectedChannels) > 0, len(req.ReferencedTaskIDs) > 0)
+	if profileConflict {
+		// SSE headers are not sent yet at this point, so a plain 400 is safe and
+		// consistent with the validation errors above.
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "profile 'chat' 与 selected_channels/referenced_task_ids 冲突：chat 场景无法读取聊天消息，请改用 summary 或省略 profile"})
+		return
 	}
 
 	// Set SSE headers
@@ -558,6 +714,14 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		sink := &sseSink{w: c.Writer}
 		h.writeSSEErrorViaSink(sink, 40100, "missing auth context")
 		return
+	}
+
+	// SS-03: persist run/spec when V2 mode is enabled (see Chat). Off → skipped.
+	// The returned run_id is injected into the tool context for the citation pass.
+	if agent.SummaryV2Enabled() {
+		if runID := h.maybePersistSummaryRun(ctx, uid, req); runID != "" {
+			ctx = context.WithValue(ctx, agent.ContextKeyRunID, runID)
+		}
 	}
 
 	// Build runner with OnEvent callback for SSE progress
