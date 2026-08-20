@@ -1,0 +1,17 @@
+{
+  "name": "project_risk_week",
+  "messages": [
+    {"channel_id": "ch_dev", "message_seq": 1, "sender_name": "alice", "content": "支付网关联调发现超时，风险较高，需要本周内定位"},
+    {"channel_id": "ch_dev", "message_seq": 2, "sender_name": "bob", "content": "我先排查网关连接池配置"},
+    {"channel_id": "ch_dev", "message_seq": 3, "sender_name": "alice", "content": "另外回归用例还差登录模块没补齐"},
+    {"channel_id": "ch_pm", "message_seq": 1, "sender_name": "carol", "content": "上线时间维持在周五，风险项需要每日同步"},
+    {"channel_id": "ch_pm", "message_seq": 2, "sender_name": "dave", "content": "文档评审还没排期"},
+    {"channel_id": "ch_pm", "message_seq": 3, "sender_name": "carol", "content": "闲聊：午饭吃什么"}
+  ],
+  "expected": {
+    "message_count": 6,
+    "required_sections": ["风险", "待办"],
+    "language": "zh"
+  },
+  "sample_summary": "## 风险\n- 支付网关联调超时，需本周内定位 [1]\n- 上线维持周五，风险项需每日同步 [4]\n\n## 待办\n- [ ] 排查网关连接池配置（bob）[2]\n- [ ] 补齐登录模块回归用例（alice）[3]\n- [ ] 安排文档评审排期（dave）[5]"
+}

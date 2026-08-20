@@ -7,10 +7,105 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 )
+
+// SS-01 止血常量。
+//
+// 历史 bug：chunk_size 默认 500，但 formatChunkForLLM 每片只格式化前 200 条，
+// 满片时静默丢弃 300/500（60%）。SS-01 先把默认值与硬上限收敛到 200 止血；
+// SS-06b 随后引入 token-aware 分片并删除了 200 格式化上限，分片改由 token 预算
+// （按渲染行计费）+ hardMessageBackstop 双重约束，覆盖恒为 100%。
+const (
+	// defaultChunkSize 是 chunk_size 缺省（<=0）时使用的每片消息数基准，
+	// 与 SS-01 止血值一致。
+	defaultChunkSize = 200
+	// oversizedMessageRunes 是单条消息被标记为“超长”的字符阈值。超长消息只
+	// 计数上报（oversized_message_count），不做静默截断——“永不丢消息、永不
+	// 切断单条消息”是 SS-06b 的刻意取舍（PR #196 review P2-3）：超过整片预算
+	// 的消息单独成片。阈值只服务于可观测性上报，与分片预算
+	// （ResolveMapMaxTokens 量级）无关。
+	oversizedMessageRunes = 4000
+)
+
+// chunkCoverage 汇总 summarize_chunk 实际喂给模型的消息覆盖情况，随工具结果
+// 返回，让 Runner/Planner 能判断是否发生丢弃或截断，而不是只看到 chunk_count。
+type chunkCoverage struct {
+	InputCount            int  `json:"input_count"`
+	ProcessedCount        int  `json:"processed_count"`
+	DroppedCount          int  `json:"dropped_count"`
+	OversizedMessageCount int  `json:"oversized_message_count"`
+	Truncated             bool `json:"truncated"`
+	ChunkSize             int  `json:"chunk_size"`
+}
+
+// clampChunkSize 把请求的 chunk_size 收敛到 [1, hardMessageBackstop]；<=0 取
+// defaultChunkSize，超过上限截到 hardMessageBackstop。chunk_size 是模型给的
+// 工具参数，未经验证的值不得原样影响出站请求规模（PR #196 review P1-1）；
+// 返回值即 splitMsgMapsByTokenBudget 的 maxMsgs，保证每片消息数有硬上限。
+func clampChunkSize(requested int) int {
+	if requested <= 0 {
+		return defaultChunkSize
+	}
+	if requested > hardMessageBackstop {
+		return hardMessageBackstop
+	}
+	return requested
+}
+
+// ProbeChunkCoverage drives the PRODUCTION chunking path — clampChunkSize ->
+// splitMsgMapsByTokenBudget -> formatChunkForLLM — over msgMaps without any
+// LLM call, and reports the coverage funnel the model would actually receive:
+// processed = lines the formatter really emitted, dropped = input − processed,
+// chunks = number of chunks the splitter produced for the given budget and
+// ratios. The eval gate (SS-02) calls this, so a silent-drop cap reintroduced
+// ANYWHERE in the chain makes dropped go non-zero and fails the gate.
+//
+// Replaces the arithmetic-only ComputeCoverage, which returned a hardcoded
+// dropped=0 and never touched the splitter or formatter — a guard that
+// cannot fail is worse than no guard (PR #196 review P1-2).
+func ProbeChunkCoverage(msgMaps []map[string]interface{}, requestedChunkSize, budget, cjkRatio, asciiRatio int) (processed, dropped, chunks int) {
+	if len(msgMaps) == 0 {
+		return 0, 0, 0
+	}
+	size := clampChunkSize(requestedChunkSize)
+	chunked := splitMsgMapsByTokenBudget(msgMaps, budget, size, cjkRatio, asciiRatio)
+	for _, c := range chunked {
+		_, p, _ := formatChunkForLLM(c)
+		processed += p
+	}
+	return processed, len(msgMaps) - processed, len(chunked)
+}
+
+// ProbeChunkCoverageDefault runs ProbeChunkCoverage across BOTH ratio sets the
+// deployment can resolve — cjk=1 (generic models) and cjk=2 (the ratio
+// ResolveCharsPerTokenCJK picks for qwen/deepseek/kimi when the env var is
+// unset) — and reports the worst case. Round-3 review (yujiawei, review
+// 4960791240): the gate previously pinned CharsPerTokenCJK: 1 only, so it
+// never exercised the production ratio; "a gate that probed the production
+// ratio ... would have caught it." The no-drop assertion is ratio-independent,
+// so processed/dropped agree across ratios; chunks reports the maximum (the
+// worst fan-out). Gates that must not depend on injected deps — the eval
+// harness, CI — probe through this.
+func ProbeChunkCoverageDefault(msgMaps []map[string]interface{}, requestedChunkSize int) (processed, dropped, chunks int) {
+	for _, cjk := range []int{1, 2} {
+		cfg := config.Config{CharsPerTokenCJK: cjk, CharsPerTokenASCII: 4}
+		p, d, c := ProbeChunkCoverage(msgMaps, requestedChunkSize, chunkTokenBudget(cfg), cfg.ResolveCharsPerTokenCJK(), cfg.CharsPerTokenASCII)
+		if p < processed || processed == 0 {
+			processed = p
+		}
+		if d > dropped {
+			dropped = d
+		}
+		if c > chunks {
+			chunks = c
+		}
+	}
+	return processed, dropped, chunks
+}
 
 // getSessionMessagePool retrieves all messages from all tool calls in the session,
 // sorts them globally by timestamp, and assigns CitationIndex.
@@ -139,7 +234,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 					},
 					"chunk_size": map[string]interface{}{
 						"type":        "integer",
-						"description": "每个 chunk 的消息数，<=0 使用默认 500",
+						"description": fmt.Sprintf("可选：每片最大消息数（叠加在 token 预算之上，取值收敛到 [1, %d]，<=0 按 %d）；分片同时受 token 预算与消息数双重约束。返回值含 input_count/processed_count/dropped_count/oversized_message_count/truncated/chunk_size。", hardMessageBackstop, defaultChunkSize),
 					},
 				},
 				"required": []string{"messages_handle"},
@@ -176,7 +271,10 @@ func SummarizeChunkTool() (Tool, Handler) {
 		}
 
 		if len(messages) == 0 {
-			return "{\"summary\":\"无可总结内容\",\"chunk_count\":0}", nil
+			// Same result shape as the normal path (PR #196 review P2-5,
+			// closed in round-3): the planner must see one stable contract on
+			// both branches, so the empty branch carries chunk_size too.
+			return `{"summary":"无可总结内容","chunk_count":0,"input_count":0,"processed_count":0,"dropped_count":0,"oversized_message_count":0,"truncated":false,"chunk_size":0}`, nil
 		}
 
 		// Get the global message pool for the session and pre-assign CitationIndex.
@@ -201,7 +299,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 			}
 		}
 
-		// Convert to map format for SplitIntoChunks
+		// Convert to map format for the token-budget splitter.
 		msgMaps := make([]map[string]interface{}, len(messages))
 		for i, msg := range messages {
 			msgMaps[i] = map[string]interface{}{
@@ -213,28 +311,47 @@ func SummarizeChunkTool() (Tool, Handler) {
 			}
 		}
 
-		chunkSize := req.ChunkSize
-		if chunkSize <= 0 {
-			chunkSize = 500
-		}
+		// SS-06b: token-aware chunking. Each chunk is bounded by a token budget
+		// that bills the RENDERED prompt lines (balanced by content — defect
+		// #9's uneven-length problem) instead of a fixed message count, and the
+		// per-chunk format cap is gone, so no message is ever dropped.
+		// chunk_size is clamped to [1, hardMessageBackstop] before use
+		// (PR #196 review P1-1): it is a model-supplied argument, and the
+		// schema documents a bound the handler must actually enforce.
+		_, _, _, cfg := GetSummaryDeps()
+		budget := chunkTokenBudget(cfg)
+		msgsPerChunk := clampChunkSize(req.ChunkSize)
+		chunks := splitMsgMapsByTokenBudget(msgMaps, budget, msgsPerChunk, cfg.ResolveCharsPerTokenCJK(), cfg.CharsPerTokenASCII)
 
-		chunks := service.SplitIntoChunks(msgMaps, chunkSize)
-
-		// For simplicity, generate a unified summary for all chunks
-		// In production, each chunk would be summarized separately and merged
+		// Summarize each chunk and aggregate honest coverage counts. Token
+		// chunking + no format cap means processed == input, so dropped_count is
+		// 0; the counters stay truthful if a future change reintroduces a cap.
+		cov := chunkCoverage{InputCount: len(messages), ChunkSize: msgsPerChunk}
 		var summaries []string
 		for _, chunk := range chunks {
-			summary, err := summarizeMessagesChunk(ctx, chunk)
+			summary, processed, oversized, err := summarizeMessagesChunk(ctx, chunk)
 			if err != nil {
 				return "", fmt.Errorf("summarize chunk: %w", err)
 			}
 			summaries = append(summaries, summary)
+			cov.ProcessedCount += processed
+			cov.OversizedMessageCount += oversized
 		}
+		cov.DroppedCount = cov.InputCount - cov.ProcessedCount
+		cov.Truncated = cov.DroppedCount > 0
 
 		combinedSummary := strings.Join(summaries, "\n\n---\n\n")
 		result := map[string]interface{}{
-			"summary":     combinedSummary,
-			"chunk_count": len(chunks),
+			"summary":                 combinedSummary,
+			"chunk_count":             len(chunks),
+			"input_count":             cov.InputCount,
+			"processed_count":         cov.ProcessedCount,
+			"dropped_count":           cov.DroppedCount,
+			"oversized_message_count": cov.OversizedMessageCount,
+			"truncated":               cov.Truncated,
+			// chunk_size is now emitted (PR #196 review P2-5): it is the
+			// clamped value actually applied, not the raw model request.
+			"chunk_size": cov.ChunkSize,
 		}
 
 		// Marshal result
@@ -248,22 +365,39 @@ func SummarizeChunkTool() (Tool, Handler) {
 	return schema, handler
 }
 
+// formatChunkForLLM renders a chunk into the "[n] sender: content" lines fed to
+// the LLM. It is a pure function (no LLM, no I/O) so coverage can be asserted
+// deterministically in tests / the eval harness without a live model.
+//
+// It returns how many messages it formatted (processed) and how many exceeded
+// oversizedMessageRunes (oversized). Oversized messages are counted but NOT
+// truncated. SS-06b removed the per-chunk message cap: chunks are bounded by a
+// token budget upstream (splitMsgMapsByTokenBudget), which bills these exact
+// rendered lines via renderMessageLine (PR #196 review P0-1) — so formatting
+// every message in the chunk cannot overflow the budget, and processed always
+// == len(chunk), i.e. no silent drop.
+func formatChunkForLLM(chunk []map[string]interface{}) (formatted string, processed, oversized int) {
+	var b strings.Builder
+	for _, msg := range chunk {
+		content, _ := msg["content"].(string)
+		if len([]rune(content)) > oversizedMessageRunes {
+			oversized++
+		}
+		b.WriteString(renderMessageLine(msg))
+		processed++
+	}
+	return b.String(), processed, oversized
+}
+
 // summarizeMessagesChunk builds a structured prompt from msgMap chunk and calls LLM.
-func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{}) (string, error) {
+// Returns the summary plus how many messages were processed / were oversized, so
+// the caller can aggregate honest coverage across chunks.
+func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{}) (summary string, processed, oversized int, err error) {
 	_, _, _, cfg := GetSummaryDeps()
 	client := service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, 30)
 
-	// Format messages for LLM with global citation_index
-	var formatted strings.Builder
-	for i, msg := range chunk {
-		if i >= 200 { // safety limit per chunk
-			break
-		}
-		sender, _ := msg["sender_name"].(string)
-		content, _ := msg["content"].(string)
-		citationIndex, _ := msg["citation_index"].(int)
-		formatted.WriteString(fmt.Sprintf("[%d] %s: %s\n", citationIndex, sender, content))
-	}
+	// Format messages for LLM with global citation_index (pure, testable).
+	formatted, processed, oversized := formatChunkForLLM(chunk)
 
 	systemPrompt := `你是专业的工作内容整理助手。请从聊天记录中提炼关键信息：
 
@@ -281,13 +415,13 @@ func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{})
 
 	msgs := []service.ChatMessage{
 		{Role: "system", Content: systemPrompt},
-		{Role: "user", Content: formatted.String()},
+		{Role: "user", Content: formatted},
 	}
 
 	content, _, err := client.Call(ctx, msgs, 0.3)
 	if err != nil {
-		return "", fmt.Errorf("call LLM: %w", err)
+		return "", processed, oversized, fmt.Errorf("call LLM: %w", err)
 	}
 
-	return strings.TrimSpace(content), nil
+	return strings.TrimSpace(content), processed, oversized, nil
 }

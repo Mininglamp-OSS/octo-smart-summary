@@ -194,8 +194,6 @@ func GetNextVersion(db *gorm.DB, taskID int64) (int, error) {
 	return *maxVer + 1, nil
 }
 
-// SplitIntoChunks splits messages into chunks of roughly chunkSize.
-
 const SummaryResultVersionKeepLimit = 5
 const PersonalResultVersionKeepLimit = 5
 
@@ -232,24 +230,6 @@ func PruneSummaryResultVersions(db *gorm.DB, taskID int64, keep int) error {
 		deleteQuery = deleteQuery.Where("id <> ?", *current.CurrentResultID)
 	}
 	return deleteQuery.Delete(&model.SummaryResult{}).Error
-}
-
-func SplitIntoChunks(messages []map[string]interface{}, chunkSize int) [][]map[string]interface{} {
-	if chunkSize <= 0 {
-		chunkSize = 500
-	}
-	if len(messages) <= chunkSize {
-		return [][]map[string]interface{}{messages}
-	}
-	var chunks [][]map[string]interface{}
-	for i := 0; i < len(messages); i += chunkSize {
-		end := i + chunkSize
-		if end > len(messages) {
-			end = len(messages)
-		}
-		chunks = append(chunks, messages[i:end])
-	}
-	return chunks
 }
 
 // InferScope infers sources and summary_mode from a topic (keyword heuristic fallback).
