@@ -194,6 +194,12 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 				// 50202, so an infra failure is not misattributed to the document itself.
 				switch {
 				case srcErr.status == http.StatusTooManyRequests:
+					// Retry-After is echoed only when the upstream supplied a valid one
+					// (see sanitizeRetryAfter); without it the 429 tells the client to back
+					// off without saying for how long, which is advice rather than contract.
+					if srcErr.retryAfter != "" {
+						c.Header("Retry-After", srcErr.retryAfter)
+					}
 					c.JSON(srcErr.status, apiResponse{Code: 42901, Message: "文档服务繁忙，请稍后重试"})
 				case srcErr.status >= http.StatusInternalServerError:
 					c.JSON(srcErr.status, apiResponse{Code: 50202, Message: "文档服务暂不可用"})

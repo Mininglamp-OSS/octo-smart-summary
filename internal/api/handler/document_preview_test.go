@@ -631,9 +631,37 @@ func TestStreamDocumentPreview_UpstreamThrottlingIsNotAnOutage(t *testing.T) {
 	}
 }
 
-func TestStreamDocumentPreview_UpstreamUnauthorizedIsADocumentCondition(t *testing.T) {
-	// A rejected Token is actionable by the user (re-auth); reporting it as a service
-	// outage told them to wait for something that will never resolve itself.
+func TestStreamDocumentPreview_ThrottlingPropagatesRetryAfter(t *testing.T) {
+	// "Back off" without "for how long" is advice, not a contract. When the upstream
+	// supplies a usable Retry-After it must reach the client; when it does not, we
+	// must not invent one.
+	t.Run("echoed when upstream supplies one", func(t *testing.T) {
+		dc := fakeDocClient{err: &documentSourceError{
+			status:     http.StatusTooManyRequests,
+			message:    "rate limited",
+			retryAfter: "30",
+		}}
+		h := &AgentSummaryHandler{llmApiURL: "http://llm.local", llmModel: "m", documentClient: dc}
+		w := runPreviewRecorder(t, h, `{"document_id":"d1"}`)
+		if got := w.Header().Get("Retry-After"); got != "30" {
+			t.Errorf("Retry-After = %q, want %q", got, "30")
+		}
+	})
+	t.Run("absent when upstream supplies none", func(t *testing.T) {
+		dc := fakeDocClient{err: &documentSourceError{status: http.StatusTooManyRequests, message: "rate limited"}}
+		h := &AgentSummaryHandler{llmApiURL: "http://llm.local", llmModel: "m", documentClient: dc}
+		w := runPreviewRecorder(t, h, `{"document_id":"d1"}`)
+		if got := w.Header().Get("Retry-After"); got != "" {
+			t.Errorf("Retry-After = %q, want it absent rather than invented", got)
+		}
+	})
+}
+
+func TestStreamDocumentPreview_HandlerMapsDocumentConditionTo40003(t *testing.T) {
+	// Named for what it exercises: the HANDLER's 4xx->40003 branch. The client-side
+	// 401/403/404 -> 400 mapping that feeds it is covered separately by
+	// TestFetchSummarySource_UpstreamStatusClasses; the previous name claimed this
+	// test covered that layer, which it never did.
 	dc := fakeDocClient{err: &documentSourceError{status: http.StatusBadRequest, message: "unauthorized"}}
 	h := &AgentSummaryHandler{llmApiURL: "http://llm.local", llmModel: "m", documentClient: dc}
 	if _, code := runPreview(t, h, `{"document_id":"d1"}`); code != 40003 {
