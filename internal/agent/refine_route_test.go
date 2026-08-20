@@ -143,6 +143,49 @@ func TestRefineAddVerbsRequireADestination(t *testing.T) {
 	}
 }
 
+// TestRefineImplicitDestinationAddIsAugment pins the round-4 P1-2 (yujiawei):
+// seven of nine "把 X 写进来/放进去/加上/带上/附上" phrasings routed to a
+// hardNoFetch rewrite because the positional rule required an explicit
+// destination noun AFTER the verb, but these express the destination implicitly
+// with a directional complement while marking the object with 把. The classifier
+// must route them so the fetch tools are NOT stripped (Fetch=true for augment, or
+// a fetching extend when a time word is present), because each explicitly asks to
+// pull in content not in the current summary.
+func TestRefineImplicitDestinationAddIsAugment(t *testing.T) {
+	augment := []string{
+		"精简一下，把客户反馈原文也写进来",
+		"总结精简些，把测试群的结论放进去",
+		"压缩一下，把销售群的数据写进去",
+		"格式改一下，把运维群的结论添上",
+		"润色一下，把架构群的决议也加上",
+		"去掉废话，把客户群的反馈加进来",
+		"改成中文，把销售群的数据带上",
+	}
+	for _, ins := range augment {
+		got := ClassifyRefine(ins)
+		if got.Intent != RefineAugment {
+			t.Errorf("ClassifyRefine(%q) intent=%s, want augment", ins, got.Intent)
+		}
+		if !got.Fetch || got.HardNoFetch {
+			t.Errorf("ClassifyRefine(%q) fetch=%t hardNoFetch=%t, want a fetching route with tools available",
+				ins, got.Fetch, got.HardNoFetch)
+		}
+	}
+
+	// "重新排版，把昨天的会议纪要附上" carries a time word (昨天): it needs yesterday's
+	// data, so a FETCHING extend is correct — the point is only that it must not be
+	// a zero-fetch rewrite.
+	if got := ClassifyRefine("重新排版，把昨天的会议纪要附上"); !got.Fetch || got.HardNoFetch {
+		t.Errorf("time-worded add = %+v, want a fetching route (not a stripped rewrite)", got)
+	}
+
+	// The construction that the positional rule was written to protect must NOT
+	// regress: no 把, no destination noun after 带上 ⇒ still a confident rewrite.
+	if got := ClassifyRefine("翻译成英文，带上下文"); got.Intent != RefineRewrite || !got.HardNoFetch {
+		t.Errorf("ClassifyRefine(翻译成英文，带上下文) = %+v, want a hardNoFetch rewrite", got)
+	}
+}
+
 // TestRefineTimeWordDoesNotForceAFetch pins the priority carve-out. extend
 // outranking rewrite meant any rewrite mentioning time was told to fetch new
 // messages for a request needing zero new data.

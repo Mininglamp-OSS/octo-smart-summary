@@ -49,7 +49,12 @@ func ListChannelsTool() (Tool, Handler) {
 			return "", fmt.Errorf("missing user identity in context")
 		}
 
-		summaryDB, imDB, _, _ := GetSummaryDeps()
+		// list_channels does NOT record discovered channels: it returns the user's
+		// ENTIRE visible surface, which is not the run's scope — recording it made
+		// the finish gate report every unfetched visible channel as an in-scope gap
+		// on nearly every run. Scope is recorded by the narrowing tools
+		// (narrow_channels_by_topic / find_shared_channels) instead.
+		_, imDB, _, _ := GetSummaryDeps()
 
 		options := []pipeline.ChannelQueryOption{pipeline.WithIncludeArchived(req.IncludeArchived)}
 		if !req.IncludeArchived {
@@ -59,8 +64,6 @@ func ListChannelsTool() (Tool, Handler) {
 		if err != nil {
 			return "", fmt.Errorf("get user channels: %w", err)
 		}
-
-		recordDiscoveredChannels(ctx, summaryDB, uid, channelIDsOf(channels))
 
 		result := map[string]interface{}{
 			"total":    len(channels),

@@ -72,14 +72,22 @@ var (
 	// had removed — 带上 ⊂ 带上下文, so "翻译成英文，带上下文" (a pure typography
 	// request) routed to augment and was told to re-fetch and re-run Map/Reduce.
 	//
-	// The distinguishing shape is a DESTINATION: an add verb only means "augment"
-	// when something is being added TO something. 带上下文 has no destination;
-	// 加进总结里 / 写进摘要 / 加到开头 do. This also covers the verbs the review
-	// listed as an uncovered tail (写进/放进/附上) without another round of guessing,
-	// because the rule is the construction, not the verb.
+	// The distinguishing shape is an ADD CONSTRUCTION, matched per clause (see
+	// containsAddition): an add verb means "augment" only when, within its own
+	// clause, it either (a) names a destination noun AFTER it (加进总结里 / 写进摘要
+	// / 加到开头), or (b) is preceded by a 把/将 object marker (把客户反馈写进来 /
+	// 把数据带上) — the "把 X <verb>" frame whose destination (the summary) is
+	// implicit in the directional complement. 带上下文 carries neither, so it stays
+	// a rewrite; 加入成员说了什么 has no 把 and no destination noun after 加入, so it
+	// stays a rewrite too.
 	refineAddVerbs = []string{"加上", "加进", "加入", "加到", "添加", "带上", "写进", "写入", "放进", "放入", "附上", "添上", "包含进", "纳入"}
 	// refineAddTargets are the things an add verb can name as its destination.
 	refineAddTargets = []string{"总结", "摘要", "报告", "纪要", "段落", "开头", "结尾", "末尾", "正文", "内容", "里面", "里头", "文中", "小标题", "标题", "列表", "章节"}
+	// refineAddObjectMarkers introduce the object of a "把 X <add-verb>" frame. A
+	// marker only counts when it sits before the add verb IN THE SAME CLAUSE, so a
+	// 把 from an unrelated earlier clause ("把这份总结精简一下，只保留最近的结论") does
+	// not manufacture an addition.
+	refineAddObjectMarkers = []string{"把", "将", "连"}
 	// refineRewriteKeywords mark a CONFIDENT pure-text request (translate,
 	// condense, polish, re-layout, or Q&A over the old summary). Matching one of
 	// these — as opposed to falling through to the default — is what lets SS-08b
@@ -136,26 +144,51 @@ func ClassifyRefine(instruction string) RefineRoute {
 }
 
 // containsAddition reports whether s asks for content to be added INTO the
-// summary, i.e. an add verb that names a destination.
+// summary. It matches the add CONSTRUCTION clause by clause, so an add verb in
+// one clause is judged against only its own clause's object marker / destination.
 //
-// Requiring the destination is what separates "把客户反馈写进总结" (augment: new
-// content must be gathered) from "翻译成英文，带上下文" (a rewrite whose 带上 is
-// just the head of 带上下文). A bare verb list cannot make that distinction, which
-// is why adding one reintroduced the collision class it was meant to close.
+// Two shapes count as an addition:
+//   - an add verb followed, in the same clause, by a destination noun
+//     ("把客户反馈写进总结" / "加进总结里" / "加到开头"); and
+//   - an add verb preceded, in the same clause, by a 把/将 object marker
+//     ("把客户反馈原文也写进来" / "把销售群的数据带上") — the destination is
+//     implicit in the directional complement (进来/进去/上).
+//
+// Clause scoping is what separates "把这份总结精简一下，只保留最近的结论" (the 把 and
+// the only add-verb-free clauses never meet) and "翻译成英文，带上下文" (带上 ⊂
+// 带上下文, no 把, no destination) from a real addition. A bare verb list cannot
+// make that distinction, which is why adding one reintroduced the collision class
+// it was meant to close.
 func containsAddition(s string) bool {
-	for _, verb := range refineAddVerbs {
-		idx := strings.Index(s, verb)
-		if idx < 0 {
-			continue
-		}
-		rest := s[idx+len(verb):]
-		for _, target := range refineAddTargets {
-			if strings.Contains(rest, target) {
+	for _, clause := range splitRefineClauses(s) {
+		for _, verb := range refineAddVerbs {
+			idx := strings.Index(clause, verb)
+			if idx < 0 {
+				continue
+			}
+			// (a) explicit destination noun after the verb.
+			if containsAny(clause[idx+len(verb):], refineAddTargets) {
+				return true
+			}
+			// (b) 把/将 object marker before the verb, same clause.
+			if containsAny(clause[:idx], refineAddObjectMarkers) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// splitRefineClauses splits an instruction on sentence/clause punctuation so the
+// add-construction match stays local to one clause.
+func splitRefineClauses(s string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool {
+		switch r {
+		case '，', ',', '。', '.', '；', ';', '、', '！', '!', '？', '?', '\n', '\r', '\t', ' ', '：', ':':
+			return true
+		}
+		return false
+	})
 }
 
 // containsAny reports whether s contains any of the substrings.

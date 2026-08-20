@@ -43,7 +43,7 @@ func NarrowChannelsByTopicTool() (Tool, Handler) {
 			return "", fmt.Errorf("parse args: %w", err)
 		}
 
-		_, _, _, cfg := GetSummaryDeps()
+		summaryDB, _, _, cfg := GetSummaryDeps()
 
 		var candidates []pipeline.ChannelInfo
 		for _, id := range req.ChannelIDs {
@@ -58,6 +58,14 @@ func NarrowChannelsByTopicTool() (Tool, Handler) {
 		}
 
 		narrowed := pipeline.NarrowByTopic(ctx, req.Topic, candidates, llmFn)
+
+		// Record the narrowed set as the run's discovered scope (open-scope only):
+		// this is a deliberate topic-relevant subset the run chose to focus on, so
+		// it is a sound baseline for the finish gate's under-fetch check — unlike
+		// list_channels' raw visible surface, which is not scope.
+		if uid, ok := ctx.Value(ContextKeyUID).(string); ok {
+			recordDiscoveredChannels(ctx, summaryDB, uid, channelIDsOf(narrowed))
+		}
 
 		result := map[string]interface{}{
 			"original_count": len(candidates),

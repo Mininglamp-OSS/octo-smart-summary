@@ -37,6 +37,7 @@ var criticalTools = map[string]bool{
 //   - handler panic                          → fatal internal error
 //   - context deadline / canceled            → retryable, not fatal
 //   - 429 / 5xx / network / DB connection    → retryable, not fatal
+//   - stale/expired messages_handle           → retryable, not fatal (cache miss)
 //   - permission / access / identity / auth  → fatal (cannot be retried into success)
 //   - explicit invalid args / parse           → retryable, not fatal
 //   - anything else on a critical tool        → fatal (data completeness at risk)
@@ -86,13 +87,31 @@ func classifyToolError(toolName string, err error) ToolErrorEnvelope {
 		strings.Contains(low, "connection is already closed") ||
 		strings.Contains(low, "broken pipe") || strings.Contains(low, "unexpected eof") ||
 		strings.Contains(low, "eof") && strings.Contains(low, "post ") ||
-		strings.Contains(low, "deadlock found") || strings.Contains(low, "lock wait timeout") ||
-		strings.Contains(low, "service unavailable") || strings.Contains(low, "try again"):
+		strings.Contains(low, "deadlock found") || strings.Contains(low, "lock wait timeout"):
+		// Strong, unambiguous transient shapes only. The weaker "service
+		// unavailable" / "try again" terms moved BELOW the permission branch:
+		// `permission denied; please try again later` carries both, and a stale
+		// permission is fatal — retrying "try again" text can never clear it.
 		env.ErrorCode, env.Retryable, env.Fatal = "TRANSIENT_TOOL_ERROR", true, false
+	case strings.Contains(low, "messages_handle"):
+		// A dropped/expired message-cache handle (`invalid or expired
+		// messages_handle: h-123`, emitted on a plain cache miss by
+		// tool_search_messages / tool_filter_relevant / tool_summarize_chunk).
+		// It is NOT a permission failure — the handle simply aged out of the
+		// cache — so it must be caught before the permission branch below.
+		// Retryable + non-fatal: re-minting the handle (list/fetch again) and
+		// re-calling succeeds, and one stale handle must not mark the whole run
+		// FAILED and suppress the retry whose success would clear it.
+		env.ErrorCode, env.Retryable, env.Fatal = "INVALID_ARGUMENT", true, false
 	case strings.Contains(low, "not accessible") || strings.Contains(low, "permission") ||
 		strings.Contains(low, "access denied") || strings.Contains(low, "identity") ||
 		strings.Contains(low, "unauthor") || strings.Contains(low, "forbidden"):
 		env.ErrorCode, env.Retryable, env.Fatal = "PERMISSION_DENIED", false, true
+	case strings.Contains(low, "service unavailable") || strings.Contains(low, "try again"):
+		// Weak transient terms, checked only after permission: a genuine
+		// "service temporarily unavailable, try again" with no permission wording
+		// is a retryable blip.
+		env.ErrorCode, env.Retryable, env.Fatal = "TRANSIENT_TOOL_ERROR", true, false
 	case strings.Contains(low, "parse args") || strings.Contains(low, "cannot parse") ||
 		strings.Contains(low, "parsing time") || strings.Contains(low, "channel_type is required"):
 		// A bad tool argument (e.g. the model sent an empty time_start, so
@@ -156,4 +175,34 @@ func (e ToolErrorEnvelope) JSON() string {
 		return `{"ok":false,"error_code":"TOOL_ERROR","retryable":true,"fatal":false,"message":"marshal error"}`
 	}
 	return string(b)
+}
+
+// toolCallTarget extracts the per-call target that the fatal-marker set is keyed
+// on (SS-07b), so a success on one channel/chunk does not clear a fatal marker
+// left by a different channel/chunk running in parallel through the worker pool.
+//
+// It reads the arguments generically: channel_id identifies a fetch_channel call,
+// messages_handle identifies a summarize_chunk / search_messages / filter_relevant
+// call (each fan-out unit gets a distinct handle). Single-target tools carry
+// neither and return "" — they key on the tool name alone, unchanged. A retry of
+// the same target is a new tool_call with the SAME channel_id / handle, so the
+// legitimate recover-on-success path still matches.
+func toolCallTarget(arguments string) string {
+	if arguments == "" {
+		return ""
+	}
+	var a struct {
+		ChannelID      string `json:"channel_id"`
+		MessagesHandle string `json:"messages_handle"`
+	}
+	if err := json.Unmarshal([]byte(arguments), &a); err != nil {
+		return ""
+	}
+	if a.ChannelID != "" {
+		return "channel_id=" + a.ChannelID
+	}
+	if a.MessagesHandle != "" {
+		return "messages_handle=" + a.MessagesHandle
+	}
+	return ""
 }

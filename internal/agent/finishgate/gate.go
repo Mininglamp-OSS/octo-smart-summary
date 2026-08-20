@@ -77,10 +77,14 @@ type RunState struct {
 	DroppedMessages   int
 	FailedChannels    []string
 
-	// DiscoveredChannels are the channels the run learned were in scope but that
-	// no spec pinned — the open-scope case, where ExpectedChannels is empty
-	// because nothing was selected in the UI. Without it an open-scope run that
-	// fetched 2 of 12 available channels reported COMPLETE with no gaps, which is
+	// DiscoveredChannels are the channels the run deliberately NARROWED to when no
+	// spec pinned a scope — the open-scope case, where ExpectedChannels is empty
+	// because nothing was selected in the UI. It is fed by the narrowing tools
+	// (narrow_channels_by_topic / find_shared_channels), NOT by list_channels: the
+	// raw visible surface is not the run's scope, and recording it made a perfect
+	// single-channel summary report every other visible channel as unfetched.
+	// Only consulted for open scope (see Evaluate); without it an open-scope run
+	// that narrowed to 12 channels and fetched 2 reported COMPLETE with no gaps —
 	// the exact under-fetch the gate exists to catch.
 	DiscoveredChannels []string
 
@@ -148,16 +152,22 @@ func Evaluate(s RunState) (Verdict, []Gap) {
 				gaps = append(gaps, Gap{Kind: GapChannel, Detail: "expected channel was not fetched", ChannelID: ch})
 			}
 		}
-		// Open scope: nothing was pinned by a spec, so the only way to notice an
-		// under-fetch is to compare what the run DISCOVERED against what it
-		// attempted. "总结我这周所有群的进展" that lists 12 channels and fetches 2
+		// Open scope ONLY. When a spec pinned channels, ExpectedChannels above is
+		// authoritative and the discovered union must not manufacture gaps for
+		// channels the run deliberately left out of a closed scope — a user who
+		// pins one channel and gets a perfect single-channel summary was being told
+		// every other discovered channel "was never fetched". For an open scope
+		// (nothing pinned) the discovered-vs-attempted delta is the only under-fetch
+		// signal: "总结我这周所有群的进展" that narrowed to 12 channels and fetched 2
 		// previously reported COMPLETE with no gaps.
-		for _, ch := range s.DiscoveredChannels {
-			if reported[ch] || attempted[ch] {
-				continue
+		if len(s.ExpectedChannels) == 0 {
+			for _, ch := range s.DiscoveredChannels {
+				if reported[ch] || attempted[ch] {
+					continue
+				}
+				reported[ch] = true
+				gaps = append(gaps, Gap{Kind: GapChannel, Detail: "in-scope channel was never fetched", ChannelID: ch})
 			}
-			reported[ch] = true
-			gaps = append(gaps, Gap{Kind: GapChannel, Detail: "in-scope channel was never fetched", ChannelID: ch})
 		}
 		for _, ch := range s.FailedChannels {
 			if !reported[ch] {

@@ -354,14 +354,15 @@ func truncateRunes(s string, max int) string {
 // failures against the run, so the finish gate returns FAILED at save time
 // (defect #5). No-op when there is no run or no store.
 //
-// The marker is RECOVERABLE, per tool. A fatal error records the tool name; a
-// later success by that same tool removes it, and the run returns to whatever
-// status it had. This is deliberately not "one more transient string in the
-// classifier": the classifier has been wrong in both directions on the same
-// error (mysql's "invalid connection" was first swallowed as a bad argument,
-// then promoted to fatal), and no list of substrings distinguishes "this failure
-// ended the run" from "this failure was retried away". A subsequent success is
-// that distinction, observed rather than predicted.
+// The marker is RECOVERABLE, per (tool, target). A fatal error records the tool
+// name and its target (channel/chunk); a later success by that same tool+target
+// removes it, and the run returns to whatever status it had. This is deliberately
+// not "one more transient string in the classifier": the classifier has been
+// wrong in both directions on the same error (mysql's "invalid connection" was
+// first swallowed as a bad argument, then promoted to fatal), and no list of
+// substrings distinguishes "this failure ended the run" from "this failure was
+// retried away". A subsequent success is that distinction, observed rather than
+// predicted.
 //
 // Concretely, the case this closes: a stale pooled connection kills a redundant
 // second fetch_channel, the model re-calls it and it works, the summary is
@@ -376,7 +377,13 @@ func (h *AgentChatHandler) attachToolErrorHook(runner *agent.Runner, userID, run
 	}
 	store := h.runStore
 	var mu sync.Mutex
-	fatalTools := map[string]bool{}
+	// Keyed on (tool, target): fetch_channel / summarize_chunk run once per
+	// channel / chunk through the worker pool, so a fatal marker keyed on the tool
+	// NAME alone let chunk B's success clear chunk A's fatal marker in the same
+	// step — verdict-by-scheduling. The target (channel_id / messages_handle) is
+	// supplied by the runner from the call arguments; single-target tools use "".
+	type fatalKey struct{ tool, target string }
+	fatalTools := map[fatalKey]bool{}
 
 	// syncStatus writes the status implied by the current fatal set. Called with mu
 	// held so concurrent tool completions cannot interleave into the wrong order.
@@ -386,35 +393,49 @@ func (h *AgentChatHandler) attachToolErrorHook(runner *agent.Runner, userID, run
 		}
 	}
 
-	runner.OnToolError = func(toolName string, env agent.ToolErrorEnvelope) {
+	runner.OnToolError = func(toolName, target string, env agent.ToolErrorEnvelope) {
 		if !env.Fatal {
 			return
 		}
+		key := fatalKey{toolName, target}
 		mu.Lock()
 		defer mu.Unlock()
-		if fatalTools[toolName] {
+		if fatalTools[key] {
 			return
 		}
-		fatalTools[toolName] = true
+		fatalTools[key] = true
 		syncStatus(model.RunStatusFailed)
 	}
 
-	runner.OnToolSuccess = func(toolName string) {
+	runner.OnToolSuccess = func(toolName, target string) {
+		key := fatalKey{toolName, target}
 		mu.Lock()
 		defer mu.Unlock()
-		if !fatalTools[toolName] {
+		if !fatalTools[key] {
 			return
 		}
-		delete(fatalTools, toolName)
+		delete(fatalTools, key)
 		if len(fatalTools) > 0 {
-			// Another tool is still in a fatal state; the run stays failed.
+			// Another tool/target is still in a fatal state; the run stays failed.
 			return
 		}
-		// Every tool that failed fatally has since succeeded. Back to running — the
-		// terminal verdict is the finish gate's call at save time, not this hook's.
+		// Every tool+target that failed fatally has since succeeded. Back to running
+		// — the terminal verdict is the finish gate's call at save time, not this
+		// hook's.
 		syncStatus(model.RunStatusRunning)
-		log.Printf("[agent] v2 run recovered after fatal tool error (run=%s tool=%s)", runID, toolName)
+		log.Printf("[agent] v2 run recovered after fatal tool error (run=%s tool=%s target=%s)", runID, toolName, target)
 	}
+}
+
+// refineFetchExpected reports whether the turn will actually gather data, which
+// is what the finish gate's FetchExpected must reflect. It is route.Fetch for a
+// refine turn and always true for a normal summary run. Keying this on
+// route.HardNoFetch instead (the previous behaviour) persisted fetch_expected=1
+// for a SOFT rewrite — Fetch=false, HardNoFetch=false — while the guidance told
+// the model not to fetch, so finalizeRun disclosed a false PARTIAL "coverage was
+// not measured" on every soft rewrite. See RefineRoute.HardNoFetch.
+func refineFetchExpected(refineActive bool, route agent.RefineRoute) bool {
+	return !refineActive || route.Fetch
 }
 
 // maybePersistSummaryRun records the SummaryRun / SummarySpec for this request
@@ -547,10 +568,13 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 	// freeze/read this run's manifest (SS-05).
 	var v2RunID string
 	if agent.SummaryV2Enabled() {
-		// fetchExpected=false for a confident rewrite: SS-08b physically removes the
-		// fetch tools, so the run cannot measure coverage and the gate must not
-		// disclose that absence as a gap.
-		if v2RunID = h.maybePersistSummaryRun(ctx, uid, req, !(refineActive && refineRoute.HardNoFetch)); v2RunID != "" {
+		// fetch_expected must track whether THIS turn will actually gather data
+		// (refineFetchExpected → route.Fetch), not whether a confident rewrite
+		// hard-stripped the tools. Keying it on HardNoFetch persisted
+		// fetch_expected=1 for a soft rewrite while the guidance told the model NOT
+		// to fetch, so finalizeRun reported a false PARTIAL "coverage was not
+		// measured" on every soft rewrite.
+		if v2RunID = h.maybePersistSummaryRun(ctx, uid, req, refineFetchExpected(refineActive, refineRoute)); v2RunID != "" {
 			ctx = context.WithValue(ctx, agent.ContextKeyRunID, v2RunID)
 		}
 	}
@@ -835,10 +859,13 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	// The returned run_id is injected into the tool context for the citation pass.
 	var v2RunID string
 	if agent.SummaryV2Enabled() {
-		// fetchExpected=false for a confident rewrite: SS-08b physically removes the
-		// fetch tools, so the run cannot measure coverage and the gate must not
-		// disclose that absence as a gap.
-		if v2RunID = h.maybePersistSummaryRun(ctx, uid, req, !(refineActive && refineRoute.HardNoFetch)); v2RunID != "" {
+		// fetch_expected must track whether THIS turn will actually gather data
+		// (refineFetchExpected → route.Fetch), not whether a confident rewrite
+		// hard-stripped the tools. Keying it on HardNoFetch persisted
+		// fetch_expected=1 for a soft rewrite while the guidance told the model NOT
+		// to fetch, so finalizeRun reported a false PARTIAL "coverage was not
+		// measured" on every soft rewrite.
+		if v2RunID = h.maybePersistSummaryRun(ctx, uid, req, refineFetchExpected(refineActive, refineRoute)); v2RunID != "" {
 			ctx = context.WithValue(ctx, agent.ContextKeyRunID, v2RunID)
 		}
 	}

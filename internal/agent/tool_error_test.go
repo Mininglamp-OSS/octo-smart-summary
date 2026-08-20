@@ -71,7 +71,7 @@ func TestRunnerToolErrorEnvelope(t *testing.T) {
 		}}
 		r := NewRunner(fc, reg, NewPool(2), Policy{MaxSteps: 5, MaxTokens: 100000})
 		var got []ToolErrorEnvelope
-		r.OnToolError = func(_ string, env ToolErrorEnvelope) { got = append(got, env) }
+		r.OnToolError = func(_, _ string, env ToolErrorEnvelope) { got = append(got, env) }
 		return r, &got
 	}
 
@@ -174,6 +174,53 @@ func TestClassifyToolErrorEvidenceReadIsNotAWriteFailure(t *testing.T) {
 	}
 }
 
+// TestClassifyToolErrorStaleHandleIsNotFatalPermission pins the round-4 P1
+// (mochashanyao / yujiawei converged): a dropped message-cache handle surfaces as
+// `invalid or expired messages_handle: h-123` on a plain cache miss from three
+// critical tools. The old text embedded "access denied", so it hit the permission
+// branch → fatal + non-retryable, which suppressed the very retry whose success
+// would have cleared the marker and reported a good deliverable as FAILED. It must
+// classify as a retryable, non-fatal bad argument, and must do so BEFORE the
+// permission branch even for the legacy "or access denied" phrasing.
+func TestClassifyToolErrorStaleHandleIsNotFatalPermission(t *testing.T) {
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+	for _, tool := range []string{"summarize_chunk", "filter_relevant", "search_messages"} {
+		for _, msg := range []string{
+			"invalid or expired messages_handle: h-123",
+			"invalid messages_handle or access denied: h-456", // legacy phrasing must still not be fatal
+		} {
+			env := classifyToolError(tool, errors.New(msg))
+			if env.ErrorCode != "INVALID_ARGUMENT" || env.Fatal || !env.Retryable {
+				t.Errorf("classifyToolError(%s, %q) = %s retryable=%t fatal=%t, want retryable non-fatal INVALID_ARGUMENT",
+					tool, msg, env.ErrorCode, env.Retryable, env.Fatal)
+			}
+		}
+	}
+}
+
+// TestClassifyToolErrorPermissionBeatsWeakTransientTerms pins the round-4
+// branch-ordering nit: `permission denied; please try again later` carries both a
+// permission word and the weak transient term "try again". The permission branch
+// must win — a stale permission is fatal and no amount of retrying clears it —
+// while a genuine transient with no permission wording still classifies retryable.
+func TestClassifyToolErrorPermissionBeatsWeakTransientTerms(t *testing.T) {
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+
+	env := classifyToolError("fetch_channel", errors.New("permission denied; please try again later"))
+	if env.ErrorCode != "PERMISSION_DENIED" || !env.Fatal || env.Retryable {
+		t.Errorf("permission-worded 'try again' = %s retryable=%t fatal=%t, want fatal PERMISSION_DENIED",
+			env.ErrorCode, env.Retryable, env.Fatal)
+	}
+
+	for _, msg := range []string{"backend service unavailable", "transient hiccup, try again"} {
+		env := classifyToolError("fetch_channel", errors.New(msg))
+		if env.ErrorCode != "TRANSIENT_TOOL_ERROR" || env.Fatal || !env.Retryable {
+			t.Errorf("classifyToolError(%q) = %s retryable=%t fatal=%t, want retryable TRANSIENT_TOOL_ERROR",
+				msg, env.ErrorCode, env.Retryable, env.Fatal)
+		}
+	}
+}
+
 // TestRunnerReportsToolSuccess pins the mechanism the recoverable failed-marker
 // rests on: a successful tool call must be observable, and only when V2 is on.
 func TestRunnerReportsToolSuccess(t *testing.T) {
@@ -185,7 +232,7 @@ func TestRunnerReportsToolSuccess(t *testing.T) {
 
 	r := NewRunner(nil, reg, NewPool(1), Policy{})
 	var succeeded []string
-	r.OnToolSuccess = func(name string) { succeeded = append(succeeded, name) }
+	r.OnToolSuccess = func(name, _ string) { succeeded = append(succeeded, name) }
 	var call ToolCall
 	call.Function.Name = "fetch_channel"
 	call.Function.Arguments = "{}"

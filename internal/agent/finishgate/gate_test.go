@@ -188,3 +188,55 @@ func TestEvaluateOpenScopeGapNamesTheChannel(t *testing.T) {
 	}
 	t.Fatalf("expected a channel gap naming ch-7, got %v", gaps)
 }
+
+// TestEvaluateClosedScopeIgnoresDiscoveredChannels pins the round-4 P0-1
+// (yujiawei / Jerry-Xin): when a spec pins a scope (ExpectedChannels), the
+// discovered union — which can hold the user's whole visible surface — must NOT
+// manufacture gaps for channels the run deliberately left out. Before the guard,
+// a user who pinned one channel and got a perfect single-channel summary was told
+// four other discovered channels "were never fetched", and SS-11 shipped that
+// fabricated gap list to the client.
+func TestEvaluateClosedScopeIgnoresDiscoveredChannels(t *testing.T) {
+	s := completeState()
+	s.ExpectedChannels = []string{"ch-1"}
+	s.AttemptedChannels = []string{"ch-1"}
+	s.SucceededChannels = []string{"ch-1"}
+	// The visible surface leaked in via a discovery tool, but scope is closed.
+	s.DiscoveredChannels = []string{"ch-1", "vis-2", "vis-3", "vis-4", "vis-5"}
+
+	v, gaps := Evaluate(s)
+	if v != Complete {
+		t.Fatalf("verdict = %s, want COMPLETE — a pinned closed scope was fully fetched; discovered channels outside it are not gaps (gaps=%v)", v, gaps)
+	}
+}
+
+// TestEvaluateClosedScopeStillCatchesUnfetchedExpected pins that the guard only
+// suppresses the discovered-union path, not the authoritative ExpectedChannels
+// check: a pinned channel that was never fetched is still a real gap.
+func TestEvaluateClosedScopeStillCatchesUnfetchedExpected(t *testing.T) {
+	s := completeState()
+	s.ExpectedChannels = []string{"ch-1", "ch-2"}
+	s.AttemptedChannels = []string{"ch-1"}
+	s.SucceededChannels = []string{"ch-1"}
+	s.DiscoveredChannels = []string{"vis-9"} // must not appear as a gap
+
+	v, gaps := Evaluate(s)
+	if v != Partial {
+		t.Fatalf("verdict = %s, want PARTIAL for an unfetched pinned channel", v)
+	}
+	var sawCh2, sawVis9 bool
+	for _, g := range gaps {
+		if g.ChannelID == "ch-2" {
+			sawCh2 = true
+		}
+		if g.ChannelID == "vis-9" {
+			sawVis9 = true
+		}
+	}
+	if !sawCh2 {
+		t.Fatalf("expected a gap naming the unfetched pinned channel ch-2, got %v", gaps)
+	}
+	if sawVis9 {
+		t.Fatalf("discovered-but-out-of-scope vis-9 must not be reported on a closed scope, got %v", gaps)
+	}
+}

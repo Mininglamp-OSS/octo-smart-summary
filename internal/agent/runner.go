@@ -40,12 +40,19 @@ type Runner struct {
 	policy  Policy
 	OnEvent func(Event) // Optional callback for progress events; nil-safe
 	// OnToolError is an optional hook (SS-07b) called when a tool returns an
-	// error. It receives the tool name and the classified envelope so the
-	// handler can record fatal failures against the run (→ finish gate FAILED).
-	// Nil-safe; must be goroutine-safe (runTools calls it from the worker pool).
-	OnToolError func(toolName string, env ToolErrorEnvelope)
+	// error. It receives the tool name, the per-call TARGET (channel/chunk id
+	// extracted from the arguments, "" for single-target tools) and the classified
+	// envelope so the handler can record fatal failures against the run (→ finish
+	// gate FAILED). The target is passed because fetch_channel / summarize_chunk
+	// run once per channel/chunk through the worker pool: keying the fatal set on
+	// the tool name alone let one chunk's success clear a different chunk's fatal
+	// marker (verdict-by-scheduling). Nil-safe; must be goroutine-safe (runTools
+	// calls it from the worker pool).
+	OnToolError func(toolName, target string, env ToolErrorEnvelope)
 
-	// OnToolSuccess is the counterpart, called when a tool call SUCCEEDS.
+	// OnToolSuccess is the counterpart, called when a tool call SUCCEEDS. It
+	// receives the same (toolName, target) key so a success clears only the
+	// matching target's fatal marker.
 	//
 	// Without it the failed marker is one-way: the model retries the same tool,
 	// succeeds, produces a perfect summary, and the run is still reported FAILED
@@ -54,8 +61,10 @@ type Runner struct {
 	// wrong in both directions across review rounds ("invalid connection" was too
 	// lenient, then too strict) — so recoverability is derived from an OBSERVED
 	// fact ("that tool worked on a later call") instead of guessed from text.
+	// A retry of the same target is a new tool_call with a new id but the SAME
+	// target, so the target (not the call id) is what makes recovery observable.
 	// Nil-safe; must be goroutine-safe.
-	OnToolSuccess func(toolName string)
+	OnToolSuccess func(toolName, target string)
 }
 
 func NewRunner(client chatter, reg *Registry, pool *Pool, policy Policy) *Runner {
@@ -256,7 +265,7 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 					env := classifyToolError(tc.Function.Name, err)
 					results[i] = env.JSON()
 					if r.OnToolError != nil {
-						r.OnToolError(tc.Function.Name, env)
+						r.OnToolError(tc.Function.Name, toolCallTarget(tc.Function.Arguments), env)
 					}
 				} else {
 					results[i] = "错误: " + err.Error()
@@ -265,11 +274,11 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 			}
 			results[i] = out
 			// SS-07b: a successful call is the evidence that whatever failed earlier on
-			// this tool was recoverable. Reported so the run's fatal marker can be
-			// cleared — see Runner.OnToolSuccess for why this is an observation rather
-			// than another error-string pattern.
+			// this tool+target was recoverable. Reported so the run's fatal marker can
+			// be cleared — see Runner.OnToolSuccess for why this is an observation
+			// rather than another error-string pattern.
 			if SummaryV2Enabled() && r.OnToolSuccess != nil {
-				r.OnToolSuccess(tc.Function.Name)
+				r.OnToolSuccess(tc.Function.Name, toolCallTarget(tc.Function.Arguments))
 			}
 		})
 	}

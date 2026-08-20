@@ -224,16 +224,25 @@ var citationMarkerRE = regexp.MustCompile(`\[(\d+)\]`)
 // (agent_summary.go) strips only the markers belonging to a referenced artifact
 // precisely because "unrelated bracketed integers remain user content".
 //
-// Two rules, both narrowing:
+// Rules, all narrowing:
 //
-//   - cits empty → nothing was claimed, so nothing can dangle. This is the
-//     reachable refine path: a rewrite turn has no tool traces, so savedCitations
-//     is nil while the rewritten text still carries the source summary's markers.
+//   - cits empty AND no build was expected → the refine-borrowed path: a rewrite
+//     turn (fetch_expected=false) ran no citation build, so savedCitations is nil
+//     while the rewritten text still carries the SOURCE summary's markers. Nothing
+//     of its own can dangle → valid.
+//   - cits empty BUT a build WAS expected (a fetch turn) → a build that produced
+//     zero citations yet left a [1]-anchored citation sequence in the text is a
+//     failed/expired citation build, not prose. Scoping the empty-slice exemption
+//     to the refine case is what stops such a build reporting COMPLETE with
+//     [1][2][3] still in the content.
 //   - a marker above the highest built index is prose, not a broken citation. A
 //     run with 2 citations cannot have meant `[2024]`. Only an in-range miss —
 //     e.g. [3] when 1, 2 and 4 exist — indicates real citation corruption.
-func citationsValid(content string, cits []model.Citation) bool {
+func citationsValid(content string, cits []model.Citation, citationBuildExpected bool) bool {
 	if len(cits) == 0 {
+		if citationBuildExpected && contentHasCitationSequence(content) {
+			return false
+		}
 		return true
 	}
 	idxSet := make(map[int]bool, len(cits))
@@ -258,6 +267,21 @@ func citationsValid(content string, cits []model.Citation) bool {
 		}
 	}
 	return true
+}
+
+// contentHasCitationSequence reports whether content carries a [1] marker — the
+// unambiguous start of a citation list. A real citation build always numbers from
+// [1], whereas an incidental bracketed integer in prose (a year [2024], a count
+// [3], a standard GB/T [50011]) does not produce a [1]. Used only to catch a
+// fetch turn whose citation build produced zero citations yet left markers behind;
+// keying on [1] keeps the prose-integer concession intact.
+func contentHasCitationSequence(content string) bool {
+	for _, m := range citationMarkerRE.FindAllStringSubmatch(content, -1) {
+		if m[1] == "1" {
+			return true
+		}
+	}
+	return false
 }
 
 // finalizeRun computes the SS-07 finish verdict (COMPLETE/PARTIAL/FAILED) for
@@ -290,7 +314,7 @@ func (h *AgentSummaryHandler) finalizeRun(ctx context.Context, uid, sessionID, r
 	state := finishgate.RunState{
 		ScopeResolved:            run.SpecID != "",
 		SummaryGenerated:         content != "",
-		CitationValidationPassed: citationsValid(content, cits),
+		CitationValidationPassed: citationsValid(content, cits, run.FetchExpected),
 		FetchExpected:            run.FetchExpected,
 		CoverageMeasured:         run.CoverageMeasured,
 		AttemptedChannels:        decodeFinishChannelIDs(run.AttemptedChannels),

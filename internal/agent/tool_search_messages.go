@@ -57,7 +57,7 @@ func SearchMessagesTool() (Tool, Handler) {
 
 		messages := messageCache.Retrieve(req.MessagesHandle, uid)
 		if messages == nil {
-			return "", fmt.Errorf("invalid messages_handle or access denied: %s", req.MessagesHandle)
+			return "", fmt.Errorf("invalid or expired messages_handle: %s", req.MessagesHandle)
 		}
 
 		// Filter by keyword match in content

@@ -67,13 +67,13 @@ func TestToolErrorHookClearsFailedOnLaterSuccess(t *testing.T) {
 	h.attachToolErrorHook(runner, "u1", run.RunID)
 
 	// A stale pooled connection kills a redundant second fetch_channel call.
-	runner.OnToolError("fetch_channel", agent.ToolErrorEnvelope{Fatal: true, ErrorCode: "CRITICAL_TOOL_ERROR"})
+	runner.OnToolError("fetch_channel", "", agent.ToolErrorEnvelope{Fatal: true, ErrorCode: "CRITICAL_TOOL_ERROR"})
 	if got := runStatus(t, db, run.RunID); got != model.RunStatusFailed {
 		t.Fatalf("status after fatal error = %q, want failed", got)
 	}
 
 	// The model retries it and it works.
-	runner.OnToolSuccess("fetch_channel")
+	runner.OnToolSuccess("fetch_channel", "")
 	if got := runStatus(t, db, run.RunID); got == model.RunStatusFailed {
 		t.Fatal("a later success by the same tool must clear the failed marker")
 	}
@@ -89,16 +89,16 @@ func TestToolErrorHookKeepsFailedWhileAnotherToolIsStillFatal(t *testing.T) {
 	runner := agent.NewRunner(nil, nil, nil, agent.Policy{})
 	h.attachToolErrorHook(runner, "u1", run.RunID)
 
-	runner.OnToolError("fetch_channel", agent.ToolErrorEnvelope{Fatal: true})
-	runner.OnToolError("summarize_chunk", agent.ToolErrorEnvelope{Fatal: true})
+	runner.OnToolError("fetch_channel", "", agent.ToolErrorEnvelope{Fatal: true})
+	runner.OnToolError("summarize_chunk", "", agent.ToolErrorEnvelope{Fatal: true})
 
 	// Recovering one tool is not recovering the run.
-	runner.OnToolSuccess("fetch_channel")
+	runner.OnToolSuccess("fetch_channel", "")
 	if got := runStatus(t, db, run.RunID); got != model.RunStatusFailed {
 		t.Fatalf("status = %q while summarize_chunk is still fatal, want failed", got)
 	}
 
-	runner.OnToolSuccess("summarize_chunk")
+	runner.OnToolSuccess("summarize_chunk", "")
 	if got := runStatus(t, db, run.RunID); got == model.RunStatusFailed {
 		t.Fatal("every fatal tool has since succeeded; the run must no longer be failed")
 	}
@@ -114,9 +114,9 @@ func TestToolErrorHookIgnoresSuccessOfNeverFailedTool(t *testing.T) {
 	runner := agent.NewRunner(nil, nil, nil, agent.Policy{})
 	h.attachToolErrorHook(runner, "u1", run.RunID)
 
-	runner.OnToolError("fetch_channel", agent.ToolErrorEnvelope{Fatal: true})
+	runner.OnToolError("fetch_channel", "", agent.ToolErrorEnvelope{Fatal: true})
 	// An unrelated tool succeeding says nothing about fetch_channel's failure.
-	runner.OnToolSuccess("merge_summaries")
+	runner.OnToolSuccess("merge_summaries", "")
 	if got := runStatus(t, db, run.RunID); got != model.RunStatusFailed {
 		t.Fatalf("status = %q, want failed — a different tool's success is not recovery", got)
 	}
@@ -132,9 +132,38 @@ func TestToolErrorHookIgnoresNonFatalErrors(t *testing.T) {
 	runner := agent.NewRunner(nil, nil, nil, agent.Policy{})
 	h.attachToolErrorHook(runner, "u1", run.RunID)
 
-	runner.OnToolError("fetch_channel", agent.ToolErrorEnvelope{Fatal: false, Retryable: true})
+	runner.OnToolError("fetch_channel", "", agent.ToolErrorEnvelope{Fatal: false, Retryable: true})
 	if got := runStatus(t, db, run.RunID); got == model.RunStatusFailed {
 		t.Fatal("a retryable error must not mark the run failed")
+	}
+}
+
+// TestToolErrorHookKeyedByTarget pins the round-4 P1-3 (yujiawei): fetch_channel
+// / summarize_chunk run once per channel / chunk through the worker pool, so the
+// fatal set must be keyed on (tool, target). Before the fix a marker keyed on the
+// tool name alone let chunk B's success clear chunk A's fatal marker in the same
+// step, making the verdict depend on scheduling order.
+func TestToolErrorHookKeyedByTarget(t *testing.T) {
+	db := newHookTestDB(t)
+	if db == nil {
+		return
+	}
+	run := hookTestRun(t, db, "req-per-target")
+	h := &AgentChatHandler{runStore: summaryrun.NewStore(db)}
+	runner := agent.NewRunner(nil, nil, nil, agent.Policy{})
+	h.attachToolErrorHook(runner, "u1", run.RunID)
+
+	// Chunk A fails fatally; chunk B (a DIFFERENT target of the same tool) succeeds.
+	runner.OnToolError("summarize_chunk", "messages_handle=chunk-A", agent.ToolErrorEnvelope{Fatal: true})
+	runner.OnToolSuccess("summarize_chunk", "messages_handle=chunk-B")
+	if got := runStatus(t, db, run.RunID); got != model.RunStatusFailed {
+		t.Fatalf("status = %q — a different chunk's success must NOT clear chunk A's fatal marker", got)
+	}
+
+	// A retry of chunk A itself (same target) is the genuine recovery signal.
+	runner.OnToolSuccess("summarize_chunk", "messages_handle=chunk-A")
+	if got := runStatus(t, db, run.RunID); got == model.RunStatusFailed {
+		t.Fatal("the failing target itself succeeded on retry; the run must no longer be failed")
 	}
 }
 
@@ -155,8 +184,8 @@ func TestToolErrorHookIsConcurrencySafe(t *testing.T) {
 		go func(i int) {
 			defer func() { done <- struct{}{} }()
 			tool := []string{"fetch_channel", "summarize_chunk"}[i%2]
-			runner.OnToolError(tool, agent.ToolErrorEnvelope{Fatal: true})
-			runner.OnToolSuccess(tool)
+			runner.OnToolError(tool, "", agent.ToolErrorEnvelope{Fatal: true})
+			runner.OnToolSuccess(tool, "")
 		}(i)
 	}
 	for i := 0; i < 8; i++ {
