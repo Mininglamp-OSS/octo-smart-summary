@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
@@ -301,6 +302,8 @@ func SummarizeChunkTool() (Tool, Handler) {
 			citationMap[key] = msg.CitationIndex
 		}
 
+		inputCount := len(messages)
+
 		// Apply the global CitationIndex to our messages. Under V2 the pool
 		// is the FROZEN manifest, so a message fetched AFTER the freeze is not
 		// in the map — it must not reach the model with its zero CitationIndex
@@ -313,6 +316,24 @@ func SummarizeChunkTool() (Tool, Handler) {
 				sessionID, runID, manifestMisses)
 		}
 		if len(messages) == 0 {
+			if manifestMisses > 0 {
+				recordDroppedMessages(ctx, uid, runID, manifestMisses)
+				result := map[string]interface{}{
+					"summary":                 "无可总结内容",
+					"chunk_count":             0,
+					"input_count":             inputCount,
+					"processed_count":         0,
+					"dropped_count":           manifestMisses,
+					"oversized_message_count": 0,
+					"truncated":               true,
+					"chunk_size":              clampChunkSize(req.ChunkSize),
+				}
+				resultJSON, err := json.Marshal(result)
+				if err != nil {
+					return "", fmt.Errorf("marshal result: %w", err)
+				}
+				return string(resultJSON), nil
+			}
 			return "{\"summary\":\"无可总结内容\",\"chunk_count\":0}", nil
 		}
 
@@ -343,7 +364,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 		// Summarize each chunk and aggregate honest coverage counts. Token
 		// chunking + no format cap means processed == input, so dropped_count is
 		// 0; the counters stay truthful if a future change reintroduces a cap.
-		cov := chunkCoverage{InputCount: len(messages), ChunkSize: msgsPerChunk}
+		cov := chunkCoverage{InputCount: inputCount, ChunkSize: msgsPerChunk}
 		// SS-06: load the run's SummarySpec-derived guidance once so every Map
 		// call summarizes toward the user's actual requirements. Empty when V2 is
 		// off / no run / no spec → legacy generic prompt.
@@ -360,6 +381,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 		}
 		cov.DroppedCount = cov.InputCount - cov.ProcessedCount
 		cov.Truncated = cov.DroppedCount > 0
+		recordDroppedMessages(ctx, uid, runID, cov.DroppedCount)
 
 		combinedSummary := strings.Join(summaries, "\n\n---\n\n")
 		result := map[string]interface{}{
@@ -384,6 +406,19 @@ func SummarizeChunkTool() (Tool, Handler) {
 	}
 
 	return schema, handler
+}
+
+func recordDroppedMessages(ctx context.Context, uid, runID string, count int) {
+	if count <= 0 || !SummaryV2Enabled() || uid == "" || runID == "" {
+		return
+	}
+	summaryDB, _, _, _ := GetSummaryDeps()
+	if summaryDB == nil {
+		return
+	}
+	if err := summaryrun.NewStore(summaryDB).AddDroppedMessages(ctx, uid, runID, count); err != nil {
+		log.Printf("[summarize_chunk] record dropped messages failed run=%s dropped=%d: %v", runID, count, err)
+	}
 }
 
 // formatChunkForLLM renders a chunk into the "[n] sender: content" lines fed to

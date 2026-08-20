@@ -4,10 +4,13 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/artifact"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
@@ -215,6 +218,77 @@ func TestGetSessionMessagePool_OwnerScoping(t *testing.T) {
 	}
 }
 
+func TestSummarizeChunkManifestMissesRecordedAsDropped(t *testing.T) {
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+	db := newFirstTurnTestDB(t)
+	if db == nil {
+		return
+	}
+
+	const uid = "test-user"
+	const sessionID = "sess-manifest-miss-recorded"
+	ctx := context.Background()
+	run, _, err := summaryrun.NewStore(db).CreateOrGetRun(ctx, uid, sessionID, "req-1", model.ScopePolicyClosed)
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	// Freeze revision 1 with a different message. The handler will later see
+	// only post-freeze messages, so all of them must be dropped and counted.
+	if _, _, _, err := artifact.NewStore(db).FreezeFromPool(ctx, run.RunID, uid, sessionID, []pipeline.Message{
+		{ChannelID: "ch1", MessageSeq: 1, Timestamp: 1_000, Content: "frozen"},
+	}, artifact.FreezeMeta{}); err != nil {
+		t.Fatalf("freeze initial manifest: %v", err)
+	}
+
+	messages := []pipeline.Message{
+		{ChannelID: "ch1", MessageSeq: 2, Timestamp: 2_000, Content: "post-freeze A"},
+		{ChannelID: "ch1", MessageSeq: 3, Timestamp: 3_000, Content: "post-freeze B"},
+	}
+	handle := messageCache.Store(messages, uid)
+	t.Cleanup(func() {
+		messageCache.mu.Lock()
+		delete(messageCache.store, handle)
+		messageCache.mu.Unlock()
+	})
+	if err := seedEvidence(db, uid, sessionID, handle, messages); err != nil {
+		t.Fatalf("seed evidence: %v", err)
+	}
+
+	SetSummaryDeps(db, nil, nil, config.Config{})
+	t.Cleanup(func() { SetSummaryDeps(nil, nil, nil, config.Config{}) })
+
+	_, h := SummarizeChunkTool()
+	toolCtx := context.WithValue(ctx, ContextKeyUID, uid)
+	toolCtx = context.WithValue(toolCtx, ContextKeySessionID, sessionID)
+	toolCtx = context.WithValue(toolCtx, ContextKeyRunID, run.RunID)
+	args, _ := json.Marshal(map[string]string{"messages_handle": handle})
+	out, err := h(toolCtx, args)
+	if err != nil {
+		t.Fatalf("summarize_chunk: %v", err)
+	}
+	var result struct {
+		InputCount     int  `json:"input_count"`
+		ProcessedCount int  `json:"processed_count"`
+		DroppedCount   int  `json:"dropped_count"`
+		Truncated      bool `json:"truncated"`
+	}
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("decode result: %v; out=%s", err, out)
+	}
+	if result.InputCount != 2 || result.ProcessedCount != 0 || result.DroppedCount != 2 || !result.Truncated {
+		t.Fatalf("coverage result = %+v, want input=2 processed=0 dropped=2 truncated=true", result)
+	}
+
+	reloaded, err := summaryrun.NewStore(db).GetByID(ctx, uid, run.RunID)
+	if err != nil {
+		t.Fatalf("reload run: %v", err)
+	}
+	if reloaded.DroppedMessages != 2 {
+		t.Fatalf("run dropped_messages = %d, want 2", reloaded.DroppedMessages)
+	}
+}
+
 // --- helpers ---
 
 func newFirstTurnTestDB(t *testing.T) *gorm.DB {
@@ -226,7 +300,13 @@ func newFirstTurnTestDB(t *testing.T) *gorm.DB {
 		t.Skipf("CGO required for sqlite: %v", err)
 		return nil
 	}
-	if err := db.AutoMigrate(&model.AgentMessage{}, &model.AgentMessageEvidence{}); err != nil {
+	if err := db.AutoMigrate(
+		&model.AgentMessage{},
+		&model.AgentMessageEvidence{},
+		&model.AgentSummaryRun{},
+		&model.AgentEvidenceArtifact{},
+		&model.AgentCitationManifest{},
+	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	return db

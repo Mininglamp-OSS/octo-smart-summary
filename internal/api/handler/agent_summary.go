@@ -20,11 +20,6 @@ import (
 	"gorm.io/gorm"
 )
 
-// errFinishFailed is the sentinel used to roll back the save transaction when
-// the SS-07 finish gate returns FAILED (§8.3: a FAILED run has no saveable
-// product). The handler maps it to HTTP 422 instead of the generic 500.
-var errFinishFailed = errors.New("finish verdict FAILED")
-
 // AgentSummaryHandler persists the deliverable produced by the agent
 // conversational entry (POST /api/v1/summaries/agent).
 //
@@ -367,10 +362,11 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 
 	var createdTaskID int64
 	// SS-11: capture the SS-07 finish verdict + gaps out of the tx closure so the
-	// success response can disclose PARTIAL / coverage gaps to the client. FAILED
-	// aborts the tx (SS-07b) and never reaches the success response.
+	// success response can disclose PARTIAL / coverage gaps to the client after
+	// the deliverable save commits.
 	var finishVerdict finishgate.Verdict
 	var finishGaps []finishgate.Gap
+	var savedCitations []model.Citation
 	err = h.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&task).Error; err != nil {
 			return fmt.Errorf("create summary_task: %w", err)
@@ -474,19 +470,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			}
 		}
 		creatorPR.SetCitations(cits)
-
-		// SS-07: compute + persist the finish verdict as an INTERNAL quality
-		// signal only. finalizeRun records COMPLETE/PARTIAL/FAILED + gaps to the
-		// run row for later offline analysis / a future repair loop — it does NOT
-		// gate the user. The save always proceeds regardless of the verdict
-		// (product call: never block a save on the quality gate; optimize later).
-		// Off / no run → no-op.
-		if agent.SummaryV2Enabled() {
-			if v, gaps := h.finalizeRun(c.Request.Context(), userID, req.SessionID, content, cits); v != "" {
-				log.Printf("[handler] agent summary finish verdict=%s gaps=%d session=%s (recorded, non-blocking)", v, len(gaps), req.SessionID)
-				finishVerdict, finishGaps = v, gaps
-			}
-		}
+		savedCitations = cits
 		// Build v1 snapshot for agent-generated summary
 		snapshot := h.buildSnapshotV1(tx, req.SessionID, userID, &task, req.Sources)
 		creatorPR.SetSnapshot(snapshot)
@@ -535,13 +519,19 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	})
 	if err != nil {
 		log.Printf("[handler] CreateAgentSummary tx failed space=%s user=%s session=%s: %v", spaceID, userID, req.SessionID, err)
-		if errors.Is(err, errFinishFailed) {
-			// SS-07b / §8.3: a FAILED run yields no saveable product.
-			c.JSON(http.StatusUnprocessableEntity, apiResponse{Code: 42200, Message: "总结未通过完成校验（FAILED），未保存: " + err.Error()})
-			return
-		}
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "落库失败: " + err.Error()})
 		return
+	}
+
+	// SS-07: record the finish verdict only after the deliverable transaction has
+	// committed. This keeps the run row honest when a later save step rolls back.
+	// The verdict is an internal, non-blocking quality signal; off / missing or
+	// unknown request_id → no-op.
+	if agent.SummaryV2Enabled() {
+		if v, gaps := h.finalizeRun(c.Request.Context(), userID, req.SessionID, req.RequestID, content, savedCitations); v != "" {
+			log.Printf("[handler] agent summary finish verdict=%s gaps=%d session=%s request=%s (recorded, non-blocking)", v, len(gaps), req.SessionID, req.RequestID)
+			finishVerdict, finishGaps = v, gaps
+		}
 	}
 
 	log.Printf("[handler] CreateAgentSummary ok space=%s user=%s task_id=%d session=%s content_len=%d origin_channel=%s/%d",
@@ -557,7 +547,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	}
 	// SS-11: disclose the SS-07 finish verdict + coverage gaps so the client can
 	// render a PARTIAL warning + gap list. Omitted (V2 off / no run) → response
-	// byte-identical to pre-SS-11. FAILED never reaches here (422 above).
+	// byte-identical to pre-SS-11.
 	if finishVerdict != "" {
 		respData["finish_status"] = string(finishVerdict)
 		if finishGaps == nil {

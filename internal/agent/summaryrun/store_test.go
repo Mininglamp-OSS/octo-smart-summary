@@ -216,7 +216,7 @@ func TestGetByIDOwnerScoped(t *testing.T) {
 	}
 }
 
-func TestFinishStatusAndLatestRunBySession(t *testing.T) {
+func TestSetFinishStatus(t *testing.T) {
 	db := newStoreTestDB(t)
 	if db == nil {
 		return
@@ -226,20 +226,20 @@ func TestFinishStatusAndLatestRunBySession(t *testing.T) {
 
 	run, _, _ := s.CreateOrGetRun(ctx, "u1", "sess1", "req1", model.ScopePolicyClosed)
 
-	got, found, err := s.GetLatestRunBySession(ctx, "u1", "sess1")
-	if err != nil || !found || got.RunID != run.RunID {
-		t.Fatalf("GetLatestRunBySession: found=%v err=%v id=%s", found, err, got.RunID)
-	}
-	if _, found, _ := s.GetLatestRunBySession(ctx, "attacker", "sess1"); found {
-		t.Fatal("cross-user GetLatestRunBySession should not find")
-	}
-
-	if err := s.SetFinishStatus(ctx, run.RunID, model.FinishStatusPartial); err != nil {
+	if err := s.SetFinishStatus(ctx, "u1", run.RunID, model.FinishStatusPartial); err != nil {
 		t.Fatalf("SetFinishStatus: %v", err)
 	}
 	reloaded, err := s.GetByID(ctx, "u1", run.RunID)
 	if err != nil || reloaded.FinishStatus != model.FinishStatusPartial {
 		t.Fatalf("finish_status = %q (err %v), want PARTIAL", reloaded.FinishStatus, err)
+	}
+
+	if err := s.SetFinishStatus(ctx, "attacker", run.RunID, model.FinishStatusFailed); err != nil {
+		t.Fatalf("cross-user SetFinishStatus returned unexpected error: %v", err)
+	}
+	reloaded, _ = s.GetByID(ctx, "u1", run.RunID)
+	if reloaded.FinishStatus != model.FinishStatusPartial {
+		t.Fatalf("cross-user SetFinishStatus changed finish_status to %q", reloaded.FinishStatus)
 	}
 }
 
@@ -252,11 +252,64 @@ func TestSetStatus(t *testing.T) {
 	ctx := context.Background()
 	run, _, _ := s.CreateOrGetRun(ctx, "u1", "sess1", "req1", model.ScopePolicyClosed)
 
-	if err := s.SetStatus(ctx, run.RunID, model.RunStatusFailed); err != nil {
+	if err := s.SetStatus(ctx, "u1", run.RunID, model.RunStatusFailed); err != nil {
 		t.Fatalf("SetStatus: %v", err)
 	}
 	got, _ := s.GetByID(ctx, "u1", run.RunID)
 	if got.Status != model.RunStatusFailed {
 		t.Fatalf("status = %q, want failed", got.Status)
+	}
+
+	if err := s.SetStatus(ctx, "attacker", run.RunID, model.RunStatusFinished); err != nil {
+		t.Fatalf("cross-user SetStatus returned unexpected error: %v", err)
+	}
+	got, _ = s.GetByID(ctx, "u1", run.RunID)
+	if got.Status != model.RunStatusFailed {
+		t.Fatalf("cross-user SetStatus changed status to %q", got.Status)
+	}
+}
+
+func TestRecordChannelFetchAndDroppedMessages(t *testing.T) {
+	db := newStoreTestDB(t)
+	if db == nil {
+		return
+	}
+	s := NewStore(db)
+	ctx := context.Background()
+	run, _, _ := s.CreateOrGetRun(ctx, "u1", "sess1", "req1", model.ScopePolicyClosed)
+
+	if err := s.RecordChannelFetch(ctx, "u1", run.RunID, "ch-1", true, false); err != nil {
+		t.Fatalf("RecordChannelFetch success: %v", err)
+	}
+	if err := s.RecordChannelFetch(ctx, "u1", run.RunID, "ch-2", false, true); err != nil {
+		t.Fatalf("RecordChannelFetch failed: %v", err)
+	}
+	if err := s.AddDroppedMessages(ctx, "u1", run.RunID, 3); err != nil {
+		t.Fatalf("AddDroppedMessages: %v", err)
+	}
+
+	got, err := s.GetByID(ctx, "u1", run.RunID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if !got.CoverageMeasured || !got.CoverageTruncated || got.DroppedMessages != 3 {
+		t.Fatalf("coverage fields = measured:%t truncated:%t dropped:%d", got.CoverageMeasured, got.CoverageTruncated, got.DroppedMessages)
+	}
+	if got.AttemptedChannels != `["ch-1","ch-2"]` {
+		t.Fatalf("attempted_channels = %s", got.AttemptedChannels)
+	}
+	if got.SucceededChannels != `["ch-1"]` {
+		t.Fatalf("succeeded_channels = %s", got.SucceededChannels)
+	}
+	if got.FailedChannels != `["ch-2"]` {
+		t.Fatalf("failed_channels = %s", got.FailedChannels)
+	}
+
+	if err := s.RecordChannelFetch(ctx, "u1", run.RunID, "ch-2", true, false); err != nil {
+		t.Fatalf("RecordChannelFetch retry success: %v", err)
+	}
+	got, _ = s.GetByID(ctx, "u1", run.RunID)
+	if got.SucceededChannels != `["ch-1","ch-2"]` || got.FailedChannels != `[]` {
+		t.Fatalf("retry should move ch-2 to succeeded, got succeeded=%s failed=%s", got.SucceededChannels, got.FailedChannels)
 	}
 }

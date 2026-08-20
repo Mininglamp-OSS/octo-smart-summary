@@ -24,6 +24,7 @@ const (
 // GapKind enumerates the disclosed coverage-gap categories.
 const (
 	GapChannel    = "channel"    // an expected channel was not fetched
+	GapCoverage   = "coverage"   // channel coverage was never measured
 	GapTruncation = "truncation" // the fetched pool was truncated
 	GapDropped    = "dropped"    // messages were dropped before the model
 	GapCitation   = "citation"   // citation integrity did not hold
@@ -36,6 +37,7 @@ type Gap struct {
 	Kind      string `json:"kind"`
 	Detail    string `json:"detail"`
 	ErrorCode string `json:"error_code,omitempty"`
+	ChannelID string `json:"channel_id,omitempty"`
 }
 
 // RunState is the evidence the gate reasons over. Fields default to the safe
@@ -52,12 +54,15 @@ type RunState struct {
 	// resolves to a real citation.
 	CitationValidationPassed bool
 
-	// Coverage facts (0 / false = unknown / none).
-	ChannelsExpected int
-	ChannelsFetched  int
-	Truncated        bool
-	DroppedMessages  int
-	FailedChannels   []string
+	// Coverage facts. CoverageMeasured is explicit because an empty set may mean
+	// either "we fetched a quiet channel" or "no coverage path ran at all".
+	CoverageMeasured  bool
+	ExpectedChannels  []string
+	AttemptedChannels []string
+	SucceededChannels []string
+	Truncated         bool
+	DroppedMessages   int
+	FailedChannels    []string
 
 	// CriticalToolErrors are unrecoverable tool failures (permission, evidence
 	// write, summary). Any entry forces FAILED.
@@ -90,14 +95,30 @@ func Evaluate(s RunState) (Verdict, []Gap) {
 	}
 
 	// Usable + valid: collect any coverage gaps → PARTIAL, else COMPLETE.
-	if s.ChannelsExpected > 0 && s.ChannelsFetched < s.ChannelsExpected {
-		gaps = append(gaps, Gap{
-			Kind:   GapChannel,
-			Detail: "not all expected channels were fetched",
-		})
-	}
-	for _, ch := range s.FailedChannels {
-		gaps = append(gaps, Gap{Kind: GapChannel, Detail: "channel fetch failed", ErrorCode: ch})
+	if !s.CoverageMeasured {
+		gaps = append(gaps, Gap{Kind: GapCoverage, Detail: "channel coverage was not measured"})
+	} else {
+		succeeded := stringSet(s.SucceededChannels)
+		failed := stringSet(s.FailedChannels)
+		reported := make(map[string]bool)
+		for _, ch := range s.ExpectedChannels {
+			if reported[ch] {
+				continue
+			}
+			reported[ch] = true
+			switch {
+			case failed[ch]:
+				gaps = append(gaps, Gap{Kind: GapChannel, Detail: "channel fetch failed", ChannelID: ch})
+			case !succeeded[ch]:
+				gaps = append(gaps, Gap{Kind: GapChannel, Detail: "expected channel was not fetched", ChannelID: ch})
+			}
+		}
+		for _, ch := range s.FailedChannels {
+			if !reported[ch] {
+				gaps = append(gaps, Gap{Kind: GapChannel, Detail: "channel fetch failed", ChannelID: ch})
+				reported[ch] = true
+			}
+		}
 	}
 	if s.Truncated {
 		gaps = append(gaps, Gap{Kind: GapTruncation, Detail: "fetched message pool was truncated"})
@@ -113,4 +134,12 @@ func Evaluate(s RunState) (Verdict, []Gap) {
 		return Partial, gaps
 	}
 	return Complete, nil
+}
+
+func stringSet(values []string) map[string]bool {
+	set := make(map[string]bool, len(values))
+	for _, value := range values {
+		set[value] = true
+	}
+	return set
 }

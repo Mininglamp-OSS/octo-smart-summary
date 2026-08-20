@@ -52,6 +52,17 @@ type AgentSummaryRun struct {
 	Status       string `gorm:"column:status;type:varchar(32);not null;default:'created'" json:"status"`
 	FinishStatus string `gorm:"column:finish_status;type:varchar(16);not null;default:''" json:"finish_status"`
 
+	// Coverage is persisted on the run rather than inferred from artifact rows.
+	// An artifact's ChannelCount counts channels that produced messages; it cannot
+	// represent a successfully-fetched quiet channel, nor distinguish zero from
+	// "never measured". These fields preserve the actual fetch attempts.
+	CoverageMeasured  bool   `gorm:"column:coverage_measured;not null;default:false" json:"coverage_measured"`
+	AttemptedChannels string `gorm:"column:attempted_channels;type:json;not null" json:"attempted_channels"`
+	SucceededChannels string `gorm:"column:succeeded_channels;type:json;not null" json:"succeeded_channels"`
+	FailedChannels    string `gorm:"column:failed_channels;type:json;not null" json:"failed_channels"`
+	CoverageTruncated bool   `gorm:"column:coverage_truncated;not null;default:false" json:"coverage_truncated"`
+	DroppedMessages   int    `gorm:"column:dropped_messages;not null;default:0" json:"dropped_messages"`
+
 	// Version is the optimistic-lock counter for serialized run updates.
 	Version int `gorm:"column:version;not null;default:0" json:"version"`
 

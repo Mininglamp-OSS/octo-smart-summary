@@ -65,16 +65,17 @@ var (
 		"补全", "补充", "补上", "遗漏", "漏了", "漏掉", "没提到", "缺了",
 		"更详细", "详细些", "详细点", "展开", "细化", "更全面", "全面些",
 		"重新分析", "换个角度", "深入", "再挖", "更完整", "完整些",
+		"加上", "加进", "加入", "添加", "带上",
 	}
 	// refineRewriteKeywords mark a CONFIDENT pure-text request (translate,
 	// condense, polish, re-layout, or Q&A over the old summary). Matching one of
 	// these — as opposed to falling through to the default — is what lets SS-08b
 	// safely strip the fetch tools (HardNoFetch).
 	refineRewriteKeywords = []string{
-		"翻译", "英文", "中文", "精简", "简化", "缩短", "压缩", "删减",
+		"翻译", "精简", "简化", "缩短", "压缩", "删减",
 		"润色", "排版", "格式", "改语气", "语气", "重新组织", "重组",
 		"摘要", "提炼", "换成", "改写成", "说了什么", "说了啥", "什么意思",
-		"讲了什么", "总结里", "只保留", "去掉", "删掉",
+		"讲了什么", "只保留", "去掉", "删掉",
 	}
 )
 

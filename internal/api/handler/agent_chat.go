@@ -357,8 +357,8 @@ func truncateRunes(s string, max int) string {
 // concurrently from the tool worker pool, so it uses a fresh context (the
 // request context may already be canceled by the very error being reported) and
 // relies on SetStatus being a plain idempotent UPDATE.
-func (h *AgentChatHandler) attachToolErrorHook(runner *agent.Runner, runID string) {
-	if runner == nil || runID == "" || h.runStore == nil {
+func (h *AgentChatHandler) attachToolErrorHook(runner *agent.Runner, userID, runID string) {
+	if runner == nil || userID == "" || runID == "" || h.runStore == nil {
 		return
 	}
 	store := h.runStore
@@ -366,7 +366,7 @@ func (h *AgentChatHandler) attachToolErrorHook(runner *agent.Runner, runID strin
 		if !env.Fatal {
 			return
 		}
-		if err := store.SetStatus(context.Background(), runID, model.RunStatusFailed); err != nil {
+		if err := store.SetStatus(context.Background(), userID, runID, model.RunStatusFailed); err != nil {
 			log.Printf("[agent] v2 mark run failed (run=%s): %v", runID, err)
 		}
 	}
@@ -525,7 +525,7 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 	ctx, system = applySelectedChannelContext(ctx, system, req.SelectedChannels)
 
 	// SS-07b: fatal tool errors mark the run failed → finish gate FAILED at save.
-	h.attachToolErrorHook(runner, v2RunID)
+	h.attachToolErrorHook(runner, uid, v2RunID)
 
 	// 读多轮历史并滑窗截断。owner-scoped：只加载当前 uid 归属的记录，
 	// 跨用户猜到相同 session_id 也只会得到空历史（SUM-158 blocker 1）。
@@ -811,7 +811,7 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	ctx, system = applySelectedChannelContext(ctx, system, req.SelectedChannels)
 
 	// SS-07b: fatal tool errors mark the run failed → finish gate FAILED at save.
-	h.attachToolErrorHook(runner, v2RunID)
+	h.attachToolErrorHook(runner, uid, v2RunID)
 
 	// Create per-request SSE sink for thread-safe concurrent writes
 	sink := &sseSink{w: c.Writer}

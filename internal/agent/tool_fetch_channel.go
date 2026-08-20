@@ -7,6 +7,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
 
@@ -89,6 +90,15 @@ func FetchChannelTool() (Tool, Handler) {
 		}
 
 		summaryDB, imDB, _, cfg := GetSummaryDeps()
+		runID, _ := ctx.Value(ContextKeyRunID).(string)
+		recordFetch := func(succeeded, truncated bool) {
+			if !SummaryV2Enabled() || summaryDB == nil || runID == "" {
+				return
+			}
+			if err := summaryrun.NewStore(summaryDB).RecordChannelFetch(ctx, uid, runID, req.ChannelID, succeeded, truncated); err != nil {
+				log.Printf("[fetch_channel] record coverage failed run=%s channel=%s succeeded=%t: %v", runID, req.ChannelID, succeeded, err)
+			}
+		}
 
 		// Security: validate channel accessibility for system-injected uid
 		options := []pipeline.ChannelQueryOption{pipeline.WithIncludeArchived(req.IncludeArchived)}
@@ -97,6 +107,7 @@ func FetchChannelTool() (Tool, Handler) {
 		}
 		accessibleChannels, err := pipeline.GetUserChannels(ctx, uid, imDB, options...)
 		if err != nil {
+			recordFetch(false, false)
 			return "", fmt.Errorf("get user channels: %w", err)
 		}
 
@@ -112,6 +123,7 @@ func FetchChannelTool() (Tool, Handler) {
 				"channel_id": req.ChannelID,
 			}
 			errData, _ := json.Marshal(errResult)
+			recordFetch(false, false)
 			return string(errData), fmt.Errorf("channel %s not accessible by user %s", req.ChannelID, uid)
 		}
 
@@ -122,8 +134,10 @@ func FetchChannelTool() (Tool, Handler) {
 
 		messages, coverage, err := pipeline.FetchMessagesFromChannelWithCoverage(ctx, req.ChannelID, req.ChannelType, timeStart.Unix(), timeEnd.Unix(), imDB, cfg.MsgTableCount, uid, maxPerChannel)
 		if err != nil {
+			recordFetch(false, false)
 			return "", fmt.Errorf("fetch messages: %w", err)
 		}
+		recordFetch(true, coverage.Truncated)
 
 		// Enrich messages with SenderName, SourceName, ChannelType before caching.
 		// This fixes citation metadata loss (SUM-46 Blocker A).

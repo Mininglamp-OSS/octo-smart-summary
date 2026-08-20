@@ -226,21 +226,21 @@ func citationsValid(content string, cits []model.Citation) bool {
 	return true
 }
 
-// finalizeRun computes the SS-07 finish verdict (COMPLETE/PARTIAL/FAILED) for the
-// session's run and persists it. Best-effort and flag-gated by the caller: for
-// SS-07 (core) it records the verdict + gaps for disclosure; it does NOT yet
-// block the save (that, plus the SSE done contract and runner-integrated retry,
-// is SS-07b). Off / no run → no-op.
+// finalizeRun computes the SS-07 finish verdict (COMPLETE/PARTIAL/FAILED) for
+// the exact request that produced the saved content and persists it. It is
+// best-effort and flag-gated by the caller. A missing/unknown request_id is a
+// no-op: selecting "the latest run in the session" is unsafe because a late
+// status update on an older run can move its updated_at past the generating run.
 //
 // Returns the verdict and gaps so the caller can surface them; on any lookup
 // failure it returns ("", nil) and the save proceeds unchanged.
-func (h *AgentSummaryHandler) finalizeRun(ctx context.Context, uid, sessionID, content string, cits []model.Citation) (finishgate.Verdict, []finishgate.Gap) {
-	if h.db == nil {
+func (h *AgentSummaryHandler) finalizeRun(ctx context.Context, uid, sessionID, requestID, content string, cits []model.Citation) (finishgate.Verdict, []finishgate.Gap) {
+	if h.db == nil || requestID == "" {
 		return "", nil
 	}
 	runStore := summaryrun.NewStore(h.db)
-	run, found, err := runStore.GetLatestRunBySession(ctx, uid, sessionID)
-	if err != nil || !found {
+	run, err := runStore.GetByRequest(ctx, uid, sessionID, requestID)
+	if err != nil {
 		return "", nil
 	}
 
@@ -248,6 +248,12 @@ func (h *AgentSummaryHandler) finalizeRun(ctx context.Context, uid, sessionID, c
 		ScopeResolved:            run.SpecID != "",
 		SummaryGenerated:         content != "",
 		CitationValidationPassed: citationsValid(content, cits),
+		CoverageMeasured:         run.CoverageMeasured,
+		AttemptedChannels:        decodeFinishChannelIDs(run.AttemptedChannels),
+		SucceededChannels:        decodeFinishChannelIDs(run.SucceededChannels),
+		FailedChannels:           decodeFinishChannelIDs(run.FailedChannels),
+		Truncated:                run.CoverageTruncated,
+		DroppedMessages:          run.DroppedMessages,
 	}
 
 	// SS-07b: a run marked failed by the tool-error hook (a fatal tool error
@@ -256,7 +262,7 @@ func (h *AgentSummaryHandler) finalizeRun(ctx context.Context, uid, sessionID, c
 		state.CriticalToolErrors = append(state.CriticalToolErrors, "fatal tool error during run")
 	}
 
-	// Coverage facts from the frozen artifact (SS-04/05), when present.
+	// Evidence facts from the frozen artifact (SS-04/05), when present.
 	// Run-scoped read (issue A fix): a session can hold multiple runs (one per
 	// submit/request_id), each with its own artifact. Reading by session would
 	// grab a different run's artifact and mismatch this run's Spec channel count
@@ -264,27 +270,41 @@ func (h *AgentSummaryHandler) finalizeRun(ctx context.Context, uid, sessionID, c
 	artStore := artifact.NewStore(h.db)
 	if art, ok, aerr := artStore.GetLatestArtifactByRun(ctx, uid, run.RunID); aerr == nil && ok {
 		state.HasUsableEvidence = art.MessageCount > 0
-		state.ChannelsFetched = art.ChannelCount
-		state.Truncated = art.Truncated
-		var failed []string
-		if art.FailedChannels != "" {
-			_ = json.Unmarshal([]byte(art.FailedChannels), &failed)
-		}
-		state.FailedChannels = failed
 	} else {
 		// No artifact (e.g. legacy path): evidence existence is implied by cits.
 		state.HasUsableEvidence = len(cits) > 0 || content != ""
 	}
+	if !state.HasUsableEvidence && run.CoverageMeasured && len(state.SucceededChannels) > 0 {
+		// A successfully fetched quiet channel is still usable negative evidence:
+		// the gate must not treat "0 messages" as "fetch never happened".
+		state.HasUsableEvidence = true
+	}
 
 	// Expected channels from the run's Spec, when persisted.
 	if spec, ok, serr := runStore.GetLatestSpec(ctx, uid, run.RunID); serr == nil && ok {
-		state.ChannelsExpected = len(spec.Channels)
+		state.ExpectedChannels = make([]string, 0, len(spec.Channels))
+		for _, ch := range spec.Channels {
+			if ch.ChannelID != "" {
+				state.ExpectedChannels = append(state.ExpectedChannels, ch.ChannelID)
+			}
+		}
 	}
 
 	verdict, gaps := finishgate.Evaluate(state)
-	if err := runStore.SetFinishStatus(ctx, run.RunID, string(verdict)); err != nil {
+	if err := runStore.SetFinishStatus(ctx, uid, run.RunID, string(verdict)); err != nil {
 		log.Printf("[finish] persist finish_status failed run=%s: %v", run.RunID, err)
 	}
 	log.Printf("[finish] session=%s run=%s verdict=%s gaps=%d", sessionID, run.RunID, verdict, len(gaps))
 	return verdict, gaps
+}
+
+func decodeFinishChannelIDs(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	var channels []string
+	if err := json.Unmarshal([]byte(raw), &channels); err != nil {
+		return nil
+	}
+	return channels
 }

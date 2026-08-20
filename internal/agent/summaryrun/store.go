@@ -64,15 +64,18 @@ func (s *Store) CreateOrGetRun(ctx context.Context, userID, sessionID, requestID
 	}
 	ts := now()
 	run := &model.AgentSummaryRun{
-		RunID:       uuid.NewString(),
-		UserID:      userID,
-		SessionID:   sessionID,
-		RequestID:   requestID,
-		ScopePolicy: scopePolicy,
-		Status:      model.RunStatusCreated,
-		Version:     0,
-		CreatedAt:   ts,
-		UpdatedAt:   ts,
+		RunID:            uuid.NewString(),
+		UserID:           userID,
+		SessionID:        sessionID,
+		RequestID:        requestID,
+		ScopePolicy:      scopePolicy,
+		Status:           model.RunStatusCreated,
+		AttemptedChannels: "[]",
+		SucceededChannels: "[]",
+		FailedChannels:    "[]",
+		Version:          0,
+		CreatedAt:        ts,
+		UpdatedAt:        ts,
 	}
 
 	// GORM maps DoNothing to ON DUPLICATE KEY UPDATE on MySQL. Do not use
@@ -238,43 +241,127 @@ func (s *Store) UpdateStatusCAS(ctx context.Context, userID, runID string, expec
 	return nil
 }
 
-// GetLatestRunBySession returns the most recently updated run for a (user,
-// session), owner-scoped. found=false (nil error) when none exists. Used at
-// finalize time to attach the finish verdict to the run that just completed.
-func (s *Store) GetLatestRunBySession(ctx context.Context, userID, sessionID string) (*model.AgentSummaryRun, bool, error) {
-	var run model.AgentSummaryRun
-	err := s.db.WithContext(ctx).
-		Where("user_id = ? AND session_id = ?", userID, sessionID).
-		Order("updated_at DESC").
-		First(&run).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, false, nil
-	}
-	if err != nil {
-		return nil, false, err
-	}
-	return &run, true, nil
-}
-
 // SetStatus force-sets the run's task-flow status without an optimistic version
 // check. Used by the SS-07b tool-error hook to mark a run failed when a fatal
 // tool error occurs mid-run (called concurrently from the tool worker pool, so
 // it must not depend on a read-modify-write of Version).
-func (s *Store) SetStatus(ctx context.Context, runID, status string) error {
+func (s *Store) SetStatus(ctx context.Context, userID, runID, status string) error {
 	return s.db.WithContext(ctx).Model(&model.AgentSummaryRun{}).
-		Where("run_id = ?", runID).
+		Where("run_id = ? AND user_id = ?", runID, userID).
 		Updates(map[string]interface{}{"status": status, "updated_at": now()}).Error
 }
 
 // SetFinishStatus records the finish-gate verdict (COMPLETE/PARTIAL/FAILED) on a
 // run. This is a terminal write (no optimistic CAS): the verdict is computed once
 // at finalize and does not race concurrent status transitions.
-func (s *Store) SetFinishStatus(ctx context.Context, runID, finishStatus string) error {
+func (s *Store) SetFinishStatus(ctx context.Context, userID, runID, finishStatus string) error {
 	res := s.db.WithContext(ctx).Model(&model.AgentSummaryRun{}).
-		Where("run_id = ?", runID).
+		Where("run_id = ? AND user_id = ?", runID, userID).
 		Updates(map[string]interface{}{
 			"finish_status": finishStatus,
 			"updated_at":    now(),
 		})
 	return res.Error
+}
+
+// RecordChannelFetch records the latest outcome of one channel fetch. The row
+// lock prevents parallel tool calls from losing each other's channel ids. A
+// successful retry clears a previous failure for that channel; a later failure
+// clears success so the final state describes the latest attempt.
+func (s *Store) RecordChannelFetch(ctx context.Context, userID, runID, channelID string, succeeded, truncated bool) error {
+	if channelID == "" {
+		return nil
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var run model.AgentSummaryRun
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("run_id = ? AND user_id = ?", runID, userID).
+			First(&run).Error; err != nil {
+			return err
+		}
+
+		attempted, err := decodeChannels(run.AttemptedChannels)
+		if err != nil {
+			return fmt.Errorf("decode attempted_channels: %w", err)
+		}
+		succeededChannels, err := decodeChannels(run.SucceededChannels)
+		if err != nil {
+			return fmt.Errorf("decode succeeded_channels: %w", err)
+		}
+		failed, err := decodeChannels(run.FailedChannels)
+		if err != nil {
+			return fmt.Errorf("decode failed_channels: %w", err)
+		}
+
+		attempted = addChannel(attempted, channelID)
+		if succeeded {
+			succeededChannels = addChannel(succeededChannels, channelID)
+			failed = removeChannel(failed, channelID)
+		} else {
+			failed = addChannel(failed, channelID)
+			succeededChannels = removeChannel(succeededChannels, channelID)
+		}
+
+		attemptedJSON, _ := json.Marshal(attempted)
+		succeededJSON, _ := json.Marshal(succeededChannels)
+		failedJSON, _ := json.Marshal(failed)
+		return tx.Model(&model.AgentSummaryRun{}).
+			Where("run_id = ? AND user_id = ?", runID, userID).
+			Updates(map[string]interface{}{
+				"coverage_measured":  true,
+				"attempted_channels": string(attemptedJSON),
+				"succeeded_channels": string(succeededJSON),
+				"failed_channels":    string(failedJSON),
+				"coverage_truncated": run.CoverageTruncated || truncated,
+				"updated_at":         now(),
+			}).Error
+	})
+}
+
+// AddDroppedMessages atomically records messages discarded before the model.
+// It is owner-scoped and additive because summarize_chunk calls may run in
+// parallel for distinct handles.
+func (s *Store) AddDroppedMessages(ctx context.Context, userID, runID string, count int) error {
+	if count <= 0 {
+		return nil
+	}
+	return s.db.WithContext(ctx).Model(&model.AgentSummaryRun{}).
+		Where("run_id = ? AND user_id = ?", runID, userID).
+		Updates(map[string]interface{}{
+			"dropped_messages": gorm.Expr("dropped_messages + ?", count),
+			"updated_at":       now(),
+		}).Error
+}
+
+func decodeChannels(raw string) ([]string, error) {
+	if raw == "" {
+		return []string{}, nil
+	}
+	var channels []string
+	if err := json.Unmarshal([]byte(raw), &channels); err != nil {
+		return nil, err
+	}
+	if channels == nil {
+		channels = []string{}
+	}
+	return channels, nil
+}
+
+func addChannel(channels []string, channelID string) []string {
+	for _, channel := range channels {
+		if channel == channelID {
+			return channels
+		}
+	}
+	return append(channels, channelID)
+}
+
+func removeChannel(channels []string, channelID string) []string {
+	out := channels[:0]
+	for _, channel := range channels {
+		if channel != channelID {
+			out = append(out, channel)
+		}
+	}
+	return out
 }

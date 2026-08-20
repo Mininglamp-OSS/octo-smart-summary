@@ -68,10 +68,14 @@ func TestHardNoFetch(t *testing.T) {
 		{"翻译成英文", RefineRewrite, true},   // explicit rewrite keyword
 		{"精简一下", RefineRewrite, true},    // explicit
 		{"总结里说了什么", RefineRewrite, true}, // explicit Q&A
-		{"随便改改", RefineRewrite, false},   // ambiguous fallback → keep tools
-		{"", RefineRewrite, false},       // empty fallback → keep tools
-		{"补全遗漏", RefineAugment, false},   // augment must keep fetch
-		{"最新进展", RefineExtend, false},    // extend must keep fetch
+		{"把下午客户会议的讨论加进总结里", RefineAugment, false},
+		{"整理中文档里提到的风险", RefineRewrite, false},
+		{"讨论精英文化的那部分", RefineRewrite, false},
+		{"帮我翻译成英文", RefineRewrite, true},
+		{"随便改改", RefineRewrite, false}, // ambiguous fallback → keep tools
+		{"", RefineRewrite, false},     // empty fallback → keep tools
+		{"补全遗漏", RefineAugment, false}, // augment must keep fetch
+		{"最新进展", RefineExtend, false},  // extend must keep fetch
 	}
 	for _, tc := range cases {
 		got := ClassifyRefine(tc.instruction)

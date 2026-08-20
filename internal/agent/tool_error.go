@@ -34,9 +34,11 @@ var criticalTools = map[string]bool{
 // deliberately conservative and text-based (the underlying tools return plain
 // errors); grow them as tools adopt typed errors.
 //
+//   - handler panic                          → fatal internal error
 //   - context deadline / canceled            → retryable, not fatal
+//   - 429 / 5xx / network / DB connection    → retryable, not fatal
 //   - permission / access / identity / auth  → fatal (cannot be retried into success)
-//   - invalid args / parse                    → not retryable, not fatal (planner bug)
+//   - explicit invalid args / parse           → retryable, not fatal
 //   - anything else on a critical tool        → fatal (data completeness at risk)
 //   - anything else on a non-critical tool    → retryable
 func classifyToolError(toolName string, err error) ToolErrorEnvelope {
@@ -48,17 +50,28 @@ func classifyToolError(toolName string, err error) ToolErrorEnvelope {
 	env := ToolErrorEnvelope{OK: false, Message: msg}
 
 	switch {
+	case strings.Contains(low, "panicked") || strings.Contains(low, "panic"):
+		env.ErrorCode, env.Retryable, env.Fatal = "INTERNAL_ERROR", false, true
 	case errors.Is(err, context.DeadlineExceeded) || strings.Contains(low, "deadline") || strings.Contains(low, "timeout"):
 		env.ErrorCode, env.Retryable, env.Fatal = "TIMEOUT", true, false
 	case errors.Is(err, context.Canceled) || strings.Contains(low, "canceled") || strings.Contains(low, "cancelled"):
 		env.ErrorCode, env.Retryable, env.Fatal = "CANCELED", true, false
+	case strings.Contains(low, "429") || strings.Contains(low, "too many requests") || strings.Contains(low, "rate limit"):
+		env.ErrorCode, env.Retryable, env.Fatal = "RATE_LIMITED", true, false
+	case containsHTTP5xx(low):
+		env.ErrorCode, env.Retryable, env.Fatal = "UPSTREAM_ERROR", true, false
+	case strings.Contains(low, "network") || strings.Contains(low, "dial tcp") ||
+		strings.Contains(low, "connection refused") || strings.Contains(low, "connection reset") ||
+		strings.Contains(low, "no such host") || strings.Contains(low, "temporary failure") ||
+		strings.Contains(low, "driver: bad connection") || strings.Contains(low, "database is closed") ||
+		strings.Contains(low, "db connection") || strings.Contains(low, "connection failed"):
+		env.ErrorCode, env.Retryable, env.Fatal = "TRANSIENT_TOOL_ERROR", true, false
 	case strings.Contains(low, "not accessible") || strings.Contains(low, "permission") ||
 		strings.Contains(low, "access denied") || strings.Contains(low, "identity") ||
 		strings.Contains(low, "unauthor") || strings.Contains(low, "forbidden"):
 		env.ErrorCode, env.Retryable, env.Fatal = "PERMISSION_DENIED", false, true
 	case strings.Contains(low, "parse args") || strings.Contains(low, "cannot parse") ||
-		strings.Contains(low, "parsing time") || strings.Contains(low, "invalid") ||
-		strings.Contains(low, "required"):
+		strings.Contains(low, "parsing time") || strings.Contains(low, "channel_type is required"):
 		// A bad tool argument (e.g. the model sent an empty time_start, so
 		// time.Parse fails with "cannot parse ...") is the agent's own mistake,
 		// not a fatal system failure. Retryable so the agent fixes and re-calls;
@@ -75,6 +88,19 @@ func classifyToolError(toolName string, err error) ToolErrorEnvelope {
 		}
 	}
 	return env
+}
+
+func containsHTTP5xx(msg string) bool {
+	for _, marker := range []string{"500", "501", "502", "503", "504", "505", "506", "507", "508", "510", "511"} {
+		if strings.Contains(msg, "status="+marker) ||
+			strings.Contains(msg, "status "+marker) ||
+			strings.Contains(msg, "http "+marker) ||
+			strings.Contains(msg, "statuscode="+marker) ||
+			strings.Contains(msg, "status code "+marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // JSON renders the envelope as the tool result string fed back to the model.

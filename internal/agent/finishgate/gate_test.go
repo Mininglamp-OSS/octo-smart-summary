@@ -9,8 +9,10 @@ func completeState() RunState {
 		HasUsableEvidence:        true,
 		SummaryGenerated:         true,
 		CitationValidationPassed: true,
-		ChannelsExpected:         2,
-		ChannelsFetched:          2,
+		CoverageMeasured:         true,
+		ExpectedChannels:         []string{"ch-1", "ch-2"},
+		AttemptedChannels:        []string{"ch-1", "ch-2"},
+		SucceededChannels:        []string{"ch-1", "ch-2"},
 	}
 }
 
@@ -59,7 +61,8 @@ func TestEvaluatePartial(t *testing.T) {
 	}{
 		"truncated":         {func(s *RunState) { s.Truncated = true }, GapTruncation},
 		"dropped messages":  {func(s *RunState) { s.DroppedMessages = 5 }, GapDropped},
-		"channel shortfall": {func(s *RunState) { s.ChannelsFetched = 1 }, GapChannel},
+		"coverage unknown":  {func(s *RunState) { s.CoverageMeasured = false }, GapCoverage},
+		"channel shortfall": {func(s *RunState) { s.SucceededChannels = []string{"ch-1"} }, GapChannel},
 		"failed channel":    {func(s *RunState) { s.FailedChannels = []string{"FETCH_TIMEOUT"} }, GapChannel},
 		"scope unresolved":  {func(s *RunState) { s.ScopeResolved = false }, GapToolError},
 	}
