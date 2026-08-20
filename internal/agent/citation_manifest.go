@@ -29,31 +29,22 @@ import (
 // answer.
 func applyFrozenManifest(ctx context.Context, uid, sessionID, runID string, pool []pipeline.Message) []pipeline.Message {
 	db, _, _, _ := GetSummaryDeps()
-	if db == nil || runID == "" {
+	if db == nil || runID == "" || len(pool) == 0 {
 		return pool
 	}
 	store := artifact.NewStore(db)
 
-	// Fast path: the run already froze a manifest — read it.
-	_, entries, found, err := store.GetLatestManifestByRun(ctx, uid, runID)
-	if err != nil {
+	// Always enter through FreezeFromPool. This removes the caller-side
+	// check-then-act race when runTools dispatches two summarize_chunk calls in
+	// parallel. Different pools may still create different artifact revisions,
+	// but every caller adopts the run's FIRST manifest below, so the ordinals
+	// used mid-run and at save time cannot diverge.
+	if _, _, _, err := store.FreezeFromPool(ctx, runID, uid, sessionID, pool, artifact.FreezeMeta{}); err != nil {
 		return pool
 	}
-	if !found {
-		// First citation pass for this run: freeze the current pool and use
-		// the manifest FreezeFromPool returns — the definitive one, whether it
-		// was created here or won a conflict race. Re-querying by
-		// revision-order after the freeze would re-open a race: another
-		// writer could land a higher revision in between, and this pass would
-		// apply THAT manifest's ordinals to its own pool.
-		_, man, _, ferr := store.FreezeFromPool(ctx, runID, uid, sessionID, pool, artifact.FreezeMeta{})
-		if ferr != nil {
-			return pool
-		}
-		entries, err = artifact.DecodeEntries(man.Entries)
-		if err != nil {
-			return pool
-		}
+	_, entries, found, err := store.GetFrozenManifestByRun(ctx, uid, runID)
+	if err != nil || !found {
+		return pool
 	}
 
 	ord := artifact.OrdinalMap(entries)

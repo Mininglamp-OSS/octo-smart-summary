@@ -321,16 +321,18 @@ func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{})
 // message is present in the map; a miss keeps the message with whatever index
 // it already had — the historical behavior, kept byte-identical.
 //
-// Returns the kept messages (same backing array, resliced) and the number of
-// dropped manifest-misses.
+// Returns a fresh kept slice and the number of dropped manifest-misses. The
+// input may be backed by the process-wide message cache, so it must remain
+// immutable after Retrieve releases the cache lock.
 func assignCitationIndexes(messages []pipeline.Message, citationMap map[string]int, v2 bool) ([]pipeline.Message, int) {
 	manifestMisses := 0
-	kept := messages[:0]
+	kept := make([]pipeline.Message, 0, len(messages))
 	for i := range messages {
 		key := fmt.Sprintf("%s:%d", messages[i].ChannelID, messages[i].MessageSeq)
 		if idx, found := citationMap[key]; found {
-			messages[i].CitationIndex = idx
-			kept = append(kept, messages[i])
+			msg := messages[i]
+			msg.CitationIndex = idx
+			kept = append(kept, msg)
 			continue
 		}
 		if v2 {

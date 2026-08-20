@@ -136,6 +136,16 @@ func TestFreezeNewContentNewRevisionAndStableOrdinals(t *testing.T) {
 	if err != nil || latest.Revision != 2 {
 		t.Fatalf("latest artifact = rev %v (err %v), want 2", latest, err)
 	}
+
+	// Hot paths adopt the first manifest even if a concurrent/later freeze
+	// persisted another revision. This is the freeze-once citation contract.
+	frozen, frozenEntries, found, err := s.GetFrozenManifestByRun(ctx, "u1", "run1")
+	if err != nil || !found || frozen.Revision != 1 {
+		t.Fatalf("frozen manifest = %#v found=%v err=%v, want revision 1", frozen, found, err)
+	}
+	if OrdinalMap(frozenEntries)["a:1"] != 1 {
+		t.Fatalf("frozen ordinals changed after revision 2: %v", OrdinalMap(frozenEntries))
+	}
 }
 
 func TestManifestOwnerScoped(t *testing.T) {
@@ -156,7 +166,7 @@ func TestManifestOwnerScoped(t *testing.T) {
 	}
 }
 
-func TestGetLatestManifestByRun(t *testing.T) {
+func TestGetFrozenManifestByRun(t *testing.T) {
 	db := newArtifactTestDB(t)
 	if db == nil {
 		return
@@ -165,13 +175,13 @@ func TestGetLatestManifestByRun(t *testing.T) {
 	ctx := context.Background()
 
 	// Not frozen yet → found=false, no error (the freeze-once read contract).
-	if _, _, found, err := s.GetLatestManifestByRun(ctx, "u1", "run1"); err != nil || found {
+	if _, _, found, err := s.GetFrozenManifestByRun(ctx, "u1", "run1"); err != nil || found {
 		t.Fatalf("pre-freeze: found=%v err=%v, want false/nil", found, err)
 	}
 
 	s.FreezeFromPool(ctx, "run1", "u1", "sess1", pool(), FreezeMeta{})
 
-	man, entries, found, err := s.GetLatestManifestByRun(ctx, "u1", "run1")
+	man, entries, found, err := s.GetFrozenManifestByRun(ctx, "u1", "run1")
 	if err != nil || !found {
 		t.Fatalf("post-freeze: found=%v err=%v, want true/nil", found, err)
 	}
@@ -179,8 +189,8 @@ func TestGetLatestManifestByRun(t *testing.T) {
 		t.Fatalf("manifest wrong: run=%s entries=%d", man.RunID, len(entries))
 	}
 	// Owner-scoped.
-	if _, _, found, _ := s.GetLatestManifestByRun(ctx, "attacker", "run1"); found {
-		t.Fatal("cross-user GetLatestManifestByRun should not find")
+	if _, _, found, _ := s.GetFrozenManifestByRun(ctx, "attacker", "run1"); found {
+		t.Fatal("cross-user GetFrozenManifestByRun should not find")
 	}
 }
 

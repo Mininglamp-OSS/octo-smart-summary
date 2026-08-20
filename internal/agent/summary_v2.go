@@ -12,10 +12,9 @@ import (
 //
 //   - off    (default): byte-identical to pre-SS-03 behavior. No run is created,
 //     no new query runs, agent_chat takes exactly the old path.
-//   - shadow: create + persist the Run/Spec for observability, but the reply
-//     path is unchanged (nothing user-visible depends on it yet).
-//   - on:     same as shadow for SS-03; later stages (SS-05+) make the tools read
-//     the persisted Spec.
+//   - shadow: currently identical to on, including user-visible profile guards
+//     and frozen-manifest behavior; the distinct name is reserved for later.
+//   - on:     enables the same Stage-2 behavior as shadow today.
 //
 // Kept as an env reader mirroring HistoryWindow() so wiring it in needs no change
 // to NewAgentChatHandler's signature or router.go — off therefore stays a true

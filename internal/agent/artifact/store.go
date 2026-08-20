@@ -78,7 +78,7 @@ func (s *Store) FreezeFromPool(ctx context.Context, runID, userID, sessionID str
 		var existing model.AgentEvidenceArtifact
 		found := tx.Where("run_id = ? AND content_hash = ?", runID, hash).First(&existing).Error
 		if found == nil {
-			m, err := loadManifestTx(tx, userID, existing.ArtifactID)
+			m, err := loadManifestTx(tx, userID, existing.ArtifactID, false)
 			if err != nil {
 				return err
 			}
@@ -140,7 +140,18 @@ func (s *Store) FreezeFromPool(ctx context.Context, runID, userID, sessionID str
 			if res.Error != nil {
 				return res.Error
 			}
-			if res.RowsAffected > 0 {
+
+			// Do not infer insert-vs-conflict from RowsAffected. GORM maps
+			// DoNothing to ON DUPLICATE KEY UPDATE on MySQL, and a DSN with
+			// clientFoundRows=true reports the conflict as one affected row.
+			// Read the unique content key back instead: our UUID means we won;
+			// another UUID means an identical-content writer won; no row means
+			// the conflict was only on (run_id, revision) and we must retry.
+			var persisted model.AgentEvidenceArtifact
+			perr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("run_id = ? AND content_hash = ?", runID, hash).
+				First(&persisted).Error
+			if perr == nil && persisted.ArtifactID == art.ArtifactID {
 				man := &model.AgentCitationManifest{
 					ManifestID: uuid.NewString(),
 					ArtifactID: art.ArtifactID,
@@ -158,6 +169,17 @@ func (s *Store) FreezeFromPool(ctx context.Context, runID, userID, sessionID str
 				won = true
 				break
 			}
+			if perr == nil {
+				m, err := loadManifestTx(tx, userID, persisted.ArtifactID, true)
+				if err != nil {
+					return err
+				}
+				artifact, manifest, created = &persisted, m, false
+				return nil
+			}
+			if !errors.Is(perr, gorm.ErrRecordNotFound) {
+				return perr
+			}
 
 			// Lost a race. Locking read for the recovery: under REPEATABLE
 			// READ a plain First would reuse the transaction snapshot taken
@@ -168,7 +190,7 @@ func (s *Store) FreezeFromPool(ctx context.Context, runID, userID, sessionID str
 				Where("run_id = ? AND content_hash = ?", runID, hash).
 				First(&winner).Error
 			if werr == nil {
-				m, err := loadManifestTx(tx, userID, winner.ArtifactID)
+				m, err := loadManifestTx(tx, userID, winner.ArtifactID, true)
 				if err != nil {
 					return err
 				}
@@ -225,7 +247,7 @@ func (s *Store) GetLatestArtifact(ctx context.Context, userID, runID string) (*m
 // LoadManifest returns the manifest for an artifact plus its decoded ordinal
 // entries. Owner-scoped by user_id.
 func (s *Store) LoadManifest(ctx context.Context, userID, artifactID string) (*model.AgentCitationManifest, []StableID, error) {
-	man, err := loadManifestTx(s.db.WithContext(ctx), userID, artifactID)
+	man, err := loadManifestTx(s.db.WithContext(ctx), userID, artifactID, false)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -236,26 +258,30 @@ func (s *Store) LoadManifest(ctx context.Context, userID, artifactID string) (*m
 	return man, entries, nil
 }
 
-func loadManifestTx(tx *gorm.DB, userID, artifactID string) (*model.AgentCitationManifest, error) {
+func loadManifestTx(tx *gorm.DB, userID, artifactID string, locking bool) (*model.AgentCitationManifest, error) {
 	var man model.AgentCitationManifest
-	if err := tx.Where("artifact_id = ? AND user_id = ?", artifactID, userID).First(&man).Error; err != nil {
+	query := tx.Where("artifact_id = ? AND user_id = ?", artifactID, userID)
+	if locking {
+		query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	if err := query.First(&man).Error; err != nil {
 		return nil, fmt.Errorf("load manifest for artifact %s: %w", artifactID, err)
 	}
 	return &man, nil
 }
 
-// GetLatestManifestByRun returns the highest-revision manifest for a run and its
+// GetFrozenManifestByRun returns the first (lowest-revision) manifest for a run and its
 // decoded entries. found=false (nil error) when the run has no manifest yet —
 // the caller then freezes one. Owner-scoped by user_id.
 //
-// This is the freeze-once read: the mid-run citation pass calls it first and
-// only freezes when nothing exists, so a later evidence growth cannot spawn a
-// second revision that would renumber the citations already emitted.
-func (s *Store) GetLatestManifestByRun(ctx context.Context, userID, runID string) (*model.AgentCitationManifest, []StableID, bool, error) {
+// This is the freeze-once read: concurrent first-freezes may persist later
+// artifact revisions, but all hot paths adopt revision 1 so evidence growth
+// cannot renumber citations already emitted.
+func (s *Store) GetFrozenManifestByRun(ctx context.Context, userID, runID string) (*model.AgentCitationManifest, []StableID, bool, error) {
 	var man model.AgentCitationManifest
 	err := s.db.WithContext(ctx).
 		Where("run_id = ? AND user_id = ?", runID, userID).
-		Order("revision DESC").
+		Order("revision ASC").
 		First(&man).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil, false, nil
@@ -274,6 +300,11 @@ func (s *Store) GetLatestManifestByRun(ctx context.Context, userID, runID string
 // for a (user, session), plus its decoded entries. found=false (nil error)
 // when the session has no frozen artifact. Owner-scoped by user_id.
 //
+// This is retained as SS-08 scaffolding and for migration tests only; no
+// production path calls it. Save-time adoption is request/run scoped through
+// GetFrozenManifestByRun, so the shipped schema intentionally carries no
+// session lookup index for this dormant helper.
+//
 // Ordering is created_at DESC with artifact_id as a deterministic tiebreaker.
 // The previous revision DESC ordering was wrong: revision is allocated PER RUN
 // (max+1 scoped by run_id in FreezeFromPool), so every run's first freeze is
@@ -283,7 +314,7 @@ func (s *Store) GetLatestManifestByRun(ctx context.Context, userID, runID string
 //
 // Callers must still prove the manifest belongs to THEIR request: the
 // save-time path resolves the run via request_id and reads
-// GetLatestManifestByRun instead, because a request that froze nothing must
+// GetFrozenManifestByRun instead, because a request that froze nothing must
 // not adopt an earlier run's manifest.
 func (s *Store) GetLatestBySession(ctx context.Context, userID, sessionID string) (*model.AgentCitationManifest, []StableID, bool, error) {
 	var art model.AgentEvidenceArtifact

@@ -16,9 +16,10 @@ import (
 // ambiguity: fetch_channel's truncated means "per-channel cap hit", peek's
 // means "the channel holds more than the sampled messages". Under V2
 // (head/middle/tail sampling) the result additionally carries
-// `sample_truncated` so a planner reading both tools in one conversation can
-// tell the flags apart. Legacy keys stay byte-identical.
-func TestPeekChannelSampleTruncatedAlias(t *testing.T) {
+// `sample_truncated` instead, so a planner reading both tools in one
+// conversation cannot confuse it with fetch_channel.truncated. Flag-off keeps
+// the legacy key byte-identical.
+func TestPeekChannelSampleTruncated(t *testing.T) {
 	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
 	t.Cleanup(func() { t.Setenv("AGENT_SUMMARY_V2_MODE", "") })
 
@@ -74,8 +75,8 @@ func TestPeekChannelSampleTruncatedAlias(t *testing.T) {
 		if m["sample_truncated"] != true {
 			t.Errorf("sample_truncated=%v, want true (10 > 5 sampled)", m["sample_truncated"])
 		}
-		if m["truncated"] != true {
-			t.Errorf("legacy truncated=%v, want true", m["truncated"])
+		if _, exists := m["truncated"]; exists {
+			t.Errorf("V2 peek must not emit ambiguous truncated key: %v", m)
 		}
 	})
 
@@ -85,8 +86,8 @@ func TestPeekChannelSampleTruncatedAlias(t *testing.T) {
 		if m["sample_truncated"] != false {
 			t.Errorf("sample_truncated=%v, want false (3 <= 5 sampled)", m["sample_truncated"])
 		}
-		if m["truncated"] != false {
-			t.Errorf("legacy truncated=%v, want false", m["truncated"])
+		if _, exists := m["truncated"]; exists {
+			t.Errorf("V2 peek must not emit ambiguous truncated key: %v", m)
 		}
 	})
 }

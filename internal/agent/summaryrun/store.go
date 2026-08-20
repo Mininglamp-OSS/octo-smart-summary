@@ -73,22 +73,18 @@ func (s *Store) CreateOrGetRun(ctx context.Context, userID, sessionID, requestID
 		UpdatedAt:   ts,
 	}
 
-	// INSERT ... ON CONFLICT DO NOTHING (INSERT IGNORE on MySQL). RowsAffected
-	// == 0 means the unique key rejected it → an existing run for this
-	// request_id, which we load and return.
+	// GORM maps DoNothing to ON DUPLICATE KEY UPDATE on MySQL. Do not use
+	// RowsAffected to distinguish insert from conflict: clientFoundRows=true
+	// changes that value. Read the unique tuple back and compare UUIDs instead.
 	res := s.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(run)
 	if res.Error != nil {
 		return nil, false, res.Error
 	}
-	if res.RowsAffected == 1 {
-		return run, true, nil
-	}
-
 	existing, err := s.GetByRequest(ctx, userID, sessionID, requestID)
 	if err != nil {
 		return nil, false, err
 	}
-	return existing, false, nil
+	return existing, existing.RunID == run.RunID, nil
 }
 
 // GetByRequest loads a run by its idempotency tuple. Owner-scoped by user_id.
@@ -156,7 +152,7 @@ func (s *Store) SaveSpec(ctx context.Context, run *model.AgentSummaryRun, expect
 			return err
 		}
 		res := tx.Model(&model.AgentSummaryRun{}).
-			Where("run_id = ? AND version = ?", run.RunID, expectedVersion).
+			Where("run_id = ? AND user_id = ? AND version = ?", run.RunID, run.UserID, expectedVersion).
 			Updates(map[string]interface{}{
 				"spec_id":      row.SpecID,
 				"spec_version": newSpecVersion,

@@ -8,6 +8,7 @@ package agent
 // in the map; a miss keeps the message unchanged (historical behavior).
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
@@ -108,5 +109,23 @@ func TestAssignCitationIndexes_V2NoMissKeepsAll(t *testing.T) {
 	}
 	if len(kept) != 2 {
 		t.Fatalf("kept %d messages, want 2", len(kept))
+	}
+}
+
+func TestAssignCitationIndexes_DoesNotMutateCachedSlice(t *testing.T) {
+	cache := newMessageCache()
+	original := []pipeline.Message{
+		{ChannelID: "ch1", MessageSeq: 50},  // miss before hit: used to compact in place
+		{ChannelID: "ch1", MessageSeq: 100}, // hit
+	}
+	handle := cache.Store(original, "u1")
+	wantCached := append([]pipeline.Message(nil), original...)
+
+	kept, misses := assignCitationIndexes(cache.Retrieve(handle, "u1"), map[string]int{"ch1:100": 1}, true)
+	if misses != 1 || len(kept) != 1 || kept[0].MessageSeq != 100 || kept[0].CitationIndex != 1 {
+		t.Fatalf("filtered result = %#v, misses=%d; want seq 100 at citation 1 and one miss", kept, misses)
+	}
+	if got := cache.Retrieve(handle, "u1"); !reflect.DeepEqual(got, wantCached) {
+		t.Fatalf("cached slice mutated: got %#v, want %#v", got, wantCached)
 	}
 }

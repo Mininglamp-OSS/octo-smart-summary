@@ -118,6 +118,29 @@ func TestSaveSpecAdvancesRunAndCAS(t *testing.T) {
 	}
 }
 
+func TestSaveSpecOwnerScoped(t *testing.T) {
+	db := newStoreTestDB(t)
+	if db == nil {
+		return
+	}
+	s := NewStore(db)
+	ctx := context.Background()
+	run, _, err := s.CreateOrGetRun(ctx, "owner", "sess1", "req1", model.ScopePolicyClosed)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	forged := *run
+	forged.UserID = "attacker"
+	spec, src := specDraft(t)
+	if _, err := s.SaveSpec(ctx, &forged, forged.Version, spec, src, "x"); !errors.Is(err, ErrConcurrentUpdate) {
+		t.Fatalf("cross-user SaveSpec err = %v, want ErrConcurrentUpdate", err)
+	}
+	var count int64
+	if err := db.Model(&model.AgentSummarySpec{}).Count(&count).Error; err != nil || count != 0 {
+		t.Fatalf("rolled-back spec rows=%d err=%v, want 0", count, err)
+	}
+}
+
 func TestUpdateStatusCAS(t *testing.T) {
 	db := newStoreTestDB(t)
 	if db == nil {

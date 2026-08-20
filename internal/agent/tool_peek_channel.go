@@ -173,15 +173,15 @@ func PeekChannelTool() (Tool, Handler) {
 			"sample_size":     len(sampled),
 			"messages":        sampled,
 			"messages_handle": handle,
-			"truncated":       len(messages) > sampleSize,
 		}
 		if useHeadMiddleTail {
 			result["sampling"] = "head_middle_tail"
-			// Disambiguate from fetch_channel's `truncated` (per-channel cap
-			// hit): here the flag means "the channel holds more than the 5
-			// sampled messages". The legacy key stays byte-identical for
-			// compatibility; the alias is what a V2 planner should read.
+			// Unlike fetch_channel.truncated (per-channel cap hit), this means
+			// only that peek returned a sample rather than every message.
 			result["sample_truncated"] = len(messages) > sampleSize
+		} else {
+			// Flag-off keeps the exact legacy result key.
+			result["truncated"] = len(messages) > sampleSize
 		}
 		data, err := json.Marshal(result)
 		if err != nil {

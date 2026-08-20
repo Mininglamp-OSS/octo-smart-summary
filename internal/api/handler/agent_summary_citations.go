@@ -184,7 +184,7 @@ func (h *AgentSummaryHandler) overrideWithRunManifest(ctx context.Context, uid, 
 	if err != nil {
 		return msgs
 	}
-	_, entries, found, err := artifact.NewStore(h.db).GetLatestManifestByRun(ctx, uid, run.RunID)
+	_, entries, found, err := artifact.NewStore(h.db).GetFrozenManifestByRun(ctx, uid, run.RunID)
 	if err != nil || !found {
 		return msgs
 	}

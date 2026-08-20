@@ -15,10 +15,8 @@ import "time"
 type AgentEvidenceArtifact struct {
 	ArtifactID string `gorm:"column:artifact_id;type:varchar(64);not null;primaryKey" json:"artifact_id"`
 	RunID      string `gorm:"column:run_id;type:varchar(64);not null;uniqueIndex:uk_artifact_hash,priority:1;uniqueIndex:uk_artifact_run_rev,priority:1" json:"run_id"`
-	// UserID is part of idx_artifact_user_session so the save-time
-	// session-scoped lookup (GetLatestBySession) is index-backed.
-	UserID    string `gorm:"column:user_id;type:varchar(64);not null;index:idx_artifact_user_session,priority:1" json:"user_id"`
-	SessionID string `gorm:"column:session_id;type:varchar(128);not null;default:'';index:idx_artifact_user_session,priority:2" json:"session_id"`
+	UserID     string `gorm:"column:user_id;type:varchar(64);not null" json:"user_id"`
+	SessionID  string `gorm:"column:session_id;type:varchar(128);not null;default:''" json:"session_id"`
 	// Revision is UNIQUE per run (uk_artifact_run_rev). It is allocated as
 	// max+1 under a LOCKING read in FreezeFromPool, which serializes the
 	// allocation; this constraint is the schema backstop if the lock is ever
@@ -42,7 +40,7 @@ type AgentEvidenceArtifact struct {
 	// Truncated: same reservation as ActualTimeRange (always false today).
 	Truncated bool `gorm:"column:truncated;not null;default:false" json:"truncated"`
 
-	CreatedAt time.Time `gorm:"column:created_at;not null;index:idx_artifact_user_session,priority:3" json:"created_at"`
+	CreatedAt time.Time `gorm:"column:created_at;not null" json:"created_at"`
 }
 
 func (AgentEvidenceArtifact) TableName() string { return "agent_evidence_artifact" }

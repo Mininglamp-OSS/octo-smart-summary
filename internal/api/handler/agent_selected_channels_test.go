@@ -68,6 +68,16 @@ func TestApplySelectedChannelContext_DropsUnknownChannelTypes(t *testing.T) {
 	}
 }
 
+func TestNormalizeSelectedChannelsMatchesPersistedScope(t *testing.T) {
+	got := normalizeSelectedChannels([]selectedChannel{
+		{ChannelID: "bad", ChannelType: "bogus", Name: "invalid"},
+		{ChannelID: " group-1 ", ChannelType: " GROUP ", Name: " valid "},
+	})
+	if len(got) != 1 || got[0].ChannelID != "group-1" || got[0].ChannelType != "group" || got[0].Name != "valid" {
+		t.Fatalf("normalized channels = %#v, want only canonical group-1", got)
+	}
+}
+
 func TestAgentChat_SelectedChannelsReachSystemPrompt(t *testing.T) {
 	reg := agent.NewRegistry()
 	pool := agent.NewPool(1)

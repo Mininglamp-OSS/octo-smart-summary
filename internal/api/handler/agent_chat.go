@@ -84,9 +84,8 @@ var sessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 // requestIDPattern 约束客户端生成的 request_id（V2 幂等键，可选）。与
 // session_id 同字符集、同 1..128 长——它流入 uk_run_request 的 VARCHAR(128)
-// 列。不加门时超长值会被 INSERT IGNORE 静默截到 128 字符插入，两个共享
-// 128 前缀的不同 request_id 会撞唯一键、后者静默沿用前者的 run。可选字段：
-// 空值（legacy 请求）直接放行，仅非空时才校验。
+// 唯一键；严格模式 MySQL 会拒绝超长值。仅 V2 开启时校验，flag-off
+// 接受并忽略该新字段，以保持旧请求路径兼容。
 var requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 // AgentChatHandler 提供非流式一问一答对话入口，复用 internal/agent 底座。
@@ -252,13 +251,31 @@ const maxSelectedChannels = 50
 // behavior and archived-thread discovery. The context value is not an authz
 // bypass: every channel tool still resolves membership through GetUserChannels.
 func applySelectedChannelContext(ctx context.Context, system string, selected []selectedChannel) (context.Context, string) {
-	if len(selected) == 0 {
+	normalized := normalizeSelectedChannels(selected)
+	if len(normalized) == 0 {
 		return ctx, system
 	}
 
+	allowedArchived := make(map[string]bool)
+	for _, ch := range normalized {
+		// Do not trust the client-provided is_archived bit for access decisions.
+		// Scope every selected thread ID through WithSelectedThreads; the DB
+		// query itself decides whether it is archived and whether uid is a member.
+		if ch.ChannelType == "thread" {
+			allowedArchived[ch.ChannelID] = true
+		}
+	}
+	if len(allowedArchived) > 0 {
+		ctx = context.WithValue(ctx, agent.ContextKeyAllowedArchivedChannels, allowedArchived)
+	}
+	return ctx, system + buildSelectedChannelsPrompt(normalized)
+}
+
+// normalizeSelectedChannels is the single normalization contract shared by
+// runtime prompt injection and persisted SummarySpec construction.
+func normalizeSelectedChannels(selected []selectedChannel) []selectedChannel {
 	normalized := make([]selectedChannel, 0, min(len(selected), maxSelectedChannels))
 	seen := make(map[string]bool, len(selected))
-	allowedArchived := make(map[string]bool)
 	for _, ch := range selected {
 		ch.ChannelID = truncateRunes(strings.TrimSpace(ch.ChannelID), 512)
 		if ch.ChannelID == "" || seen[ch.ChannelID] || len(normalized) >= maxSelectedChannels {
@@ -275,20 +292,8 @@ func applySelectedChannelContext(ctx context.Context, system string, selected []
 			continue
 		}
 		normalized = append(normalized, ch)
-		// Do not trust the client-provided is_archived bit for access decisions.
-		// Scope every selected thread ID through WithSelectedThreads; the DB
-		// query itself decides whether it is archived and whether uid is a member.
-		if ch.ChannelType == "thread" {
-			allowedArchived[ch.ChannelID] = true
-		}
 	}
-	if len(normalized) == 0 {
-		return ctx, system
-	}
-	if len(allowedArchived) > 0 {
-		ctx = context.WithValue(ctx, agent.ContextKeyAllowedArchivedChannels, allowedArchived)
-	}
-	return ctx, system + buildSelectedChannelsPrompt(normalized)
+	return normalized
 }
 
 func buildSelectedChannelsPrompt(selected []selectedChannel) string {
@@ -351,9 +356,10 @@ func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid strin
 		return ""
 	}
 
-	// UI-selected channels ⇒ closed scope; otherwise open (checklist A2 / §4.1).
+	normalizedChannels := normalizeSelectedChannels(req.SelectedChannels)
+	// Valid UI-selected channels ⇒ closed scope; otherwise open (checklist A2 / §4.1).
 	scopePolicy := model.ScopePolicyOpen
-	if len(req.SelectedChannels) > 0 {
+	if len(normalizedChannels) > 0 {
 		scopePolicy = model.ScopePolicyClosed
 	}
 
@@ -373,7 +379,7 @@ func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid strin
 	// any UI-selected channels so the contract is populated end to end.
 	objective := truncateRunes(req.Message, 1000)
 	draft := summaryspec.Draft{Objective: &objective}
-	for _, ch := range req.SelectedChannels {
+	for _, ch := range normalizedChannels {
 		draft.Channels = append(draft.Channels, summaryspec.Channel{
 			ChannelID: ch.ChannelID, Name: ch.Name, Type: ch.ChannelType,
 		})
@@ -424,9 +430,9 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "session_id 非法"})
 		return
 	}
-	// request_id 可选；非空时必须过 requestIDPattern，否则超长值会被
-	// INSERT IGNORE 静默截断并撞 uk_run_request。
-	if req.RequestID != "" && !requestIDPattern.MatchString(req.RequestID) {
+	// V2 开启时 request_id 非空必须匹配持久化列约束；flag-off 接受并
+	// 忽略这一新字段，保持 merge-base 的请求行为。
+	if agent.SummaryV2Enabled() && req.RequestID != "" && !requestIDPattern.MatchString(req.RequestID) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "request_id 非法"})
 		return
 	}
@@ -649,9 +655,9 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "session_id 非法"})
 		return
 	}
-	// request_id 可选；非空时必须过 requestIDPattern，否则超长值会被
-	// INSERT IGNORE 静默截断并撞 uk_run_request。
-	if req.RequestID != "" && !requestIDPattern.MatchString(req.RequestID) {
+	// V2 开启时 request_id 非空必须匹配持久化列约束；flag-off 接受并
+	// 忽略这一新字段，保持 merge-base 的请求行为。
+	if agent.SummaryV2Enabled() && req.RequestID != "" && !requestIDPattern.MatchString(req.RequestID) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "request_id 非法"})
 		return
 	}

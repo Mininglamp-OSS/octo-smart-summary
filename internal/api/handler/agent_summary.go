@@ -88,10 +88,10 @@ type createAgentSummaryReq struct {
 	// 前端在保存时把首轮引用的 task IDs 透传过来,后端记录到 SummaryTask
 	// (方便日后做衍生关系追溯),不影响本次生成的 content/citations。
 	ReferencedTaskIDs []int64 `json:"referenced_task_ids,omitempty"`
-	// RequestID 可选:生成被保存内容的 agent chat 轮次的 request_id
-	// (SS-03 idempotency key)。传了它,save 时 citations 就能解析出该轮
-	// freeze 的 manifest、用运行中模型看到的编号;缺省/未知 → 与 legacy
-	// 逐字节一致的重算路径,绝不报错(never a 400)。
+	// RequestID 可选:必须是生成当前最新 assistant 内容的同一 agent chat
+	// 轮次的 request_id (SS-03 idempotency key)。当前 AgentMessage 尚未持久化
+	// run_id，服务端无法验证跨轮错配；该绑定由客户端负责，SS-08 再持久化
+	// 校验。缺省/未知 → 与 legacy 一致的重算路径。
 	RequestID string `json:"request_id,omitempty"`
 }
 
@@ -122,6 +122,10 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	// --- validation (contract-defined error codes) ---
 	if req.SessionID == "" || !sessionIDPattern.MatchString(req.SessionID) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "session_id 缺失或不符合正则 ^[A-Za-z0-9_-]{1,128}$"})
+		return
+	}
+	if agent.SummaryV2Enabled() && req.RequestID != "" && !requestIDPattern.MatchString(req.RequestID) {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "request_id 非法"})
 		return
 	}
 
