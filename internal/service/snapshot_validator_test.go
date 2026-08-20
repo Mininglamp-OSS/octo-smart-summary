@@ -24,6 +24,7 @@ func TestValidatePersonalWorkflow_ActorRequired(t *testing.T) {
 		model.SnapshotScope{ChannelIDs: []string{"grp1"}},
 		1,
 		"", 0,
+		false,
 		time.Time{}, time.Time{},
 		31,
 	)
@@ -36,7 +37,6 @@ func TestValidateScheduledWorkflow_ActorRequired(t *testing.T) {
 	err := ValidateScheduledWorkflow(
 		"", "daily",
 		model.SnapshotScope{},
-		"", 1, 0,
 	)
 	if err == nil || err.Code != 40100 {
 		t.Fatalf("expected 40100 for empty actor on schedule, got %v", err)
@@ -63,6 +63,7 @@ func TestValidatePersonalWorkflow_BaseChecks(t *testing.T) {
 		srcCount int
 		origID   string
 		origType int
+		explicit bool
 		start    time.Time
 		end      time.Time
 		maxDays  int
@@ -113,8 +114,18 @@ func TestValidatePersonalWorkflow_BaseChecks(t *testing.T) {
 			scope:    model.SnapshotScope{ChannelIDs: []string{"g1"}},
 			start:    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 			end:      time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC), // ~59 days > 31
+			explicit: true,
 			maxDays:  31,
 			wantCode: 40002, wantMsg: "时间范围不能超过31天",
+		},
+		{
+			name:  "half-open time range rejected",
+			title: "t", topic: "x",
+			scope:    model.SnapshotScope{TimeRange: model.TimeRangeJSON{End: "2026-03-01T00:00:00Z"}},
+			explicit: true,
+			end:      time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),
+			maxDays:  31,
+			wantCode: 40002, wantMsg: "time_range.start 和 time_range.end 必须同时提供",
 		},
 		{
 			name:  "scope has no signal, no topic, no time range",
@@ -133,6 +144,7 @@ func TestValidatePersonalWorkflow_BaseChecks(t *testing.T) {
 				tc.scope,
 				tc.srcCount,
 				tc.origID, tc.origType,
+				tc.explicit,
 				tc.start, tc.end,
 				tc.maxDays,
 			)
@@ -198,6 +210,7 @@ func TestValidatePersonalWorkflow_SignalSources(t *testing.T) {
 			err := ValidatePersonalWorkflow(
 				"u1", "title", tc.topic,
 				scope, 0, "", 0,
+				!tc.start.IsZero() || !tc.end.IsZero(),
 				tc.start, tc.end,
 				31,
 			)
@@ -218,6 +231,7 @@ func TestValidatePersonalWorkflow_NoTimeRangeSpanCapWhenAbsent(t *testing.T) {
 		"u1", "t", "topic",
 		model.SnapshotScope{},
 		0, "", 0,
+		false,
 		time.Time{}, time.Time{},
 		31,
 	)
@@ -228,35 +242,10 @@ func TestValidatePersonalWorkflow_NoTimeRangeSpanCapWhenAbsent(t *testing.T) {
 
 // ------------------------- scheduled_workflow ---------------------------
 
-func TestValidateScheduledWorkflow_RecurrenceRequired(t *testing.T) {
-	err := ValidateScheduledWorkflow(
-		"u1", "daily",
-		model.SnapshotScope{},
-		"", 0, 0,
-	)
-	if err == nil || err.Code != 40010 {
-		t.Fatalf("expected 40010 for empty recurrence, got %v", err)
-	}
-
-	// interval_days > 0 passes.
-	if err := ValidateScheduledWorkflow("u1", "daily", model.SnapshotScope{}, "", 1, 0); err != nil {
-		t.Errorf("interval_days=1 should pass, got %v", err)
-	}
-	// cron_expr passes.
-	if err := ValidateScheduledWorkflow("u1", "daily", model.SnapshotScope{}, "0 9 * * *", 0, 0); err != nil {
-		t.Errorf("cron_expr should pass, got %v", err)
-	}
-	// interval_months passes.
-	if err := ValidateScheduledWorkflow("u1", "monthly", model.SnapshotScope{}, "", 0, 1); err != nil {
-		t.Errorf("interval_months=1 should pass, got %v", err)
-	}
-}
-
 func TestValidateScheduledWorkflow_TitleCapEnforced(t *testing.T) {
 	err := ValidateScheduledWorkflow(
 		"u1", strings.Repeat("总", MaxSummaryTitleRunes+1),
 		model.SnapshotScope{},
-		"", 1, 0,
 	)
 	if err == nil || err.Code != 40001 || err.Message != "title 不能超过 2300 字符" {
 		t.Fatalf("expected 40001 title over cap, got %v", err)
@@ -340,6 +329,13 @@ func TestValidateAgentSave_NegativeMessageIDRejected(t *testing.T) {
 	err := ValidateAgentSave("u1", "t", "sess1", "hello", "", 0, -1, 0)
 	if err == nil || err.Code != 40001 {
 		t.Fatalf("expected 40001 for negative msg_id, got %v", err)
+	}
+}
+
+func TestValidateAgentSave_NegativeSnapshotVersionRejected(t *testing.T) {
+	err := ValidateAgentSave("u1", "t", "sess1", "hello", "", 0, 0, -1)
+	if err == nil || err.Code != 40001 {
+		t.Fatalf("expected 40001 for negative snapshot_version, got %v", err)
 	}
 }
 

@@ -506,7 +506,6 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		userID,
 		req.Title,
 		scheduleScopeFromReq(req),
-		req.CronExpr, req.IntervalDays, req.IntervalMonths,
 	); bizE != nil {
 		bizErr(c, bizE)
 		return

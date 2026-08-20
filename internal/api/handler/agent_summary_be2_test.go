@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 
@@ -63,7 +64,7 @@ func doAgentSave(t *testing.T, r http.Handler, body map[string]interface{}, head
 
 func TestCreateAgentSummary_BE2_MessageIDCrossUser_404(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	// Seed a message owned by SOMEONE ELSE on the same session id.
@@ -94,7 +95,7 @@ func TestCreateAgentSummary_BE2_MessageIDCrossUser_404(t *testing.T) {
 
 func TestCreateAgentSummary_BE2_MessageIDWrongSession_404(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	// Seed for this user but on a DIFFERENT session id.
@@ -115,7 +116,7 @@ func TestCreateAgentSummary_BE2_MessageIDWrongSession_404(t *testing.T) {
 
 func TestCreateAgentSummary_BE2_MessageIDUserRole_404(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	// Seed a role=user row (not an assistant reply).
@@ -142,7 +143,7 @@ func TestCreateAgentSummary_BE2_MessageIDUserRole_404(t *testing.T) {
 
 func TestCreateAgentSummary_BE2_MessageIDToolCall_404(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	// Assistant row that carries a tool_calls payload (intermediate "call
@@ -176,7 +177,7 @@ func TestCreateAgentSummary_BE2_MessageIDToolCall_404(t *testing.T) {
 
 func TestCreateAgentSummary_BE2_SnapshotVersionConflict_409(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 	msg := seedAssistantMessage(t, db, "test-user", "sess-v", "final answer")
 
@@ -199,7 +200,7 @@ func TestCreateAgentSummary_BE2_SnapshotVersionConflict_409(t *testing.T) {
 
 func TestCreateAgentSummary_BE2_MessageIDWithoutVersion_400(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 	msg := seedAssistantMessage(t, db, "test-user", "sess-half", "final")
 
@@ -224,7 +225,7 @@ func TestCreateAgentSummary_BE2_IdempotencyReplaysSameTask(t *testing.T) {
 	if err := db.AutoMigrate(&model.SummaryAgentSaveIdempotency{}); err != nil {
 		t.Fatalf("migrate idempotency table: %v", err)
 	}
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	msg := seedAssistantMessage(t, db, "test-user", "sess-idem", "final answer")
@@ -248,8 +249,8 @@ func TestCreateAgentSummary_BE2_IdempotencyReplaysSameTask(t *testing.T) {
 	_ = json.Unmarshal(w1.Body.Bytes(), &r1)
 	taskID1 := r1["data"].(map[string]interface{})["task_id"]
 
-	// Re-seed the assistant message: the first save's tx DELETEs it. A
-	// replay must NOT need the draft any more (the whole point of
+	// The first save's tx DELETEs the assistant message. A replay must NOT
+	// need the draft any more (the whole point of
 	// idempotency is that the client can retry without holding session
 	// state). If the preflight works, we never re-read agent_message and
 	// the replay succeeds.
@@ -285,7 +286,7 @@ func TestCreateAgentSummary_BE2_IdempotencyMismatch409(t *testing.T) {
 	if err := db.AutoMigrate(&model.SummaryAgentSaveIdempotency{}); err != nil {
 		t.Fatalf("migrate idempotency table: %v", err)
 	}
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	msg1 := seedAssistantMessage(t, db, "test-user", "sess-mismatch-A", "answer A")
@@ -298,7 +299,7 @@ func TestCreateAgentSummary_BE2_IdempotencyMismatch409(t *testing.T) {
 		"agent_message_id":    msg1.ID,
 		"snapshot_version":    1,
 	}
-	headers := map[string]string{"Idempotency-Key": "req-mismatch-001"}
+	headers := map[string]string{"Idempotency-Key": "idem-mismatch-example"}
 
 	w1 := doAgentSave(t, r, body1, headers)
 	if w1.Code != http.StatusOK {
@@ -335,6 +336,85 @@ func TestCreateAgentSummary_BE2_IdempotencyMismatch409(t *testing.T) {
 	}
 }
 
+func TestCreateAgentSummary_BE2_ParticipantChangeConflictsBeforeDraftRead(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	if err := db.AutoMigrate(&model.SummaryAgentSaveIdempotency{}); err != nil {
+		t.Fatalf("migrate idempotency table: %v", err)
+	}
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	r := setupAgentSummaryRouter(h)
+	msg := seedAssistantMessage(t, db, "test-user", "sess-participants", "final answer")
+	body := map[string]interface{}{
+		"session_id":          "sess-participants",
+		"origin_channel_id":   "chan-1",
+		"origin_channel_type": 1,
+		"agent_message_id":    msg.ID,
+		"snapshot_version":    1,
+		"participants":        []map[string]interface{}{{"user_id": "alice"}},
+	}
+	headers := map[string]string{"Idempotency-Key": "idem-participants-example"}
+	if w := doAgentSave(t, r, body, headers); w.Code != http.StatusOK {
+		t.Fatalf("first save want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	body["participants"] = []map[string]interface{}{{"user_id": "bob"}}
+	w := doAgentSave(t, r, body, headers)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("participant-changing retry want 409, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateAgentSummary_BE2_DeletedTaskIsNotReplayed(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	if err := db.AutoMigrate(&model.SummaryAgentSaveIdempotency{}); err != nil {
+		t.Fatalf("migrate idempotency table: %v", err)
+	}
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	r := setupAgentSummaryRouter(h)
+	msg := seedAssistantMessage(t, db, "test-user", "sess-deleted", "final answer")
+	body := map[string]interface{}{
+		"session_id":          "sess-deleted",
+		"origin_channel_id":   "chan-1",
+		"origin_channel_type": 1,
+		"agent_message_id":    msg.ID,
+		"snapshot_version":    1,
+	}
+	headers := map[string]string{"Idempotency-Key": "idem-deleted-example"}
+	w1 := doAgentSave(t, r, body, headers)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("first save want 200, got %d: %s", w1.Code, w1.Body.String())
+	}
+	var first map[string]interface{}
+	_ = json.Unmarshal(w1.Body.Bytes(), &first)
+	taskID := int64(first["data"].(map[string]interface{})["task_id"].(float64))
+	if err := db.Model(&model.SummaryTask{}).Where("id = ?", taskID).Update("deleted_at", time.Now()).Error; err != nil {
+		t.Fatalf("soft delete task: %v", err)
+	}
+	w2 := doAgentSave(t, r, body, headers)
+	if w2.Code != http.StatusConflict {
+		t.Fatalf("deleted-task retry want 409, got %d: %s", w2.Code, w2.Body.String())
+	}
+	if bytes.Contains(w2.Body.Bytes(), []byte(`"replayed":true`)) {
+		t.Fatalf("deleted task must not be replayed: %s", w2.Body.String())
+	}
+}
+
+func TestCreateAgentSummary_BE2_WhitespaceIdempotencyKeyRejected(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	r := setupAgentSummaryRouter(h)
+	msg := seedAssistantMessage(t, db, "test-user", "sess-blank-key", "final answer")
+	w := doAgentSave(t, r, map[string]interface{}{
+		"session_id":          "sess-blank-key",
+		"origin_channel_id":   "chan-1",
+		"origin_channel_type": 1,
+		"agent_message_id":    msg.ID,
+		"snapshot_version":    1,
+	}, map[string]string{"Idempotency-Key": "   "})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("blank key want 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // -----------------------------------------------------------------------
 // 4. Agent draft never enters the traditional personal / meta Processor
 // -----------------------------------------------------------------------
@@ -347,7 +427,7 @@ func TestCreateAgentSummary_BE2_AgentDraftDoesNotEnterPersonalProcessor(t *testi
 	// draft. Design section 2.2: "不能把 Agent 草稿交给 personal/meta Processor
 	// 再生成一次".
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	msg := seedAssistantMessage(t, db, "test-user", "sess-proc", "final content")
@@ -402,7 +482,7 @@ func TestCreateAgentSummary_BE2_AgentDraftDoesNotEnterPersonalProcessor(t *testi
 
 func TestCreateAgentSummary_BE2_LegacyPathStillWorksAndWritesAudit(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	msg := seedAssistantMessage(t, db, "test-user", "sess-legacy", "old client answer")
@@ -429,8 +509,8 @@ func TestCreateAgentSummary_BE2_LegacyPathStillWorksAndWritesAudit(t *testing.T)
 	if task.AgentMessageID != msg.ID {
 		t.Errorf("audit AgentMessageID=%d want %d (resolved from latest assistant)", task.AgentMessageID, msg.ID)
 	}
-	if task.SnapshotVersion != 1 {
-		t.Errorf("audit SnapshotVersion=%d want 1", task.SnapshotVersion)
+	if task.SnapshotVersion != 0 {
+		t.Errorf("legacy audit SnapshotVersion=%d want 0", task.SnapshotVersion)
 	}
 }
 
@@ -444,7 +524,7 @@ func TestCreateAgentSummary_BE2_ValidationFailureKeepsDraft(t *testing.T) {
 	// corrected snapshot_version and reach the same content. Design
 	// section 7.7: "保存失败时保留草稿,可安全重试".
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	// Seed two messages (a user turn + an assistant reply) so we can

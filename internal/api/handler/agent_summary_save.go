@@ -30,7 +30,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -53,11 +52,6 @@ const maxAgentSaveIdempotencyKeyLen = maxBotIdempotencyKeyLen
 
 var agentSaveIdempotencyKeyPattern = botIdempotencyKeyPattern
 
-// agentSaveKeyPresentPattern rejects a header the client explicitly sent but
-// filled with only whitespace / bracket noise. len==0 (header absent) is the
-// pre-BE-2 legacy path handled separately by the caller.
-var agentSaveKeyPresentPattern = regexp.MustCompile(`\S`)
-
 // validAgentSaveIdempotencyKey mirrors validBotIdempotencyKey.
 func validAgentSaveIdempotencyKey(key string) bool {
 	return len(key) > 0 &&
@@ -69,19 +63,17 @@ func validAgentSaveIdempotencyKey(key string) bool {
 // the draft to save, verifying every DB-side identity axis in one WHERE
 // clause. Non-assistant / tool-call / cross-user / cross-session / deleted
 // message ids all return errNoAgentOutput (indistinguishable from "session
-// has no output" so the API surface does not leak whether the id exists —
-// mirrors loadLatestAssistantContent's owner-scope 404 discipline).
+// has no output" so the API surface does not leak whether the id exists).
 //
 // Callers pass a positive messageID to opt into the BE-2 targeted lookup;
-// messageID == 0 keeps the pre-BE-2 "latest assistant on session" behaviour
-// (see loadLatestAssistantContent). This dual mode lets FE-2 (SUM-7) roll
+// messageID == 0 keeps the pre-BE-2 "latest assistant on session" behaviour.
+// This dual mode lets FE-2 (SUM-7) roll
 // out the strict form while older frontends keep working during the release
 // window; once FE-2 ships, the fallback can be removed in a follow-up.
 func loadAgentMessageForSave(db *gorm.DB, sessionID, userID string, messageID int64) (model.AgentMessage, error) {
 	var msg model.AgentMessage
 	if messageID <= 0 {
-		// Legacy fallback: reuse loadLatestAssistantContent's semantics but
-		// return the row (not just the content) so the caller can echo the
+		// Legacy fallback returns the row (not just the content) so the caller can echo the
 		// resolved AgentMessageID onto SummaryTask for audit even on the
 		// legacy path.
 		err := db.Where(
@@ -118,27 +110,31 @@ func loadAgentMessageForSave(db *gorm.DB, sessionID, userID string, messageID in
 // the assistant content (server-trusted, would defeat the hash-vs-body-drift
 // contract because the client can't see server-canonicalised text).
 //
-// Included:
-//   - session_id + agent_message_id + snapshot_version — the exact draft
-//     the client thinks it is saving;
-//   - title (post-trim), origin channel (id + type after resolution);
-//   - referenced_task_ids (sorted, deduped) — same task retried should hash
-//     the same regardless of ordering;
-//   - sources (sorted by (type, id)).
-func canonicalAgentSaveRequestHash(
-	sessionID, title, originID string,
-	originType int,
-	messageID int64,
-	snapshotVersion int,
-	sources []sourceReq,
-	referencedTaskIDs []int64,
-) string {
-	sortedSources := make([]sourceReq, 0, len(sources))
-	for _, s := range sources {
+// The hash is intentionally computed from request-owned fields only, before
+// any session/message read. A successful save deletes agent_message rows, so
+// server-resolved values cannot be part of a replay key.
+func canonicalAgentSaveRequestHash(userID string, req createAgentSummaryReq) string {
+	type canonicalSource struct {
+		SourceType int    `json:"source_type"`
+		SourceID   string `json:"source_id"`
+	}
+	type canonicalParticipant struct {
+		UserID   string `json:"user_id"`
+		UserName string `json:"user_name"`
+	}
+
+	sortedSources := make([]canonicalSource, 0, len(req.Sources))
+	seenSources := make(map[string]struct{}, len(req.Sources))
+	for _, s := range req.Sources {
 		if s.SourceID == "" {
 			continue
 		}
-		sortedSources = append(sortedSources, s)
+		key := fmt.Sprintf("%d:%s", s.SourceType, s.SourceID)
+		if _, exists := seenSources[key]; exists {
+			continue
+		}
+		seenSources[key] = struct{}{}
+		sortedSources = append(sortedSources, canonicalSource{SourceType: s.SourceType, SourceID: s.SourceID})
 	}
 	sort.SliceStable(sortedSources, func(i, j int) bool {
 		if sortedSources[i].SourceType != sortedSources[j].SourceType {
@@ -147,7 +143,21 @@ func canonicalAgentSaveRequestHash(
 		return sortedSources[i].SourceID < sortedSources[j].SourceID
 	})
 
-	refCopy := append([]int64(nil), referencedTaskIDs...)
+	participants := make([]canonicalParticipant, 0, len(req.Participants))
+	seenParticipants := map[string]struct{}{userID: {}}
+	for _, p := range req.Participants {
+		if p.UserID == "" {
+			continue
+		}
+		if _, exists := seenParticipants[p.UserID]; exists {
+			continue
+		}
+		seenParticipants[p.UserID] = struct{}{}
+		participants = append(participants, canonicalParticipant{UserID: p.UserID, UserName: p.UserName})
+	}
+	sort.Slice(participants, func(i, j int) bool { return participants[i].UserID < participants[j].UserID })
+
+	refCopy := append([]int64(nil), req.ReferencedTaskIDs...)
 	sort.Slice(refCopy, func(i, j int) bool { return refCopy[i] < refCopy[j] })
 	// De-dup adjacent equal ids after sort.
 	if len(refCopy) > 1 {
@@ -161,23 +171,36 @@ func canonicalAgentSaveRequestHash(
 		refCopy = refCopy[:w]
 	}
 
+	originProvided := req.OriginChannelID != nil
+	originID := ""
+	originType := 0
+	if originProvided {
+		originID = *req.OriginChannelID
+		originType = req.OriginChannelType
+	}
 	payload := struct {
-		SessionID         string      `json:"session_id"`
-		AgentMessageID    int64       `json:"agent_message_id"`
-		SnapshotVersion   int         `json:"snapshot_version"`
-		Title             string      `json:"title"`
-		OriginChannelID   string      `json:"origin_channel_id"`
-		OriginChannelType int         `json:"origin_channel_type"`
-		Sources           []sourceReq `json:"sources"`
-		ReferencedTaskIDs []int64     `json:"referenced_task_ids"`
+		SessionID         string                 `json:"session_id"`
+		RequestID         string                 `json:"request_id"`
+		AgentMessageID    int64                  `json:"agent_message_id"`
+		SnapshotVersion   int                    `json:"snapshot_version"`
+		Title             string                 `json:"title"`
+		OriginProvided    bool                   `json:"origin_provided"`
+		OriginChannelID   string                 `json:"origin_channel_id"`
+		OriginChannelType int                    `json:"origin_channel_type"`
+		Sources           []canonicalSource      `json:"sources"`
+		Participants      []canonicalParticipant `json:"participants"`
+		ReferencedTaskIDs []int64                `json:"referenced_task_ids"`
 	}{
-		SessionID:         strings.TrimSpace(sessionID),
-		AgentMessageID:    messageID,
-		SnapshotVersion:   snapshotVersion,
-		Title:             strings.TrimSpace(title),
+		SessionID:         strings.TrimSpace(req.SessionID),
+		RequestID:         strings.TrimSpace(req.RequestID),
+		AgentMessageID:    req.AgentMessageID,
+		SnapshotVersion:   req.SnapshotVersion,
+		Title:             strings.TrimSpace(req.Title),
+		OriginProvided:    originProvided,
 		OriginChannelID:   originID,
 		OriginChannelType: originType,
 		Sources:           sortedSources,
+		Participants:      participants,
 		ReferencedTaskIDs: refCopy,
 	}
 	// json.Marshal on a struct is field-order deterministic — same layout in
@@ -201,30 +224,32 @@ func canonicalAgentSaveRequestHash(
 func findAgentSaveIdempotentTaskWithHash(
 	ctx context.Context, db *gorm.DB,
 	spaceID, userID, key, requestHash string,
-) (model.SummaryTask, bool, bool, error) {
+) (model.SummaryTask, bool, bool, bool, error) {
 	var binding model.SummaryAgentSaveIdempotency
 	if err := db.WithContext(ctx).
 		Where("space_id = ? AND user_id = ? AND idempotency_key = ?", spaceID, userID, key).
 		First(&binding).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return model.SummaryTask{}, false, false, nil
+			return model.SummaryTask{}, false, false, false, nil
 		}
-		return model.SummaryTask{}, false, false, err
+		return model.SummaryTask{}, false, false, false, err
 	}
-	// Load the referenced task (space + creator scoped so a stale binding
-	// whose task was hard-deleted falls through to a fresh create instead
-	// of silently pointing at another user's row).
+	// Load only a live referenced task. SummaryTask.DeletedAt is *time.Time,
+	// not gorm.DeletedAt, so the predicate must be explicit.
 	var task model.SummaryTask
 	if err := db.WithContext(ctx).
-		Where("id = ? AND space_id = ? AND creator_id = ?", binding.TaskID, spaceID, userID).
+		Where("id = ? AND space_id = ? AND creator_id = ? AND deleted_at IS NULL", binding.TaskID, spaceID, userID).
 		First(&task).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return model.SummaryTask{}, false, false, nil
+			// Keep the binding as a tombstone. Reusing an idempotency key after
+			// its resource was deleted must not recreate a side effect, and must
+			// not fall into the UNIQUE-conflict -> 500 loop either.
+			return model.SummaryTask{ID: binding.TaskID}, binding.RequestHash != requestHash, true, true, nil
 		}
-		return model.SummaryTask{}, false, false, err
+		return model.SummaryTask{}, false, false, false, err
 	}
 	if binding.RequestHash != requestHash {
-		return task, true, true, nil
+		return task, true, true, false, nil
 	}
-	return task, false, true, nil
+	return task, false, true, false, nil
 }

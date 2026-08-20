@@ -109,9 +109,9 @@ func scopeHasSignal(scope model.SnapshotScope) bool {
 //     what the validator gates on, NOT a parallel DTO.
 //   - sourceCount:      len(req.Sources) — the count cap is target-specific.
 //   - originChannelID / originChannelType: raw request fields.
-//   - explicitTimeStart / explicitTimeEnd: the caller-supplied range (zero
-//     values ⇒ caller let the server compute a default range and
-//     wants the span cap skipped, matching pre-refactor behaviour).
+//   - explicitTimeRange: whether the caller supplied time_range at all.
+//   - explicitTimeStart / explicitTimeEnd: the caller-supplied endpoints;
+//     when explicitTimeRange is true both must be non-zero.
 //   - maxDays: pipeline.DefaultTimeRangeDays passed explicitly so the
 //     validator has no runtime dependency on a mutable global.
 func ValidatePersonalWorkflow(
@@ -119,6 +119,7 @@ func ValidatePersonalWorkflow(
 	scope model.SnapshotScope,
 	sourceCount int,
 	originChannelID string, originChannelType int,
+	explicitTimeRange bool,
 	explicitTimeStart, explicitTimeEnd time.Time,
 	maxDays int,
 ) *BizError {
@@ -131,7 +132,10 @@ func ValidatePersonalWorkflow(
 	if err := validateOriginChannel(originChannelID, originChannelType); err != nil {
 		return err
 	}
-	if maxDays > 0 && !explicitTimeStart.IsZero() && !explicitTimeEnd.IsZero() {
+	if explicitTimeRange && (explicitTimeStart.IsZero() || explicitTimeEnd.IsZero()) {
+		return NewBizError(40002, "time_range.start 和 time_range.end 必须同时提供", http.StatusBadRequest)
+	}
+	if explicitTimeRange && maxDays > 0 {
 		if explicitTimeEnd.Sub(explicitTimeStart) > time.Duration(maxDays)*24*time.Hour {
 			return NewBizError(40002, fmt.Sprintf("时间范围不能超过%d天", maxDays), http.StatusBadRequest)
 		}
@@ -162,16 +166,12 @@ func ValidatePersonalWorkflow(
 func ValidateScheduledWorkflow(
 	actor, title string,
 	scope model.SnapshotScope,
-	cronExpr string, intervalDays, intervalMonths int,
 ) *BizError {
 	if err := requireActor(actor); err != nil {
 		return err
 	}
 	if err := validateTitleAndTopic(title, ""); err != nil {
 		return err
-	}
-	if cronExpr == "" && intervalDays == 0 && intervalMonths == 0 {
-		return NewBizError(40010, "schedule 必须提供 cron_expr / interval_days / interval_months 之一", http.StatusBadRequest)
 	}
 	// Non-blocking: an entirely empty scope on a schedule is legal in this
 	// repo (Layer 3 auto-narrow picks channels at run time), so we do NOT
@@ -242,6 +242,9 @@ func ValidateAgentSave(
 	}
 	if agentMessageID < 0 {
 		return NewBizError(40001, "agent_message_id 必须为正整数", http.StatusBadRequest)
+	}
+	if expectedSnapshotVersion < 0 {
+		return NewBizError(40001, "snapshot_version 必须为正整数", http.StatusBadRequest)
 	}
 	if expectedSnapshotVersion > 0 && expectedSnapshotVersion != AgentSaveExpectedSnapshotVersion {
 		// AGENT_DRAFT_STALE — client is looking at a snapshot the server never

@@ -43,38 +43,57 @@ func TestValidAgentSaveIdempotencyKey(t *testing.T) {
 func TestCanonicalAgentSaveRequestHash_StableAcrossOrdering(t *testing.T) {
 	// Same semantic body, different source/reference ORDER — must hash the
 	// same (client retry with re-sorted maps must replay, not 409).
-	base := "sess-abc"
-	a := canonicalAgentSaveRequestHash(
-		base, "Weekly", "chan-1", 1, 42, 1,
-		[]sourceReq{{SourceType: 1, SourceID: "s1"}, {SourceType: 1, SourceID: "s2"}},
-		[]int64{7, 3, 5},
-	)
-	b := canonicalAgentSaveRequestHash(
-		base, "Weekly", "chan-1", 1, 42, 1,
-		[]sourceReq{{SourceType: 1, SourceID: "s2"}, {SourceType: 1, SourceID: "s1"}},
-		[]int64{5, 3, 7, 3}, // includes a duplicate — de-dup contract
-	)
+	origin := "chan-1"
+	a := canonicalAgentSaveRequestHash("u1", createAgentSummaryReq{
+		SessionID: "sess-abc", Title: "Weekly", OriginChannelID: &origin, OriginChannelType: 1,
+		AgentMessageID: 42, SnapshotVersion: 1,
+		Sources:           []sourceReq{{SourceType: 1, SourceID: "s1"}, {SourceType: 1, SourceID: "s2"}},
+		Participants:      []participantReq{{UserID: "u3", UserName: "U3"}, {UserID: "u2", UserName: "U2"}},
+		ReferencedTaskIDs: []int64{7, 3, 5},
+	})
+	b := canonicalAgentSaveRequestHash("u1", createAgentSummaryReq{
+		SessionID: "sess-abc", Title: "Weekly", OriginChannelID: &origin, OriginChannelType: 1,
+		AgentMessageID: 42, SnapshotVersion: 1,
+		Sources:           []sourceReq{{SourceType: 1, SourceID: "s2"}, {SourceType: 1, SourceID: "s1"}, {SourceType: 1, SourceID: "s1", SourceName: "ignored"}},
+		Participants:      []participantReq{{UserID: "u2", UserName: "U2"}, {UserID: "u3", UserName: "U3"}, {UserID: "u2", UserName: "ignored duplicate"}},
+		ReferencedTaskIDs: []int64{5, 3, 7, 3},
+	})
 	if a != b {
 		t.Fatalf("hash should be order+dedup invariant, got a=%s b=%s", a, b)
 	}
 }
 
 func TestCanonicalAgentSaveRequestHash_DifferentBodyDiffers(t *testing.T) {
-	base := canonicalAgentSaveRequestHash(
-		"sess-abc", "Weekly", "chan-1", 1, 42, 1,
-		[]sourceReq{{SourceType: 1, SourceID: "s1"}}, nil,
-	)
+	origin1 := "chan-1"
+	origin2 := "chan-2"
+	baseReq := createAgentSummaryReq{
+		SessionID: "sess-abc", RequestID: "turn-1", Title: "Weekly",
+		OriginChannelID: &origin1, OriginChannelType: 1,
+		AgentMessageID: 42, SnapshotVersion: 1,
+		Sources: []sourceReq{{SourceType: 1, SourceID: "s1"}},
+	}
+	base := canonicalAgentSaveRequestHash("u1", baseReq)
 	// Changing ANY of the identity axes must produce a different hash so a
 	// same-key-different-body retry hits the 409 path.
 	shifts := map[string]string{
-		"session":    canonicalAgentSaveRequestHash("sess-xyz", "Weekly", "chan-1", 1, 42, 1, []sourceReq{{SourceType: 1, SourceID: "s1"}}, nil),
-		"title":      canonicalAgentSaveRequestHash("sess-abc", "Daily", "chan-1", 1, 42, 1, []sourceReq{{SourceType: 1, SourceID: "s1"}}, nil),
-		"channel_id": canonicalAgentSaveRequestHash("sess-abc", "Weekly", "chan-2", 1, 42, 1, []sourceReq{{SourceType: 1, SourceID: "s1"}}, nil),
-		"channel_tp": canonicalAgentSaveRequestHash("sess-abc", "Weekly", "chan-1", 2, 42, 1, []sourceReq{{SourceType: 1, SourceID: "s1"}}, nil),
-		"msg_id":     canonicalAgentSaveRequestHash("sess-abc", "Weekly", "chan-1", 1, 43, 1, []sourceReq{{SourceType: 1, SourceID: "s1"}}, nil),
-		"snap_ver":   canonicalAgentSaveRequestHash("sess-abc", "Weekly", "chan-1", 1, 42, 2, []sourceReq{{SourceType: 1, SourceID: "s1"}}, nil),
-		"sources":    canonicalAgentSaveRequestHash("sess-abc", "Weekly", "chan-1", 1, 42, 1, []sourceReq{{SourceType: 2, SourceID: "s1"}}, nil),
-		"refs":       canonicalAgentSaveRequestHash("sess-abc", "Weekly", "chan-1", 1, 42, 1, []sourceReq{{SourceType: 1, SourceID: "s1"}}, []int64{99}),
+		"session":    canonicalAgentSaveRequestHash("u1", func() createAgentSummaryReq { r := baseReq; r.SessionID = "sess-xyz"; return r }()),
+		"request":    canonicalAgentSaveRequestHash("u1", func() createAgentSummaryReq { r := baseReq; r.RequestID = "turn-2"; return r }()),
+		"title":      canonicalAgentSaveRequestHash("u1", func() createAgentSummaryReq { r := baseReq; r.Title = "Daily"; return r }()),
+		"channel_id": canonicalAgentSaveRequestHash("u1", func() createAgentSummaryReq { r := baseReq; r.OriginChannelID = &origin2; return r }()),
+		"channel_tp": canonicalAgentSaveRequestHash("u1", func() createAgentSummaryReq { r := baseReq; r.OriginChannelType = 2; return r }()),
+		"msg_id":     canonicalAgentSaveRequestHash("u1", func() createAgentSummaryReq { r := baseReq; r.AgentMessageID = 43; return r }()),
+		"snap_ver":   canonicalAgentSaveRequestHash("u1", func() createAgentSummaryReq { r := baseReq; r.SnapshotVersion = 2; return r }()),
+		"sources": canonicalAgentSaveRequestHash("u1", func() createAgentSummaryReq {
+			r := baseReq
+			r.Sources = []sourceReq{{SourceType: 2, SourceID: "s1"}}
+			return r
+		}()),
+		"participants": canonicalAgentSaveRequestHash("u1", func() createAgentSummaryReq {
+			r := baseReq
+			r.Participants = []participantReq{{UserID: "u2"}}
+			return r
+		}()),
+		"refs": canonicalAgentSaveRequestHash("u1", func() createAgentSummaryReq { r := baseReq; r.ReferencedTaskIDs = []int64{99}; return r }()),
 	}
 	for axis, h := range shifts {
 		if h == base {
@@ -86,8 +105,9 @@ func TestCanonicalAgentSaveRequestHash_DifferentBodyDiffers(t *testing.T) {
 func TestCanonicalAgentSaveRequestHash_TitleTrimmed(t *testing.T) {
 	// Whitespace-only title differences should NOT split idempotency
 	// (mirrors bot hash contract on trimmed title/topic).
-	a := canonicalAgentSaveRequestHash("sess", "Weekly", "c", 1, 1, 1, nil, nil)
-	b := canonicalAgentSaveRequestHash("sess", "  Weekly  ", "c", 1, 1, 1, nil, nil)
+	origin := "c"
+	a := canonicalAgentSaveRequestHash("u1", createAgentSummaryReq{SessionID: "sess", Title: "Weekly", OriginChannelID: &origin, OriginChannelType: 1, AgentMessageID: 1, SnapshotVersion: 1})
+	b := canonicalAgentSaveRequestHash("u1", createAgentSummaryReq{SessionID: "sess", Title: "  Weekly  ", OriginChannelID: &origin, OriginChannelType: 1, AgentMessageID: 1, SnapshotVersion: 1})
 	if a != b {
 		t.Errorf("title whitespace should be trimmed for hashing")
 	}
@@ -98,11 +118,19 @@ func TestCanonicalAgentSaveRequestHash_EmptySourceIDDropped(t *testing.T) {
 	// insert loop does — it too skips empty ids). Client accidentally
 	// sending {source_type:1, source_id:""} on one retry vs skipping it on
 	// the next must replay cleanly.
-	a := canonicalAgentSaveRequestHash("sess", "t", "c", 1, 1, 1,
-		[]sourceReq{{SourceType: 1, SourceID: "real"}}, nil)
-	b := canonicalAgentSaveRequestHash("sess", "t", "c", 1, 1, 1,
-		[]sourceReq{{SourceType: 1, SourceID: ""}, {SourceType: 1, SourceID: "real"}}, nil)
+	origin := "c"
+	a := canonicalAgentSaveRequestHash("u1", createAgentSummaryReq{SessionID: "sess", Title: "t", OriginChannelID: &origin, OriginChannelType: 1, AgentMessageID: 1, SnapshotVersion: 1, Sources: []sourceReq{{SourceType: 1, SourceID: "real"}}})
+	b := canonicalAgentSaveRequestHash("u1", createAgentSummaryReq{SessionID: "sess", Title: "t", OriginChannelID: &origin, OriginChannelType: 1, AgentMessageID: 1, SnapshotVersion: 1, Sources: []sourceReq{{SourceType: 1, SourceID: ""}, {SourceType: 1, SourceID: "real"}}})
 	if a != b {
 		t.Errorf("empty source id should be dropped, got a=%s b=%s", a, b)
+	}
+}
+
+func TestCanonicalAgentSaveRequestHash_ImplicitOriginDiffersFromExplicitEmpty(t *testing.T) {
+	empty := ""
+	implicit := canonicalAgentSaveRequestHash("u1", createAgentSummaryReq{SessionID: "sess"})
+	explicit := canonicalAgentSaveRequestHash("u1", createAgentSummaryReq{SessionID: "sess", OriginChannelID: &empty})
+	if implicit == explicit {
+		t.Fatal("implicit origin and explicitly empty origin must hash differently")
 	}
 }

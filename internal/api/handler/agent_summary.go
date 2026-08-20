@@ -147,6 +147,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "request_id 非法"})
 		return
 	}
+	req.Title = strings.TrimSpace(req.Title)
 
 	// SUM-24: origin_channel fields are now optional. Distinguish between:
 	// - nil (not provided) → resolve from session
@@ -172,13 +173,71 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		return
 	}
 
+	// SUM-BE2 idempotency preflight must run before any session/origin/draft
+	// lookup. A successful save deletes the session messages, so replay cannot
+	// depend on state that the first request intentionally destroys.
+	keyHeader := http.CanonicalHeaderKey("Idempotency-Key")
+	keyValues, keyPresent := c.Request.Header[keyHeader]
+	idempotencyKey := strings.TrimSpace(c.GetHeader(keyHeader))
+	if keyPresent && (len(keyValues) != 1 || idempotencyKey == "") {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "valid Idempotency-Key header is required"})
+		return
+	}
+	var requestHash string
+	if idempotencyKey != "" {
+		if !validAgentSaveIdempotencyKey(idempotencyKey) {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "valid Idempotency-Key header is required"})
+			return
+		}
+		requestHash = canonicalAgentSaveRequestHash(userID, req)
+		existing, mismatched, ok, stale, ferr := findAgentSaveIdempotentTaskWithHash(
+			c.Request.Context(), h.db, spaceID, userID, idempotencyKey, requestHash,
+		)
+		if ferr != nil {
+			log.Printf("[handler] CreateAgentSummary idempotency lookup failed space=%s user=%s key=%s: %v", spaceID, userID, idempotencyKey, ferr)
+			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "idempotency check failed"})
+			return
+		}
+		if stale {
+			c.JSON(http.StatusConflict, apiResponse{
+				Code:    40009,
+				Message: "idempotency key is bound to a deleted summary",
+				Data:    gin.H{"task_id": existing.ID},
+			})
+			return
+		}
+		if ok && mismatched {
+			c.JSON(http.StatusConflict, apiResponse{
+				Code:    40009,
+				Message: "idempotency key already bound to a different agent save request",
+				Data:    gin.H{"task_id": existing.ID, "task_no": existing.TaskNo},
+			})
+			return
+		}
+		if ok {
+			log.Printf("[handler] CreateAgentSummary idempotency replay space=%s user=%s key=%s task_id=%d", spaceID, userID, idempotencyKey, existing.ID)
+			c.JSON(http.StatusOK, apiResponse{
+				Code:    0,
+				Message: "ok",
+				Data: gin.H{
+					"task_id":    existing.ID,
+					"task_no":    existing.TaskNo,
+					"status":     existing.Status,
+					"created_at": existing.CreatedAt,
+					"replayed":   true,
+				},
+			})
+			return
+		}
+	}
+
 	if req.OriginChannelID == nil {
 		// Not provided → resolve from session tool traces
 		resolvedID, resolvedType, err := h.resolveOriginChannelFromSession(c.Request.Context(), req.SessionID, userID)
 		if err != nil {
 			// DB error or other real failure → 500
 			log.Printf("[handler] resolveOriginChannelFromSession failed session=%s: %v", req.SessionID, err)
-			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "resolve origin channel failed: " + err.Error()})
+			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "resolve origin channel failed"})
 			return
 		}
 		if resolvedID == "" {
@@ -297,7 +356,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	}
 
 	// SUM-BE1: the agent_save-target validator runs a few lines below,
-	// AFTER loadLatestAssistantContent + stripAgentPreamble have resolved
+	// AFTER loadAgentMessageForSave + stripAgentPreamble have resolved
 	// the server-trusted deliverable — that way ContentLen is measured on
 	// the real content the DB will persist, not a request-supplied number
 	// the client could lie about. Running the validator here instead would
@@ -314,7 +373,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	//
 	// Every rejection path collapses to errNoAgentOutput → 40004 so an
 	// attacker cannot probe whether a specific message id exists (matches
-	// loadLatestAssistantContent's owner-scope 404 discipline, SUM-158
+	// the legacy loader's owner-scope 404 discipline, SUM-158
 	// blocker 1).
 	draftMsg, err := loadAgentMessageForSave(h.db.WithContext(c.Request.Context()), req.SessionID, userID, req.AgentMessageID)
 	if err != nil {
@@ -351,7 +410,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	// which would otherwise silently save an empty deliverable.
 	//
 	// Note on parameters: message ownership / role / session identity are
-	// already enforced by loadLatestAssistantContent's WHERE clause
+	// already enforced by loadAgentMessageForSave's WHERE clause
 	// (user_id + session_id + role='assistant'), so this call does not
 	// re-declare those. Snapshot-version and message-id enforcement remain
 	// BE-2 scope (they require new storage-side reads BE-1 does not add);
@@ -368,61 +427,6 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	); bizE != nil {
 		bizErr(c, bizE)
 		return
-	}
-
-	// --- SUM-BE2 idempotency preflight ---
-	// Same-key-same-body: replay the previously-created task without touching
-	// any table. Same-key-different-body: 409 with the original task_id so
-	// the client can recover. Header absent: skip idempotency (legacy path,
-	// removed once FE-2 SUM-7 ships the header on every save).
-	idempotencyKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
-	var requestHash string
-	if idempotencyKey != "" {
-		if !validAgentSaveIdempotencyKey(idempotencyKey) {
-			c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "valid Idempotency-Key header is required"})
-			return
-		}
-		requestHash = canonicalAgentSaveRequestHash(
-			req.SessionID, req.Title, finalChannelID, finalChannelType,
-			resolvedAgentMessageID, req.SnapshotVersion,
-			req.Sources, req.ReferencedTaskIDs,
-		)
-		existing, mismatched, ok, ferr := findAgentSaveIdempotentTaskWithHash(
-			c.Request.Context(), h.db, spaceID, userID, idempotencyKey, requestHash,
-		)
-		if ferr != nil {
-			log.Printf("[handler] CreateAgentSummary idempotency lookup failed space=%s user=%s key=%s: %v", spaceID, userID, idempotencyKey, ferr)
-			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "idempotency check failed: " + ferr.Error()})
-			return
-		}
-		if ok && mismatched {
-			// SUMMARY_ALREADY_CREATED conflict variant — same key, different
-			// body. Echo the original task_id so the client can jump to it.
-			c.JSON(http.StatusConflict, apiResponse{
-				Code:    40009,
-				Message: "idempotency key already bound to a different agent save request",
-				Data:    gin.H{"task_id": existing.ID, "task_no": existing.TaskNo},
-			})
-			return
-		}
-		if ok {
-			// Clean replay — the client's retry matched byte-for-byte. Return
-			// the original task without touching the DB. This is the "重复保存
-			// 返回同一 Summary" contract in design section 7.7.
-			log.Printf("[handler] CreateAgentSummary idempotency replay space=%s user=%s key=%s task_id=%d", spaceID, userID, idempotencyKey, existing.ID)
-			c.JSON(http.StatusOK, apiResponse{
-				Code:    0,
-				Message: "ok",
-				Data: gin.H{
-					"task_id":    existing.ID,
-					"task_no":    existing.TaskNo,
-					"status":     existing.Status,
-					"created_at": existing.CreatedAt,
-					"replayed":   true,
-				},
-			})
-			return
-		}
 	}
 
 	// --- title fallback: caller may skip, we generate the same way the
@@ -475,7 +479,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		// assistant" fallback also writes the real message id, not 0).
 		AgentSessionID:  req.SessionID,
 		AgentMessageID:  resolvedAgentMessageID,
-		SnapshotVersion: service.AgentSaveExpectedSnapshotVersion,
+		SnapshotVersion: req.SnapshotVersion,
 	}
 
 	var createdTaskID int64
@@ -658,12 +662,20 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	if errors.Is(err, errAgentSaveIdempotencyConflict) {
 		// A concurrent request won the UNIQUE race. Re-read the binding to
 		// decide replay-vs-mismatch, mirroring bot_summary_create.go's flow.
-		existing, mismatched, ok, ferr := findAgentSaveIdempotentTaskWithHash(
+		existing, mismatched, ok, stale, ferr := findAgentSaveIdempotentTaskWithHash(
 			c.Request.Context(), h.db, spaceID, userID, idempotencyKey, requestHash,
 		)
 		if ferr != nil || !ok {
 			log.Printf("[handler] CreateAgentSummary idempotency race re-read failed space=%s user=%s key=%s ok=%v: %v", spaceID, userID, idempotencyKey, ok, ferr)
 			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "idempotency race resolution failed"})
+			return
+		}
+		if stale {
+			c.JSON(http.StatusConflict, apiResponse{
+				Code:    40009,
+				Message: "idempotency key is bound to a deleted summary",
+				Data:    gin.H{"task_id": existing.ID},
+			})
 			return
 		}
 		if mismatched {
@@ -689,7 +701,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	}
 	if err != nil {
 		log.Printf("[handler] CreateAgentSummary tx failed space=%s user=%s session=%s: %v", spaceID, userID, req.SessionID, err)
-		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "落库失败: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "落库失败"})
 		return
 	}
 
@@ -713,27 +725,6 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 // errNoAgentOutput signals that the session exists but has no assistant reply
 // worth persisting as a summary yet — mapped by the handler to error code 40004.
 var errNoAgentOutput = errors.New("no assistant output on session")
-
-// loadLatestAssistantContent returns the latest non-empty assistant message
-// text on the given session (skipping intermediate "call this tool" messages,
-// which are recognisable because they carry a tool_calls payload).
-//
-// owner-scoped：必须传 userID，跨用户匹配返回 errNoAgentOutput（与真实空会话
-// 在响应上不可区分，不泄漏 session 存在）(SUM-158 blocker 1)。
-func loadLatestAssistantContent(db *gorm.DB, sessionID, userID string) (string, error) {
-	var msg model.AgentMessage
-	err := db.Where("user_id = ? AND session_id = ? AND role = ? AND tool_calls IS NULL AND content <> ''", userID, sessionID, "assistant").
-		Order("id DESC").
-		Limit(1).
-		Take(&msg).Error
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return "", errNoAgentOutput
-		}
-		return "", err
-	}
-	return msg.Content, nil
-}
 
 // buildSnapshotV1 constructs the v1 snapshot for an agent-generated summary.
 // This is the initial snapshot (parent_snapshot_version=null, user_instruction=null).

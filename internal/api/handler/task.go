@@ -372,6 +372,7 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		scope,
 		len(req.Sources),
 		req.OriginChannelID, req.OriginChannelType,
+		explicitTimeRange,
 		validatorStart, validatorEnd,
 		maxDays,
 	); bizE != nil {
