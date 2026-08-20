@@ -181,10 +181,10 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 			// same window as a disconnect must still be visible, or the very signal this
 			// branch protects gets holes punched in it. Marked so it is filterable.
 			if errors.Is(c.Request.Context().Err(), context.Canceled) {
-				log.Printf("[handler] preview fetch source aborted (client disconnected) doc=%q user=%s space=%s: %v", ref.DocumentID, userID, spaceID, err)
+				log.Printf("[handler] preview fetch source aborted (client disconnected) doc=%q user=%q space=%q: %v", ref.DocumentID, userID, spaceID, err)
 				return
 			}
-			log.Printf("[handler] preview fetch source failed doc=%q user=%s space=%s: %v", ref.DocumentID, userID, spaceID, err)
+			log.Printf("[handler] preview fetch source failed doc=%q user=%q space=%q: %v", ref.DocumentID, userID, spaceID, err)
 			var srcErr *documentSourceError
 			if errors.As(err, &srcErr) {
 				// Map the upstream class faithfully: 401/403/404 is a document/permission
@@ -266,10 +266,10 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 		// failure, and the error frame would be written to a socket nobody reads. The
 		// record is kept for the same reason as above.
 		if errors.Is(c.Request.Context().Err(), context.Canceled) {
-			log.Printf("[handler] preview stream aborted (client disconnected) doc=%q user=%s space=%s: %v", ref.DocumentID, userID, spaceID, err)
+			log.Printf("[handler] preview stream aborted (client disconnected) doc=%q user=%q space=%q: %v", ref.DocumentID, userID, spaceID, err)
 			return
 		}
-		log.Printf("[handler] preview stream failed doc=%q user=%s space=%s: %v", ref.DocumentID, userID, spaceID, err)
+		log.Printf("[handler] preview stream failed doc=%q user=%q space=%q: %v", ref.DocumentID, userID, spaceID, err)
 		_ = writeSSE(w, "error", previewEvent{Type: "error", Content: "文档速览生成失败"})
 		w.Flush()
 		return
@@ -295,7 +295,13 @@ func buildDocumentPreviewPrompt(doc *documentSummarySource) string {
 		utf8.RuneCountInString(truncatedMarker) -
 		utf8.RuneCountInString(closeFence)
 	if bodyLimit < 1 {
-		bodyLimit = maxDocumentPromptRunes
+		// Clamp CLOSED, not open. An earlier version reset this to the full budget,
+		// which handed the entire 80,000 runes to untrusted body text in exactly the
+		// situation the guard exists to catch. Unreachable today (the instruction is
+		// ~300 runes), but it is the next editor of documentPreviewInstruction who
+		// would pay for it. Zero means "append nothing", which appendBody already
+		// handles, and the truncation marker then tells the user why.
+		bodyLimit = 0
 	}
 	used := 0
 	appendBody := func(s string) bool {

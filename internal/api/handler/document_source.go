@@ -19,7 +19,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -149,7 +148,7 @@ func (c *httpDocumentSourceClient) FetchSummarySource(ctx context.Context, space
 	// per-user. Collapsing them in the dashboard would hide a service-wide
 	// misconfiguration inside routine permission noise.
 	if resp.StatusCode == http.StatusUnauthorized {
-		log.Printf("[handler] document source rejected the forwarded Token (upstream 401) doc=%q user=%s space=%s — check token audience/format agreement between services", documentID, userID, spaceID)
+		log.Printf("[handler] document source rejected the forwarded Token (upstream 401) doc=%q user=%q space=%q — check token audience/format agreement between services", documentID, userID, spaceID)
 		return nil, &documentSourceError{status: http.StatusBadRequest, message: fmt.Sprintf("document %s is not accessible (upstream %d)", documentID, resp.StatusCode)}
 	}
 	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound {
@@ -273,106 +272,28 @@ func validateDocumentRefs(refs []documentRefReq) error {
 	return nil
 }
 
-// sanitizeDocumentFenceText neutralizes untrusted document text that could close
-// the <文档数据> fence early: full-width / small-form / CJK angle-and-slash folding,
-// invisible-character stripping, then two structural passes.
-//
-// Two passes, in this order:
-//
-//  1. docFenceTagPattern — the full, well-formed tag. Folds to the readable
-//     [文档数据] placeholder, and is what lets documentTextWithoutFenceTags strip a
-//     fence-only body to the empty string.
-//  2. docFenceHeadPattern — the tag *head* alone, with no closing `>` required.
-//
-// Pass 2 is what makes this convergent. Rounds 4–7 each widened pass 1's tail to
-// cover one more well-formed shape (attributes, self-closing, repeated solidus)
-// and each left a longer variant reachable: any bound on the tail is a bound the
-// attacker picks, and no bound at all lets a stray `<文档数据` swallow the document
-// up to a distant unrelated `>`. Neutralizing the head sidesteps the tail
-// entirely — once the leading `<` is gone the remainder is inert text, whatever
-// its shape — so the overlong, unclosed, and not-yet-imagined forms all collapse
-// together rather than one per round.
-//
-// The class claim is scoped, not absolute. After the normalization below, pass 2
-// covers every tail shape, closed or not, PROVIDED the tag name is not continued
-// by a letter or digit — see the boundary-class note on docFenceHeadPattern.
-// This is not a general Unicode-confusable or entity decoder: encoded delimiters
-// such as `&lt;/文档数据&gt;` and unlisted lookalikes remain defense-in-depth cases
-// for the system prompt and the planned shared sanitizer + fuzz work.
-//
-// Budget invariant (relied on by buildDocumentPreviewPrompt's post-assembly pass):
-// both passes can only ever shorten the text. Pass 1's shortest match is
-// `<文档数据>` (6 runes) against a 6-rune placeholder; pass 2's is `<文档数据`
-// (5 runes) against a 4-rune placeholder.
-//
-// NOTE: this intentionally duplicates the <引用数据> guard in
-// agent_reference_context.go, and the two have now *diverged* — that one accepts
-// neither an attribute tail nor repeated solidus. Centralizing both onto one
-// tag-parameterized helper, with a fuzz target over the tag grammar, is the agreed
-// next change; it is a cross-feature refactor and stays out of this PR.
-// Ignorable marks are accepted only between runes of the protected tag name.
-// Stripping all \p{Mn} globally would corrupt legitimate decomposed document text.
-const docFenceIgnorable = `[\p{Cf}\p{Mn}\x{00ad}]*`
+// docFenceGuard neutralizes untrusted document text that could close the
+// <文档数据> fence early. The whole implementation — homoglyph folding, invisible
+// handling, and the two structural passes — lives in fence_guard.go and is shared
+// with the <引用数据> guard; see that file for why neither the delimiter set nor
+// the invisible set is enumerated by hand any more.
+var docFenceGuard = newFenceGuard("文档数据")
 
-const docFenceTagNamePattern = `文` + docFenceIgnorable + `档` + docFenceIgnorable +
-	`数` + docFenceIgnorable + `据` + docFenceIgnorable
-
+// Names kept so the existing test suite keeps addressing the guard's parts directly
+// after centralization — those tests are the regression barrier for rounds 4–10 and
+// are deliberately not rewritten as part of this change.
 var (
-	docFenceInvisiblePattern = regexp.MustCompile(`[\p{Cf}\x{00ad}]`)
-	// Pass 1: well-formed tag. The optional tail must *start* with whitespace or a
-	// solidus, i.e. real attribute/self-closing syntax — so `<文档数据格式说明>` and
-	// `x < 文档数据量 > 1000` (prose that merely contains the tag name) are left alone
-	// instead of being collapsed into the placeholder. Anything this pass declines is
-	// still caught by pass 2, so declining costs no containment.
-	docFenceTagPattern = regexp.MustCompile(`<[\s\p{Zs}]*/*[\s\p{Zs}]*` + docFenceTagNamePattern + `(?:[\s\p{Zs}/][^>]{0,64})?>`)
-	// Pass 2: tag head, no `>` required. The boundary condition is deliberately
-	// NEGATIVE — "the tag name is not continued by another letter or digit" — rather
-	// than an allow-list of delimiters. An allow-list is a bound the attacker picks:
-	// round 8 briefly used `[\s\p{Zs}/>]` and `</文档数据">` (one punctuation rune)
-	// matched neither pass and shipped verbatim. Since the tag name is CJK, the only
-	// thing that makes `<文档数据…` a *different* token is a letter/digit
-	// continuation, so `[^\p{L}\p{N}]` is exactly the prose-fidelity carve-out that
-	// pass 1's tail restriction was for: `<文档数据格式说明>` and `x < 文档数据量 > 1000`
-	// stay byte-identical, while every punctuation/quote/backslash tail collapses.
-	// Runs after pass 1 so ordinary tags still render as the nicer [文档数据];
-	// substituting this for pass 1 would break the fence-only emptiness gate
-	// (`<文档数据>` would strip to `>`, not to "").
-	//
-	// Residual by construction: `<文档数据abc` — a letter/digit continuation is a
-	// different tag name, not a closer for this fence. Entity-encoded delimiters
-	// (`&lt;/文档数据&gt;`) are also untouched here; that gap is shared with the
-	// <引用数据> guard and belongs to the centralization + fuzz work below.
-	docFenceHeadPattern = regexp.MustCompile(`<[\s\p{Zs}]*/*[\s\p{Zs}]*` + docFenceTagNamePattern + `([^\p{L}\p{N}]|$)`)
-	// Fold full-width (＜＞／), small-form (﹤﹥), and CJK (〈〉) angle brackets/solidus to
-	// ASCII, and collapse control + line-separator chars, before structural matching.
-	docFenceReplacer = strings.NewReplacer(
-		"＜", "<", "＞", ">", "／", "/",
-		"〈", "<", "〉", ">",
-		"﹤", "<", "﹥", ">",
-		"\u2329", "<", "\u232a", ">",
-		"\u2215", "/", "\u2044", "/", "\u29f8", "/",
-		"\r", " ", "\t", " ", "\x00", " ", "\v", " ", "\f", " ",
-		"\u0085", " ", "\u2028", " ", "\u2029", " ",
-	)
+	docFencePlaceholder     = docFenceGuard.placeholder
+	docFenceHeadPlaceholder = docFenceGuard.headPlaceholder
+	docFenceTagPattern      = docFenceGuard.tagPattern
+	docFenceHeadPattern     = docFenceGuard.headPattern
 )
 
-const docFencePlaceholder = "[文档数据]"
-
-// docFenceHeadPlaceholder is deliberately 4 runes — shorter than the 5-rune
-// shortest head match (`<文档数据` at end of text) — so pass 2 keeps the "sanitizing
-// only ever shortens" property structurally true, with no budget-reservation
-// arithmetic anywhere. The boundary character is preserved via ${1}, so the
-// replacement is always exactly one rune shorter than what it replaced.
-const docFenceHeadPlaceholder = "文档数据"
-
+// sanitizeDocumentFenceText neutralizes forged <文档数据> tags in untrusted document
+// text, replacing them with a visible placeholder. Only ever shortens its input,
+// which buildDocumentPreviewPrompt's post-assembly pass relies on.
 func sanitizeDocumentFenceText(s string) string {
-	s = docFenceReplacer.Replace(s)
-	s = docFenceInvisiblePattern.ReplaceAllString(s, "")
-	s = docFenceTagPattern.ReplaceAllString(s, docFencePlaceholder)
-	// Head pass runs second, over whatever pass 1 declined: overlong tails, unclosed
-	// forms, and anything else that is not a well-formed tag.
-	s = docFenceHeadPattern.ReplaceAllString(s, docFenceHeadPlaceholder+"${1}")
-	return strings.TrimSpace(s)
+	return docFenceGuard.neutralize(s)
 }
 
 func normalizeFetchedDocumentSource(doc *documentSummarySource, ref documentRefReq) {
@@ -458,8 +379,5 @@ func documentPreviewHasNoContent(doc *documentSummarySource) bool {
 }
 
 func documentTextWithoutFenceTags(s string) string {
-	s = docFenceReplacer.Replace(s)
-	s = docFenceInvisiblePattern.ReplaceAllString(s, "")
-	s = docFenceTagPattern.ReplaceAllString(s, "")
-	return strings.TrimSpace(docFenceHeadPattern.ReplaceAllString(s, "${1}"))
+	return docFenceGuard.strip(s)
 }
