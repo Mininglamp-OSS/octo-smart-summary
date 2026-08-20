@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"log"
 	"sort"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/artifact"
@@ -25,8 +26,8 @@ import (
 // reaches here and stays byte-identical to the pre-SS-05 recompute.
 //
 // On any failure (no DB, freeze error) it returns the input pool unchanged, so
-// the worst case is a silent fall-back to the legacy recompute — never a lost
-// answer.
+// the worst case is an observable fall-back to the legacy recompute — never a
+// lost answer.
 func applyFrozenManifest(ctx context.Context, uid, sessionID, runID string, pool []pipeline.Message) []pipeline.Message {
 	db, _, _, _ := GetSummaryDeps()
 	if db == nil || runID == "" || len(pool) == 0 {
@@ -40,10 +41,16 @@ func applyFrozenManifest(ctx context.Context, uid, sessionID, runID string, pool
 	// but every caller adopts the run's FIRST manifest below, so the ordinals
 	// used mid-run and at save time cannot diverge.
 	if _, _, _, err := store.FreezeFromPool(ctx, runID, uid, sessionID, pool, artifact.FreezeMeta{}); err != nil {
+		log.Printf("[citations] freeze manifest failed run=%s session=%s: %v; falling back to legacy citation recompute", runID, sessionID, err)
 		return pool
 	}
 	_, entries, found, err := store.GetFrozenManifestByRun(ctx, uid, runID)
-	if err != nil || !found {
+	if err != nil {
+		log.Printf("[citations] load frozen manifest failed run=%s session=%s: %v; falling back to legacy citation recompute", runID, sessionID, err)
+		return pool
+	}
+	if !found {
+		log.Printf("[citations] frozen manifest missing after freeze run=%s session=%s; falling back to legacy citation recompute", runID, sessionID)
 		return pool
 	}
 

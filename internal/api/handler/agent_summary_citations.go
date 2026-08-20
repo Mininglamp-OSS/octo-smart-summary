@@ -175,19 +175,25 @@ func (h *AgentSummaryHandler) buildCitationsForSession(
 // the citable set.
 //
 // On any miss — unknown request_id (the run never existed: V2 off at chat
-// time, or a replay), no manifest frozen by that run, or a DB error — it
-// returns the input unchanged and keeps the recomputed indexes. The fallback
-// is always the full legacy recompute, never a partial override.
+// time, or a replay), no manifest frozen by that run, or a DB error — it logs
+// the reason, returns the input unchanged, and keeps the recomputed indexes.
+// The fallback is always the full legacy recompute, never a partial override.
 func (h *AgentSummaryHandler) overrideWithRunManifest(ctx context.Context, uid, sessionID, requestID string, msgs []pipeline.Message) []pipeline.Message {
 	if h.db == nil {
 		return msgs
 	}
 	run, err := summaryrun.NewStore(h.db).GetByRequest(ctx, uid, sessionID, requestID)
 	if err != nil {
+		log.Printf("[citations] resolve run for frozen manifest failed session=%s request_id=%s: %v; falling back to legacy citation recompute", sessionID, requestID, err)
 		return msgs
 	}
 	_, entries, found, err := artifact.NewStore(h.db).GetFrozenManifestByRun(ctx, uid, run.RunID)
-	if err != nil || !found {
+	if err != nil {
+		log.Printf("[citations] load frozen manifest failed session=%s run=%s: %v; falling back to legacy citation recompute", sessionID, run.RunID, err)
+		return msgs
+	}
+	if !found {
+		log.Printf("[citations] frozen manifest missing session=%s run=%s; falling back to legacy citation recompute", sessionID, run.RunID)
 		return msgs
 	}
 	ord := artifact.OrdinalMap(entries)
