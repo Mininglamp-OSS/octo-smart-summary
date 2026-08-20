@@ -554,6 +554,18 @@ func TestDocumentPreviewHasNoContent_MirrorsPromptBuilderPrecedence(t *testing.T
 	if documentPreviewHasNoContent(&documentSummarySource{DocumentID: "d1", Content: "有内容"}) {
 		t.Error("content-only doc must not be judged empty")
 	}
+	// Mn marks inside/after the protected tag name must not turn a fence-only body
+	// into billable content. They are matched inside the tag grammar rather than
+	// stripped globally, preserving legitimate decomposed text elsewhere.
+	for _, content := range []string{
+		"<文\uFE0F档数据>",
+		"<文档数据\uFE0F>",
+		"<文\u0301档数据>",
+	} {
+		if !documentPreviewHasNoContent(&documentSummarySource{DocumentID: "d1", Content: content}) {
+			t.Errorf("fence-only content with Mn mark should be empty: %q", content)
+		}
+	}
 }
 
 func TestStreamDocumentPreview_OversizedTrailingBytesReportedAsTooLarge(t *testing.T) {

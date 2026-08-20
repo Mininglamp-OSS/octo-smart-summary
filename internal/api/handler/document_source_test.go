@@ -25,6 +25,19 @@ func TestSanitizeDocumentFenceText(t *testing.T) {
 		{"repeated fullwidth solidus folded", "</／文档数据>", docFencePlaceholder},
 		{"spaced fence still matched", "<  文档数据 >", docFencePlaceholder},
 		{"zero-width inside fence stripped", "<文​档数据>", docFencePlaceholder},
+		{"variation selector 16 inside tag name", "</文\uFE0F档数据>", docFencePlaceholder},
+		{"variation selector 1 inside tag name", "</文\uFE00档数据>", docFencePlaceholder},
+		{"combining grapheme joiner inside tag name", "</文\u034F档数据>", docFencePlaceholder},
+		{"combining acute inside tag name", "</文\u0301档数据>", docFencePlaceholder},
+		{"variation selector supplement inside tag name", "</文\U000E0100档数据>", docFencePlaceholder},
+		{"variation selector in opening tag", "<文\uFE0F档数据>", docFencePlaceholder},
+		{"variation selector after tag name", "<文档数据\uFE0F>", docFencePlaceholder},
+		{"variation selectors between every tag rune", "</文\uFE0F档\uFE0F数\uFE0F据\uFE0F>", docFencePlaceholder},
+		{"canonical angle brackets folded", "\u2329/文档数据\u232A", docFencePlaceholder},
+		{"division slash folded", "<\u2215文档数据>", docFencePlaceholder},
+		{"fraction slash folded", "<\u2044文档数据>", docFencePlaceholder},
+		{"big solidus folded", "<\u29F8文档数据>", docFencePlaceholder},
+		{"folded brackets plus variation selector", "〈/文\uFE0F档数据〉", docFencePlaceholder},
 		// Attribute-bearing closers: a whitespace-only tail rejected these, so they were
 		// emitted verbatim into the prompt — strictly easier to author than the
 		// cross-chunk split, since the attacker only types one extra character.

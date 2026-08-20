@@ -293,13 +293,12 @@ func validateDocumentRefs(refs []documentRefReq) error {
 // its shape — so the overlong, unclosed, and not-yet-imagined forms all collapse
 // together rather than one per round.
 //
-// The class claim is scoped, not absolute. Pass 2 covers every tail shape, closed
-// or not, PROVIDED the tag name is not continued by a letter or digit — see the
-// boundary-class note on docFenceHeadPattern. What it does NOT cover, and what no
-// amount of widening here will cover, is a delimiter the model decodes but this
-// pass never sees as `<` — HTML entities (`&lt;/文档数据&gt;`) being the known
-// example. That belongs to the centralization + fuzz work noted at the bottom of
-// this comment, not to another pattern widening.
+// The class claim is scoped, not absolute. After the normalization below, pass 2
+// covers every tail shape, closed or not, PROVIDED the tag name is not continued
+// by a letter or digit — see the boundary-class note on docFenceHeadPattern.
+// This is not a general Unicode-confusable or entity decoder: encoded delimiters
+// such as `&lt;/文档数据&gt;` and unlisted lookalikes remain defense-in-depth cases
+// for the system prompt and the planned shared sanitizer + fuzz work.
 //
 // Budget invariant (relied on by buildDocumentPreviewPrompt's post-assembly pass):
 // both passes can only ever shorten the text. Pass 1's shortest match is
@@ -311,6 +310,13 @@ func validateDocumentRefs(refs []documentRefReq) error {
 // neither an attribute tail nor repeated solidus. Centralizing both onto one
 // tag-parameterized helper, with a fuzz target over the tag grammar, is the agreed
 // next change; it is a cross-feature refactor and stays out of this PR.
+// Ignorable marks are accepted only between runes of the protected tag name.
+// Stripping all \p{Mn} globally would corrupt legitimate decomposed document text.
+const docFenceIgnorable = `[\p{Cf}\p{Mn}\x{00ad}]*`
+
+const docFenceTagNamePattern = `文` + docFenceIgnorable + `档` + docFenceIgnorable +
+	`数` + docFenceIgnorable + `据` + docFenceIgnorable
+
 var (
 	docFenceInvisiblePattern = regexp.MustCompile(`[\p{Cf}\x{00ad}]`)
 	// Pass 1: well-formed tag. The optional tail must *start* with whitespace or a
@@ -318,7 +324,7 @@ var (
 	// `x < 文档数据量 > 1000` (prose that merely contains the tag name) are left alone
 	// instead of being collapsed into the placeholder. Anything this pass declines is
 	// still caught by pass 2, so declining costs no containment.
-	docFenceTagPattern = regexp.MustCompile(`<[\s\p{Zs}]*/*[\s\p{Zs}]*文档数据(?:[\s\p{Zs}/][^>]{0,64})?>`)
+	docFenceTagPattern = regexp.MustCompile(`<[\s\p{Zs}]*/*[\s\p{Zs}]*` + docFenceTagNamePattern + `(?:[\s\p{Zs}/][^>]{0,64})?>`)
 	// Pass 2: tag head, no `>` required. The boundary condition is deliberately
 	// NEGATIVE — "the tag name is not continued by another letter or digit" — rather
 	// than an allow-list of delimiters. An allow-list is a bound the attacker picks:
@@ -336,13 +342,15 @@ var (
 	// different tag name, not a closer for this fence. Entity-encoded delimiters
 	// (`&lt;/文档数据&gt;`) are also untouched here; that gap is shared with the
 	// <引用数据> guard and belongs to the centralization + fuzz work below.
-	docFenceHeadPattern = regexp.MustCompile(`<[\s\p{Zs}]*/*[\s\p{Zs}]*文档数据([^\p{L}\p{N}]|$)`)
+	docFenceHeadPattern = regexp.MustCompile(`<[\s\p{Zs}]*/*[\s\p{Zs}]*` + docFenceTagNamePattern + `([^\p{L}\p{N}]|$)`)
 	// Fold full-width (＜＞／), small-form (﹤﹥), and CJK (〈〉) angle brackets/solidus to
 	// ASCII, and collapse control + line-separator chars, before structural matching.
 	docFenceReplacer = strings.NewReplacer(
 		"＜", "<", "＞", ">", "／", "/",
 		"〈", "<", "〉", ">",
 		"﹤", "<", "﹥", ">",
+		"\u2329", "<", "\u232a", ">",
+		"\u2215", "/", "\u2044", "/", "\u29f8", "/",
 		"\r", " ", "\t", " ", "\x00", " ", "\v", " ", "\f", " ",
 		"\u0085", " ", "\u2028", " ", "\u2029", " ",
 	)
