@@ -80,7 +80,11 @@ var (
 	// implicit in the directional complement. 带上下文 carries neither, so it stays
 	// a rewrite; 加入成员说了什么 has no 把 and no destination noun after 加入, so it
 	// stays a rewrite too.
-	refineAddVerbs = []string{"加上", "加进", "加入", "加到", "添加", "带上", "写进", "写入", "放进", "放入", "附上", "添上", "包含进", "纳入"}
+	refineAddVerbs = []string{"加上", "加进", "加入", "加到", "添加", "带上", "写进", "写入", "放进", "放入", "附上", "添上", "包含进", "纳入",
+		// Round 6: the families reported as still hard-stripped. Note these tend to
+		// take their destination BEFORE the verb (在摘要中增加…), which is why
+		// containsAddition scans both sides of the verb rather than only after it.
+		"增加", "覆盖", "扩展", "扩充", "算上", "收录", "补进", "同步"}
 	// refineAddTargets are the things an add verb can name as its destination.
 	refineAddTargets = []string{"总结", "摘要", "报告", "纪要", "段落", "开头", "结尾", "末尾", "正文", "内容", "里面", "里头", "文中", "小标题", "标题", "列表", "章节"}
 	// refineAddObjectMarkers introduce the object of a "把 X <add-verb>" frame. A
@@ -88,6 +92,13 @@ var (
 	// 把 from an unrelated earlier clause ("把这份总结精简一下，只保留最近的结论") does
 	// not manufacture an addition.
 	refineAddObjectMarkers = []string{"把", "将", "连"}
+	// refineQuestionMarkers mark an INTERROGATIVE — a question ABOUT the artifact
+	// rather than an instruction to change it. They gate only the
+	// destination-before-verb rule (c) below, where a destination noun and an add
+	// verb can co-occur inside a noun phrase without any addition being asked for:
+	// "总结里新加入成员说了什么" is asking what the newly-JOINED members said, so
+	// 加入 modifies 成员 and is not an imperative at all.
+	refineQuestionMarkers = []string{"说了什么", "说了啥", "说了些什么", "什么意思", "讲了什么", "讲了啥"}
 	// refineRewriteKeywords mark a CONFIDENT pure-text request (translate,
 	// condense, polish, re-layout, or Q&A over the old summary). Matching one of
 	// these — as opposed to falling through to the default — is what lets SS-08b
@@ -95,7 +106,7 @@ var (
 	refineRewriteKeywords = []string{
 		"翻译", "精简", "简化", "缩短", "压缩", "删减",
 		"润色", "排版", "格式", "改语气", "语气", "重新组织", "重组",
-		"摘要", "提炼", "换成", "改写成", "说了什么", "说了啥", "什么意思",
+		"提炼", "换成", "改写成", "说了什么", "说了啥", "什么意思",
 		"讲了什么", "只保留", "去掉", "删掉",
 		// Anchored language phrasings. Round 1 removed bare 英文/中文 because they
 		// collided with 精英文化 / 整理中文档, which lost the two commonest rewrite
@@ -104,6 +115,32 @@ var (
 		// without reopening the collision.
 		"翻译成英文", "输出英文", "用英文", "改成英文", "英文版", "英文输出",
 		"翻译成中文", "输出中文", "用中文", "改成中文", "中文版", "中文输出",
+	}
+	// refineDataSignals VETO the physical tool strip. They are not a routing
+	// signal — they only decide whether a misclassification stays RECOVERABLE.
+	//
+	// HardNoFetch is the one decision in this PR that a runtime mistake cannot
+	// undo: buildRunnerForProfile removes list/narrow/find/peek/fetch/search/filter
+	// outright, so a request for new data becomes silently impossible to satisfy.
+	// Every other misroute costs at most one extra fetch. Rounds 4, 5 and 6 each
+	// found a NEW family of phrasings being hard-stripped while the previously
+	// pinned families stayed green — the signature of a keyword list at its limit,
+	// not of a list that is one entry short.
+	//
+	// So the strip is gated on a high-precision condition instead: a rewrite verb
+	// matched AND nothing anywhere in the instruction suggests the user wants data.
+	// The asymmetry makes over-triggering this veto free (the turn keeps tools it
+	// then does not use) and under-triggering it expensive, so the list is
+	// deliberately generous and scans the WHOLE string rather than one clause.
+	// Unrecognised addition phrasings now land in the soft path by construction,
+	// which is what closes the class rather than the instance.
+	refineDataSignals = []string{
+		// Sources the user can only mean to read from.
+		"群", "频道", "子区", "会话", "聊天记录", "消息里", "对话",
+		// Verbs that ask for more material rather than a transformation of the text.
+		"增加", "覆盖", "扩展", "扩充", "算上", "收录", "补进", "同步", "包括", "纳入",
+		"看看", "看下", "看一下", "查一下", "查下", "查查", "翻一下", "找一下",
+		"还有没有", "有没有别的", "新动态", "后续进展", "新情况",
 	}
 )
 
@@ -130,10 +167,15 @@ func ClassifyRefine(instruction string) RefineRoute {
 		// Confident rewrite: an explicit pure-text keyword matched, so it is safe
 		// to strip the fetch tools (HardNoFetch) — 纯格式零 fetch.
 		//
-		// One exception: when a time word IS present the request is only *probably*
-		// a rewrite, so the tools stay available. The route is still the no-fetch
-		// path, but a mis-read stays recoverable instead of being enforced in code.
-		hardNoFetch := !containsAny(s, refineExtendKeywords)
+		// Two vetoes keep the strip high-precision, because it is the only
+		// unrecoverable decision here (see refineDataSignals):
+		//   - a time word: the request is only *probably* a rewrite;
+		//   - any data signal: the instruction names a source or asks for more
+		//     material, so whatever else it says, the model must keep the ability
+		//     to go and get it.
+		// The route is still the no-fetch path either way; only the enforcement is
+		// relaxed, so a mis-read stays recoverable instead of being made impossible.
+		hardNoFetch := !containsAny(s, refineExtendKeywords) && !containsAny(s, refineDataSignals)
 		return RefineRoute{Intent: RefineRewrite, Fetch: false, ReuseTimeRange: false, ReuseCitations: true, HardNoFetch: hardNoFetch}
 	default:
 		// Ambiguous fallback: still the rewrite path (cheapest, no fetch by
@@ -174,6 +216,18 @@ func containsAddition(s string) bool {
 			if containsAny(clause[:idx], refineAddObjectMarkers) {
 				return true
 			}
+			// (c) destination noun BEFORE the verb, same clause. Chinese puts the
+			// destination first as often as last — "在摘要中增加客户反馈",
+			// "这份摘要要覆盖运维群的内容" — and the positional rule missed every
+			// one of them, which is how those phrasings reached the hard strip.
+			//
+			// Not for interrogatives: in a question the two can co-occur inside a noun
+			// phrase with nothing being added ("总结里新加入成员说了什么" — 加入 modifies
+			// 成员). Rules (a) and (b) carry an explicit imperative frame, so they do
+			// not need the guard.
+			if !containsAny(clause, refineQuestionMarkers) && containsAny(clause[:idx], refineAddTargets) {
+				return true
+			}
 		}
 	}
 	return false
@@ -181,10 +235,18 @@ func containsAddition(s string) bool {
 
 // splitRefineClauses splits an instruction on sentence/clause punctuation so the
 // add-construction match stays local to one clause.
+//
+// Whitespace is NOT a boundary. Chinese does not delimit clauses with spaces, so
+// treating ' ' and '\t' as separators shattered "翻译一下 并 把销售数据 加进 报告"
+// into fragments, which lost the 把…加进 construction and hard-stripped the tools —
+// a regression the clause-scoping change introduced. Spaces are normalised away
+// before matching instead, so they can neither split a construction nor glue two
+// real clauses together.
 func splitRefineClauses(s string) []string {
+	s = strings.NewReplacer(" ", "", "\t", "", "\u3000", "").Replace(s)
 	return strings.FieldsFunc(s, func(r rune) bool {
 		switch r {
-		case '，', ',', '。', '.', '；', ';', '、', '！', '!', '？', '?', '\n', '\r', '\t', ' ', '：', ':':
+		case '，', ',', '。', '.', '；', ';', '、', '！', '!', '？', '?', '\n', '\r', '：', ':':
 			return true
 		}
 		return false

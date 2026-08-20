@@ -333,3 +333,83 @@ func TestEvaluateExpectationOnlyExplainsAbsence(t *testing.T) {
 		t.Fatalf("gaps differ on fetch_expected alone: %v vs %v", gapsExpected, gapsUnexpected)
 	}
 }
+
+// TestEvaluateOpportunisticFetchDoesNotCreateScopeObligation pins the round-6
+// over-correction — a regression the previous commit introduced.
+//
+// Fact-before-expectation is right, but it was applied to the WHOLE coverage
+// block instead of to the recorded-outcome half. "In scope but never fetched" is
+// itself an ABSENCE, so it stays explainable by the expectation exactly like the
+// unmeasured case. A soft rewrite KEEPS its fetch tools, so a turn with channels
+// still pinned in the UI whose model touched one to check a detail became PARTIAL
+// with bogus "was not fetched" gaps shipped to the client — strictly worse than
+// the COMPLETE it reported before. One voluntary fetch does not create an
+// obligation to cover a scope the turn never owed.
+func TestEvaluateOpportunisticFetchDoesNotCreateScopeObligation(t *testing.T) {
+	t.Run("closed scope", func(t *testing.T) {
+		s := completeState()
+		s.FetchExpected = false
+		s.CoverageMeasured = true
+		s.ExpectedChannels = []string{"c1", "c2", "c3"}
+		s.AttemptedChannels = []string{"c1"}
+		s.SucceededChannels = []string{"c1"}
+
+		if v, gaps := Evaluate(s); v != Complete {
+			t.Fatalf("verdict = %s, want COMPLETE — the turn never owed this scope (gaps=%v)", v, gaps)
+		}
+	})
+
+	t.Run("open scope", func(t *testing.T) {
+		s := completeState()
+		s.FetchExpected = false
+		s.CoverageMeasured = true
+		s.ExpectedChannels = nil
+		s.DiscoveredChannels = []string{"d1", "d2", "d3"}
+		s.AttemptedChannels = []string{"d1"}
+		s.SucceededChannels = []string{"d1"}
+
+		if v, gaps := Evaluate(s); v != Complete {
+			t.Fatalf("verdict = %s, want COMPLETE — discovery is not an obligation here either (gaps=%v)", v, gaps)
+		}
+	})
+
+	// The recorded-outcome half must stay unconditional: this is the round-5
+	// invariant, and the fix above must not walk it back.
+	t.Run("a real failure is still audited", func(t *testing.T) {
+		s := completeState()
+		s.FetchExpected = false
+		s.CoverageMeasured = true
+		s.ExpectedChannels = []string{"c1", "c2"}
+		s.AttemptedChannels = []string{"c1", "c2"}
+		s.SucceededChannels = []string{"c1"}
+		s.FailedChannels = []string{"c2"}
+
+		v, gaps := Evaluate(s)
+		if v != Partial {
+			t.Fatalf("verdict = %s, want PARTIAL — a recorded failure is a fact", v)
+		}
+		named := false
+		for _, g := range gaps {
+			if g.Kind == GapChannel && g.ChannelID == "c2" {
+				named = true
+			}
+		}
+		if !named {
+			t.Fatalf("the failed channel must be named, got %v", gaps)
+		}
+	})
+
+	// And a turn that WAS obliged to cover the scope still gets the shortfall.
+	t.Run("expected turn still owes its scope", func(t *testing.T) {
+		s := completeState()
+		s.FetchExpected = true
+		s.CoverageMeasured = true
+		s.ExpectedChannels = []string{"c1", "c2"}
+		s.AttemptedChannels = []string{"c1"}
+		s.SucceededChannels = []string{"c1"}
+
+		if v, _ := Evaluate(s); v != Partial {
+			t.Fatalf("verdict = %s, want PARTIAL — this turn did owe c2", v)
+		}
+	})
+}

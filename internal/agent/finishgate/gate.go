@@ -153,42 +153,56 @@ func Evaluate(s RunState) (Verdict, []Gap) {
 	}
 	if s.CoverageMeasured {
 		succeeded := stringSet(s.SucceededChannels)
-		failed := stringSet(s.FailedChannels)
 		attempted := stringSet(s.AttemptedChannels)
 		reported := make(map[string]bool)
-		for _, ch := range s.ExpectedChannels {
+
+		// RECORDED OUTCOMES — audited unconditionally. A fetch that was tried and
+		// failed is a fact; no expectation may suppress it. This half is what the
+		// fact-before-expectation ordering above exists for.
+		for _, ch := range s.FailedChannels {
 			if reported[ch] {
 				continue
 			}
 			reported[ch] = true
-			switch {
-			case failed[ch]:
-				gaps = append(gaps, Gap{Kind: GapChannel, Detail: "channel fetch failed", ChannelID: ch})
-			case !succeeded[ch]:
-				gaps = append(gaps, Gap{Kind: GapChannel, Detail: "expected channel was not fetched", ChannelID: ch})
-			}
+			gaps = append(gaps, Gap{Kind: GapChannel, Detail: "channel fetch failed", ChannelID: ch})
 		}
-		// Open scope ONLY. When a spec pinned channels, ExpectedChannels above is
-		// authoritative and the discovered union must not manufacture gaps for
-		// channels the run deliberately left out of a closed scope — a user who
-		// pins one channel and gets a perfect single-channel summary was being told
-		// every other discovered channel "was never fetched". For an open scope
-		// (nothing pinned) the discovered-vs-attempted delta is the only under-fetch
-		// signal: "总结我这周所有群的进展" that narrowed to 12 channels and fetched 2
-		// previously reported COMPLETE with no gaps.
-		if len(s.ExpectedChannels) == 0 {
-			for _, ch := range s.DiscoveredChannels {
-				if reported[ch] || attempted[ch] {
+
+		// ABSENCE — "in scope but never fetched" is the *absence* of a fetch, so it
+		// stays explainable by the expectation, exactly like the unmeasured case above.
+		//
+		// Applying fact-before-expectation to this half too was an over-correction:
+		// a soft rewrite KEEPS its fetch tools, so a turn with three channels still
+		// pinned in the UI whose model opportunistically touched one to check a
+		// detail became PARTIAL with two bogus "was not fetched" gaps shipped to the
+		// client — strictly worse than the COMPLETE it reported before. The turn was
+		// never obliged to cover that scope; one voluntary fetch does not create the
+		// obligation.
+		if s.FetchExpected {
+			for _, ch := range s.ExpectedChannels {
+				if reported[ch] {
 					continue
 				}
 				reported[ch] = true
-				gaps = append(gaps, Gap{Kind: GapChannel, Detail: "in-scope channel was never fetched", ChannelID: ch})
+				if !succeeded[ch] {
+					gaps = append(gaps, Gap{Kind: GapChannel, Detail: "expected channel was not fetched", ChannelID: ch})
+				}
 			}
-		}
-		for _, ch := range s.FailedChannels {
-			if !reported[ch] {
-				gaps = append(gaps, Gap{Kind: GapChannel, Detail: "channel fetch failed", ChannelID: ch})
-				reported[ch] = true
+			// Open scope ONLY. When a spec pinned channels, ExpectedChannels above is
+			// authoritative and the discovered union must not manufacture gaps for
+			// channels the run deliberately left out of a closed scope — a user who
+			// pins one channel and gets a perfect single-channel summary was being told
+			// every other discovered channel "was never fetched". For an open scope
+			// (nothing pinned) the discovered-vs-attempted delta is the only under-fetch
+			// signal: "总结我这周所有群的进展" that narrowed to 12 channels and fetched 2
+			// previously reported COMPLETE with no gaps.
+			if len(s.ExpectedChannels) == 0 {
+				for _, ch := range s.DiscoveredChannels {
+					if reported[ch] || attempted[ch] {
+						continue
+					}
+					reported[ch] = true
+					gaps = append(gaps, Gap{Kind: GapChannel, Detail: "in-scope channel was never fetched", ChannelID: ch})
+				}
 			}
 		}
 	}

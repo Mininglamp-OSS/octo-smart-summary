@@ -230,3 +230,141 @@ func TestRefineAnchoredLanguagePhrasings(t *testing.T) {
 		}
 	}
 }
+
+// TestRefineNeverStripsToolsWhenDataIsAsked pins the round-4/5/6 blocker class.
+//
+// HardNoFetch is the one decision in this PR a runtime mistake cannot undo:
+// buildRunnerForProfile removes list/narrow/find/peek/fetch/search/filter
+// outright, so a request for new data becomes silently impossible to satisfy.
+// Three consecutive rounds found a NEW family of phrasings being hard-stripped
+// while the previously pinned families stayed green — the signature of a keyword
+// list at its limit, not of a list one entry short.
+//
+// So the strip is now gated on a high-precision veto (refineDataSignals) rather
+// than on the routing decision alone. The assertion here is deliberately weak on
+// INTENT and strict on ENFORCEMENT: whichever way these route, the model must
+// keep the ability to go and get the data.
+func TestRefineNeverStripsToolsWhenDataIsAsked(t *testing.T) {
+	for _, instruction := range []string{
+		// Round 5/6 blocker set (Jerry-Xin), verbatim.
+		"在摘要中增加客户反馈",
+		"摘要里再增加一下产品群的讨论",
+		"这份摘要要覆盖运维群的内容",
+		"把摘要扩展到包括销售群",
+		"换成按项目分组，并把测试群也算上",
+		"只保留 P0 问题，另外看看研发群还有没有别的",
+		// Round 6 additions (yujiawei), verbatim.
+		"精简一下，并同步销售群的新动态",
+		"把总结翻译成英文，顺便看看研发群后续进展",
+		"用中文重写，并查一下客服群刚才说了什么",
+		"翻译一下 并 把销售数据 加进 报告",
+		// Round 6 family stress-test (Jerry-Xin), not from any earlier CR.
+		"把运维群也纳入总结里",
+		"加上客户群的讨论",
+		"补上运维数据",
+		"收录销售反馈",
+		"带上测试群的消息",
+		"总结里再加一段客户评价",
+		"报告里添上运维群的问题",
+		"内容再扩充一下销售群的反馈",
+		"帮我汇总一下测试群的意见放进摘要",
+		"摘要再补充一些客户反馈",
+	} {
+		if got := ClassifyRefine(instruction); got.HardNoFetch {
+			t.Errorf("ClassifyRefine(%q) strips the fetch tools, so the request is impossible to satisfy: %+v", instruction, got)
+		}
+	}
+}
+
+// TestRefineStillStripsToolsForPureTextRequests is the counterpart. The veto must
+// stay high-precision in the other direction too, or SS-08b's zero-fetch
+// enforcement stops firing for the requests it exists for.
+func TestRefineStillStripsToolsForPureTextRequests(t *testing.T) {
+	for _, instruction := range []string{
+		"精简一下",
+		"翻译成英文",
+		"用英文重写",
+		"改成中文",
+		"润色一下",
+		"重新排版",
+		"总结里说了什么",
+		"翻译成英文，带上下文", // 带上 ⊂ 带上下文: no addition, no data signal
+	} {
+		if got := ClassifyRefine(instruction); !got.HardNoFetch {
+			t.Errorf("ClassifyRefine(%q) is a pure-text request and should enforce zero fetch: %+v", instruction, got)
+		}
+	}
+}
+
+// TestRefineWhitespaceIsNotAClauseBoundary pins the regression the clause-scoping
+// change introduced: Chinese does not delimit clauses with spaces, so treating
+// ' ' as a separator shattered the 把…加进 construction into fragments and
+// hard-stripped the tools. Spaces are normalised away before matching instead.
+func TestRefineWhitespaceIsNotAClauseBoundary(t *testing.T) {
+	spaced := ClassifyRefine("翻译一下 并 把销售数据 加进 报告")
+	tight := ClassifyRefine("翻译一下并把销售数据加进报告")
+	if spaced.Intent != tight.Intent || spaced.HardNoFetch != tight.HardNoFetch {
+		t.Errorf("spacing changed the classification: spaced=%+v tight=%+v", spaced, tight)
+	}
+	if spaced.Intent != RefineAugment {
+		t.Errorf("把X加进Y is an addition regardless of spacing, got %+v", spaced)
+	}
+
+	// And a real clause boundary must still scope the match: the 把 here belongs
+	// to a different clause than any add verb.
+	if got := ClassifyRefine("把这份总结精简一下，只保留最近的结论"); got.Intent != RefineRewrite {
+		t.Errorf("a 把 in an unrelated clause must not manufacture an addition: %+v", got)
+	}
+}
+
+// TestRefineDestinationBeforeVerbIsAnAddition covers the other half of the
+// positional fix. Chinese puts the destination before the verb as often as after
+// it (在摘要中增加X / 这份摘要要覆盖Y), and the after-only rule missed every one.
+func TestRefineDestinationBeforeVerbIsAnAddition(t *testing.T) {
+	for _, instruction := range []string{
+		"在摘要中增加客户反馈",
+		"这份摘要要覆盖运维群的内容",
+		"报告里添上运维群的问题",
+	} {
+		if got := ClassifyRefine(instruction); got.Intent != RefineAugment {
+			t.Errorf("ClassifyRefine(%q) intent=%s, want augment", instruction, got.Intent)
+		}
+	}
+
+	// But not in a QUESTION: there the destination noun and the add verb can
+	// co-occur inside a noun phrase with nothing being added — 加入 modifies 成员.
+	if got := ClassifyRefine("总结里新加入成员说了什么"); got.Intent != RefineRewrite {
+		t.Errorf("an interrogative is not an addition instruction: %+v", got)
+	}
+}
+
+// TestRefineArtifactNounDoesNotAuthorizeTheStrip pins the removal of 摘要 from
+// refineRewriteKeywords.
+//
+// 摘要 is the artifact NOUN, not an operation verb — it is simultaneously listed
+// in refineAddTargets, which is its correct role. While it sat in the rewrite set,
+// ANY instruction that merely named the thing being edited landed in the
+// confident-rewrite branch and had its fetch tools removed, which is why every
+// "在摘要中增加…" phrasing was unsatisfiable. Naming the artifact says nothing
+// about the operation, so it must fall to the recoverable path.
+//
+// Pinned separately because the other round-6 fixes (the data-signal veto and the
+// destination-before-verb rule) independently rescue the reported phrasings: put
+// 摘要 back and the reported set still passes, so without this test the removal
+// would be silently revertible.
+func TestRefineArtifactNounDoesNotAuthorizeTheStrip(t *testing.T) {
+	for _, instruction := range []string{
+		"这份摘要",
+		"摘要重新整理一下",
+		"摘要里的第三点",
+	} {
+		if got := ClassifyRefine(instruction); got.HardNoFetch {
+			t.Errorf("ClassifyRefine(%q): naming the artifact is not an operation and must not strip the tools: %+v", instruction, got)
+		}
+	}
+
+	// A real operation verb in the same sentence still authorizes the strip.
+	if got := ClassifyRefine("把摘要精简一下"); !got.HardNoFetch {
+		t.Errorf("摘要 + a genuine rewrite verb should still enforce zero fetch: %+v", got)
+	}
+}
