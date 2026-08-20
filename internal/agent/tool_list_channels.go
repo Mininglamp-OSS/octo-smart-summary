@@ -49,7 +49,7 @@ func ListChannelsTool() (Tool, Handler) {
 			return "", fmt.Errorf("missing user identity in context")
 		}
 
-		_, imDB, _, _ := GetSummaryDeps()
+		summaryDB, imDB, _, _ := GetSummaryDeps()
 
 		options := []pipeline.ChannelQueryOption{pipeline.WithIncludeArchived(req.IncludeArchived)}
 		if !req.IncludeArchived {
@@ -59,6 +59,8 @@ func ListChannelsTool() (Tool, Handler) {
 		if err != nil {
 			return "", fmt.Errorf("get user channels: %w", err)
 		}
+
+		recordDiscoveredChannels(ctx, summaryDB, uid, channelIDsOf(channels))
 
 		result := map[string]interface{}{
 			"total":    len(channels),

@@ -71,33 +71,49 @@ func FetchChannelTool() (Tool, Handler) {
 			return "", fmt.Errorf("missing user identity in context")
 		}
 
+		summaryDB, imDB, _, cfg := GetSummaryDeps()
+		runID, _ := ctx.Value(ContextKeyRunID).(string)
+		recordFetch := func(succeeded, truncated bool) {
+			if !SummaryV2Enabled() || summaryDB == nil || runID == "" || req.ChannelID == "" {
+				return
+			}
+			// WithoutCancel, not ctx: the dominant cause of the failures we are trying
+			// to RECORD is that this very ctx was canceled, and RecordChannelFetch
+			// opens a transaction on it. Recording the loss must not fail for the same
+			// reason the fetch did — the fatal-error hook already reasons this way
+			// (agent_chat.go uses a fresh context for exactly this).
+			recordCtx := context.WithoutCancel(ctx)
+			if err := summaryrun.NewStore(summaryDB).RecordChannelFetch(recordCtx, uid, runID, req.ChannelID, succeeded, truncated); err != nil {
+				log.Printf("[fetch_channel] record coverage failed run=%s channel=%s succeeded=%t: %v", runID, req.ChannelID, succeeded, err)
+			}
+		}
+
 		// channel_type must be explicitly supplied — silently defaulting to 1
 		// (Group) caused SQL mismatch when the real channel was Thread (type=5)
 		// or DM (type=1), returning 0 rows and misleading agent into "no
 		// messages" answers. See CHAT-REFERENCE-BASED-DESIGN-v1 diagnostic.
+		//
+		// These three argument checks record a failed attempt before returning.
+		// They used to sit ABOVE the recordFetch closure, which meant the most
+		// COMMON fetch failures — an empty time_start is why INVALID_ARGUMENT and
+		// commit ae154c9 exist at all — left no trace on the run row: the abandoned
+		// channel appeared in neither attempted_channels nor failed_channels, so the
+		// gate could not see it at all.
 		if req.ChannelType == 0 {
 			log.Printf("[fetch_channel] rejecting call: agent did not supply channel_type. channel=%s", req.ChannelID)
+			recordFetch(false, false)
 			return "", fmt.Errorf("channel_type is required (1=DM, 2=Group, 5=Thread); check reference material's candidate channels for the correct value")
 		}
 
 		timeStart, err := time.Parse(time.RFC3339, req.TimeStart)
 		if err != nil {
+			recordFetch(false, false)
 			return "", fmt.Errorf("parse time_start: %w", err)
 		}
 		timeEnd, err := time.Parse(time.RFC3339, req.TimeEnd)
 		if err != nil {
+			recordFetch(false, false)
 			return "", fmt.Errorf("parse time_end: %w", err)
-		}
-
-		summaryDB, imDB, _, cfg := GetSummaryDeps()
-		runID, _ := ctx.Value(ContextKeyRunID).(string)
-		recordFetch := func(succeeded, truncated bool) {
-			if !SummaryV2Enabled() || summaryDB == nil || runID == "" {
-				return
-			}
-			if err := summaryrun.NewStore(summaryDB).RecordChannelFetch(ctx, uid, runID, req.ChannelID, succeeded, truncated); err != nil {
-				log.Printf("[fetch_channel] record coverage failed run=%s channel=%s succeeded=%t: %v", runID, req.ChannelID, succeeded, err)
-			}
 		}
 
 		// Security: validate channel accessibility for system-injected uid
@@ -137,7 +153,6 @@ func FetchChannelTool() (Tool, Handler) {
 			recordFetch(false, false)
 			return "", fmt.Errorf("fetch messages: %w", err)
 		}
-		recordFetch(true, coverage.Truncated)
 
 		// Enrich messages with SenderName, SourceName, ChannelType before caching.
 		// This fixes citation metadata loss (SUM-46 Blocker A).
@@ -157,8 +172,16 @@ func FetchChannelTool() (Tool, Handler) {
 		// handle's messages invisible to citation building for the entire
 		// session, so a write failure is escalated as a tool-level error.
 		if err := PersistEvidence(summaryDB, ctx, handle, messages); err != nil {
+			// Record the channel as FAILED, not succeeded. The success record used to
+			// fire before this write, so a channel whose evidence INSERT was lost was
+			// counted in succeeded_channels while its messages were absent from
+			// buildCitationsForSession — the gate saw succeeded == expected and
+			// reported COMPLETE over evidence a third of which was uncitable.
+			recordFetch(false, coverage.Truncated)
 			return "", fmt.Errorf("persist evidence: %w", err)
 		}
+		// Recorded only once the messages are durably discoverable for citations.
+		recordFetch(true, coverage.Truncated)
 
 		result := map[string]interface{}{
 			"total":           len(messages),

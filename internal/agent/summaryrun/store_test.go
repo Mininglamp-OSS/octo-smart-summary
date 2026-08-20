@@ -313,3 +313,71 @@ func TestRecordChannelFetchAndDroppedMessages(t *testing.T) {
 		t.Fatalf("retry should move ch-2 to succeeded, got succeeded=%s failed=%s", got.SucceededChannels, got.FailedChannels)
 	}
 }
+
+func TestRecordDiscoveredChannels(t *testing.T) {
+	db := newStoreTestDB(t)
+	if db == nil {
+		return
+	}
+	s := NewStore(db)
+	ctx := context.Background()
+	run, _, _ := s.CreateOrGetRun(ctx, "u1", "sess1", "req-disc", model.ScopePolicyOpen)
+
+	// Discovery arrives across several tool calls, each seeing only its own slice,
+	// so the write must union rather than replace.
+	if err := s.RecordDiscoveredChannels(ctx, "u1", run.RunID, []string{"ch-1", "ch-2"}); err != nil {
+		t.Fatalf("RecordDiscoveredChannels: %v", err)
+	}
+	if err := s.RecordDiscoveredChannels(ctx, "u1", run.RunID, []string{"ch-2", "ch-3", ""}); err != nil {
+		t.Fatalf("RecordDiscoveredChannels second call: %v", err)
+	}
+
+	got, err := s.GetByID(ctx, "u1", run.RunID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.DiscoveredChannels != `["ch-1","ch-2","ch-3"]` {
+		t.Fatalf("discovered_channels = %s, want a deduped union with the empty id dropped", got.DiscoveredChannels)
+	}
+
+	// Owner-scoped like every other run write: another user's call is a no-op.
+	if err := s.RecordDiscoveredChannels(ctx, "u2", run.RunID, []string{"ch-9"}); err == nil {
+		t.Error("cross-user RecordDiscoveredChannels should not find the row")
+	}
+	got, _ = s.GetByID(ctx, "u1", run.RunID)
+	if got.DiscoveredChannels != `["ch-1","ch-2","ch-3"]` {
+		t.Fatalf("cross-user call mutated the row: %s", got.DiscoveredChannels)
+	}
+}
+
+// TestCreateOrGetRunFetchExpectation pins the flag the finish gate uses to tell
+// "was never supposed to fetch" from "should have fetched and did not". The
+// default is true so an ordinary summary turn is still coverage-judged; only an
+// SS-08b confident rewrite, whose fetch tools are physically removed, sets false.
+func TestCreateOrGetRunFetchExpectation(t *testing.T) {
+	db := newStoreTestDB(t)
+	if db == nil {
+		return
+	}
+	s := NewStore(db)
+	ctx := context.Background()
+
+	def, _, err := s.CreateOrGetRun(ctx, "u1", "sess1", "req-default", model.ScopePolicyClosed)
+	if err != nil {
+		t.Fatalf("CreateOrGetRun: %v", err)
+	}
+	if !def.FetchExpected {
+		t.Error("the default must be fetch-expected, or the gate goes silent on ordinary runs")
+	}
+
+	rewrite, _, err := s.CreateOrGetRunWithFetchExpectation(ctx, "u1", "sess1", "req-rewrite", model.ScopePolicyClosed, false)
+	if err != nil {
+		t.Fatalf("CreateOrGetRunWithFetchExpectation: %v", err)
+	}
+	if rewrite.FetchExpected {
+		t.Error("a confident rewrite must be recorded as not fetch-expected")
+	}
+	if rewrite.DiscoveredChannels != "[]" {
+		t.Errorf("discovered_channels should initialize to []: %s", rewrite.DiscoveredChannels)
+	}
+}

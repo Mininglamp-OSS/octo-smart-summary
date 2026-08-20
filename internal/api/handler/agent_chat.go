@@ -1,7 +1,5 @@
 package handler
 
-import "sync"
-
 import (
 	"context"
 	"encoding/json"
@@ -11,6 +9,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
@@ -351,24 +350,70 @@ func truncateRunes(s string, max int) string {
 	return string(runes[:max])
 }
 
-// attachToolErrorHook installs the SS-07b runner hook that marks the run failed
-// when a fatal tool error occurs mid-run, so the finish gate returns FAILED at
-// save time (defect #5). No-op when there is no run or no store. The hook runs
-// concurrently from the tool worker pool, so it uses a fresh context (the
-// request context may already be canceled by the very error being reported) and
-// relies on SetStatus being a plain idempotent UPDATE.
+// attachToolErrorHook installs the SS-07b runner hooks that track fatal tool
+// failures against the run, so the finish gate returns FAILED at save time
+// (defect #5). No-op when there is no run or no store.
+//
+// The marker is RECOVERABLE, per tool. A fatal error records the tool name; a
+// later success by that same tool removes it, and the run returns to whatever
+// status it had. This is deliberately not "one more transient string in the
+// classifier": the classifier has been wrong in both directions on the same
+// error (mysql's "invalid connection" was first swallowed as a bad argument,
+// then promoted to fatal), and no list of substrings distinguishes "this failure
+// ended the run" from "this failure was retried away". A subsequent success is
+// that distinction, observed rather than predicted.
+//
+// Concretely, the case this closes: a stale pooled connection kills a redundant
+// second fetch_channel, the model re-calls it and it works, the summary is
+// complete — and the user was shown finish_status=FAILED on a good deliverable.
+//
+// The hooks run concurrently from the tool worker pool, so state is mutex-guarded
+// and DB writes use a fresh context (the request context may already be canceled
+// by the very error being reported); SetStatus is a plain idempotent UPDATE.
 func (h *AgentChatHandler) attachToolErrorHook(runner *agent.Runner, userID, runID string) {
 	if runner == nil || userID == "" || runID == "" || h.runStore == nil {
 		return
 	}
 	store := h.runStore
-	runner.OnToolError = func(_ string, env agent.ToolErrorEnvelope) {
+	var mu sync.Mutex
+	fatalTools := map[string]bool{}
+
+	// syncStatus writes the status implied by the current fatal set. Called with mu
+	// held so concurrent tool completions cannot interleave into the wrong order.
+	syncStatus := func(status string) {
+		if err := store.SetStatus(context.Background(), userID, runID, status); err != nil {
+			log.Printf("[agent] v2 set run status=%s (run=%s): %v", status, runID, err)
+		}
+	}
+
+	runner.OnToolError = func(toolName string, env agent.ToolErrorEnvelope) {
 		if !env.Fatal {
 			return
 		}
-		if err := store.SetStatus(context.Background(), userID, runID, model.RunStatusFailed); err != nil {
-			log.Printf("[agent] v2 mark run failed (run=%s): %v", runID, err)
+		mu.Lock()
+		defer mu.Unlock()
+		if fatalTools[toolName] {
+			return
 		}
+		fatalTools[toolName] = true
+		syncStatus(model.RunStatusFailed)
+	}
+
+	runner.OnToolSuccess = func(toolName string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !fatalTools[toolName] {
+			return
+		}
+		delete(fatalTools, toolName)
+		if len(fatalTools) > 0 {
+			// Another tool is still in a fatal state; the run stays failed.
+			return
+		}
+		// Every tool that failed fatally has since succeeded. Back to running — the
+		// terminal verdict is the finish gate's call at save time, not this hook's.
+		syncStatus(model.RunStatusRunning)
+		log.Printf("[agent] v2 run recovered after fatal tool error (run=%s tool=%s)", runID, toolName)
 	}
 }
 
@@ -383,7 +428,7 @@ func (h *AgentChatHandler) attachToolErrorHook(runner *agent.Runner, userID, run
 //
 // A request without request_id (legacy client) or without a runStore (test
 // constructor) is a no-op returning "" — we never 400 on the missing field.
-func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid string, req agentChatRequest) string {
+func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid string, req agentChatRequest, fetchExpected bool) string {
 	if h.runStore == nil || req.RequestID == "" {
 		return ""
 	}
@@ -395,7 +440,7 @@ func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid strin
 		scopePolicy = model.ScopePolicyClosed
 	}
 
-	run, created, err := h.runStore.CreateOrGetRun(ctx, uid, req.SessionID, req.RequestID, scopePolicy)
+	run, created, err := h.runStore.CreateOrGetRunWithFetchExpectation(ctx, uid, req.SessionID, req.RequestID, scopePolicy, fetchExpected)
 	if err != nil {
 		log.Printf("[agent] v2 create/get run failed (session=%s): %v", req.SessionID, err)
 		return ""
@@ -502,7 +547,10 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 	// freeze/read this run's manifest (SS-05).
 	var v2RunID string
 	if agent.SummaryV2Enabled() {
-		if v2RunID = h.maybePersistSummaryRun(ctx, uid, req); v2RunID != "" {
+		// fetchExpected=false for a confident rewrite: SS-08b physically removes the
+		// fetch tools, so the run cannot measure coverage and the gate must not
+		// disclose that absence as a gap.
+		if v2RunID = h.maybePersistSummaryRun(ctx, uid, req, !(refineActive && refineRoute.HardNoFetch)); v2RunID != "" {
 			ctx = context.WithValue(ctx, agent.ContextKeyRunID, v2RunID)
 		}
 	}
@@ -787,7 +835,10 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	// The returned run_id is injected into the tool context for the citation pass.
 	var v2RunID string
 	if agent.SummaryV2Enabled() {
-		if v2RunID = h.maybePersistSummaryRun(ctx, uid, req); v2RunID != "" {
+		// fetchExpected=false for a confident rewrite: SS-08b physically removes the
+		// fetch tools, so the run cannot measure coverage and the gate must not
+		// disclose that absence as a gap.
+		if v2RunID = h.maybePersistSummaryRun(ctx, uid, req, !(refineActive && refineRoute.HardNoFetch)); v2RunID != "" {
 			ctx = context.WithValue(ctx, agent.ContextKeyRunID, v2RunID)
 		}
 	}

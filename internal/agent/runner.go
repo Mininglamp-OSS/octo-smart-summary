@@ -44,6 +44,18 @@ type Runner struct {
 	// handler can record fatal failures against the run (→ finish gate FAILED).
 	// Nil-safe; must be goroutine-safe (runTools calls it from the worker pool).
 	OnToolError func(toolName string, env ToolErrorEnvelope)
+
+	// OnToolSuccess is the counterpart, called when a tool call SUCCEEDS.
+	//
+	// Without it the failed marker is one-way: the model retries the same tool,
+	// succeeds, produces a perfect summary, and the run is still reported FAILED
+	// because nothing ever clears the flag. Growing the classifier's list of
+	// transient error strings cannot fix that — the same string has been judged
+	// wrong in both directions across review rounds ("invalid connection" was too
+	// lenient, then too strict) — so recoverability is derived from an OBSERVED
+	// fact ("that tool worked on a later call") instead of guessed from text.
+	// Nil-safe; must be goroutine-safe.
+	OnToolSuccess func(toolName string)
 }
 
 func NewRunner(client chatter, reg *Registry, pool *Pool, policy Policy) *Runner {
@@ -252,6 +264,13 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 				return
 			}
 			results[i] = out
+			// SS-07b: a successful call is the evidence that whatever failed earlier on
+			// this tool was recoverable. Reported so the run's fatal marker can be
+			// cleared — see Runner.OnToolSuccess for why this is an observation rather
+			// than another error-string pattern.
+			if SummaryV2Enabled() && r.OnToolSuccess != nil {
+				r.OnToolSuccess(tc.Function.Name)
+			}
 		})
 	}
 	wg.Wait()

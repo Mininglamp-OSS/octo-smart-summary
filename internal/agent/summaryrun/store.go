@@ -59,23 +59,33 @@ func NewStore(db *gorm.DB) *Store { return &Store{db: db} }
 // so concurrent first-time requests with the same request_id converge on one
 // row.
 func (s *Store) CreateOrGetRun(ctx context.Context, userID, sessionID, requestID, scopePolicy string) (*model.AgentSummaryRun, bool, error) {
+	return s.CreateOrGetRunWithFetchExpectation(ctx, userID, sessionID, requestID, scopePolicy, true)
+}
+
+// CreateOrGetRunWithFetchExpectation is CreateOrGetRun with the turn's fetch
+// expectation stated explicitly. fetchExpected=false marks a turn that is
+// fetch-free by design (SS-08b confident rewrite), so the finish gate does not
+// disclose "coverage not measured" for a turn that was never allowed to measure.
+func (s *Store) CreateOrGetRunWithFetchExpectation(ctx context.Context, userID, sessionID, requestID, scopePolicy string, fetchExpected bool) (*model.AgentSummaryRun, bool, error) {
 	if scopePolicy != model.ScopePolicyOpen {
 		scopePolicy = model.ScopePolicyClosed
 	}
 	ts := now()
 	run := &model.AgentSummaryRun{
-		RunID:            uuid.NewString(),
-		UserID:           userID,
-		SessionID:        sessionID,
-		RequestID:        requestID,
-		ScopePolicy:      scopePolicy,
-		Status:           model.RunStatusCreated,
-		AttemptedChannels: "[]",
-		SucceededChannels: "[]",
-		FailedChannels:    "[]",
-		Version:          0,
-		CreatedAt:        ts,
-		UpdatedAt:        ts,
+		RunID:              uuid.NewString(),
+		UserID:             userID,
+		SessionID:          sessionID,
+		RequestID:          requestID,
+		ScopePolicy:        scopePolicy,
+		Status:             model.RunStatusCreated,
+		AttemptedChannels:  "[]",
+		SucceededChannels:  "[]",
+		FailedChannels:     "[]",
+		DiscoveredChannels: "[]",
+		FetchExpected:      fetchExpected,
+		Version:            0,
+		CreatedAt:          ts,
+		UpdatedAt:          ts,
 	}
 
 	// GORM maps DoNothing to ON DUPLICATE KEY UPDATE on MySQL. Do not use
@@ -331,6 +341,47 @@ func (s *Store) AddDroppedMessages(ctx context.Context, userID, runID string, co
 			"dropped_messages": gorm.Expr("dropped_messages + ?", count),
 			"updated_at":       now(),
 		}).Error
+}
+
+// RecordDiscoveredChannels unions channel ids the run learned are in scope.
+//
+// For an open-scope run the Spec pins nothing, so this is the only way the gate
+// can tell "fetched everything in scope" from "found 12 channels and fetched 2".
+// Union rather than replace: discovery happens across several tool calls
+// (list_channels, narrow_channels_by_topic, find_shared_channels) and each sees
+// only its own slice.
+func (s *Store) RecordDiscoveredChannels(ctx context.Context, userID, runID string, channelIDs []string) error {
+	if len(channelIDs) == 0 {
+		return nil
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var run model.AgentSummaryRun
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("run_id = ? AND user_id = ?", runID, userID).
+			First(&run).Error; err != nil {
+			return err
+		}
+		discovered, err := decodeChannels(run.DiscoveredChannels)
+		if err != nil {
+			return fmt.Errorf("decode discovered_channels: %w", err)
+		}
+		before := len(discovered)
+		for _, id := range channelIDs {
+			if id != "" {
+				discovered = addChannel(discovered, id)
+			}
+		}
+		if len(discovered) == before {
+			return nil
+		}
+		discoveredJSON, _ := json.Marshal(discovered)
+		return tx.Model(&model.AgentSummaryRun{}).
+			Where("run_id = ? AND user_id = ?", runID, userID).
+			Updates(map[string]interface{}{
+				"discovered_channels": string(discoveredJSON),
+				"updated_at":          now(),
+			}).Error
+	})
 }
 
 func decodeChannels(raw string) ([]string, error) {

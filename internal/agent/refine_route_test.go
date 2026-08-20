@@ -106,3 +106,84 @@ func TestBuildRefineGuidance(t *testing.T) {
 		t.Errorf("extend guidance should forbid reusing the old range: %s", extend)
 	}
 }
+
+// TestRefineAddVerbsRequireADestination pins the round-2 collision. Adding the
+// bare add-verbs 加上/加进/加入/添加/带上 to the augment list fixed the reported
+// repros and immediately reintroduced the CJK substring class the round-1 fix had
+// removed: 带上 ⊂ 带上下文, so a pure typography request routed to augment and was
+// told to re-fetch and re-run Map/Reduce.
+//
+// An add verb now has to name a DESTINATION, which is the actual distinguishing
+// shape ("write X INTO the summary" vs "带上下文"). That rule also covers the
+// verbs flagged as an uncovered tail (写进/放进/附上) without another guessing
+// round, because what is matched is the construction rather than the verb.
+func TestRefineAddVerbsRequireADestination(t *testing.T) {
+	cases := []struct {
+		instruction string
+		wantIntent  RefineIntent
+		why         string
+	}{
+		// Real additions: a destination is named, so new content must be gathered.
+		{"把下午客户会议的讨论加进总结里", RefineAugment, "round-1 repro"},
+		{"把客户反馈原文也写进总结", RefineAugment, "写进 + 总结"},
+		{"把摘要加入到开头", RefineAugment, "加入 + 开头"},
+		{"精简后把客户反馈原文也写进总结", RefineAugment, "rewrite verb present, but it IS an addition"},
+		{"给每段加上小标题", RefineAugment, "加上 + 小标题"},
+
+		// Not additions: the verb is part of another word, or nothing is being
+		// added to anything.
+		{"翻译成英文，带上下文", RefineRewrite, "带上 ⊂ 带上下文 — the round-2 collision"},
+		{"总结里新加入成员说了什么", RefineRewrite, "加入成员 is the subject, not a destination"},
+	}
+	for _, tc := range cases {
+		got := ClassifyRefine(tc.instruction)
+		if got.Intent != tc.wantIntent {
+			t.Errorf("ClassifyRefine(%q) intent=%s, want %s (%s)", tc.instruction, got.Intent, tc.wantIntent, tc.why)
+		}
+	}
+}
+
+// TestRefineTimeWordDoesNotForceAFetch pins the priority carve-out. extend
+// outranking rewrite meant any rewrite mentioning time was told to fetch new
+// messages for a request needing zero new data.
+func TestRefineTimeWordDoesNotForceAFetch(t *testing.T) {
+	for _, instruction := range []string{
+		"把这份总结精简一下，只保留最近的结论",
+		"更新一下格式",
+		"去掉最近的部分",
+	} {
+		got := ClassifyRefine(instruction)
+		if got.Intent != RefineRewrite || got.Fetch {
+			t.Errorf("ClassifyRefine(%q) intent=%s fetch=%t, want a no-fetch rewrite", instruction, got.Intent, got.Fetch)
+		}
+		// Tools stay available: a time word makes this only PROBABLY a rewrite, so
+		// a mis-read must stay recoverable rather than be enforced in code.
+		if got.HardNoFetch {
+			t.Errorf("ClassifyRefine(%q): a time word present ⇒ keep the tools available", instruction)
+		}
+	}
+
+	// The genuine extend case must still fetch.
+	if got := ClassifyRefine("补充最新进展"); got.Intent != RefineExtend || !got.Fetch {
+		t.Errorf("ClassifyRefine(补充最新进展) = %+v, want a fetching extend", got)
+	}
+}
+
+// TestRefineAnchoredLanguagePhrasings recovers the two commonest rewrite requests
+// that round 1 lost. Dropping the bare 英文/中文 keywords fixed 精英文化 / 中文档 but
+// sent 用英文重写 and 改成中文 to the ambiguous fallback, so SS-08b's zero-fetch
+// enforcement stopped firing for them. Anchored phrasings restore both without
+// reopening the collision — the two are asserted together so a future edit cannot
+// trade one for the other again.
+func TestRefineAnchoredLanguagePhrasings(t *testing.T) {
+	for _, instruction := range []string{"用英文重写", "改成中文", "翻译成英文", "输出中文"} {
+		if got := ClassifyRefine(instruction); !got.HardNoFetch {
+			t.Errorf("ClassifyRefine(%q) should be a confident rewrite, got %+v", instruction, got)
+		}
+	}
+	for _, instruction := range []string{"讨论精英文化的那部分", "整理中文档里提到的风险"} {
+		if got := ClassifyRefine(instruction); got.HardNoFetch {
+			t.Errorf("ClassifyRefine(%q) is prose containing the keyword, must not strip tools", instruction)
+		}
+	}
+}

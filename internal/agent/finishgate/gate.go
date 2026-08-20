@@ -33,10 +33,12 @@ const (
 
 // Gap is a structured disclosure of one coverage/quality shortfall, surfaced to
 // the user on PARTIAL (and explaining a FAILED).
+//
+// ErrorCode was removed after ChannelID was added: every producer moved to the
+// typed field and it shipped as an always-absent key in a client-facing contract.
 type Gap struct {
 	Kind      string `json:"kind"`
 	Detail    string `json:"detail"`
-	ErrorCode string `json:"error_code,omitempty"`
 	ChannelID string `json:"channel_id,omitempty"`
 }
 
@@ -54,6 +56,17 @@ type RunState struct {
 	// resolves to a real citation.
 	CitationValidationPassed bool
 
+	// FetchExpected is whether this turn was supposed to gather data at all.
+	//
+	// It is false for turns that are fetch-free BY DESIGN: SS-08b strips the
+	// fetch tools from a confident rewrite, so `coverage_measured` physically
+	// cannot be set. Without this flag the gate reported PARTIAL with a coverage
+	// gap on exactly the turns whose zero-fetch was the intended behaviour — one
+	// half of this PR disclosing the other half's correctness as a defect.
+	//
+	// "Not measured" is only a gap when measurement was expected.
+	FetchExpected bool
+
 	// Coverage facts. CoverageMeasured is explicit because an empty set may mean
 	// either "we fetched a quiet channel" or "no coverage path ran at all".
 	CoverageMeasured  bool
@@ -63,6 +76,13 @@ type RunState struct {
 	Truncated         bool
 	DroppedMessages   int
 	FailedChannels    []string
+
+	// DiscoveredChannels are the channels the run learned were in scope but that
+	// no spec pinned — the open-scope case, where ExpectedChannels is empty
+	// because nothing was selected in the UI. Without it an open-scope run that
+	// fetched 2 of 12 available channels reported COMPLETE with no gaps, which is
+	// the exact under-fetch the gate exists to catch.
+	DiscoveredChannels []string
 
 	// CriticalToolErrors are unrecoverable tool failures (permission, evidence
 	// write, summary). Any entry forces FAILED.
@@ -78,6 +98,12 @@ type RunState struct {
 //     valid, and NO undisclosed gap (no truncation, no dropped messages, all
 //     expected channels fetched).
 //   - PARTIAL: usable evidence and a summary, but at least one coverage gap.
+//
+// Coverage is judged against what the turn was SUPPOSED to do (FetchExpected)
+// and against everything it knew was in scope (ExpectedChannels for a closed
+// scope, DiscoveredChannels for an open one). Judging "was coverage measured"
+// alone made the gate strict on runs whose coverage was complete and silent on
+// the open-scope runs that actually under-fetched — backwards in both halves.
 func Evaluate(s RunState) (Verdict, []Gap) {
 	// Hard failures first — nothing usable to save.
 	if !s.HasUsableEvidence || !s.SummaryGenerated {
@@ -95,11 +121,20 @@ func Evaluate(s RunState) (Verdict, []Gap) {
 	}
 
 	// Usable + valid: collect any coverage gaps → PARTIAL, else COMPLETE.
-	if !s.CoverageMeasured {
+	switch {
+	case !s.FetchExpected:
+		// A turn that was never supposed to fetch has nothing to disclose. This is
+		// the confident-rewrite / answer-from-history shape: SS-08b removes the
+		// fetch tools on purpose, so treating the resulting absence of coverage as
+		// a gap would make PARTIAL the standing verdict for every correct rewrite.
+	case !s.CoverageMeasured:
+		// Measurement WAS expected and did not happen — unknown, not zero. Disclose
+		// it rather than asserting completeness over data we never looked at.
 		gaps = append(gaps, Gap{Kind: GapCoverage, Detail: "channel coverage was not measured"})
-	} else {
+	default:
 		succeeded := stringSet(s.SucceededChannels)
 		failed := stringSet(s.FailedChannels)
+		attempted := stringSet(s.AttemptedChannels)
 		reported := make(map[string]bool)
 		for _, ch := range s.ExpectedChannels {
 			if reported[ch] {
@@ -112,6 +147,17 @@ func Evaluate(s RunState) (Verdict, []Gap) {
 			case !succeeded[ch]:
 				gaps = append(gaps, Gap{Kind: GapChannel, Detail: "expected channel was not fetched", ChannelID: ch})
 			}
+		}
+		// Open scope: nothing was pinned by a spec, so the only way to notice an
+		// under-fetch is to compare what the run DISCOVERED against what it
+		// attempted. "总结我这周所有群的进展" that lists 12 channels and fetches 2
+		// previously reported COMPLETE with no gaps.
+		for _, ch := range s.DiscoveredChannels {
+			if reported[ch] || attempted[ch] {
+				continue
+			}
+			reported[ch] = true
+			gaps = append(gaps, Gap{Kind: GapChannel, Detail: "in-scope channel was never fetched", ChannelID: ch})
 		}
 		for _, ch := range s.FailedChannels {
 			if !reported[ch] {

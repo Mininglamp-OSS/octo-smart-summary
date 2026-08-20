@@ -209,14 +209,42 @@ var citationMarkerRE = regexp.MustCompile(`\[(\d+)\]`)
 
 // citationsValid reports whether every [n] marker in content resolves to a built
 // citation index. No markers → vacuously valid (nothing to break).
+//
+// A marker only counts when the content HAS citations to resolve against. The
+// penalty for failing is a hard FAILED verdict (finishgate.Evaluate), which is
+// far too heavy to hang on any bracketed integer in prose: `根据 [2024] 年规划`,
+// `待办共 [3] 项`, and `GB/T [50011]` all failed a good summary. This repo
+// already concedes such integers exist — stripUnresolvedCitationMarkers
+// (agent_summary.go) strips only the markers belonging to a referenced artifact
+// precisely because "unrelated bracketed integers remain user content".
+//
+// Two rules, both narrowing:
+//
+//   - cits empty → nothing was claimed, so nothing can dangle. This is the
+//     reachable refine path: a rewrite turn has no tool traces, so savedCitations
+//     is nil while the rewritten text still carries the source summary's markers.
+//   - a marker above the highest built index is prose, not a broken citation. A
+//     run with 2 citations cannot have meant `[2024]`. Only an in-range miss —
+//     e.g. [3] when 1, 2 and 4 exist — indicates real citation corruption.
 func citationsValid(content string, cits []model.Citation) bool {
+	if len(cits) == 0 {
+		return true
+	}
 	idxSet := make(map[int]bool, len(cits))
+	maxIdx := 0
 	for _, c := range cits {
 		idxSet[c.Index] = true
+		if c.Index > maxIdx {
+			maxIdx = c.Index
+		}
 	}
 	for _, m := range citationMarkerRE.FindAllStringSubmatch(content, -1) {
 		var n int
 		if _, err := fmt.Sscanf(m[1], "%d", &n); err != nil {
+			continue
+		}
+		if n < 1 || n > maxIdx {
+			// Outside the citation space entirely: a year, a count, a standard number.
 			continue
 		}
 		if !idxSet[n] {
@@ -241,17 +269,28 @@ func (h *AgentSummaryHandler) finalizeRun(ctx context.Context, uid, sessionID, r
 	runStore := summaryrun.NewStore(h.db)
 	run, err := runStore.GetByRequest(ctx, uid, sessionID, requestID)
 	if err != nil {
-		return "", nil
+		// A disclosure feature must not degrade to "no warning" — that is
+		// indistinguishable from a clean run. finalizeRun now executes AFTER the
+		// save transaction commits, so a client disconnecting the instant the save
+		// returns cancels this ctx and the lookup fails; the client would then be
+		// shown a deliverable with no verdict at all. Say we could not verify.
+		log.Printf("[finish] run lookup failed session=%s request=%s: %v", sessionID, requestID, err)
+		return finishgate.Partial, []finishgate.Gap{{
+			Kind:   finishgate.GapToolError,
+			Detail: "could not verify run completeness",
+		}}
 	}
 
 	state := finishgate.RunState{
 		ScopeResolved:            run.SpecID != "",
 		SummaryGenerated:         content != "",
 		CitationValidationPassed: citationsValid(content, cits),
+		FetchExpected:            run.FetchExpected,
 		CoverageMeasured:         run.CoverageMeasured,
 		AttemptedChannels:        decodeFinishChannelIDs(run.AttemptedChannels),
 		SucceededChannels:        decodeFinishChannelIDs(run.SucceededChannels),
 		FailedChannels:           decodeFinishChannelIDs(run.FailedChannels),
+		DiscoveredChannels:       decodeFinishChannelIDs(run.DiscoveredChannels),
 		Truncated:                run.CoverageTruncated,
 		DroppedMessages:          run.DroppedMessages,
 	}

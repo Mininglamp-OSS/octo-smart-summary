@@ -97,3 +97,101 @@ func TestRunnerToolErrorEnvelope(t *testing.T) {
 		}
 	})
 }
+
+// TestClassifyToolErrorTransientConnectionShapes pins the round-2 P1. Removing
+// the bare "invalid" match correctly stopped mysql's ErrInvalidConn being
+// swallowed as a bad ARGUMENT, but it then fell to the critical-tool default and
+// became FATAL — strictly worse than the previous head for that string, because
+// a fatal marker makes the whole run report FAILED.
+//
+// These are all stale-pooled-connection or interrupted-stream shapes: one class,
+// one branch. Splitting them is how `driver: bad connection` ended up retryable
+// while `invalid connection` — the same situation — did not.
+func TestClassifyToolErrorTransientConnectionShapes(t *testing.T) {
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+	for _, msg := range []string{
+		"get user channels: invalid connection",
+		"fetch messages: mysql: invalid connection",
+		"get user channels: sql: connection is already closed",
+		"fetch messages: broken pipe",
+		`merge summaries: call LLM: Post "https://llm/v1": unexpected EOF`,
+		"fetch messages: Error 1213: Deadlock found when trying to get lock",
+		"fetch messages: Error 1205: Lock wait timeout exceeded",
+	} {
+		env := classifyToolError("fetch_channel", errors.New(msg))
+		if env.Fatal || !env.Retryable {
+			t.Errorf("classifyToolError(%q) = %s retryable=%t fatal=%t, want a retryable non-fatal transient error",
+				msg, env.ErrorCode, env.Retryable, env.Fatal)
+		}
+	}
+}
+
+// TestClassifyToolErrorAnchorsHTTPStatuses pins that incidental digits are not
+// read as HTTP statuses. Channel and user ids are interpolated into error text,
+// so an unanchored "429" match reported a permission failure as a throttle and
+// the model retried a call that can never succeed until MaxSteps ran out.
+func TestClassifyToolErrorAnchorsHTTPStatuses(t *testing.T) {
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+
+	env := classifyToolError("fetch_channel", errors.New("channel 1234297 not accessible by user u-88"))
+	if env.ErrorCode != "PERMISSION_DENIED" {
+		t.Errorf("channel id containing 429 = %s, want PERMISSION_DENIED", env.ErrorCode)
+	}
+
+	env = classifyToolError("fetch_channel", errors.New("some error with status 5000 in it"))
+	if env.ErrorCode == "UPSTREAM_ERROR" {
+		t.Error("status 5000 is not a 5xx: the code must not be part of a longer number")
+	}
+
+	// Real statuses must still classify.
+	for _, msg := range []string{"LLM API error: status=503 body=upstream busy", "http 429 too many"} {
+		env = classifyToolError("merge_summaries", errors.New(msg))
+		if env.Fatal || !env.Retryable {
+			t.Errorf("classifyToolError(%q) = %s fatal=%t, want retryable", msg, env.ErrorCode, env.Fatal)
+		}
+	}
+}
+
+// TestClassifyToolErrorEvidenceReadIsNotAWriteFailure pins the narrowing of the
+// bare "evidence" match: a READ failure ("query evidence rows: ...") was being
+// reported as a fatal evidence-WRITE failure even when the underlying cause was a
+// one-second connection blip.
+func TestClassifyToolErrorEvidenceReadIsNotAWriteFailure(t *testing.T) {
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+
+	env := classifyToolError("summarize_chunk", errors.New("get session message pool: query evidence rows: invalid connection"))
+	if env.ErrorCode == "EVIDENCE_WRITE_FAILED" {
+		t.Error("an evidence READ blip must not be classified as a fatal write failure")
+	}
+	if env.Fatal {
+		t.Errorf("evidence read blip = %s fatal=true, want non-fatal", env.ErrorCode)
+	}
+
+	// A genuine write failure stays fatal.
+	env = classifyToolError("fetch_channel", errors.New("persist evidence: duplicate key"))
+	if env.ErrorCode != "EVIDENCE_WRITE_FAILED" || !env.Fatal {
+		t.Errorf("persist evidence failure = %s fatal=%t, want a fatal EVIDENCE_WRITE_FAILED", env.ErrorCode, env.Fatal)
+	}
+}
+
+// TestRunnerReportsToolSuccess pins the mechanism the recoverable failed-marker
+// rests on: a successful tool call must be observable, and only when V2 is on.
+func TestRunnerReportsToolSuccess(t *testing.T) {
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+
+	reg := NewRegistry()
+	reg.Register(Tool{Type: "function", Function: ToolFunction{Name: "fetch_channel"}},
+		func(_ context.Context, _ json.RawMessage) (string, error) { return "{}", nil })
+
+	r := NewRunner(nil, reg, NewPool(1), Policy{})
+	var succeeded []string
+	r.OnToolSuccess = func(name string) { succeeded = append(succeeded, name) }
+	var call ToolCall
+	call.Function.Name = "fetch_channel"
+	call.Function.Arguments = "{}"
+	r.runTools(context.Background(), []ToolCall{call}, 1, 1)
+
+	if len(succeeded) != 1 || succeeded[0] != "fetch_channel" {
+		t.Fatalf("OnToolSuccess not fired for a successful call, got %v", succeeded)
+	}
+}
