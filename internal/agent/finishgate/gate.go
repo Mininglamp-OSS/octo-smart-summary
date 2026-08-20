@@ -125,17 +125,33 @@ func Evaluate(s RunState) (Verdict, []Gap) {
 	}
 
 	// Usable + valid: collect any coverage gaps → PARTIAL, else COMPLETE.
+	//
+	// FACT BEFORE EXPECTATION. CoverageMeasured is a fact (a fetch was recorded);
+	// FetchExpected is an expectation (one should have been). The fact is examined
+	// first and the expectation only ever explains an ABSENCE — it can never
+	// suppress a recorded outcome.
+	//
+	// The previous order let the expectation short-circuit the whole audit: with
+	// FetchExpected=false the coverage branch was skipped even when failed_channels
+	// held a real failure, so a fetch that genuinely failed reported COMPLETE. That
+	// reachable case is a soft rewrite — route.Fetch=false, so FetchExpected=false,
+	// but the fetch tools are deliberately KEPT (only a confident rewrite strips
+	// them), so the model may fetch and that fetch may fail. Ordering on the fact
+	// removes the class rather than the instance: no flag can erase what happened.
 	switch {
-	case !s.FetchExpected:
-		// A turn that was never supposed to fetch has nothing to disclose. This is
-		// the confident-rewrite / answer-from-history shape: SS-08b removes the
-		// fetch tools on purpose, so treating the resulting absence of coverage as
-		// a gap would make PARTIAL the standing verdict for every correct rewrite.
-	case !s.CoverageMeasured:
-		// Measurement WAS expected and did not happen — unknown, not zero. Disclose
-		// it rather than asserting completeness over data we never looked at.
+	case s.CoverageMeasured:
+		// A fetch happened. Audit it in full, whatever the turn was supposed to do.
+	case s.FetchExpected:
+		// Nothing recorded, and a fetch WAS expected — unknown, not zero. Disclose it
+		// rather than asserting completeness over data we never looked at.
 		gaps = append(gaps, Gap{Kind: GapCoverage, Detail: "channel coverage was not measured"})
 	default:
+		// Nothing recorded and none expected: nothing to disclose. This is the
+		// confident-rewrite / answer-from-history shape — SS-08b removes the fetch
+		// tools on purpose, so treating that absence as a gap would make PARTIAL the
+		// standing verdict for every correct rewrite.
+	}
+	if s.CoverageMeasured {
 		succeeded := stringSet(s.SucceededChannels)
 		failed := stringSet(s.FailedChannels)
 		attempted := stringSet(s.AttemptedChannels)

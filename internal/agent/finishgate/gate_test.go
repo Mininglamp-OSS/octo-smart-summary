@@ -240,3 +240,96 @@ func TestEvaluateClosedScopeStillCatchesUnfetchedExpected(t *testing.T) {
 		t.Fatalf("discovered-but-out-of-scope vis-9 must not be reported on a closed scope, got %v", gaps)
 	}
 }
+
+// TestEvaluateRecordedFailureSurvivesFetchNotExpected pins the round-5 finding:
+// FACT BEFORE EXPECTATION.
+//
+// FetchExpected used to short-circuit the entire coverage audit, so a run with a
+// real failure sitting in FailedChannels reported COMPLETE purely because the
+// turn "was not supposed to fetch". The reachable shape is a SOFT rewrite:
+// route.Fetch=false ⇒ FetchExpected=false, but only a CONFIDENT rewrite strips
+// the fetch tools, so a soft rewrite can and does fetch — and that fetch can
+// fail. Coverage was measured; the flag then erased it.
+func TestEvaluateRecordedFailureSurvivesFetchNotExpected(t *testing.T) {
+	s := completeState()
+	s.FetchExpected = false // soft rewrite: not expected to fetch...
+	s.CoverageMeasured = true
+	s.ExpectedChannels = nil
+	s.AttemptedChannels = []string{"ch-1"}
+	s.SucceededChannels = nil
+	s.FailedChannels = []string{"ch-1"} // ...but it did, and it failed
+
+	v, gaps := Evaluate(s)
+	if v != Partial {
+		t.Fatalf("verdict = %s, want PARTIAL — a recorded failure cannot be erased by fetch_expected=false", v)
+	}
+	named := false
+	for _, g := range gaps {
+		if g.Kind == GapChannel && g.ChannelID == "ch-1" {
+			named = true
+		}
+	}
+	if !named {
+		t.Fatalf("the failed channel must be disclosed by id, got %v", gaps)
+	}
+}
+
+// TestEvaluateTruncationAndDropSurviveFetchNotExpected covers the other two
+// facts on the same path. Truncation and dropped messages are recorded by
+// summarize_chunk, which a soft rewrite retains, so they can occur on a turn
+// whose FetchExpected is false and must not be silently dropped either.
+func TestEvaluateTruncationAndDropSurviveFetchNotExpected(t *testing.T) {
+	for name, mutate := range map[string]func(*RunState){
+		"truncated": func(s *RunState) { s.Truncated = true },
+		"dropped":   func(s *RunState) { s.DroppedMessages = 7 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := completeState()
+			s.FetchExpected = false
+			s.CoverageMeasured = false
+			s.ExpectedChannels = nil
+			s.AttemptedChannels = nil
+			s.SucceededChannels = nil
+			mutate(&s)
+
+			if v, gaps := Evaluate(s); v != Partial {
+				t.Fatalf("verdict = %s, want PARTIAL — %s is a recorded fact (gaps=%v)", v, name, gaps)
+			}
+		})
+	}
+}
+
+// TestEvaluateExpectationOnlyExplainsAbsence states the invariant directly:
+// FetchExpected may only ever change the verdict when NOTHING was recorded. Once
+// coverage exists, flipping the expectation must make no difference at all.
+//
+// Written as a property over both values rather than as another example, because
+// the two previous rounds each fixed one example of this class and left the class
+// open (round 2 added the flag as a veto; round 4 changed where the flag came
+// from, which moved the hole rather than closing it).
+func TestEvaluateExpectationOnlyExplainsAbsence(t *testing.T) {
+	base := func() RunState {
+		s := completeState()
+		s.CoverageMeasured = true
+		s.ExpectedChannels = []string{"ch-1", "ch-2"}
+		s.AttemptedChannels = []string{"ch-1", "ch-2"}
+		s.SucceededChannels = []string{"ch-1"}
+		s.FailedChannels = []string{"ch-2"}
+		return s
+	}
+
+	expected := base()
+	expected.FetchExpected = true
+	vExpected, gapsExpected := Evaluate(expected)
+
+	unexpected := base()
+	unexpected.FetchExpected = false
+	vUnexpected, gapsUnexpected := Evaluate(unexpected)
+
+	if vExpected != vUnexpected {
+		t.Fatalf("verdict differs on fetch_expected alone with coverage recorded: %s vs %s", vExpected, vUnexpected)
+	}
+	if len(gapsExpected) != len(gapsUnexpected) {
+		t.Fatalf("gaps differ on fetch_expected alone: %v vs %v", gapsExpected, gapsUnexpected)
+	}
+}

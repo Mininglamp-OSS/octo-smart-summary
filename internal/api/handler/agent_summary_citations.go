@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"regexp"
@@ -15,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/worker"
+	"gorm.io/gorm"
 )
 
 // buildCitationsForSession 反查 session_id 的所有工具轨迹,组 messages 池,
@@ -290,8 +292,9 @@ func contentHasCitationSequence(content string) bool {
 // no-op: selecting "the latest run in the session" is unsafe because a late
 // status update on an older run can move its updated_at past the generating run.
 //
-// Returns the verdict and gaps so the caller can surface them; on any lookup
-// failure it returns ("", nil) and the save proceeds unchanged.
+// Returns the verdict and gaps so the caller can surface them. A request with no
+// run row returns ("", nil) and the save proceeds unchanged; only a genuine
+// lookup FAILURE reports an unverified PARTIAL.
 func (h *AgentSummaryHandler) finalizeRun(ctx context.Context, uid, sessionID, requestID, content string, cits []model.Citation) (finishgate.Verdict, []finishgate.Gap) {
 	if h.db == nil || requestID == "" {
 		return "", nil
@@ -299,11 +302,22 @@ func (h *AgentSummaryHandler) finalizeRun(ctx context.Context, uid, sessionID, r
 	runStore := summaryrun.NewStore(h.db)
 	run, err := runStore.GetByRequest(ctx, uid, sessionID, requestID)
 	if err != nil {
-		// A disclosure feature must not degrade to "no warning" — that is
-		// indistinguishable from a clean run. finalizeRun now executes AFTER the
-		// save transaction commits, so a client disconnecting the instant the save
-		// returns cancels this ctx and the lookup fails; the client would then be
-		// shown a deliverable with no verdict at all. Say we could not verify.
+		// "No such run" and "could not read the run" are opposite situations and were
+		// being reported identically.
+		//
+		// GetByRequest uses First(), so a request that simply has no run row comes
+		// back as ErrRecordNotFound. That is the NORMAL path whenever V2 is off or
+		// run creation was skipped/failed — there is nothing to judge, and reporting
+		// PARTIAL there put an "incomplete" warning on perfectly ordinary saves.
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return "", nil
+		}
+		// A genuine lookup failure is different: the run may well exist and be
+		// incomplete, and we cannot tell. A disclosure feature must not degrade to
+		// "no warning" — that is indistinguishable from a clean run. finalizeRun
+		// executes AFTER the save transaction commits, so a client disconnecting the
+		// instant the save returns cancels this ctx and lands here. Say we could not
+		// verify.
 		log.Printf("[finish] run lookup failed session=%s request=%s: %v", sessionID, requestID, err)
 		return finishgate.Partial, []finishgate.Gap{{
 			Kind:   finishgate.GapToolError,

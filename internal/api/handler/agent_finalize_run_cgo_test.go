@@ -64,17 +64,45 @@ func TestFinalizeRunRequiresRequestID(t *testing.T) {
 	}
 }
 
-func TestFinalizeRunUnknownRunReportsUnverified(t *testing.T) {
+// TestFinalizeRunMissingRunIsANoOp pins the round-5 fix: "no such run" and
+// "could not read the run" are opposite situations and were reported identically.
+//
+// GetByRequest uses First(), so a request with no run row returns
+// ErrRecordNotFound — the NORMAL path whenever V2 is off or run creation was
+// skipped/failed. Reporting an unverified PARTIAL there put an "incomplete"
+// warning on perfectly ordinary saves.
+func TestFinalizeRunMissingRunIsANoOp(t *testing.T) {
 	db := newFinalizeTestDB(t)
 	if db == nil {
 		return
 	}
 	h := &AgentSummaryHandler{db: db}
 
-	// A lookup failure must not degrade to "no warning" — that is indistinguishable
-	// from a clean run. finalizeRun executes after the save commits, so a client
-	// disconnecting the instant the save returns lands here.
 	verdict, gaps := h.finalizeRun(context.Background(), "u1", "sess1", "req-unknown", "内容", nil)
+	if verdict != "" || gaps != nil {
+		t.Fatalf("a request with no run row has nothing to judge, got verdict=%s gaps=%v", verdict, gaps)
+	}
+}
+
+// TestFinalizeRunLookupFailureReportsUnverified is the counterpart, and the
+// reason the two must stay distinguishable: when the read genuinely FAILS the
+// run may well exist and be incomplete, and we cannot tell. Degrading to "no
+// warning" there is indistinguishable from a clean run.
+//
+// The failure is produced by dropping the table rather than by cancelling the
+// context, so the error is a real query failure and not a ctx error that a
+// future refactor might special-case.
+func TestFinalizeRunLookupFailureReportsUnverified(t *testing.T) {
+	db := newFinalizeTestDB(t)
+	if db == nil {
+		return
+	}
+	if err := db.Migrator().DropTable(&model.AgentSummaryRun{}); err != nil {
+		t.Fatalf("drop table: %v", err)
+	}
+	h := &AgentSummaryHandler{db: db}
+
+	verdict, gaps := h.finalizeRun(context.Background(), "u1", "sess1", "req-broken", "内容", nil)
 	if verdict != finishgate.Partial {
 		t.Fatalf("verdict = %s, want PARTIAL (could not verify)", verdict)
 	}
@@ -183,7 +211,9 @@ func TestFinalizeRunPersistsVerdict(t *testing.T) {
 }
 
 // TestFinalizeRunIsOwnerScoped pins that another user's request_id cannot reach
-// this run — the run is resolved by (user_id, session_id, request_id).
+// this run — the run is resolved by (user_id, session_id, request_id). The
+// owner-scoped query simply finds nothing, which is a no-op rather than an
+// unverified verdict.
 func TestFinalizeRunIsOwnerScoped(t *testing.T) {
 	db := newFinalizeTestDB(t)
 	if db == nil {
@@ -197,7 +227,13 @@ func TestFinalizeRunIsOwnerScoped(t *testing.T) {
 
 	h := &AgentSummaryHandler{db: db}
 	verdict, gaps := h.finalizeRun(ctx, "u2", "sess1", "req-owner", "内容", nil)
-	if verdict != finishgate.Partial || !hasGapKind(gaps, finishgate.GapToolError) {
+	if verdict != "" || gaps != nil {
 		t.Fatalf("another user's run must not resolve; got verdict=%s gaps=%v", verdict, gaps)
+	}
+
+	// And the owner still gets a verdict for the same request_id, so the no-op
+	// above is scoping rather than the lookup being broken outright.
+	if v, _ := h.finalizeRun(ctx, "u1", "sess1", "req-owner", "内容", nil); v == "" {
+		t.Fatal("the owner must still resolve the run")
 	}
 }
