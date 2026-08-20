@@ -28,11 +28,19 @@ func TestClassifyToolError(t *testing.T) {
 		{"invalid args", "fetch_channel", errors.New("parse args: bad json"), "INVALID_ARGUMENT", true, false},
 		{"empty time_start (issue C)", "fetch_channel", errors.New("parse time_start: parsing time \"\" as \"2006-01-02T15:04:05Z07:00\": cannot parse \"\" as \"2006\""), "INVALID_ARGUMENT", true, false},
 		{"specific required arg", "fetch_channel", errors.New("channel_type is required (1=DM, 2=Group, 5=Thread)"), "INVALID_ARGUMENT", true, false},
-		{"bare invalid does not classify as argument", "fetch_channel", errors.New("upstream returned invalid response shape"), "CRITICAL_TOOL_ERROR", false, true},
-		{"bare required does not classify as argument", "fetch_channel", errors.New("required backend unavailable"), "CRITICAL_TOOL_ERROR", false, true},
+		// The critical-tool default is fatal AND retryable. The two fields answer
+		// different questions: fatal = "completeness is compromised if this is never
+		// recovered", retryable = "a retry might recover it". An UNRECOGNISED error
+		// is not known to be permanent, and this arm's own mitigation (the marker
+		// clears when the same tool later succeeds) REQUIRES the retry.
+		{"bare invalid does not classify as argument", "fetch_channel", errors.New("upstream returned invalid response shape"), "CRITICAL_TOOL_ERROR", true, true},
+		{"bare required does not classify as argument", "fetch_channel", errors.New("required backend unavailable"), "CRITICAL_TOOL_ERROR", true, true},
 		{"evidence", "fetch_channel", errors.New("persist evidence: db down"), "EVIDENCE_WRITE_FAILED", false, true},
-		{"critical default", "summarize_chunk", errors.New("something odd"), "CRITICAL_TOOL_ERROR", false, true},
+		{"critical default", "summarize_chunk", errors.New("something odd"), "CRITICAL_TOOL_ERROR", true, true},
 		{"noncritical default", "get_current_time", errors.New("something odd"), "TOOL_ERROR", true, false},
+		// A permission denial is fatal only where it costs the deliverable something.
+		{"permission on a non-critical tool is not fatal", "peek_channel", errors.New("channel 12345 not accessible by user u-88"), "PERMISSION_DENIED", false, false},
+		{"permission on list_channels is not fatal", "list_channels", errors.New("channel 12345 not accessible by user u-88"), "PERMISSION_DENIED", false, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -241,4 +249,56 @@ func TestRunnerReportsToolSuccess(t *testing.T) {
 	if len(succeeded) != 1 || succeeded[0] != "fetch_channel" {
 		t.Fatalf("OnToolSuccess not fired for a successful call, got %v", succeeded)
 	}
+}
+
+// TestFatalIsNotSelfSealing pins round-7 P1-4.
+//
+// The file's own design note argues the classifier need not be exact because "the
+// run's fatal marker is cleared when the same tool later succeeds". That
+// mitigation requires a retry — and every fatal envelope also set
+// Retryable=false, which is the hint the model is given. Fatal + non-retryable is
+// a closed loop, so any unlisted DB/RPC wording turned a transient blip into a
+// permanent FAILED, the strongest label the contract has.
+//
+// The two fields answer different questions and must be allowed to disagree:
+// fatal = "completeness is compromised if this is never recovered";
+// retryable = "a retry might recover it". An UNRECOGNISED error is by definition
+// not known to be permanent.
+func TestFatalIsNotSelfSealing(t *testing.T) {
+	t.Run("everyday transient wordings stay retryable", func(t *testing.T) {
+		for _, tc := range []struct{ tool, msg string }{
+			{"fetch_channel", "Error 1040: Too many connections"},
+			{"fetch_channel", "im rpc: Unavailable desc = transport is closing"},
+			{"fetch_channel", "server closed idle connection"},
+			{"summarize_chunk", "unexpected end of JSON input"},
+			{"summarize_chunk", "upstream returned 502"},
+		} {
+			env := classifyToolError(tc.tool, errors.New(tc.msg))
+			if !env.Retryable {
+				t.Errorf("classifyToolError(%q, %q) retryable=false — the fatal marker's own mitigation is the retry: %+v",
+					tc.tool, tc.msg, env)
+			}
+		}
+	})
+
+	// A permission denial can never be retried into success, so it stays
+	// non-retryable — and therefore its fatal marker is unclearable BY
+	// CONSTRUCTION. That is exactly why it must not be fatal on a tool whose
+	// failure costs the deliverable nothing.
+	t.Run("permission is fatal only where it costs the deliverable", func(t *testing.T) {
+		for _, tool := range []string{"peek_channel", "list_channels", "narrow_channels_by_topic"} {
+			env := classifyToolError(tool, errors.New("channel 12345 not accessible by user u-88"))
+			if env.Fatal {
+				t.Errorf("a permission denial on %s must not mark the whole run FAILED: %+v", tool, env)
+			}
+			if env.Retryable {
+				t.Errorf("a permission denial is never retryable: %+v", env)
+			}
+		}
+
+		// On a critical tool it is still fatal: that one does cost completeness.
+		if env := classifyToolError("fetch_channel", errors.New("channel not accessible by user")); !env.Fatal {
+			t.Errorf("a permission denial on fetch_channel must stay fatal: %+v", env)
+		}
+	})
 }

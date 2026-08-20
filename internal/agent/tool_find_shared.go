@@ -69,7 +69,17 @@ func FindSharedChannelsTool() (Tool, Handler) {
 		// only): the multi-party flow learns its scope solely here, so without this
 		// an open-scope run that fetched 2 of N shared channels reported COMPLETE —
 		// the gate failing open against its own fail-closed design.
-		recordDiscoveredChannels(ctx, summaryDB, uid, channelIDsOf(shared))
+		//
+		// ONLY when an intersection was actually computed. IntersectParticipantChannels
+		// returns creatorChannels UNCHANGED when participant_uids is empty, and
+		// creatorChannels is the same pipeline.GetUserChannels call list_channels
+		// makes — so {"participant_uids": []} recorded every visible channel as the
+		// run's scope, re-entering through a sibling handler the exact input
+		// list_channels was deliberately stopped from recording. `required` in the
+		// tool schema is advisory metadata sent to the model, not validation.
+		if len(req.ParticipantUIDs) > 0 {
+			recordDiscoveredChannels(ctx, summaryDB, uid, channelIDsOf(shared))
+		}
 
 		result := map[string]interface{}{
 			"total":    len(shared),

@@ -179,10 +179,17 @@ func TestRefineImplicitDestinationAddIsAugment(t *testing.T) {
 		t.Errorf("time-worded add = %+v, want a fetching route (not a stripped rewrite)", got)
 	}
 
-	// The construction that the positional rule was written to protect must NOT
-	// regress: no 把, no destination noun after 带上 ⇒ still a confident rewrite.
-	if got := ClassifyRefine("翻译成英文，带上下文"); got.Intent != RefineRewrite || !got.HardNoFetch {
-		t.Errorf("ClassifyRefine(翻译成英文，带上下文) = %+v, want a hardNoFetch rewrite", got)
+	// The construction that the positional rule was written to protect must still
+	// not be read as an ADDITION: no 把, no destination noun after 带上 ⇒ rewrite.
+	//
+	// It no longer keeps HardNoFetch, and that is a deliberate, priced trade. Under
+	// the ∀-quantifier (allClausesRewrite) the clause 带上下文 carries no rewrite
+	// keyword, so it blocks the strip. The cost is one turn that keeps tools it then
+	// does not use; the benefit is that every UNRECOGNISED clause now fails in that
+	// same harmless direction instead of producing an unsatisfiable request. Round 7
+	// measured this exact swap and accepted it.
+	if got := ClassifyRefine("翻译成英文，带上下文"); got.Intent != RefineRewrite {
+		t.Errorf("ClassifyRefine(翻译成英文，带上下文) = %+v, want a rewrite", got)
 	}
 }
 
@@ -288,7 +295,17 @@ func TestRefineStillStripsToolsForPureTextRequests(t *testing.T) {
 		"润色一下",
 		"重新排版",
 		"总结里说了什么",
-		"翻译成英文，带上下文", // 带上 ⊂ 带上下文: no addition, no data signal
+		// Multi-clause pure text: EVERY clause is a rewrite clause, so the strip
+		// still fires. This is the half of the ∀ rule that keeps SS-08b useful.
+		"翻译成英文并精简",
+		"精简一下，去掉第三段",
+		"把这份总结翻译成英文，排版也调一下",
+		// A group-chat summarizer: naming the artifact's ORIGIN is not a retrieval
+		// request, so these must keep the strip. An earlier veto keyed on source
+		// nouns switched SS-08b off for most real instructions in this product.
+		"把这份群总结翻译成英文",
+		"精简一下群消息总结",
+		"对话记录的总结润色一下",
 	} {
 		if got := ClassifyRefine(instruction); !got.HardNoFetch {
 			t.Errorf("ClassifyRefine(%q) is a pure-text request and should enforce zero fetch: %+v", instruction, got)
@@ -366,5 +383,148 @@ func TestRefineArtifactNounDoesNotAuthorizeTheStrip(t *testing.T) {
 	// A real operation verb in the same sentence still authorizes the strip.
 	if got := ClassifyRefine("把摘要精简一下"); !got.HardNoFetch {
 		t.Errorf("摘要 + a genuine rewrite verb should still enforce zero fetch: %+v", got)
+	}
+}
+
+// TestRefineStripRequiresEveryClauseToBeARewrite pins the round-7 quantifier fix.
+//
+// Rounds 4, 5, 6 and 7 each found a NEW family of phrasings whose fetch tools were
+// physically removed. Every fix up to and including my own "data signal" veto was
+// an EXISTENTIAL test — strip when SOME part of the instruction looks like a
+// rewrite — under which an unrecognised addition is silently harmless to the
+// decision, because the recognised rewrite clause beside it still authorises the
+// strip. That is why each round produced a new unsatisfiable family and why
+// widening a keyword list could only ever chase it.
+//
+// Under ∀ the default for unrecognised text flips: a clause nobody taught this
+// function about BLOCKS the strip, so an unknown phrasing fails as "kept tools it
+// does not use" (free) instead of "cannot do what was asked" (unrecoverable).
+//
+// The fifteen strings below are yujiawei's round-7 measurement set, none of them
+// taken from any earlier round.
+func TestRefineStripRequiresEveryClauseToBeARewrite(t *testing.T) {
+	t.Run("a rewrite clause beside a request for material must not strip", func(t *testing.T) {
+		for _, instruction := range []string{
+			"润色，并补一些运营数据",
+			"精简一下，另外补一点客户意见",
+			"翻译成英文，再列一下张三的原话",
+			"格式改一下，把王五的原话引上",
+			"排版调整，再提一提测试结果",
+			"改成中文，另外提及销售数字",
+			"润色一下，再加些运维细节",
+			"只保留结论，另外统计一下参与人数",
+			"压缩篇幅，另外核实一下数字",
+			"重新组织，并把相关的讨论都汇总进来",
+			"改语气，再把反对意见也写上",
+		} {
+			if got := ClassifyRefine(instruction); got.HardNoFetch {
+				t.Errorf("ClassifyRefine(%q) strips the fetch tools, so the request is impossible to satisfy: %+v", instruction, got)
+			}
+		}
+	})
+
+	// The other half of the rule: ∀ must not be so strict that SS-08b's zero-fetch
+	// enforcement stops firing for the requests it exists for.
+	t.Run("every clause a rewrite clause still strips", func(t *testing.T) {
+		for _, instruction := range []string{
+			"翻译成英文并精简",
+			"精简一下，去掉第三段",
+			"把这份总结翻译成英文，排版也调一下",
+		} {
+			if got := ClassifyRefine(instruction); !got.HardNoFetch {
+				t.Errorf("ClassifyRefine(%q) is pure text in every clause and must enforce zero fetch: %+v", instruction, got)
+			}
+		}
+	})
+
+	// A retrieval verb disqualifies a clause even when a rewrite keyword also
+	// matched. 说了什么 is a rewrite keyword (Q&A over the old summary) that reads
+	// identically inside a genuine retrieval request, so ∀ alone authorised the
+	// strip on this one — found by the round-6 pinning test, not by inspection.
+	t.Run("a retrieval verb disqualifies its clause", func(t *testing.T) {
+		if got := ClassifyRefine("用中文重写，并查一下客服群刚才说了什么"); got.HardNoFetch {
+			t.Errorf("查一下 asks the model to GO AND GET; no text transformation satisfies it: %+v", got)
+		}
+	})
+}
+
+// TestRefineSourceNounIsNotARetrievalRequest guards the direction the veto got
+// wrong before. This is a group-chat summarizer, so 群 / 对话 / 消息 appear in
+// ordinary pure-text requests; vetoing on the NOUN switched SS-08b's enforcement
+// off for most real instructions in the product. Only retrieval VERBS veto.
+func TestRefineSourceNounIsNotARetrievalRequest(t *testing.T) {
+	for _, instruction := range []string{
+		"把这份群总结翻译成英文",
+		"精简一下群消息总结",
+		"对话记录的总结润色一下",
+	} {
+		if got := ClassifyRefine(instruction); !got.HardNoFetch {
+			t.Errorf("ClassifyRefine(%q): naming the artifact's origin is not a retrieval request: %+v", instruction, got)
+		}
+	}
+}
+
+// TestRefinePureTextEditsDoNotFetch pins round-7 P2-1. The before-verb rule and
+// the eight new add verbs matched ordinary formatting instructions, and the extra
+// fetch is not free: route.Fetch=true persists fetch_expected=1, so a model that
+// correctly does NOT fetch on a title-numbering request then produces a
+// "channel coverage was not measured" gap shipped to the client.
+func TestRefinePureTextEditsDoNotFetch(t *testing.T) {
+	for _, instruction := range []string{
+		"标题增加一个编号",
+		"给每个小标题加上序号",
+		"正文排版扩展一下行距",
+		"摘要覆盖掉重复内容",
+		"内容同步一下格式",
+		"把重复内容覆盖掉",
+	} {
+		if got := ClassifyRefine(instruction); got.Fetch {
+			t.Errorf("ClassifyRefine(%q) fetches for a pure-text edit, which persists fetch_expected=1 and yields a false PARTIAL: %+v", instruction, got)
+		}
+	}
+
+	// But a destination noun with a locative particle IS a destination, and an
+	// ambiguous verb next to a data source still reads as an addition.
+	for _, instruction := range []string{
+		"在摘要中增加客户反馈",
+		"报告里添上运维群的问题",
+		"这份摘要要覆盖运维群的内容",
+	} {
+		if got := ClassifyRefine(instruction); got.Intent != RefineAugment {
+			t.Errorf("ClassifyRefine(%q) intent=%s, want augment", instruction, got.Intent)
+		}
+	}
+}
+
+// TestRefineAugmentWithATimeWordStillExtends pins round-7 P2-2. The file's own
+// header states the rule: 补充最新进展 carries an augment word AND a fresh-data
+// word and must route to extend. The rewrite carve-out ignored augment keywords,
+// so adding any rewrite verb demoted it to augment/ReuseTimeRange — answering an
+// explicit request for today's material out of yesterday's window.
+func TestRefineAugmentWithATimeWordStillExtends(t *testing.T) {
+	for _, instruction := range []string{
+		"补充最新进展",
+		"格式调整，补充最新进展",
+		"精简一下，展开详细些，昨天的",
+		"润色，并更全面一点，今天的",
+	} {
+		got := ClassifyRefine(instruction)
+		if got.Intent != RefineExtend {
+			t.Errorf("ClassifyRefine(%q) intent=%s, want extend (it needs a fresh window)", instruction, got.Intent)
+		}
+		if got.ReuseTimeRange {
+			t.Errorf("ClassifyRefine(%q) reuses the OLD window for an explicit fresh-data request: %+v", instruction, got)
+		}
+	}
+
+	// The carve-out it was carved out of must survive: a rewrite that merely
+	// mentions time, with no augment verb and no addition, still does not fetch.
+	for _, instruction := range []string{
+		"把这份总结精简一下，只保留最近的结论",
+		"更新一下格式",
+	} {
+		if got := ClassifyRefine(instruction); got.Fetch {
+			t.Errorf("ClassifyRefine(%q) must not fetch: %+v", instruction, got)
+		}
 	}
 }

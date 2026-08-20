@@ -57,13 +57,23 @@ func NarrowChannelsByTopicTool() (Tool, Handler) {
 			return content, err
 		}
 
-		narrowed := pipeline.NarrowByTopic(ctx, req.Topic, candidates, llmFn)
+		narrowed, didNarrow := pipeline.NarrowByTopicReport(ctx, req.Topic, candidates, llmFn)
 
 		// Record the narrowed set as the run's discovered scope (open-scope only):
 		// this is a deliberate topic-relevant subset the run chose to focus on, so
 		// it is a sound baseline for the finish gate's under-fetch check — unlike
 		// list_channels' raw visible surface, which is not scope.
-		if uid, ok := ctx.Value(ContextKeyUID).(string); ok {
+		//
+		// ONLY when the filter actually narrowed. NarrowByTopic is the identity on
+		// four paths (empty topic / no candidates / nil llmFn, an LLM error,
+		// unparseable model output, zero matches), and recording unconditionally
+		// meant a transient LLM blip during narrowing persisted the ENTIRE candidate
+		// list — in the documented flow, the full list_channels output — as the run's
+		// committed scope. Since the union is monotonic that is unrecoverable for the
+		// rest of the run: every later clean fetch still reports the untouched
+		// candidates as never-fetched gaps. A pass-through is the absence of a scope
+		// decision, not a decision to cover everything.
+		if uid, ok := ctx.Value(ContextKeyUID).(string); ok && didNarrow {
 			recordDiscoveredChannels(ctx, summaryDB, uid, channelIDsOf(narrowed))
 		}
 

@@ -40,6 +40,16 @@ func newFinalizeTestDB(t *testing.T) *gorm.DB {
 	return db
 }
 
+// finalizeRunFor is a readability shim: build the handler and call finalizeRun.
+type finalizeHelper struct{}
+
+var h finalizeHelper
+
+func (finalizeHelper) finalizeRunFor(t *testing.T, db *gorm.DB, ctx context.Context, uid, sess, req, content string, cits []model.Citation) (finishgate.Verdict, []finishgate.Gap) {
+	t.Helper()
+	return (&AgentSummaryHandler{db: db}).finalizeRun(ctx, uid, sess, req, content, cits)
+}
+
 func hasGapKind(gaps []finishgate.Gap, kind string) bool {
 	for _, g := range gaps {
 		if g.Kind == kind {
@@ -235,5 +245,66 @@ func TestFinalizeRunIsOwnerScoped(t *testing.T) {
 	// above is scoping rather than the lookup being broken outright.
 	if v, _ := h.finalizeRun(ctx, "u1", "sess1", "req-owner", "内容", nil); v == "" {
 		t.Fatal("the owner must still resolve the run")
+	}
+}
+
+// TestFinalizeRunCitationExemptionKeysOnTheFact pins round-7 P1-3 AT THE CALL
+// SITE.
+//
+// A unit test on citationsValid passes the flag as a literal, so it cannot catch
+// the wiring being reverted to run.FetchExpected — mutation-verifying that revert
+// left every citationsValid test green. The defect is precisely which run column
+// is handed in, so it has to be pinned here, where the row is real.
+//
+// The soft-rewrite state is reachable end to end inside this PR: fetch_expected=0
+// is persisted while the fetch tools are KEPT, the model uses them
+// (coverage_measured=1), the save-time citation build then fails and yields nil,
+// and the content keeps its [1][2][3]. Keyed on the expectation that is COMPLETE;
+// keyed on the fact it is a FAILED with a citation gap.
+func TestFinalizeRunCitationExemptionKeysOnTheFact(t *testing.T) {
+	db := newFinalizeTestDB(t)
+	if db == nil {
+		return
+	}
+	store := summaryrun.NewStore(db)
+	ctx := context.Background()
+
+	// Soft rewrite: no fetch expected, but the tools were kept.
+	run, _, err := store.CreateOrGetRunWithFetchExpectation(ctx, "u1", "sess1", "req-soft", model.ScopePolicyClosed, false)
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	// ... and the model went and fetched anyway. That is the FACT.
+	if err := db.Model(&model.AgentSummaryRun{}).Where("run_id = ?", run.RunID).
+		Updates(map[string]any{
+			"spec_id":            "spec-1",
+			"coverage_measured":  true,
+			"attempted_channels": `["c1"]`,
+			"succeeded_channels": `["c1"]`,
+		}).Error; err != nil {
+		t.Fatalf("record the fetch: %v", err)
+	}
+
+	// The citation build failed → nil citations, markers still in the content.
+	verdict, gaps := h.finalizeRunFor(t, db, ctx, "u1", "sess1", "req-soft", "结论一 [1]，结论二 [2][3]", nil)
+	if verdict == finishgate.Complete {
+		t.Fatalf("verdict = COMPLETE for a summary with dangling citation markers — the expectation overruled the fact (gaps=%v)", gaps)
+	}
+	if !hasGapKind(gaps, finishgate.GapCitation) {
+		t.Fatalf("gaps = %v, want a citation gap naming the real defect", gaps)
+	}
+
+	// The genuine refine-borrowed turn — never fetched at all — stays COMPLETE.
+	run2, _, err := store.CreateOrGetRunWithFetchExpectation(ctx, "u1", "sess1", "req-borrow", model.ScopePolicyClosed, false)
+	if err != nil {
+		t.Fatalf("create borrow run: %v", err)
+	}
+	if err := db.Model(&model.AgentSummaryRun{}).Where("run_id = ?", run2.RunID).
+		Update("spec_id", "spec-1").Error; err != nil {
+		t.Fatalf("set spec_id: %v", err)
+	}
+	verdict2, gaps2 := h.finalizeRunFor(t, db, ctx, "u1", "sess1", "req-borrow", "重写后的总结 [1][2]", nil)
+	if verdict2 != finishgate.Complete {
+		t.Fatalf("verdict = %s, want COMPLETE — a turn that never fetched borrows its markers (gaps=%v)", verdict2, gaps2)
 	}
 }

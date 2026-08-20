@@ -45,25 +45,25 @@ func TestCitationsValidDoesNotFailOnOrdinaryBracketedIntegers(t *testing.T) {
 }
 
 // TestCitationsValidWithNoCitationsIsVacuouslyTrue pins the reachable refine
-// path: a rewrite turn (fetch_expected=false, no build) produces no tool traces,
-// so savedCitations is nil while the rewritten content still carries the source
-// summary's markers. Nothing of its own was claimed, so nothing can dangle — this
-// used to be an automatic FAILED.
+// path: a rewrite turn that fetched nothing (coverage_measured=false) produces no
+// tool traces, so savedCitations is nil while the rewritten content still carries
+// the source summary's markers. Nothing of its own was claimed, so nothing can
+// dangle — this used to be an automatic FAILED.
 func TestCitationsValidWithNoCitationsIsVacuouslyTrue(t *testing.T) {
-	if !citationsValid("重写后的总结 [1][2]", nil, false /* no build expected: refine-borrowed */) {
+	if !citationsValid("重写后的总结 [1][2]", nil, false /* run fetched nothing: refine-borrowed */) {
 		t.Error("a rewrite turn with no built citations must not be FAILED")
 	}
 }
 
 // TestCitationsValidEmptySliceScopedToRefine pins the round-4 P1-4 (yujiawei):
 // the empty-slice exemption is vacuously-valid ONLY on the refine-borrowed path.
-// When a build WAS expected (a fetch turn) and produced zero citations, content
-// still carrying a [1]-anchored citation sequence is a failed/expired citation
-// build — it must not pass as valid and report COMPLETE.
+// When the run DID fetch and the build produced zero citations, content still
+// carrying a [1]-anchored citation sequence is a failed/expired citation build —
+// it must not pass as valid and report COMPLETE.
 func TestCitationsValidEmptySliceScopedToRefine(t *testing.T) {
-	// Fetch turn, build expected, zero citations, but [1][2][3] left in the text.
+	// Fetch turn, zero citations, but [1][2][3] left in the text.
 	if citationsValid("结论一 [1]，结论二 [2][3]", nil, true) {
-		t.Error("a failed citation build (build expected, zero cits) with a [1] sequence must be invalid")
+		t.Error("a failed citation build (run fetched, zero cits) with a [1] sequence must be invalid")
 	}
 
 	// The prose-integer concession must survive on a zero-citation build turn: a
@@ -76,5 +76,36 @@ func TestCitationsValidEmptySliceScopedToRefine(t *testing.T) {
 		if !citationsValid(content, nil, true) {
 			t.Errorf("a bracketed integer with no [1] sequence must not fail a zero-citation build: %q", content)
 		}
+	}
+}
+
+// TestCitationsValidKeysOnTheFactNotTheExpectation pins round-7 P1-3.
+//
+// The exemption used to be keyed on run.FetchExpected — a persisted EXPECTATION —
+// which is the exact conflation finishgate.Evaluate reordered itself to eliminate,
+// still live one file away. All four steps are reachable inside this PR:
+//
+//  1. a soft rewrite routes Fetch=false, HardNoFetch=false, so fetch_expected=0 is
+//     persisted WHILE the fetch tools are kept;
+//  2. the model uses them, then buildCitationsForSession (which runs on EVERY save)
+//     fails and yields nil;
+//  3. with no ReferencedTaskIDs the stripUnresolvedCitationMarkers fallback never
+//     runs, so [1][2][3] stay in the saved content;
+//  4. the exemption fires on the expectation and the run is labelled COMPLETE.
+//
+// A summary with dangling citation markers is exactly the confidently-wrong
+// deliverable SS-07 exists to catch. Keyed on the fact (coverage_measured), the
+// same state is correctly invalid.
+func TestCitationsValidKeysOnTheFactNotTheExpectation(t *testing.T) {
+	const dangling = "结论一 [1]，结论二 [2][3]"
+
+	// The soft-rewrite state: the run fetched (the fact), whatever it expected.
+	if citationsValid(dangling, nil, true /* coverage measured: the run DID fetch */) {
+		t.Error("a run that fetched, whose citation build produced nothing, must not pass with dangling markers")
+	}
+
+	// And the genuine refine-borrowed state is still exempt.
+	if !citationsValid(dangling, nil, false /* the run fetched nothing at all */) {
+		t.Error("a turn that never fetched borrows its markers and must stay valid")
 	}
 }

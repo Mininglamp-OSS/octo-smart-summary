@@ -228,21 +228,29 @@ var citationMarkerRE = regexp.MustCompile(`\[(\d+)\]`)
 //
 // Rules, all narrowing:
 //
-//   - cits empty AND no build was expected → the refine-borrowed path: a rewrite
-//     turn (fetch_expected=false) ran no citation build, so savedCitations is nil
-//     while the rewritten text still carries the SOURCE summary's markers. Nothing
-//     of its own can dangle → valid.
-//   - cits empty BUT a build WAS expected (a fetch turn) → a build that produced
-//     zero citations yet left a [1]-anchored citation sequence in the text is a
-//     failed/expired citation build, not prose. Scoping the empty-slice exemption
-//     to the refine case is what stops such a build reporting COMPLETE with
+//   - cits empty AND the run never fetched anything — keyed on the FACT
+//     (coverage_measured=false), not on an expectation — the refine-borrowed
+//     path: the rewritten text still carries the SOURCE summary's markers, and
+//     nothing of its own can dangle → valid.
+//   - cits empty BUT the run DID fetch → a build that produced zero citations yet
+//     left a [1]-anchored citation sequence in the text is a failed/expired
+//     citation build, not prose. Scoping the empty-slice exemption to the
+//     never-fetched case is what stops such a build reporting COMPLETE with
 //     [1][2][3] still in the content.
+//
+// The parameter is deliberately the fact and not run.FetchExpected. Keying it on
+// the expectation reopened the exact class finishgate.Evaluate reordered itself
+// to close: buildCitationsForSession runs on EVERY save and yields nil on error,
+// while a soft rewrite persists fetch_expected=0 and KEEPS its fetch tools — so a
+// soft rewrite that fetched, whose citation build then failed, passed validation
+// with dangling markers and was labelled COMPLETE. An expectation may explain an
+// absence; it may not overrule what the run actually did.
 //   - a marker above the highest built index is prose, not a broken citation. A
 //     run with 2 citations cannot have meant `[2024]`. Only an in-range miss —
 //     e.g. [3] when 1, 2 and 4 exist — indicates real citation corruption.
-func citationsValid(content string, cits []model.Citation, citationBuildExpected bool) bool {
+func citationsValid(content string, cits []model.Citation, runFetchedAnything bool) bool {
 	if len(cits) == 0 {
-		if citationBuildExpected && contentHasCitationSequence(content) {
+		if runFetchedAnything && contentHasCitationSequence(content) {
 			return false
 		}
 		return true
@@ -328,7 +336,7 @@ func (h *AgentSummaryHandler) finalizeRun(ctx context.Context, uid, sessionID, r
 	state := finishgate.RunState{
 		ScopeResolved:            run.SpecID != "",
 		SummaryGenerated:         content != "",
-		CitationValidationPassed: citationsValid(content, cits, run.FetchExpected),
+		CitationValidationPassed: citationsValid(content, cits, run.CoverageMeasured),
 		FetchExpected:            run.FetchExpected,
 		CoverageMeasured:         run.CoverageMeasured,
 		AttemptedChannels:        decodeFinishChannelIDs(run.AttemptedChannels),

@@ -38,9 +38,12 @@ var criticalTools = map[string]bool{
 //   - context deadline / canceled            → retryable, not fatal
 //   - 429 / 5xx / network / DB connection    → retryable, not fatal
 //   - stale/expired messages_handle           → retryable, not fatal (cache miss)
-//   - permission / access / identity / auth  → fatal (cannot be retried into success)
+//   - permission / access / identity / auth  → never retryable; fatal only on a
+//     critical tool (elsewhere it is a per-channel gap, not a failed run)
 //   - explicit invalid args / parse           → retryable, not fatal
-//   - anything else on a critical tool        → fatal (data completeness at risk)
+//   - anything else on a critical tool        → fatal AND retryable: completeness is
+//     at risk if it is never recovered, but an unrecognised error is not known to
+//     be permanent, and the fatal marker's mitigation IS the retry
 //   - anything else on a non-critical tool    → retryable
 //
 // The classification is advisory about RECOVERY, not authoritative: the run's
@@ -106,7 +109,15 @@ func classifyToolError(toolName string, err error) ToolErrorEnvelope {
 	case strings.Contains(low, "not accessible") || strings.Contains(low, "permission") ||
 		strings.Contains(low, "access denied") || strings.Contains(low, "identity") ||
 		strings.Contains(low, "unauthor") || strings.Contains(low, "forbidden"):
-		env.ErrorCode, env.Retryable, env.Fatal = "PERMISSION_DENIED", false, true
+		// Never retryable — a permission denial cannot be retried into success —
+		// but fatal ONLY on a tool whose failure actually compromises the
+		// deliverable. peek_channel / list_channels touching one channel the user
+		// was just removed from costs the run nothing, yet a run-level fatal marker
+		// here is unclearable BY CONSTRUCTION (the mitigation is "the same tool
+		// later succeeds", and this one never will), so a complete, correct summary
+		// over the other four channels was reported FAILED — the strongest label
+		// the contract has. On a non-critical tool it degrades to a per-channel gap.
+		env.ErrorCode, env.Retryable, env.Fatal = "PERMISSION_DENIED", false, criticalTools[toolName]
 	case strings.Contains(low, "service unavailable") || strings.Contains(low, "try again"):
 		// Weak transient terms, checked only after permission: a genuine
 		// "service temporarily unavailable, try again" with no permission wording
@@ -129,7 +140,18 @@ func classifyToolError(toolName string, err error) ToolErrorEnvelope {
 		env.ErrorCode, env.Retryable, env.Fatal = "EVIDENCE_WRITE_FAILED", false, true
 	default:
 		if criticalTools[toolName] {
-			env.ErrorCode, env.Retryable, env.Fatal = "CRITICAL_TOOL_ERROR", false, true
+			// Retryable AND fatal is not a contradiction, it is the whole point:
+			// the two fields answer different questions. Fatal says "if this is
+			// never recovered, completeness is compromised"; retryable says "a
+			// retry might recover it". An UNRECOGNISED error is by definition not
+			// known to be permanent, so claiming retryable=false here asserted
+			// knowledge the classifier does not have — and it sealed the branch
+			// shut: this arm's own documented mitigation is that the marker clears
+			// when the same tool later succeeds, which requires the retry that
+			// retryable=false tells the model not to attempt. Every unlisted DB/RPC
+			// wording (Too many connections, transport is closing, a bare upstream
+			// 502) therefore turned a transient blip into a permanent FAILED.
+			env.ErrorCode, env.Retryable, env.Fatal = "CRITICAL_TOOL_ERROR", true, true
 		} else {
 			env.ErrorCode, env.Retryable, env.Fatal = "TOOL_ERROR", true, false
 		}

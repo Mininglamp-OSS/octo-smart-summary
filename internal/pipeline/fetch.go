@@ -389,9 +389,24 @@ func ApplySourceConstraints(userChannels []ChannelInfo, specifiedSources []map[s
 
 // Deprecated: use ResolveChannelScope instead.
 // NarrowByTopic uses LLM to filter channels relevant to the topic. (Layer 3)
+//
+// It returns candidates unchanged on four paths (no topic / no candidates / no
+// llmFn, an LLM error, unparseable model output, and zero matches). Callers that
+// need to tell a real narrowing from one of those pass-throughs must use
+// NarrowByTopicReport — the difference is not observable from the result alone,
+// and treating a pass-through as a deliberate scope choice is how a transient LLM
+// blip persisted the entire candidate list as the run's scope.
 func NarrowByTopic(ctx context.Context, topic string, candidates []ChannelInfo, llmFn LLMCallFn) []ChannelInfo {
+	out, _ := NarrowByTopicReport(ctx, topic, candidates, llmFn)
+	return out
+}
+
+// NarrowByTopicReport is NarrowByTopic plus the one fact the result cannot carry:
+// whether the topic filter actually ran and selected a subset (narrowed=true), or
+// whether the input was passed through untouched (narrowed=false).
+func NarrowByTopicReport(ctx context.Context, topic string, candidates []ChannelInfo, llmFn LLMCallFn) (result []ChannelInfo, narrowed bool) {
 	if topic == "" || len(candidates) == 0 || llmFn == nil {
-		return candidates
+		return candidates, false
 	}
 
 	topic = sanitizeTopic(topic)
@@ -405,14 +420,14 @@ func NarrowByTopic(ctx context.Context, topic string, candidates []ChannelInfo, 
 		topic, strings.Join(lines, "\n"),
 	)
 
-	result, err := llmFn(ctx, prompt)
+	raw, err := llmFn(ctx, prompt)
 	if err != nil {
-		return candidates
+		return candidates, false
 	}
 
 	var selectedIDs []string
-	if err := json.Unmarshal([]byte(result), &selectedIDs); err != nil {
-		return candidates
+	if err := json.Unmarshal([]byte(raw), &selectedIDs); err != nil {
+		return candidates, false
 	}
 
 	idSet := make(map[string]bool, len(selectedIDs))
@@ -427,9 +442,9 @@ func NarrowByTopic(ctx context.Context, topic string, candidates []ChannelInfo, 
 		}
 	}
 	if len(filtered) == 0 {
-		return candidates
+		return candidates, false
 	}
-	return filtered
+	return filtered, true
 }
 
 // FetchMessagesFromChannel fetches text messages from a sharded table. (Layer 4)
