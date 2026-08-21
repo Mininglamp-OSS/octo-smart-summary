@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/worker"
+	"gorm.io/gorm"
 )
 
 // buildCitationsForSession 反查 session_id 的所有工具轨迹,组 messages 池,
@@ -47,6 +48,17 @@ func (h *AgentSummaryHandler) buildCitationsForSession(
 	uid string,
 	requestID string,
 ) ([]model.Citation, error) {
+	return h.buildCitationsForSessionWithDB(ctx, h.db, sessionID, content, uid, requestID)
+}
+
+func (h *AgentSummaryHandler) buildCitationsForSessionWithDB(
+	ctx context.Context,
+	db *gorm.DB,
+	sessionID string,
+	content string,
+	uid string,
+	requestID string,
+) ([]model.Citation, error) {
 	// 1. Discover handles from agent_message_evidence — must stay symmetric
 	// with getSessionMessagePool in tool_summarize_chunk.go. Rows are written
 	// synchronously by PersistEvidence inside every data-fetching tool
@@ -55,7 +67,7 @@ func (h *AgentSummaryHandler) buildCitationsForSession(
 	// handle the LLM could cite — regardless of whether the subsequent
 	// AppendMessages persisted the corresponding agent_message tool row.
 	var evidenceRows []model.AgentMessageEvidence
-	err := h.db.WithContext(ctx).
+	err := db.WithContext(ctx).
 		Where("user_id = ? AND session_id = ?", uid, sessionID).
 		Order("created_at ASC, handle ASC").
 		Find(&evidenceRows).Error
@@ -148,7 +160,7 @@ func (h *AgentSummaryHandler) buildCitationsForSession(
 	// here would renumber/drop its citations deterministically. No request_id
 	// → keep the recomputed indexes (legacy path), never a partial override.
 	if agent.SummaryV2Enabled() && requestID != "" {
-		allMessages = h.overrideWithRunManifest(ctx, uid, sessionID, requestID, allMessages)
+		allMessages = overrideWithRunManifest(ctx, db, uid, sessionID, requestID, allMessages)
 	}
 
 	// 5. Build nameMap
@@ -176,15 +188,15 @@ func (h *AgentSummaryHandler) buildCitationsForSession(
 // time, or a replay), no manifest frozen by that run, or a DB error — it
 // returns the input unchanged and keeps the recomputed indexes. The fallback
 // is always the full legacy recompute, never a partial override.
-func (h *AgentSummaryHandler) overrideWithRunManifest(ctx context.Context, uid, sessionID, requestID string, msgs []pipeline.Message) []pipeline.Message {
-	if h.db == nil {
+func overrideWithRunManifest(ctx context.Context, db *gorm.DB, uid, sessionID, requestID string, msgs []pipeline.Message) []pipeline.Message {
+	if db == nil {
 		return msgs
 	}
-	run, err := summaryrun.NewStore(h.db).GetByRequest(ctx, uid, sessionID, requestID)
+	run, err := summaryrun.NewStore(db).GetByRequest(ctx, uid, sessionID, requestID)
 	if err != nil {
 		return msgs
 	}
-	_, entries, found, err := artifact.NewStore(h.db).GetFrozenManifestByRun(ctx, uid, run.RunID)
+	_, entries, found, err := artifact.NewStore(db).GetFrozenManifestByRun(ctx, uid, run.RunID)
 	if err != nil || !found {
 		return msgs
 	}

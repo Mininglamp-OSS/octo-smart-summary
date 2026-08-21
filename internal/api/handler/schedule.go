@@ -495,8 +495,15 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		return
 	}
 
-	if utf8.RuneCountInString(req.Title) > maxSummaryTopicRunes {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 2300 字符"})
+	// SUM-BE1 (revised per SUM-9): the shared schedule validator owns the
+	// actor/title gates. Deep recurrence / anchor / run-time / day-of-week /
+	// day-of-month / time-range-type checks still run below via the existing
+	// service validators.
+	if bizE := service.ValidateScheduledWorkflow(
+		userID,
+		req.Title,
+	); bizE != nil {
+		bizErr(c, bizE)
 		return
 	}
 	generationInstruction, err := normalizeScheduleGenerationInstruction(req.GenerationInstruction)

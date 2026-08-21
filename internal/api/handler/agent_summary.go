@@ -7,7 +7,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
-	"unicode/utf8"
+	"strings"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
@@ -52,6 +52,9 @@ type AgentSummaryHandler struct {
 	// Not exposed via NewAgentSummaryHandler — tests assign this field
 	// directly using same-package access.
 	runnerFactory func(profile, uid string) (refineRunner, string, error)
+	// beforeDraftLoad is a test-only synchronization hook used to exercise
+	// the race where another request commits after idempotency preflight.
+	beforeDraftLoad func()
 }
 
 // refineRunner is the minimal subset of *agent.Runner used by RefineAgentSummary.
@@ -77,6 +80,18 @@ func NewAgentSummaryHandler(db, imDB *gorm.DB, llmApiURL, llmApiKey, llmModel st
 // createAgentSummaryReq mirrors the SUM-24 v1.0 contract where origin_channel
 // fields are now optional. OriginChannelID is a pointer to distinguish between
 // "not provided" (nil) and "explicitly provided as empty string" (non-nil pointing to "").
+//
+// SUM-BE2 additions (all optional during the FE-2 rollout window; once FE-2
+// SUM-7 ships they become the only valid inputs):
+//   - AgentMessageID: primary key of the assistant reply the user confirmed
+//     as their draft. When >0, the server loads by (id, user, session,
+//     role='assistant', tool_calls IS NULL) instead of "latest assistant";
+//     0 keeps the pre-BE-2 legacy behaviour.
+//   - SnapshotVersion: the snapshot version the client thinks it is saving.
+//     BE-2 only writes v1; other values fail as AGENT_DRAFT_STALE (40901).
+//     Must be paired with a non-zero AgentMessageID.
+//   - Idempotency-Key is HTTP-header-borne (mirrors bot_summary_create.go);
+//     absent header keeps the non-idempotent legacy path.
 type createAgentSummaryReq struct {
 	SessionID         string           `json:"session_id"`
 	OriginChannelID   *string          `json:"origin_channel_id,omitempty"`
@@ -93,6 +108,12 @@ type createAgentSummaryReq struct {
 	// run_id，服务端无法验证跨轮错配；该绑定由客户端负责，SS-08 再持久化
 	// 校验。缺省/未知 → 与 legacy 一致的重算路径。
 	RequestID string `json:"request_id,omitempty"`
+	// AgentMessageID + SnapshotVersion form the trusted draft reference the
+	// design (section 6.5) requires. Both are optional in BE-2 for backward
+	// compat during the FE-2 (SUM-7) rollout; when either is >0 the other
+	// must also be >0 (enforced by service.ValidateAgentSave).
+	AgentMessageID  int64 `json:"agent_message_id,omitempty"`
+	SnapshotVersion int   `json:"snapshot_version,omitempty"`
 }
 
 // CreateAgentSummary handles POST /api/v1/summaries/agent.
@@ -128,6 +149,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "request_id 非法"})
 		return
 	}
+	req.Title = strings.TrimSpace(req.Title)
 
 	// SUM-24: origin_channel fields are now optional. Distinguish between:
 	// - nil (not provided) → resolve from session
@@ -153,13 +175,44 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		return
 	}
 
+	// SUM-BE2 idempotency preflight must run before any session/origin/draft
+	// lookup. A successful save deletes the session messages, so replay cannot
+	// depend on state that the first request intentionally destroys.
+	keyHeader := http.CanonicalHeaderKey("Idempotency-Key")
+	keyValues, keyPresent := c.Request.Header[keyHeader]
+	idempotencyKey := strings.TrimSpace(c.GetHeader(keyHeader))
+	if keyPresent && (len(keyValues) != 1 || idempotencyKey == "") {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "valid Idempotency-Key header is required"})
+		return
+	}
+	var requestHash string
+	if idempotencyKey != "" {
+		if !validAgentSaveIdempotencyKey(idempotencyKey) {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "valid Idempotency-Key header is required"})
+			return
+		}
+		requestHash = canonicalAgentSaveRequestHash(userID, req)
+		existing, mismatched, ok, stale, ferr := findAgentSaveIdempotentTaskWithHash(
+			c.Request.Context(), h.db, spaceID, userID, idempotencyKey, requestHash,
+		)
+		if ferr != nil {
+			log.Printf("[handler] CreateAgentSummary idempotency lookup failed space=%s user=%s key=%s: %v", spaceID, userID, idempotencyKey, ferr)
+			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "idempotency check failed"})
+			return
+		}
+		if ok {
+			writeAgentSaveIdempotencyResponse(c, existing, mismatched, stale)
+			return
+		}
+	}
+
 	if req.OriginChannelID == nil {
 		// Not provided → resolve from session tool traces
 		resolvedID, resolvedType, err := h.resolveOriginChannelFromSession(c.Request.Context(), req.SessionID, userID)
 		if err != nil {
 			// DB error or other real failure → 500
 			log.Printf("[handler] resolveOriginChannelFromSession failed session=%s: %v", req.SessionID, err)
-			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "resolve origin channel failed: " + err.Error()})
+			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "resolve origin channel failed"})
 			return
 		}
 		if resolvedID == "" {
@@ -277,19 +330,49 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		}
 	}
 
-	if utf8.RuneCountInString(req.Title) > maxSummaryTopicRunes {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 2300 字符"})
-		return
-	}
+	// SUM-BE1: the agent_save-target validator runs a few lines below,
+	// AFTER loadAgentMessageForSave + stripAgentPreamble have resolved
+	// the server-trusted deliverable — that way ContentLen is measured on
+	// the real content the DB will persist, not a request-supplied number
+	// the client could lie about. Running the validator here instead would
+	// force a placeholder ContentLen, which the review comment on SUM-3
+	// specifically flagged as a bypass risk.
 
 	// --- pull the agent's produced deliverable content from agent_message ---
-	// Contract: use the latest role=assistant message on this session as the
-	// deliverable. Empty content ⇒ 40004 (must block, no empty summary allowed).
-	// We only look at messages with tool_calls IS NULL to skip the intermediate
-	// "call this tool" assistant messages; the final answer never has tool_calls.
-	content, err := loadLatestAssistantContent(h.db, req.SessionID, userID)
+	// SUM-BE2: when the client supplies a positive AgentMessageID we load by
+	// primary key AND owner AND session AND role='assistant' AND
+	// tool_calls IS NULL — every ownership axis the design (section 6.5.2)
+	// requires the server to verify. When AgentMessageID == 0 we fall back
+	// to the pre-BE-2 "latest assistant" behaviour so older frontends keep
+	// working during the FE-2 rollout window.
+	//
+	// Every rejection path collapses to errNoAgentOutput → 40004 so an
+	// attacker cannot probe whether a specific message id exists (matches
+	// the legacy loader's owner-scope 404 discipline, SUM-158
+	// blocker 1).
+	if h.beforeDraftLoad != nil {
+		h.beforeDraftLoad()
+	}
+	draftMsg, err := loadAgentMessageForSave(h.db.WithContext(c.Request.Context()), req.SessionID, userID, req.AgentMessageID)
 	if err != nil {
 		if errors.Is(err, errNoAgentOutput) {
+			// A concurrent winner may have committed after our preflight and
+			// deleted the shared draft. Re-check the durable binding before
+			// reporting a missing output so an overlapping retry still replays.
+			if idempotencyKey != "" {
+				existing, mismatched, ok, stale, ferr := findAgentSaveIdempotentTaskWithHash(
+					c.Request.Context(), h.db, spaceID, userID, idempotencyKey, requestHash,
+				)
+				if ferr != nil {
+					log.Printf("[handler] CreateAgentSummary idempotency retry lookup failed space=%s user=%s key=%s: %v", spaceID, userID, idempotencyKey, ferr)
+					c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "idempotency check failed"})
+					return
+				}
+				if ok {
+					writeAgentSaveIdempotencyResponse(c, existing, mismatched, stale)
+					return
+				}
+			}
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40004, Message: "session 无有效产出,请先在对话中生成总结再保存"})
 			return
 		}
@@ -297,6 +380,8 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "读取 session 产出失败"})
 		return
 	}
+	content := draftMsg.Content
+	resolvedAgentMessageID := draftMsg.ID
 
 	// Strip conversational preamble that agents sometimes leak despite prompt
 	// discipline. Defense-in-depth — see agent_content_strip.go for the
@@ -311,6 +396,33 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		log.Printf("[handler] CreateAgentSummary session %s: stripped %d chars of preamble", req.SessionID, len(content)-len(stripped))
 	}
 	content = stripped
+
+	// SUM-BE1 (revised per SUM-9): real agent_save gate. Run the shared
+	// validator with the server-trusted content (post-strip) so a caller
+	// can never bypass the "empty content" check by lying about the
+	// payload. Defense-in-depth normally — becomes load-bearing the moment
+	// stripAgentPreamble reduces content to empty (an all-preamble reply),
+	// which would otherwise silently save an empty deliverable.
+	//
+	// Note on parameters: message ownership / role / session identity are
+	// already enforced by loadAgentMessageForSave's WHERE clause
+	// (user_id + session_id + role='assistant'), so this call does not
+	// re-declare those. Snapshot-version and message-id enforcement remain
+	// BE-2 scope (they require new storage-side reads BE-1 does not add);
+	// keeping them as declared-but-ignored parameters here would be the
+	// exact shell coverage SUM-9 rejected.
+	if bizE := service.ValidateAgentSave(
+		userID,
+		req.Title,
+		req.SessionID,
+		content,
+		finalChannelID, finalChannelType,
+		req.AgentMessageID,  // client-declared id — 0 means legacy fallback
+		req.SnapshotVersion, // client-declared expected version — 0 means legacy fallback
+	); bizE != nil {
+		bizErr(c, bizE)
+		return
+	}
 
 	// --- title fallback: caller may skip, we generate the same way the
 	// traditional endpoint does so the two look identical in list views. ---
@@ -357,6 +469,12 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		// and session-resolved origins keep the zero value (unmasked).
 		OriginFromDerived: finalOriginFromDerived,
 		ReferencedTaskIDs: serializeReferencedTaskIDs(req.ReferencedTaskIDs),
+		// SUM-BE2 audit trail. resolvedAgentMessageID is the id
+		// loadAgentMessageForSave actually returned (so the legacy "latest
+		// assistant" fallback also writes the real message id, not 0).
+		AgentSessionID:  req.SessionID,
+		AgentMessageID:  resolvedAgentMessageID,
+		SnapshotVersion: req.SnapshotVersion,
 	}
 
 	var createdTaskID int64
@@ -426,7 +544,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			UpdatedAt:        now,
 		}
 		// Build citations from session tool traces (fallback to empty array on error)
-		cits, cerr := h.buildCitationsForSession(c.Request.Context(), req.SessionID, content, userID, req.RequestID)
+		cits, cerr := h.buildCitationsForSessionWithDB(c.Request.Context(), tx, req.SessionID, content, userID, req.RequestID)
 		if cerr != nil {
 			log.Printf("[handler] buildCitationsForSession failed session=%s: %v (fallback to empty)", req.SessionID, cerr)
 			cits = nil
@@ -492,6 +610,29 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			}
 		}
 
+		// --- SUM-BE2 idempotency binding ---
+		// When the client sent an Idempotency-Key header, persist the
+		// (space, user, key) -> task_id + request_hash binding inside the
+		// same transaction that created the task. Same-body retries replay
+		// via the preflight above; different-body retries hit the preflight
+		// 409. A concurrent duplicate hitting Create with the same tuple
+		// loses the UNIQUE race; a locked read-back identifies the winner
+		// without relying on MySQL's DSN-sensitive RowsAffected value. The
+		// outer handler then re-reads the binding to decide replay vs mismatch.
+		if idempotencyKey != "" {
+			binding := model.SummaryAgentSaveIdempotency{
+				SpaceID:        spaceID,
+				UserID:         userID,
+				IdempotencyKey: idempotencyKey,
+				RequestHash:    requestHash,
+				TaskID:         task.ID,
+				CreatedAt:      now,
+			}
+			if err := createAgentSaveIdempotencyBinding(tx, &binding); err != nil {
+				return err
+			}
+		}
+
 		// Session lifecycle: chat is a "temporary workshop" — once the
 		// deliverable is persisted, DELETE all agent_message rows for this
 		// session so the workshop cannot be revisited (see
@@ -509,9 +650,23 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 
 		return nil
 	})
+	if errors.Is(err, errAgentSaveIdempotencyConflict) {
+		// A concurrent request won the UNIQUE race. Re-read the binding to
+		// decide replay-vs-mismatch, mirroring bot_summary_create.go's flow.
+		existing, mismatched, ok, stale, ferr := findAgentSaveIdempotentTaskWithHash(
+			c.Request.Context(), h.db, spaceID, userID, idempotencyKey, requestHash,
+		)
+		if ferr != nil || !ok {
+			log.Printf("[handler] CreateAgentSummary idempotency race re-read failed space=%s user=%s key=%s ok=%v: %v", spaceID, userID, idempotencyKey, ok, ferr)
+			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "idempotency race resolution failed"})
+			return
+		}
+		writeAgentSaveIdempotencyResponse(c, existing, mismatched, stale)
+		return
+	}
 	if err != nil {
 		log.Printf("[handler] CreateAgentSummary tx failed space=%s user=%s session=%s: %v", spaceID, userID, req.SessionID, err)
-		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "落库失败: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "落库失败"})
 		return
 	}
 
@@ -532,30 +687,50 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	})
 }
 
+func writeAgentSaveIdempotencyResponse(c *gin.Context, task model.SummaryTask, mismatched, stale bool) {
+	if stale {
+		c.JSON(http.StatusConflict, apiResponse{
+			Code:    40009,
+			Message: "idempotency key is bound to a deleted summary",
+			Data: gin.H{
+				"task_id":         task.ID,
+				"task_no":         task.TaskNo,
+				"reason":          "deleted_summary",
+				"recovery_action": "start_new_summary",
+			},
+		})
+		return
+	}
+	if mismatched {
+		c.JSON(http.StatusConflict, apiResponse{
+			Code:    40009,
+			Message: "idempotency key already bound to a different agent save request; open the existing summary to edit it",
+			Data: gin.H{
+				"task_id":         task.ID,
+				"task_no":         task.TaskNo,
+				"reason":          "request_mismatch",
+				"recovery_action": "open_existing_summary",
+			},
+		})
+		return
+	}
+	log.Printf("[handler] CreateAgentSummary idempotency replay task_id=%d", task.ID)
+	c.JSON(http.StatusOK, apiResponse{
+		Code:    0,
+		Message: "ok",
+		Data: gin.H{
+			"task_id":    task.ID,
+			"task_no":    task.TaskNo,
+			"status":     task.Status,
+			"created_at": task.CreatedAt,
+			"replayed":   true,
+		},
+	})
+}
+
 // errNoAgentOutput signals that the session exists but has no assistant reply
 // worth persisting as a summary yet — mapped by the handler to error code 40004.
 var errNoAgentOutput = errors.New("no assistant output on session")
-
-// loadLatestAssistantContent returns the latest non-empty assistant message
-// text on the given session (skipping intermediate "call this tool" messages,
-// which are recognisable because they carry a tool_calls payload).
-//
-// owner-scoped：必须传 userID，跨用户匹配返回 errNoAgentOutput（与真实空会话
-// 在响应上不可区分，不泄漏 session 存在）(SUM-158 blocker 1)。
-func loadLatestAssistantContent(db *gorm.DB, sessionID, userID string) (string, error) {
-	var msg model.AgentMessage
-	err := db.Where("user_id = ? AND session_id = ? AND role = ? AND tool_calls IS NULL AND content <> ''", userID, sessionID, "assistant").
-		Order("id DESC").
-		Limit(1).
-		Take(&msg).Error
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return "", errNoAgentOutput
-		}
-		return "", err
-	}
-	return msg.Content, nil
-}
 
 // buildSnapshotV1 constructs the v1 snapshot for an agent-generated summary.
 // This is the initial snapshot (parent_snapshot_version=null, user_instruction=null).
