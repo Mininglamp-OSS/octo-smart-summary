@@ -10,8 +10,9 @@ import (
 )
 
 const (
-	maxSummaryHandles    = 128
-	maxSummaryHandleText = 8 << 20 // 8 MiB per request
+	maxSummaryHandles         = 128
+	maxSummaryHandleText      = 8 << 20 // 8 MiB per request
+	anonymousMapFailurePrefix = "tool_call_id="
 )
 
 // summaryHandleEntry is one Map result kept out of the planner transcript.
@@ -167,9 +168,9 @@ func summaryToolStepFromContext(ctx context.Context) int {
 }
 
 // MarkMapFailed records a summarize_chunk failure that did not produce a
-// summary handle. Recovery must use the same messages_handle in a later step;
-// without durable lineage, a different handle cannot prove it covers the same
-// message set.
+// summary handle. A valid messages_handle gives the failure durable lineage;
+// malformed/handle-less calls use an anonymous tool_call_id key because there
+// is no message set to bind yet.
 func (s *summaryHandleStore) MarkMapFailed(target string, step int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -178,13 +179,23 @@ func (s *summaryHandleStore) MarkMapFailed(target string, step int) {
 
 // MarkMapSucceeded clears only a failure recovered in a LATER tool step. This
 // prevents a parallel success in the same fan-out from masking another Map
-// call's failure. A success on a different handle never clears it: the two
-// handles may represent unrelated channels.
+// call's failure. A known messages_handle clears only its exact failure because
+// different handles may represent unrelated channels. If there is no exact
+// match, one older anonymous argument failure may be cleared: a malformed call
+// has no lineage to match, and without this bounded fallback a corrected retry
+// with a new tool-call ID could never recover the request.
 func (s *summaryHandleStore) MarkMapSucceeded(target string, step int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if failure, ok := s.mapFailures[target]; ok && failure.Step < step {
 		delete(s.mapFailures, target)
+		return
+	}
+	for failedTarget, failure := range s.mapFailures {
+		if strings.HasPrefix(failedTarget, anonymousMapFailurePrefix) && failure.Step < step {
+			delete(s.mapFailures, failedTarget)
+			return
+		}
 	}
 }
 
@@ -192,6 +203,18 @@ func (s *summaryHandleStore) PendingMapFailures() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.mapFailures)
+}
+
+func (s *summaryHandleStore) PendingAnonymousMapFailures() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	count := 0
+	for target := range s.mapFailures {
+		if strings.HasPrefix(target, anonymousMapFailurePrefix) {
+			count++
+		}
+	}
+	return count
 }
 
 // MarkReduced records a successful Reduce only if no new Map result appeared

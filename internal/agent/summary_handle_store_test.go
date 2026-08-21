@@ -135,6 +135,31 @@ func TestSummaryHandleStoreUnrelatedSuccessCannotClearFailure(t *testing.T) {
 	}
 }
 
+func TestSummaryHandleStoreLaterSuccessClearsOneAnonymousArgumentFailure(t *testing.T) {
+	store := newSummaryHandleStore()
+	store.MarkMapFailed(anonymousMapFailurePrefix+"bad-1", 1)
+	store.MarkMapFailed(anonymousMapFailurePrefix+"bad-2", 1)
+	if store.PendingAnonymousMapFailures() != 2 {
+		t.Fatalf("anonymous failures = %d, want 2", store.PendingAnonymousMapFailures())
+	}
+
+	store.MarkMapSucceeded("messages_handle=corrected", 1)
+	if store.PendingMapFailures() != 2 {
+		t.Fatal("same-step success must not clear an anonymous argument failure")
+	}
+	store.MarkMapSucceeded("messages_handle=corrected", 2)
+	if store.PendingMapFailures() != 1 {
+		t.Fatalf("first corrected retry should clear one anonymous failure, pending=%d", store.PendingMapFailures())
+	}
+	store.MarkMapSucceeded("messages_handle=corrected-again", 2)
+	if store.PendingMapFailures() != 0 {
+		t.Fatalf("second corrected retry should clear the remaining anonymous failure, pending=%d", store.PendingMapFailures())
+	}
+	if store.PendingAnonymousMapFailures() != 0 {
+		t.Fatalf("anonymous failures remained after recovery: %d", store.PendingAnonymousMapFailures())
+	}
+}
+
 func TestSummaryHandleStoreConcurrentPut(t *testing.T) {
 	const n = 64
 	store := newSummaryHandleStore()

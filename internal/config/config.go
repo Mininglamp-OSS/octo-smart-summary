@@ -369,9 +369,9 @@ const (
 	// 3, not the worker path's 5: the agent runner executes up to 4 tool calls
 	// from one LLM turn concurrently (agent.NewPool(4)), and each of those can
 	// be a summarize_chunk. The knobs multiply, so the real ceiling of in-flight
-	// Map calls is poolSize * AgentMapConcurrency = 12 at this default — before
-	// the LLM client's own 3-attempt retry budget. The worker path has no such
-	// outer fan-out, which is why its default can be higher.
+	// Map calls is poolSize * AgentMapConcurrency = 12 at this default. The
+	// worker path has no such outer fan-out, which is why its default can be
+	// higher.
 	defaultAgentMapConcurrency = 3
 	// maxAgentMapConcurrency caps operator input. Above this the gateway sees
 	// 4*N concurrent completions from a single user request.

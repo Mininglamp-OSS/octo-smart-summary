@@ -124,8 +124,8 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 
 		// stepCtx bounds ONLY the planning LLM call (r.client.Chat below).
 		// Tool execution must NOT share this budget: LLM-backed tools such
-		// as summarize_chunk and merge_summaries run their own sequential
-		// per-chunk LLM calls, each with its own LLMTimeout (default 180s,
+		// as summarize_chunk and merge_summaries run their own LLM calls
+		// (Map calls use bounded concurrency), each with its own LLMTimeout (default 180s,
 		// see config.go). Wrapping runTools in stepCtx (default 60s) — as
 		// briefly attempted in commit 4f614cc — clamps every large map-reduce
 		// summary to 60s and breaks the feature's primary path (byte-verified
@@ -153,14 +153,18 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 			store, storeErr := summaryHandleStoreFromContext(ctx)
 			if storeErr == nil && (store.PendingMapFailures() > 0 || store.NeedsReduce()) {
 				pendingMaps := store.PendingMapFailures()
-				log.Printf("[agent] step %d/%d: final answer attempted with pending summary work (map_failures=%d reduce_needed=%t)",
-					step+1, r.policy.MaxSteps, pendingMaps, store.NeedsReduce())
+				anonymousMaps := store.PendingAnonymousMapFailures()
+				log.Printf("[agent] step %d/%d: final answer attempted with pending summary work (map_failures=%d anonymous_map_failures=%d reduce_needed=%t)",
+					step+1, r.policy.MaxSteps, pendingMaps, anonymousMaps, store.NeedsReduce())
 				if step >= r.policy.MaxSteps-1 {
 					return "", nil, errors.New("successful Map retries and Reduce required before final answer")
 				}
 				instruction := "本次请求仍有未合并的 Map 结果。请先调用 merge_summaries，并在 summary_handles 中原样传入本次请求产生的全部 summary_handle；不要复制摘要正文，也不要直接输出最终答案。"
 				if pendingMaps > 0 {
 					instruction = "本次请求仍有失败的 summarize_chunk。请先使用原 messages_handle 重试每个失败的 Map 调用。不同 handle 不能证明覆盖同一批消息；若原 handle 已失效，本轮必须失败并由用户重新发起请求。全部 Map 成功后，再调用 merge_summaries 合并全部 summary_handle；不要直接输出最终答案。"
+					if anonymousMaps > 0 {
+						instruction = "本次请求仍有 summarize_chunk 参数无效或缺少 messages_handle。请修正参数，使用本次请求中正确的 messages_handle 逐一重试失败的 Map 调用；每个失败调用都需要一次后续成功。全部 Map 成功后，再调用 merge_summaries 合并全部 summary_handle；不要直接输出最终答案。"
+					}
 				}
 				msgs = append(msgs, Message{
 					Role:    "user",
@@ -223,7 +227,7 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 		// 单跳内多工具并发执行；结果按原索引回填以保证顺序稳定、无数据竞争。
 		// Use the outer request ctx (300s ChatStream backstop) — NOT stepCtx.
 		// See the stepCtx setup comment above for why: LLM-backed tools like
-		// summarize_chunk run their own sequential LLM calls that legitimately
+		// summarize_chunk run their own bounded-concurrent LLM calls that legitimately
 		// exceed the 60s per-step planning budget.
 		results := r.runTools(ctx, turn.ToolCalls, step+1, r.policy.MaxSteps)
 		for i, tc := range turn.ToolCalls {
@@ -296,7 +300,7 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 				if store, storeErr := summaryHandleStoreFromContext(ctx); storeErr == nil {
 					target := toolCallTarget(tc.Function.Arguments)
 					if target == "" {
-						target = "tool_call_id=" + tc.ID
+						target = anonymousMapFailurePrefix + tc.ID
 					}
 					if err != nil {
 						store.MarkMapFailed(target, step)

@@ -566,12 +566,17 @@ type chunkMapOutcome struct {
 //   - Cancellation. Acquiring the semaphore selects on ctx.Done(): when the
 //     request deadline fires, queued chunks abort immediately instead of
 //     waiting for an in-flight LLM call to release a slot.
+//   - Panic containment. Registry.Dispatch deliberately converts handler
+//     panics into tool errors. Map workers run below that recovery boundary, so
+//     each worker must recover locally to preserve the same process-safety
+//     contract as the old serial loop.
 //
 // Concurrency 1 takes a dedicated serial path (see below) rather than a
 // one-permit semaphore, so it is a true rollback switch.
 func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]interface{}, specGuidance string, cov *chunkCoverage) ([]string, error) {
 	_, _, _, cfg := GetSummaryDeps()
 	concurrency := cfg.ResolveAgentMapConcurrency()
+	start := time.Now()
 
 	// Concurrency 1 is the documented rollback setting, so it must reproduce the
 	// pre-change loop EXACTLY — including dispatch order. A 1-permit semaphore
@@ -591,6 +596,8 @@ func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]inte
 			cov.ProcessedCount += processed
 			cov.OversizedMessageCount += oversized
 		}
+		log.Printf("[summarize_chunk] map phase: chunks=%d concurrency=1 elapsed=%dms",
+			len(chunks), time.Since(start).Milliseconds())
 		return summaries, nil
 	}
 
@@ -598,11 +605,15 @@ func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]inte
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 
-	start := time.Now()
 	for i, chunk := range chunks {
 		wg.Add(1)
 		go func(idx int, c []map[string]interface{}) {
 			defer wg.Done()
+			defer func() {
+				if p := recover(); p != nil {
+					outcomes[idx] = chunkMapOutcome{err: fmt.Errorf("map chunk %d panicked: %v", idx, p)}
+				}
+			}()
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():

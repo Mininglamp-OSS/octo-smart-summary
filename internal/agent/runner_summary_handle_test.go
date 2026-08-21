@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,54 @@ type reduceAwareClient struct {
 	bodyLeaked      bool
 	sawNudge        bool
 	sawBudgetReduce bool
+}
+
+type malformedMapRetryClient struct {
+	calls    int
+	sawNudge bool
+}
+
+func (c *malformedMapRetryClient) Chat(_ context.Context, msgs []Message, _ []Tool) (AssistantTurn, error) {
+	c.calls++
+	for _, msg := range msgs {
+		if strings.Contains(msg.Content, "参数无效或缺少 messages_handle") {
+			c.sawNudge = true
+		}
+	}
+	switch c.calls {
+	case 1:
+		return AssistantTurn{ToolCalls: []ToolCall{
+			mkToolCall("bad-map-call", "summarize_chunk", `{"chunk_size":10}`),
+		}}, nil
+	case 2:
+		return AssistantTurn{Content: "premature final after malformed Map"}, nil
+	case 3:
+		return AssistantTurn{ToolCalls: []ToolCall{
+			mkToolCall("good-map-call", "summarize_chunk", `{"messages_handle":"messages-1"}`),
+		}}, nil
+	case 4:
+		var handle string
+		for _, msg := range msgs {
+			if msg.Role != "tool" || msg.Name != "summarize_chunk" {
+				continue
+			}
+			var result struct {
+				SummaryHandle string `json:"summary_handle"`
+			}
+			if json.Unmarshal([]byte(msg.Content), &result) == nil && result.SummaryHandle != "" {
+				handle = result.SummaryHandle
+			}
+		}
+		if handle == "" {
+			return AssistantTurn{}, fmt.Errorf("corrected Map did not return a summary_handle")
+		}
+		args, _ := json.Marshal(map[string]interface{}{"summary_handles": []string{handle}})
+		return AssistantTurn{ToolCalls: []ToolCall{
+			mkToolCall("reduce-call", "merge_summaries", string(args)),
+		}}, nil
+	default:
+		return AssistantTurn{Content: "final after corrected retry"}, nil
+	}
 }
 
 func (c *reduceAwareClient) Chat(_ context.Context, msgs []Message, _ []Tool) (AssistantTurn, error) {
@@ -156,5 +205,56 @@ func TestRunnerShadowsSummaryStoreFromParentContext(t *testing.T) {
 	}
 	if !parentStore.NeedsReduce() {
 		t.Fatal("runner mutated the parent store instead of shadowing it")
+	}
+}
+
+func TestRunnerMalformedMapArgsCanRecoverWithCorrectedRetry(t *testing.T) {
+	client := &malformedMapRetryClient{}
+	reg := NewRegistry()
+	reg.Register(Tool{Type: "function", Function: ToolFunction{Name: "summarize_chunk"}},
+		func(ctx context.Context, args json.RawMessage) (string, error) {
+			var req struct {
+				MessagesHandle string `json:"messages_handle"`
+			}
+			if err := json.Unmarshal(args, &req); err != nil {
+				return "", fmt.Errorf("parse args: %w", err)
+			}
+			if req.MessagesHandle == "" {
+				return "", fmt.Errorf("messages_handle is required")
+			}
+			store, _ := summaryHandleStoreFromContext(ctx)
+			handle, err := store.PutAtStep("corrected Map body", 1, summaryToolStepFromContext(ctx))
+			if err != nil {
+				return "", err
+			}
+			return `{"summary_handle":"` + handle + `","chunk_count":1}`, nil
+		})
+	reg.Register(Tool{Type: "function", Function: ToolFunction{Name: "merge_summaries"}},
+		func(ctx context.Context, args json.RawMessage) (string, error) {
+			var req struct {
+				Handles []string `json:"summary_handles"`
+			}
+			if err := json.Unmarshal(args, &req); err != nil {
+				return "", err
+			}
+			store, _ := summaryHandleStoreFromContext(ctx)
+			resolved, err := store.ResolveAllBefore(req.Handles, summaryToolStepFromContext(ctx))
+			if err != nil {
+				return "", err
+			}
+			store.MarkReduced(resolved.Generation)
+			return `{"merged_summary":"merged","chunk_count":1}`, nil
+		})
+
+	runner := NewRunner(client, reg, NewPool(2), Policy{MaxSteps: 5, MaxTokens: 100000, StepTimeout: time.Second})
+	out, _, err := runner.RunWithHistory(context.Background(), "system", nil, "summarize")
+	if err != nil {
+		t.Fatalf("RunWithHistory: %v", err)
+	}
+	if out != "final after corrected retry" || client.calls != 5 {
+		t.Fatalf("out=%q calls=%d, want successful recovery in 5 turns", out, client.calls)
+	}
+	if !client.sawNudge {
+		t.Fatal("runner did not explain how to recover a handle-less Map failure")
 	}
 }

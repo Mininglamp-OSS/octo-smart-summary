@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -22,14 +23,11 @@ import (
 // test and restores whatever deps were set before.
 func withMapConcurrency(t *testing.T, n int) {
 	t.Helper()
-	summaryDB, imDB, octoClient, prev := func() (a, b interface{}, c interface{}, cfg config.Config) {
+	prev := func() (cfg config.Config) {
 		defer func() { _ = recover() }() // deps may be unset in a fresh package run
-		db, im, oc, cf := GetSummaryDeps()
-		return db, im, oc, cf
+		_, _, _, cfg = GetSummaryDeps()
+		return cfg
 	}()
-	_ = summaryDB
-	_ = imDB
-	_ = octoClient
 
 	cfg := prev
 	cfg.AgentMapConcurrency = n
@@ -191,7 +189,8 @@ func TestSummarizeChunksConcurrently_OneFailureFailsAll(t *testing.T) {
 // Queued chunks must abort on cancellation instead of waiting for an in-flight
 // LLM call to release a semaphore slot.
 func TestSummarizeChunksConcurrently_CancelReleasesQueuedChunks(t *testing.T) {
-	withMapConcurrency(t, 1) // everything after the first chunk queues on the semaphore
+	const concurrency = 3
+	withMapConcurrency(t, concurrency)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var started sync.WaitGroup
@@ -225,8 +224,29 @@ func TestSummarizeChunksConcurrently_CancelReleasesQueuedChunks(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected a cancellation error, got nil")
 	}
-	if n := atomic.LoadInt64(&calls); n > 1 {
-		t.Fatalf("%d Map calls started after cancellation, want 1 — queued chunks should abort at the semaphore", n)
+	if n := atomic.LoadInt64(&calls); n > concurrency {
+		t.Fatalf("%d Map calls started after cancellation, want <=%d — queued chunks should abort at the semaphore", n, concurrency)
+	}
+}
+
+// A panic below Registry.Dispatch's recovery boundary must become a normal Map
+// error rather than terminating the process.
+func TestSummarizeChunksConcurrently_PanicBecomesError(t *testing.T) {
+	withMapConcurrency(t, 2)
+	withStubMapCall(t, func(_ context.Context, chunk []map[string]interface{}, _ string) (string, int, int, error) {
+		if chunk[0]["content"].(string) == "chunk-1" {
+			panic("boom")
+		}
+		return "s", 1, 0, nil
+	})
+
+	var cov chunkCoverage
+	got, err := summarizeChunksConcurrently(context.Background(), makeChunks(3), "", &cov)
+	if err == nil || !strings.Contains(err.Error(), "map chunk 1 panicked: boom") {
+		t.Fatalf("error = %v, want contained worker panic", err)
+	}
+	if got != nil {
+		t.Fatalf("panic must fail the whole Map phase, got %d summaries", len(got))
 	}
 }
 

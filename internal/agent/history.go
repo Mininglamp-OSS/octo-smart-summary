@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"os"
 	"strconv"
 	"strings"
@@ -93,5 +94,11 @@ func compactSummaryToolHistory(history []Message) []Message {
 
 func isHistoricalToolError(content string) bool {
 	trimmed := strings.TrimSpace(content)
-	return strings.HasPrefix(trimmed, "错误:") || strings.Contains(trimmed, `"ok":false`)
+	if strings.HasPrefix(trimmed, "错误:") {
+		return true
+	}
+	var envelope struct {
+		OK *bool `json:"ok"`
+	}
+	return json.Unmarshal([]byte(trimmed), &envelope) == nil && envelope.OK != nil && !*envelope.OK
 }

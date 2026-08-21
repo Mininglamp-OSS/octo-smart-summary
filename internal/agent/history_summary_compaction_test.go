@@ -18,7 +18,8 @@ func TestCompactSummaryToolHistoryRemovesLegacyBodiesAndKeepsPairs(t *testing.T)
 		{Role: "assistant", ToolCalls: []ToolCall{mergeCall}},
 		{Role: "tool", ToolCallID: "reduce-1", Name: "merge_summaries", Content: `{"merged_summary":"` + legacyBody + `"}`},
 		{Role: "assistant", Content: "durable final summary"},
-		{Role: "tool", ToolCallID: "error-1", Name: "merge_summaries", Content: `{"ok":false,"message":"keep this error"}`},
+		{Role: "tool", ToolCallID: "error-1", Name: "merge_summaries", Content: `{"ok": false, "message":"keep this error"}`},
+		{Role: "tool", ToolCallID: "quoted-1", Name: "summarize_chunk", Content: `{"summary":"quoted marker: \"ok\":false should not look like an envelope"}`},
 	}
 
 	got := compactSummaryToolHistory(history)
@@ -43,6 +44,9 @@ func TestCompactSummaryToolHistoryRemovesLegacyBodiesAndKeepsPairs(t *testing.T)
 	}
 	if got[6].Content != history[6].Content {
 		t.Fatalf("historical tool error should be preserved: %q", got[6].Content)
+	}
+	if got[7].Content != compactedMapHistoryResult {
+		t.Fatalf("summary body quoting an ok:false marker should still be compacted: %q", got[7].Content)
 	}
 }
 

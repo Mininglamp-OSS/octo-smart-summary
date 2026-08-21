@@ -650,6 +650,14 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 	log.Printf("[personal-worker] task=%d marked failed (terminal), sanitizedMsg=%s", pr.TaskID, sanitized)
 }
 
+func isFatalMapError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "reasoning budget exhausted") || strings.Contains(msg, "truncated")
+}
+
 func (p *Processor) executePersonalPipeline(ctx context.Context, task model.SummaryTask, userID string, reportStage func(string), streamDelta func(string) error) (string, []model.Citation, int, int, string, error) {
 	totalStart := time.Now()
 	taskNo := task.TaskNo
@@ -1045,8 +1053,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 				timing.RecordLLMSince(taskNo, fmt.Sprintf("Map: 分块总结 chunk#%d", idx), callStart, tokens)
 				if err != nil {
 					log.Printf("[personal-worker] Map chunk %d failed: %v", idx, err)
-					isFatal := errors.Is(err, service.ErrReasoningBudgetExhausted) || errors.Is(err, service.ErrTokenLimitExhausted)
-					results[idx] = chunkResult{failed: true, fatal: isFatal}
+					results[idx] = chunkResult{failed: true, fatal: isFatalMapError(err)}
 				} else {
 					results[idx] = chunkResult{summary: summary, tokens: tokens, model: usedModel}
 				}
@@ -1069,7 +1076,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		}
 		if len(fatalChunks) > 0 {
 			return "", nil, 0, 0, "", fmt.Errorf(
-				"Map phase aborted: reasoning budget exhausted on chunk(s) %v", fatalChunks)
+				"Map phase aborted: output truncated or reasoning budget exhausted on chunk(s) %v", fatalChunks)
 		}
 
 		var chunkSummaries []string

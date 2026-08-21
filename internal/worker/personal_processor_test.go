@@ -3,6 +3,7 @@
 package worker
 
 import (
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -14,6 +15,26 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
+
+func TestIsFatalMapError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "reasoning budget", err: errors.New("reasoning budget exhausted on chunk 2"), want: true},
+		{name: "non-stream truncation", err: errors.New("output truncated on chunk 3"), want: true},
+		{name: "stream truncation", err: errors.New("LLM streamed response truncated due to token limit"), want: true},
+		{name: "transient network", err: errors.New("connection reset by peer"), want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isFatalMapError(tc.err); got != tc.want {
+				t.Fatalf("isFatalMapError(%v) = %t, want %t", tc.err, got, tc.want)
+			}
+		})
+	}
+}
 
 func TestDecidePersonalMessages_NoTarget_AllMessages(t *testing.T) {
 	all := []pipeline.Message{
