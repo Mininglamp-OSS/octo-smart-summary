@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmfallback"
 )
+
+const truncatedAnswerNotice = "\n\n> 输出因长度限制被截断，请缩小范围或降低详细程度后重试。"
 
 // Client 是 agent 自带的 LLM 客户端，独立于 service/llm.go，只依赖标准库。
 type Client struct {
@@ -169,12 +172,21 @@ func (c *Client) attemptChat(ctx context.Context, model string, msgs []Message, 
 		return AssistantTurn{}, llmfallback.Terminal, fmt.Errorf("empty choices in response")
 	}
 	choice := cr.Choices[0]
-	if choice.FinishReason == "length" {
-		// Tool-call arguments can be syntactically present but cut off mid-JSON.
-		// Never dispatch a truncated planner turn as if it were valid.
-		return AssistantTurn{}, false, fmt.Errorf("LLM response truncated: finish_reason=length")
-	}
 	msg := choice.Message
+	if choice.FinishReason == "length" {
+		if len(msg.ToolCalls) > 0 {
+			// Tool-call arguments can be syntactically present but cut off mid-JSON.
+			// Never dispatch a truncated planner turn as if it were valid.
+			return AssistantTurn{}, llmfallback.Terminal, fmt.Errorf("LLM tool response truncated: finish_reason=length")
+		}
+		if strings.TrimSpace(msg.Content) == "" {
+			return AssistantTurn{}, llmfallback.RetrySameModel, fmt.Errorf("LLM response truncated before producing content: finish_reason=length")
+		}
+		// A content-only turn is the user-facing answer. It is degraded but still
+		// usable, so preserve it with an explicit disclosure instead of failing
+		// the whole request and discarding everything the model produced.
+		msg.Content += truncatedAnswerNotice
+	}
 	return AssistantTurn{
 		Content:   msg.Content,
 		ToolCalls: msg.ToolCalls,

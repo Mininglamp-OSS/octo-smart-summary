@@ -200,9 +200,20 @@ func readErrorBody(body io.Reader) string {
 	return llmfallback.SafeTextForLog(string(b), 200)
 }
 
-// Call makes a chat completion request. Returns (content, tokenUsed, error).
+const streamedTruncationNotice = "\n\n> 输出因长度限制被截断，请缩小范围或降低详细程度后重试。"
+
+// Call makes a general chat completion request. A non-empty content response
+// remains usable when the provider reports finish_reason=length, preserving the
+// pre-existing behavior for refine and topic-narrowing callers.
 func (c *LLMClient) Call(ctx context.Context, messages []ChatMessage, temperature float64) (string, int, error) {
-	content, tokens, _, err := c.CallWithModel(ctx, messages, temperature)
+	content, tokens, _, err := c.callWithModel(ctx, messages, temperature, false)
+	return content, tokens, err
+}
+
+// CallStrict rejects any length-truncated response. Map/Reduce callers use this
+// path because a partial intermediate result can silently drop coverage.
+func (c *LLMClient) CallStrict(ctx context.Context, messages []ChatMessage, temperature float64) (string, int, error) {
+	content, tokens, _, err := c.callWithModel(ctx, messages, temperature, true)
 	return content, tokens, err
 }
 
@@ -210,6 +221,10 @@ func (c *LLMClient) Call(ctx context.Context, messages []ChatMessage, temperatur
 // that produced the response. Callers that persist model attribution should
 // use this method instead of ModelVersion.
 func (c *LLMClient) CallWithModel(ctx context.Context, messages []ChatMessage, temperature float64) (string, int, string, error) {
+	return c.callWithModel(ctx, messages, temperature, false)
+}
+
+func (c *LLMClient) callWithModel(ctx context.Context, messages []ChatMessage, temperature float64, rejectTruncation bool) (string, int, string, error) {
 	type result struct {
 		content string
 		tokens  int
@@ -280,7 +295,7 @@ func (c *LLMClient) CallWithModel(ctx context.Context, messages []ChatMessage, t
 				reasoningLen, chatResp.Choices[0].FinishReason, chatResp.Usage.CompletionTokens)
 			return result{tokens: chatResp.Usage.TotalTokens}, llmfallback.Terminal, ErrReasoningBudgetExhausted
 		}
-		if chatResp.Choices[0].FinishReason == "length" {
+		if chatResp.Choices[0].FinishReason == "length" && (rejectTruncation || content == "") {
 			log.Printf("[llm] WARNING: response truncated with finish_reason=length, completion_tokens=%d", chatResp.Usage.CompletionTokens)
 			return result{tokens: chatResp.Usage.TotalTokens}, llmfallback.Terminal, ErrTokenLimitExhausted
 		}
@@ -304,17 +319,30 @@ type chatStreamResponse struct {
 	} `json:"usage"`
 }
 
-// CallStream makes a chat completion streaming request. onDelta is called for
-// each user-visible content delta. It returns the accumulated full content so
-// downstream citation building and DB persistence remain source-of-truth.
+// CallStream makes a general streaming request and preserves the historical
+// behavior for non-empty length-truncated content: what was already delivered
+// remains the returned/persisted source of truth.
 func (c *LLMClient) CallStream(ctx context.Context, messages []ChatMessage, temperature float64, onDelta func(string) error) (string, int, error) {
-	content, tokens, _, err := c.CallStreamWithModel(ctx, messages, temperature, onDelta)
+	content, tokens, _, err := c.callStreamWithModel(ctx, messages, temperature, onDelta, false)
+	return content, tokens, err
+}
+
+// callStreamWithTruncationNotice is used by user-visible Map/Reduce streams.
+// Once deltas have been emitted they cannot be retracted, so a usable partial
+// result is completed with an explicit notice instead of returning an error
+// after the client has already rendered content.
+func (c *LLMClient) callStreamWithTruncationNotice(ctx context.Context, messages []ChatMessage, temperature float64, onDelta func(string) error) (string, int, error) {
+	content, tokens, _, err := c.callStreamWithModel(ctx, messages, temperature, onDelta, true)
 	return content, tokens, err
 }
 
 // CallStreamWithModel is CallStream with the actual producing model included
 // for persistence and audit attribution.
 func (c *LLMClient) CallStreamWithModel(ctx context.Context, messages []ChatMessage, temperature float64, onDelta func(string) error) (string, int, string, error) {
+	return c.callStreamWithModel(ctx, messages, temperature, onDelta, false)
+}
+
+func (c *LLMClient) callStreamWithModel(ctx context.Context, messages []ChatMessage, temperature float64, onDelta func(string) error, discloseTruncation bool) (string, int, string, error) {
 	type result struct {
 		content string
 		tokens  int
@@ -436,11 +464,19 @@ func (c *LLMClient) CallStreamWithModel(ctx context.Context, messages []ChatMess
 		if content == "" && reasoningLen > 0 {
 			return result{tokens: totalTokens}, llmfallback.Terminal, ErrReasoningBudgetExhausted
 		}
-		if finishReason == "length" {
-			return result{tokens: totalTokens}, llmfallback.Terminal, ErrTokenLimitExhausted
-		}
 		if content == "" {
+			if finishReason == "length" {
+				return result{tokens: totalTokens}, llmfallback.Terminal, ErrTokenLimitExhausted
+			}
 			return streamFailure(fmt.Errorf("LLM returned empty streamed content"))
+		}
+		if finishReason == "length" && discloseTruncation {
+			if onDelta != nil {
+				if err := onDelta(streamedTruncationNotice); err != nil {
+					return result{content: content, tokens: totalTokens}, llmfallback.Terminal, err
+				}
+			}
+			content += streamedTruncationNotice
 		}
 		return result{content: content, tokens: totalTokens}, llmfallback.Success, nil
 	})
@@ -689,10 +725,10 @@ func (c *LLMClient) CallMapWithModel(ctx context.Context, formattedMessages stri
 	userPrompt := fmt.Sprintf("来源：%s\n时间范围：%s ~ %s\n消息数：%d 条\n\n聊天记录：\n%s",
 		sourceName, timeStart, timeEnd, msgCount, formattedMessages)
 
-	content, tokens, usedModel, err := c.CallWithModel(ctx, []ChatMessage{
+	content, tokens, usedModel, err := c.callWithModel(ctx, []ChatMessage{
 		{Role: "system", Content: systemPrompt},
 		{Role: "user", Content: userPrompt},
-	}, 0.1)
+	}, 0.1, true)
 	if err == nil {
 		return content, tokens, usedModel, nil
 	}
@@ -728,10 +764,10 @@ func (c *LLMClient) CallReduceWithModel(ctx context.Context, chunkSummaries []st
 	userPrompt := fmt.Sprintf("信息来源：%s\n时间范围：%s ~ %s\n消息总量：%d 条\n\n以下是各分片的总结，请合并：\n\n%s",
 		sourceNames, startTime, endTime, totalMsgCount, summariesText)
 
-	return c.CallWithModel(ctx, []ChatMessage{
+	return c.callWithModel(ctx, []ChatMessage{
 		{Role: "system", Content: system},
 		{Role: "user", Content: userPrompt},
-	}, 0.1)
+	}, 0.1, true)
 }
 
 // CallMapStream runs the Map phase for a user-visible single chunk and streams
@@ -758,10 +794,10 @@ func (c *LLMClient) CallMapStreamWithModel(ctx context.Context, formattedMessage
 		}
 		return onDelta(delta)
 	}
-	content, tokens, usedModel, err := c.CallStreamWithModel(ctx, []ChatMessage{
+	content, tokens, usedModel, err := c.callStreamWithModel(ctx, []ChatMessage{
 		{Role: "system", Content: systemPrompt},
 		{Role: "user", Content: userPrompt},
-	}, 0.1, wrappedDelta)
+	}, 0.1, wrappedDelta, true)
 	if err == nil {
 		return content, tokens, usedModel, nil
 	}
@@ -803,10 +839,10 @@ func (c *LLMClient) CallReduceStreamWithModel(ctx context.Context, chunkSummarie
 	userPrompt := fmt.Sprintf("信息来源：%s\n时间范围：%s ~ %s\n消息总量：%d 条\n\n以下是各分片的总结，请合并：\n\n%s",
 		sourceNames, startTime, endTime, totalMsgCount, summariesText)
 
-	return c.CallStreamWithModel(ctx, []ChatMessage{
+	return c.callStreamWithModel(ctx, []ChatMessage{
 		{Role: "system", Content: system},
 		{Role: "user", Content: userPrompt},
-	}, 0.1, onDelta)
+	}, 0.1, onDelta, true)
 }
 
 func buildReduceByPersonMessages(participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string) []ChatMessage {
@@ -836,22 +872,22 @@ func buildReduceByPersonMessages(participantSummaries []struct{ Name, Summary st
 // CallReduceByPerson merges participant-level summaries.
 // Each participant is assigned a [Pn] tag that the LLM should reference in the output.
 func (c *LLMClient) CallReduceByPerson(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string) (string, int, error) {
-	return c.Call(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1)
+	return c.CallStrict(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1)
 }
 
 // CallReduceByPersonWithModel is CallReduceByPerson with the actual producing model included.
 func (c *LLMClient) CallReduceByPersonWithModel(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string) (string, int, string, error) {
-	return c.CallWithModel(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1)
+	return c.callWithModel(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1, true)
 }
 
 // CallReduceByPersonStream merges participant-level summaries and streams the
 // final team summary. Each participant is assigned a [Pn] tag that the LLM should
 // reference in the output.
 func (c *LLMClient) CallReduceByPersonStream(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string, onDelta func(string) error) (string, int, error) {
-	return c.CallStream(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1, onDelta)
+	return c.callStreamWithTruncationNotice(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1, onDelta)
 }
 
 // CallReduceByPersonStreamWithModel is CallReduceByPersonStream with the actual producing model included.
 func (c *LLMClient) CallReduceByPersonStreamWithModel(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string, onDelta func(string) error) (string, int, string, error) {
-	return c.CallStreamWithModel(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1, onDelta)
+	return c.callStreamWithModel(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1, onDelta, true)
 }

@@ -124,6 +124,6 @@ func mergeSummariesWithLLM(ctx context.Context, combined string, specGuidance st
 		{Role: "user", Content: combined},
 	}
 
-	content, _, err := client.Call(ctx, msgs, 0.1)
+	content, _, err := client.CallStrict(ctx, msgs, 0.1)
 	return content, err
 }

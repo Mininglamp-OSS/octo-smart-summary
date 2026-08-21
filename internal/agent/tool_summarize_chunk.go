@@ -484,7 +484,7 @@ func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{},
 		{Role: "user", Content: formatted},
 	}
 
-	content, _, err := client.Call(ctx, msgs, 0.3)
+	content, _, err := client.CallStrict(ctx, msgs, 0.3)
 	if err != nil {
 		return "", processed, oversized, fmt.Errorf("call LLM: %w", err)
 	}
