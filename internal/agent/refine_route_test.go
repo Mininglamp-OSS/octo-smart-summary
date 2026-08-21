@@ -580,3 +580,214 @@ func TestRefineAugmentWithATimeWordStillExtends(t *testing.T) {
 		}
 	}
 }
+
+// TestRefineStripNeedsResidueAndQuantifierTogether pins the round-10 P1-1
+// (yujiawei): the residue test and the ∀-clause quantifier are CONJUNCTS, and
+// neither subsumes the other.
+//
+// At the previous head the strip was residue-only, and 15 instructions that had
+// kept their tools one commit earlier began hard-stripping: 总结 is also the
+// primary Chinese verb "to summarize" and 整理/组织 the primary verbs for
+// "compile from source material", so "compile + <container>" — the canonical way
+// to ask for a fetch — reduced to an empty residue. The quantifier catches those
+// because the compile clause carries no rewrite keyword of its own.
+func TestRefineStripNeedsResidueAndQuantifierTogether(t *testing.T) {
+	t.Run("a compile verb over a container keeps its tools", func(t *testing.T) {
+		for _, instruction := range []string{
+			"帮我精简一下，再总结一下会话",
+			"精简一下，另外总结第二群",
+			"压缩篇幅，同时整理频道消息",
+			"重新组织，把消息调整一下",
+			"润色一下，整理对话",
+			"翻译成英文，整理一下子区",
+			"精简，总结一下对话记录",
+			"只保留结论，整理群",
+			"去掉第三段，总结消息",
+			"改语气，组织一下群消息",
+			"翻译成英文，调一下频道",
+			"排版，整理聊天记录",
+			// The quantifier alone cannot see these three: one clause, and it does
+			// carry a rewrite keyword. The container is the OBJECT of the rewrite
+			// verb rather than a modifier of an artifact noun, so it survives the
+			// residue as material — which is what keeps the tools.
+			"翻译频道消息",
+			"改写第十群消息",
+			"请整理第三子区内的聊天记录并重写总结",
+		} {
+			if got := ClassifyRefine(instruction); got.HardNoFetch {
+				t.Errorf("ClassifyRefine(%q) strips the fetch tools; asking to compile a container is a request for material: %+v", instruction, got)
+			}
+		}
+	})
+
+	// The other direction: a container that MODIFIES an artifact noun is
+	// structural, and those requests must still strip. A flat filler list cannot
+	// satisfy both halves — a word is either filler or it is not — so the
+	// container rule is positional (stripModifierContainers).
+	t.Run("a container modifying an artifact noun still strips", func(t *testing.T) {
+		for _, instruction := range []string{
+			"把这份群总结翻译成英文",
+			"精简一下群消息总结",
+			"对话记录的总结润色一下",
+		} {
+			if got := ClassifyRefine(instruction); !got.HardNoFetch {
+				t.Errorf("ClassifyRefine(%q): naming the artifact's origin is not a retrieval request: %+v", instruction, got)
+			}
+		}
+	})
+}
+
+// TestRefineContainerAdjacencyIsJudgedOnSourceText pins the #206 P1-1
+// (yujiawei): stripModifierContainers must read adjacency from the ORIGINAL
+// instruction, never from a keyword-stripped intermediate.
+//
+// The positional rule's whole content is "a container followed, optionally
+// through 的, by an artifact noun is a modifier". Adjacency is a property of what
+// the user typed. When the rule ran after keyword removal, deleting whatever sat
+// BETWEEN the container and the artifact noun manufactured an adjacency that
+// never existed — 把群消息改写成总结 became 把群消息总结, the container was erased
+// as "structural", the residue went empty and the tools were removed from a
+// request that can only be satisfied by fetching.
+//
+// It was also self-inconsistent: 改写第十群消息 keeps its tools (pinned above),
+// while appending a destination artifact — which makes the request MORE clearly a
+// compile-from-material, not less — stripped them.
+func TestRefineContainerAdjacencyIsJudgedOnSourceText(t *testing.T) {
+	t.Run("reported strings keep their tools", func(t *testing.T) {
+		for _, instruction := range []string{
+			"把群消息改写成总结",
+			"把聊天记录改写成纪要",
+			"把频道消息改写成报告",
+			"把对话记录改写成摘要",
+			"把子区消息改写成文档",
+			"把群消息换成总结",
+			"帮我把群消息改写成总结",
+		} {
+			if got := ClassifyRefine(instruction); got.HardNoFetch {
+				t.Errorf("ClassifyRefine(%q): the container is the OBJECT of the rewrite verb, not a modifier of the artifact — this is a compile-from-material request: %+v", instruction, got)
+			}
+		}
+	})
+
+	// The sweep the review used to find the class. A single miss here means the
+	// ordering regressed, so it is pinned as a whole rather than by example.
+	t.Run("把<container><rewrite-verb><artifact> never strips", func(t *testing.T) {
+		containers := []string{"群消息", "对话记录", "聊天记录", "群聊", "频道", "子区", "会话", "对话"}
+		verbs := []string{"改写成", "换成", "翻译成", "精简成", "压缩成", "提炼成", "重写", "改写"}
+		artifacts := []string{"总结", "摘要", "报告", "纪要", "文档"}
+		for _, c := range containers {
+			for _, v := range verbs {
+				for _, a := range artifacts {
+					instruction := "把" + c + v + a
+					if got := ClassifyRefine(instruction); got.HardNoFetch {
+						t.Errorf("ClassifyRefine(%q) strips the fetch tools: %+v", instruction, got)
+					}
+				}
+			}
+		}
+	})
+
+	// The other direction must survive the reordering: when the container really
+	// IS adjacent to the artifact noun in the source text, it is a modifier and
+	// the request still strips.
+	t.Run("genuine modifiers still strip", func(t *testing.T) {
+		for _, instruction := range []string{
+			"把这份群总结翻译成英文",
+			"精简一下群消息总结",
+			"对话记录的总结润色一下",
+		} {
+			if got := ClassifyRefine(instruction); !got.HardNoFetch {
+				t.Errorf("ClassifyRefine(%q): the container modifies the artifact noun in the source text, so this is pure text: %+v", instruction, got)
+			}
+		}
+	})
+}
+
+// TestRefineDocumentPartIsNotAnAdjacencyTarget pins the #206 round-2 P1-1
+// (yujiawei): 正文 / 全文 are document PART nouns, not artifact names, so they
+// must not serve as the right-hand side of the positional container rule.
+//
+// refineArtifactNouns has two jobs — residue filler, and adjacency target in
+// stripModifierContainers — and they need different vocabularies. As fillers the
+// two words behave identically either way (翻译正文 still strips); as adjacency
+// targets they are wrong, because "<container>全文" is the full text OF the
+// container, i.e. the raw material, not an artifact derived from it. Treating
+// them as targets erased the container and hard-stripped 2352 requests for
+// source material, contradicting this file's own must-keep table:
+//
+//	翻译频道消息      keep (pinned above)
+//	翻译频道消息全文   stripped ← appending 全文 makes it MORE clearly material
+func TestRefineDocumentPartIsNotAnAdjacencyTarget(t *testing.T) {
+	t.Run("reported strings keep their tools", func(t *testing.T) {
+		for _, instruction := range []string{
+			"翻译消息全文",
+			"翻译对话记录全文",
+			"翻译群消息全文",
+			"翻译频道消息全文",
+			"用英文重写聊天记录正文",
+			"翻译群消息正文",
+			"把群消息全文翻译成英文",
+			"精简对话全文",
+			"改写第十群消息全文",
+		} {
+			if got := ClassifyRefine(instruction); got.HardNoFetch {
+				t.Errorf("ClassifyRefine(%q): 全文/正文 names a PART of the container, so this asks for the material itself: %+v", instruction, got)
+			}
+		}
+	})
+
+	// A container in front of a document part must never be erased, across the
+	// whole frame space. Pinned as a sweep because three consecutive rounds found
+	// families that example-by-example pinning did not predict.
+	t.Run("<container><part> never strips", func(t *testing.T) {
+		containers := []string{"群消息", "对话记录", "聊天记录", "群聊", "频道", "子区", "会话", "对话", "消息", "群", "频道消息", "子区消息"}
+		parts := []string{"正文", "全文"}
+		verbs := []string{"翻译", "精简", "简化", "缩短", "压缩", "删减", "润色", "排版", "重写", "改写", "提炼", "重新组织", "翻译成英文", "用英文重写"}
+		for _, c := range containers {
+			for _, p := range parts {
+				for _, v := range verbs {
+					for _, instruction := range []string{
+						v + c + p, "把" + c + p + v, "帮我" + v + c + p, v + "一下" + c + p,
+						"请" + v + c + p, v + c + p + "吧", "把" + c + p + v + "成英文",
+					} {
+						if got := ClassifyRefine(instruction); got.HardNoFetch {
+							t.Errorf("ClassifyRefine(%q) strips the fetch tools: %+v", instruction, got)
+						}
+					}
+				}
+			}
+		}
+	})
+
+	// The other direction: with no container in front, a document part is an
+	// ordinary filler and the request is pure text, so it must still strip.
+	t.Run("a bare document part still strips", func(t *testing.T) {
+		for _, instruction := range []string{
+			"翻译正文", "润色一下正文", "把全文翻译成英文", "精简全文",
+		} {
+			if got := ClassifyRefine(instruction); !got.HardNoFetch {
+				t.Errorf("ClassifyRefine(%q) is a pure-text edit of the artifact: %+v", instruction, got)
+			}
+		}
+	})
+}
+
+// TestRefineArtifactNounsAreValidAdjacencyTargets covers the half of
+// refineArtifactNouns' contract that nothing tested before (#206 round-2
+// suggestion 2): the single-source-of-truth refactor made that list load-bearing
+// in TWO places, and only the filler half had coverage.
+//
+// Every member must work as an adjacency target — <container><artifact> is a
+// modifier construction and strips — which is exactly the property 正文 / 全文
+// failed. A future addition to this list is only legitimate if it satisfies this.
+func TestRefineArtifactNounsAreValidAdjacencyTargets(t *testing.T) {
+	for _, artifact := range refineArtifactNouns {
+		for _, container := range []string{"群", "频道", "对话记录"} {
+			instruction := "把这份" + container + artifact + "翻译成英文"
+			if got := ClassifyRefine(instruction); !got.HardNoFetch {
+				t.Errorf("ClassifyRefine(%q): %q is in refineArtifactNouns, so a container modifying it must be structural: %+v",
+					instruction, artifact, got)
+			}
+		}
+	}
+}

@@ -71,6 +71,17 @@ func NewRunner(client chatter, reg *Registry, pool *Pool, policy Policy) *Runner
 	return &Runner{client: client, reg: reg, pool: pool, policy: policy}
 }
 
+// ToolSchemas exposes the tool schemas this runner will offer the model, so a
+// caller can assert WHICH toolset a runner was built with. SS-08b removes the
+// data-fetching tools for a confident rewrite, and that decision is only
+// observable through the registry the runner ended up holding. Nil-safe.
+func (r *Runner) ToolSchemas() []Tool {
+	if r == nil || r.reg == nil {
+		return nil
+	}
+	return r.reg.Schemas()
+}
+
 // Run 无状态单轮入口：委托 RunWithHistory（history=nil），保持旧签名零回归。
 func (r *Runner) Run(ctx context.Context, system, userInput string) (string, error) {
 	reply, _, err := r.RunWithHistory(ctx, system, nil, userInput)

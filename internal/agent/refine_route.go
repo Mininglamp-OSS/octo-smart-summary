@@ -4,6 +4,7 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // SS-08: deterministic 3-way refine routing (缺点十二 note + 原方案 §7 "Refine
@@ -161,15 +162,30 @@ var (
 		"外加", "外带", "此外", "加之", "捎带", "兼", "随后", "跟着", "以后", "之后", "要",
 		// "re-" modifiers
 		"重新", "重",
-		// artifact nouns (naming the thing being edited is not new data)
-		"摘要", "总结", "报告", "纪要", "正文", "全文", "文档", "文章", "这篇", "本文",
+		// artifact nouns — naming the thing being edited is not new data. The nouns
+		// themselves come from refineArtifactNouns (single source of truth, appended
+		// in the init below) so the filler pass and the positional container rule
+		// cannot drift apart; only the demonstratives are listed here.
+		"这篇", "本文",
 		// parts of an existing document (subtractive edits name these, never new data)
+		//
+		// 正文 / 全文 live HERE, not in refineArtifactNouns, and the distinction is
+		// load-bearing. As a filler they behave identically (翻译正文 / 把全文翻译成英文
+		// still strip), but refineArtifactNouns is ALSO the right-hand side of the
+		// adjacency test in stripModifierContainers, and there they are wrong: they
+		// name a PART of a document, not a produced artifact. "<container>全文" means
+		// "the full text OF the container" — the raw material — not "the artifact
+		// derived from it", so treating them as adjacency targets erased the container
+		// and hard-stripped 2352 requests for source material (翻译频道消息全文 stripped
+		// while 翻译频道消息, pinned must-keep, did not). Found by yujiawei, #206 round 2.
+		"正文", "全文",
 		"段落", "段", "句子", "句", "行", "字词", "字", "词", "小标题", "标题", "开头", "结尾",
 		"末尾", "部分", "结论", "章节", "列表", "序号", "编号", "第", "篇幅",
-		// origin containers — WHERE material lives, structural like the artifact nouns.
-		// An addition that names a container also names its content (a channel name, a
-		// data kind), and that content noun is NOT a filler, so it survives the residue.
-		"群消息", "群", "频道", "子区", "会话", "对话记录", "聊天记录", "对话", "消息",
+		// NOTE: the origin containers (群 / 频道 / 子区 / 消息 / 对话记录 …) are deliberately
+		// NOT filler. They are structural only when they MODIFY an artifact noun
+		// (群总结, 对话记录的总结); standing alone they ARE the material, and erasing them
+		// unconditionally is what let 翻译频道消息 reduce to an empty residue and strip.
+		// They are removed positionally instead — see stripModifierContainers.
 		// pure-adjustment verbs that are not themselves rewrite keywords
 		"调整", "调", "整理", "组织",
 		// locatives
@@ -208,10 +224,28 @@ func ClassifyRefine(instruction string) RefineRoute {
 		// Confident rewrite: an explicit pure-text keyword matched, so it MAY be safe
 		// to strip the fetch tools (HardNoFetch) — 纯格式零 fetch.
 		//
-		// The strip fires only when NOTHING content-bearing is left after the rewrite
-		// keywords are removed (rewriteResidueEmpty). A time word additionally vetoes
-		// it, because then the request is only *probably* a rewrite.
-		hardNoFetch := rewriteResidueEmpty(s) && !containsAny(s, refineExtendKeywords)
+		// The strip fires only when THREE independent conditions hold together. Each
+		// closes a class the others provably cannot; rounds 4-10 established that any
+		// one of them alone regresses.
+		//
+		//  1. rewriteResidueEmpty  — nothing content-bearing survives keyword removal.
+		//     Closes the no-connective additions ("翻译成英文补一些运营数据"): the added
+		//     content noun survives into the residue, so no conjunction list is needed.
+		//     Cannot see a clause built ENTIRELY of fillers.
+		//  2. allClausesCarryARewriteKeyword — every punctuation-delimited clause is
+		//     itself qualified as a rewrite. Closes exactly what (1) cannot: a compile
+		//     verb over a container ("精简一下，整理频道消息") reduces to an empty residue
+		//     because 整理/总结 are also artifact/structural words, but the second clause
+		//     carries no rewrite keyword, so the request keeps its tools.
+		//  3. no extend keyword — a time word means the request is only *probably* a
+		//     rewrite.
+		//
+		// Neither (1) nor (2) needs new vocabulary, and they are conjuncts rather than
+		// alternatives on purpose: HardNoFetch is the one decision here a runtime
+		// mistake cannot undo, so both must agree before the tools are removed.
+		hardNoFetch := rewriteResidueEmpty(s) &&
+			allClausesCarryARewriteKeyword(s) &&
+			!containsAny(s, refineExtendKeywords)
 		return RefineRoute{Intent: RefineRewrite, Fetch: false, ReuseTimeRange: false, ReuseCitations: true, HardNoFetch: hardNoFetch}
 	default:
 		// Ambiguous fallback: still the rewrite path (cheapest, no fetch by
@@ -219,6 +253,180 @@ func ClassifyRefine(instruction string) RefineRoute {
 		// can still recover by fetching.
 		return RefineRoute{Intent: RefineRewrite, Fetch: false, ReuseTimeRange: false, ReuseCitations: true, HardNoFetch: false}
 	}
+}
+
+// allClausesCarryARewriteKeyword reports whether EVERY punctuation-delimited
+// clause of s carries a rewrite keyword of its own.
+//
+// This is the conjunct that closes what rewriteResidueEmpty structurally cannot.
+// The residue test asks "is anything content-bearing left over?", and its filler
+// list has to classify the artifact nouns (摘要/总结/报告), the origin containers
+// (群/频道/消息/对话记录) and the generic adjustment verbs (整理/组织/调整) as
+// structural — otherwise ordinary pure-text requests like "把这份群总结翻译成英文"
+// stop stripping and SS-08b never fires. But 总结 is also the primary Chinese VERB
+// "to summarize", and 整理/组织 are the primary verbs for "compile from source
+// material", so "compile/summarize + <container>" — the canonical way to ask for a
+// fetch — reduces to an empty residue too:
+//
+//	"精简一下，整理频道消息"   residue ""  — but clause 2 has no rewrite keyword
+//	"翻译频道消息"          residue ""  — single clause, 翻译 qualifies it
+//
+// A word cannot be both a filler and not a filler, so the residue list cannot be
+// trimmed to fix this. The quantifier resolves it on a different axis: the
+// difference between the two lines above is not vocabulary but whether the
+// container is the object of a REWRITE verb or of a non-rewrite verb, and that is
+// exactly what per-clause qualification measures.
+//
+// Symmetrically, the quantifier alone is not enough either — an unrecognised
+// addition glued to a rewrite clause without a connective ("翻译成英文补一些运营
+// 数据") is ONE clause that does carry a rewrite keyword, and only the residue
+// sees the leftover obligation. Neither test subsumes the other; both must agree.
+//
+// Clause segmentation is punctuation-only and deliberately carries no conjunction
+// vocabulary: rounds 4-9 showed a closed connective list never converges (也/
+// 还要/顺手/此外/兔带… each arrived a round late). Any unpunctuated chaining the
+// quantifier misses is caught by the residue conjunct instead.
+//
+// Credit: proposed and measured by yujiawei in the round-10 review (44/44
+// must-keep, 19/19 must-strip against the union of every pinned string in this
+// PR's history).
+func allClausesCarryARewriteKeyword(s string) bool {
+	clauses := splitRefineClauses(s)
+	if len(clauses) == 0 {
+		return false
+	}
+	for _, clause := range clauses {
+		if !containsAny(clause, refineRewriteKeywords) {
+			return false
+		}
+	}
+	return true
+}
+
+// refineOriginContainers name WHERE material lives. They are NOT unconditional
+// fillers: see stripModifierContainers for the positional rule that decides when
+// an occurrence is structural.
+var refineOriginContainers = []string{
+	"群消息", "对话记录", "聊天记录", "群聊", "频道", "子区", "会话", "对话", "消息", "群",
+}
+
+// refineArtifactNouns are the names of the PRODUCED ARTIFACT, and the SINGLE
+// SOURCE OF TRUTH for that vocabulary: refineResidueFillers embeds this slice by
+// reference rather than repeating it.
+//
+// This list has TWO jobs, and membership must satisfy both:
+//
+//  1. residue filler — naming the thing being edited is not new data;
+//  2. adjacency target in stripModifierContainers — a container that MODIFIES one
+//     of these is structural (群总结 = "the summary of the group", not a request to
+//     go read the group).
+//
+// Job 2 is the strict one. Only nouns that name the OUTPUT belong here. Document
+// PART nouns (正文 / 全文 / 段落 / 章节 …) are fillers too, but they are NOT valid
+// adjacency targets: "<container>全文" is the full text OF the container — raw
+// material — so treating them as targets erases the container and strips a
+// request that can only be satisfied by fetching. They live in the
+// document-parts block of refineResidueFillers instead.
+//
+// The duplication this replaces was a live regression source: the positional rule
+// and the filler pass must agree on what an artifact noun is, so adding 简报 to the
+// filler list but not here would silently stop 群简报 from being recognised as a
+// modifier construction, with no test failing. Rounds 4-12 of this work were
+// almost entirely vocabulary churn, so the two lists are wired together instead of
+// being kept in sync by hand.
+var refineArtifactNouns = []string{
+	"摘要", "总结", "报告", "纪要", "文档", "文章",
+}
+
+var refineOriginContainersByLen = sortByRuneLenDesc(refineOriginContainers)
+
+// stripModifierContainers removes only those origin-container occurrences that
+// MODIFY an artifact noun, and leaves standalone ones in place.
+//
+// This is the positional rule that replaces the unconditional container fillers.
+// The round-10 review established both halves of the requirement, and a flat word
+// list cannot satisfy them at once — a word is either filler or it is not:
+//
+//	"把这份群总结翻译成英文"  群 modifies 总结  -> structural -> residue empty -> STRIP
+//	"翻译频道消息"            频道消息 stands alone -> IS the material -> KEEP tools
+//
+// With the containers as unconditional fillers the second line reduced to an
+// empty residue and the fetch tools were removed from a request that can only be
+// satisfied by fetching. Adjacency is the disambiguator: a container followed
+// (optionally through 的) by an artifact noun is a modifier; anywhere else it is
+// the material itself.
+//
+// The loop repeats to completion because removing one modifier can create a new
+// adjacency (群频道总结), and the direction of error is safe: a container left in
+// place only makes the residue non-empty, i.e. keeps the tools.
+// Single left-to-right pass. The modifier relation is resolved by a right-to-left
+// precomputation of "does a chain of containers / 的 particles starting here end in
+// an artifact noun", which is what makes chains like 群频道总结 resolve transitively.
+// The previous restart-from-zero fixpoint loop bought the same transitivity at
+// O(removals × len × |containers|) — 37ms of synchronous CPU at the handler's
+// 8192-rune cap, on an authenticated request path (#206 P2-3).
+func stripModifierContainers(s string) string {
+	if s == "" {
+		return s
+	}
+	const de = "的"
+	n := len(s)
+	// leadsToArtifact[i]: starting at byte i, the text is a (possibly empty) chain of
+	// containers and 的 particles that ends in an artifact noun.
+	leadsToArtifact := make([]bool, n+1)
+	// matchLen[i]: byte length of the container matched at i (0 = none). dropAt[i]:
+	// that container modifies an artifact noun and must be removed.
+	matchLen := make([]int, n+1)
+	dropAt := make([]bool, n+1)
+	for i := n - 1; i >= 0; i-- {
+		if hasPrefixAny(s[i:], refineArtifactNouns) {
+			leadsToArtifact[i] = true
+		}
+		if strings.HasPrefix(s[i:], de) && leadsToArtifact[i+len(de)] {
+			leadsToArtifact[i] = true
+		}
+		for _, c := range refineOriginContainersByLen {
+			if !strings.HasPrefix(s[i:], c) {
+				continue
+			}
+			if matchLen[i] == 0 {
+				// Longest container at this position, kept so the emit loop can skip
+				// past it whole: an offset INSIDE a container the rule decided to keep
+				// must never be reconsidered as its own match.
+				matchLen[i] = len(c)
+			}
+			if leadsToArtifact[i+len(c)] {
+				leadsToArtifact[i] = true
+				matchLen[i] = len(c)
+				dropAt[i] = true
+				break
+			}
+		}
+	}
+	var b strings.Builder
+	b.Grow(n)
+	for i := 0; i < n; {
+		if l := matchLen[i]; l > 0 {
+			if !dropAt[i] {
+				b.WriteString(s[i : i+l])
+			}
+			i += l
+			continue
+		}
+		_, size := utf8.DecodeRuneInString(s[i:])
+		b.WriteString(s[i : i+size])
+		i += size
+	}
+	return b.String()
+}
+
+func hasPrefixAny(s string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // rewriteResidueEmpty reports whether, after deleting every matched rewrite
@@ -252,7 +460,24 @@ func ClassifyRefine(instruction string) RefineRoute {
 // Credit: proposed and hand-verified against the protection set by yujiawei in the
 // round-9 review.
 func rewriteResidueEmpty(s string) bool {
-	residue := s
+	// Container removal MUST run on the ORIGINAL text, before any keyword removal.
+	//
+	// The positional rule reads adjacency ("a container followed, optionally through
+	// 的, by an artifact noun is a modifier"), and adjacency is a property of what
+	// the user actually typed. Running it on a keyword-stripped string let the
+	// removal of whatever sat BETWEEN the container and the artifact noun
+	// manufacture an adjacency that never existed:
+	//
+	//	把群消息改写成总结  -→ (改写成 removed) → 把群消息总结 → 群消息 now
+	//	                          "modifies" 总结 → erased → residue empty → STRIP
+	//
+	// — i.e. exactly the compile-from-material class the rule exists to protect, and
+	// self-inconsistent with 改写第十群消息 being pinned as must-keep: appending a
+	// destination artifact makes a request MORE clearly a compile, not less.
+	// Judged on the source text, 群消息 is followed by 改写成, so it is material, it
+	// survives, and the tools stay. Found by yujiawei in the #206 review (160
+	// strings in a 把<container><rewrite-verb><artifact> sweep).
+	residue := stripModifierContainers(s)
 	// Rewrite keywords longest-first, so a compound like 翻译成英文 is removed whole
 	// before its substring 翻译 could leave 成英文 behind.
 	for _, kw := range refineRewriteKeywordsByLen {
@@ -278,7 +503,11 @@ var refineRewriteKeywordsByLen = sortByRuneLenDesc(refineRewriteKeywords)
 
 // refineResidueFillersByLen is refineResidueFillers longest-first, so a compound
 // filler (摘要) is removed before a single-rune filler (要) can split it.
-var refineResidueFillersByLen = sortByRuneLenDesc(refineResidueFillers)
+//
+// The artifact nouns are appended from refineArtifactNouns rather than repeated
+// in the literal above (P2-2): the filler pass and the positional container rule
+// must agree on that vocabulary, and a hand-kept copy silently breaks the rule.
+var refineResidueFillersByLen = sortByRuneLenDesc(append(append([]string(nil), refineResidueFillers...), refineArtifactNouns...))
 
 func sortByRuneLenDesc(in []string) []string {
 	out := append([]string(nil), in...)

@@ -196,28 +196,14 @@ var defaultSummaryToolNames = []string{
 // the data-discovery/fetch tools (list/narrow/find/peek/fetch/search/filter) are
 // dropped, leaving only time + local summarize/merge, so a pure rewrite cannot
 // fetch new data. Citations are preserved via borrowCitationsFromReference.
+//
+// Whether a verdict is ACTED ON is decided at runtime by
+// agent.RefineHardStripEnabled (AGENT_SUMMARY_HARD_STRIP, default off); see
+// refineStripsFetchTools.
 var refineRewriteToolNames = []string{
 	"get_current_time", "extract_time_range",
 	"summarize_chunk", "merge_summaries",
 }
-
-// refineHardStripEnforced decides whether a HardNoFetch verdict is ACTED ON
-// (tools physically removed) or merely computed and logged.
-//
-// It is false in this PR by design. HardNoFetch is the only decision in the V2
-// contract that a runtime mistake cannot undo — buildRunnerForProfile removes
-// list/narrow/find/peek/fetch/search/filter outright, so a misclassified request
-// for new data becomes impossible to satisfy with no recovery path. The
-// classifier that produces the verdict is still converging (see the SS-08/08b
-// follow-up PR), and the asymmetry is brutal: a false negative costs a few unused
-// tool schemas in the prompt, a false positive costs an unsatisfiable request.
-//
-// So the route is classified, persisted (fetch_expected) and logged on every
-// refine turn — which is what SS-11 and the finish gate consume — while the
-// physical strip stays off until the classifier's false-positive rate is measured
-// against real traffic rather than argued from examples. Flipping this to true is
-// the single switch that enables SS-08b enforcement.
-const refineHardStripEnforced = false
 
 // buildSummaryRegistryWithUID builds the full summary registry with uid injected.
 func (h *AgentChatHandler) buildSummaryRegistryWithUID(uid, sessionID string) (*agent.Registry, error) {
@@ -445,6 +431,44 @@ func (h *AgentChatHandler) attachToolErrorHook(runner *agent.Runner, userID, run
 	}
 }
 
+// refineStripsFetchTools decides whether THIS turn hands the model the restricted
+// rewrite toolset. It is the single expression behind the SS-08b strip, extracted
+// so the behavioural change is testable and observable rather than being an
+// inline conjunction repeated on the two entry points (#206 P2-1).
+//
+// All three terms are load-bearing: enforcement must be enabled at RUNTIME
+// (agent.RefineHardStripEnabled — env-driven, default off, and requires mode==on
+// so `shadow` stays observe-only), the turn must be a refine (refineActive), and
+// the classifier must have reached a confident-rewrite verdict (HardNoFetch).
+//
+// What guards a MISCLASSIFICATION is not the enforcement flag but the classifier
+// itself, and it is worth being precise about which part: for a multi-clause
+// instruction, rewriteResidueEmpty and allClausesCarryARewriteKeyword each close
+// a family the other cannot. For a SINGLE unpunctuated clause — the most common
+// phrasing, and where both of the last two false-positive families lived — the
+// quantifier is satisfied by the very keyword that selected the rewrite branch,
+// so it contributes nothing; there the decision rests entirely on
+// rewriteResidueEmpty plus the positional container rule. That asymmetry is why
+// this flag defaults to off: the single-clause case is guarded by one test, not
+// two, and its false-positive rate is a measurement rather than an argument.
+func refineStripsFetchTools(refineActive bool, route agent.RefineRoute) bool {
+	return agent.RefineHardStripEnabled() && refineActive && route.HardNoFetch
+}
+
+// logRefineRoute records the route, and marks the turn distinctly when the fetch
+// tools were actually removed.
+//
+// The strip is the one decision here a runtime mistake cannot undo, and it is
+// otherwise invisible: fetch_expected is 0 on the rewrite path, so a wrongly
+// stripped turn cannot surface as PARTIAL/FAILED through the finish gate either
+// (#206 P2-4). This line is what makes the false-positive rate countable in
+// production — grep tools_stripped=true — which is the evidence #205 asked for
+// before enforcement was enabled.
+func logRefineRoute(sessionID string, route agent.RefineRoute, stripped bool) {
+	log.Printf("[agent] refine route session=%s intent=%s fetch=%t hardNoFetch=%t tools_stripped=%t",
+		sessionID, route.Intent, route.Fetch, route.HardNoFetch, stripped)
+}
+
 // refineFetchExpected reports whether the turn will actually gather data, which
 // is what the finish gate's FetchExpected must reflect. It is route.Fetch for a
 // refine turn and always true for a normal summary run. Keying this on
@@ -611,11 +635,18 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 	var runner *agent.Runner
 	var system string
 	var err error
+	// toolsStripped records what was ACTUALLY passed to buildRunnerForProfile, so
+	// the log line below reports the toolset the model really got. Recomputing the
+	// predicate there would claim tools_stripped=true on the injected-runner path,
+	// which keeps its tools — and this line is the sole evidence channel for the
+	// strip's false-positive rate, so it has to be structurally honest.
+	toolsStripped := false
 	if h.testRunner != nil {
 		runner = h.testRunner
 		system = h.testSystem
 	} else {
-		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID, refineHardStripEnforced && refineActive && refineRoute.HardNoFetch)
+		toolsStripped = refineStripsFetchTools(refineActive, refineRoute)
+		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID, toolsStripped)
 		if err != nil {
 			log.Printf("[agent] build runner for profile %q: %v", profileName, err)
 			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "failed to initialize agent", Detail: safeErrorDetail(err)})
@@ -669,7 +700,7 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 	// byte-identical. Route was classified once above.
 	if refineActive {
 		system = system + agent.BuildRefineGuidance(refineRoute)
-		log.Printf("[agent] refine route session=%s intent=%s fetch=%t hardNoFetch=%t", req.SessionID, refineRoute.Intent, refineRoute.Fetch, refineRoute.HardNoFetch)
+		logRefineRoute(req.SessionID, refineRoute, toolsStripped)
 	}
 
 	history = agent.TruncateHistory(history, h.window)
@@ -902,11 +933,14 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	var runner *agent.Runner
 	var system string
 	var err error
+	// See Chat: log what was actually handed to the runner, not a recomputation.
+	toolsStripped := false
 	if h.testRunner != nil {
 		runner = h.testRunner
 		system = h.testSystem
 	} else {
-		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID, refineHardStripEnforced && refineActive && refineRoute.HardNoFetch)
+		toolsStripped = refineStripsFetchTools(refineActive, refineRoute)
+		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID, toolsStripped)
 		if err != nil {
 			log.Printf("[agent] build runner for profile %q: %v", profileName, err)
 			sink := &sseSink{w: c.Writer}
@@ -963,7 +997,7 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	// v2-gated → flag-off byte-identical. Route was classified once above.
 	if refineActive {
 		system = system + agent.BuildRefineGuidance(refineRoute)
-		log.Printf("[agent] refine route session=%s intent=%s fetch=%t hardNoFetch=%t", req.SessionID, refineRoute.Intent, refineRoute.Fetch, refineRoute.HardNoFetch)
+		logRefineRoute(req.SessionID, refineRoute, toolsStripped)
 	}
 
 	history = agent.TruncateHistory(history, h.window)
