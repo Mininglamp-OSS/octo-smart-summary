@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"regexp"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -25,12 +24,17 @@ const (
 // Using a placeholder (not "") prevents split-token reassembly attacks
 // where deleting a fence tag splices neighbours together to form a new
 // copy of the same token (P1-2 fix).
+//
+// Kept as a named constant because the existing test suite asserts against it;
+// refFenceGuard derives the identical value from the tag name.
 const fencePlaceholder = "[引用数据]"
 
-var (
-	refInvisiblePattern = regexp.MustCompile(`[\p{Cf}\x{00ad}]`)
-	refFenceTagPattern  = regexp.MustCompile(`<[\s\p{Zs}]*/?[\s\p{Zs}]*引用数据[\s\p{Zs}]*>`)
-)
+// refFenceGuard shares its implementation with the <文档数据> guard (fence_guard.go).
+// Before centralization these two had diverged — this one accepted neither an
+// attribute tail nor repeated solidus, so fixes landed on one and missed the other.
+// Both now inherit the same homoglyph folding, ignorable-in-tag-name handling, and
+// head-neutralization pass.
+var refFenceGuard = newFenceGuard("引用数据")
 
 // sanitizeRef neutralizes untrusted referenced-summary text before it is
 // embedded in the agent's system prompt (SUM-158 blocker 3 — prompt
@@ -54,27 +58,12 @@ func sanitizeRef(s string) string {
 }
 
 func normalizeRefFenceSyntax(s string, preserveNewline bool) string {
-	replacements := []string{
-		"＜", "<",
-		"＞", ">",
-		"／", "/",
-		"\r", " ",
-		"\t", " ",
-		"\x00", " ",
-		"\v", " ",
-		"\f", " ",
-		"\u0085", " ",
-		"\u2028", " ",
-		"\u2029", " ",
-	}
+	// Newline handling is the only thing that differs between the line and block
+	// render sites, so it stays here; all fence structure is the shared guard's job.
 	if !preserveNewline {
-		replacements = append(replacements, "\n", " ")
+		s = strings.ReplaceAll(s, "\n", " ")
 	}
-	s = strings.NewReplacer(replacements...).Replace(s)
-	// Format/invisible characters can visually splice or split the tag name
-	// (for example 引用\u200b数据). Remove them before structural matching.
-	s = refInvisiblePattern.ReplaceAllString(s, "")
-	return refFenceTagPattern.ReplaceAllString(s, fencePlaceholder)
+	return refFenceGuard.neutralize(s)
 }
 
 // sanitizeRefLine sanitizes text rendered at single-value sites (bullets,
