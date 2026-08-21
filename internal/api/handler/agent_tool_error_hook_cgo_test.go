@@ -197,3 +197,97 @@ func TestToolErrorHookIsConcurrencySafe(t *testing.T) {
 		t.Fatalf("status = %q after every tool recovered", got)
 	}
 }
+
+// TestReplayClearsStaleFailedStatus pins the round-10 P1 (mochashanyao P1 /
+// yujiawei P1-2): a stale status=failed must not latch across a same-request_id
+// replay.
+//
+// The fatal marker lives in the per-runner hook closure, so attempt B's
+// OnToolSuccess can only clear a marker attempt B itself set. Before the fix, an
+// SSE downgrade that reused request_id resolved to the SAME run row — still
+// carrying attempt A's failure — built a fresh runner with an empty fatal set,
+// ran cleanly, and finalizeRun still disclosed FAILED for a good deliverable.
+// The run row is the only state shared across attempts, so the reset belongs
+// there, at the moment the replay is recognised.
+func TestReplayClearsStaleFailedStatus(t *testing.T) {
+	db := newHookTestDB(t)
+	if db == nil {
+		return
+	}
+	store := summaryrun.NewStore(db)
+	ctx := context.Background()
+
+	// Attempt A: fatal tool error latches status=failed on the run row.
+	run := hookTestRun(t, db, "req-replay")
+	h := &AgentChatHandler{runStore: store}
+	runnerA := agent.NewRunner(nil, nil, nil, agent.Policy{})
+	h.attachToolErrorHook(runnerA, "u1", run.RunID)
+	runnerA.OnToolError("fetch_channel", "channel_id=ch-1", agent.ToolErrorEnvelope{Fatal: true})
+	if got := runStatus(t, db, run.RunID); got != model.RunStatusFailed {
+		t.Fatalf("attempt A status = %q, want failed", got)
+	}
+
+	// Attempt B: the client retries with the SAME request_id. CreateOrGetRun
+	// resolves the existing row (created=false) — this is the replay branch that
+	// maybePersistSummaryRun takes.
+	replay, created, err := store.CreateOrGetRun(ctx, "u1", "sess1", "req-replay", model.ScopePolicyClosed)
+	if err != nil {
+		t.Fatalf("replay CreateOrGetRun: %v", err)
+	}
+	if created {
+		t.Fatal("same request_id must resolve to the existing run, not a new one")
+	}
+	if replay.RunID != run.RunID {
+		t.Fatalf("replay run_id = %q, want %q", replay.RunID, run.RunID)
+	}
+
+	if err := store.ClearFailedStatusForReplay(ctx, "u1", replay.RunID); err != nil {
+		t.Fatalf("ClearFailedStatusForReplay: %v", err)
+	}
+	if got := runStatus(t, db, run.RunID); got == model.RunStatusFailed {
+		t.Fatal("a replay must start from a clean slate; attempt A's failure must not latch")
+	}
+
+	// And the new attempt's own fatal errors still mark the run, as usual.
+	runnerB := agent.NewRunner(nil, nil, nil, agent.Policy{})
+	h.attachToolErrorHook(runnerB, "u1", run.RunID)
+	runnerB.OnToolError("fetch_channel", "channel_id=ch-9", agent.ToolErrorEnvelope{Fatal: true})
+	if got := runStatus(t, db, run.RunID); got != model.RunStatusFailed {
+		t.Fatalf("status = %q — attempt B's OWN fatal error must still mark the run failed", got)
+	}
+}
+
+// TestClearFailedStatusForReplayIsScoped pins the two limits of the reset: it
+// only ever moves failed → running, and it is owner-scoped.
+func TestClearFailedStatusForReplayIsScoped(t *testing.T) {
+	db := newHookTestDB(t)
+	if db == nil {
+		return
+	}
+	store := summaryrun.NewStore(db)
+	ctx := context.Background()
+
+	// A finished run is not a failed run; the reset must leave it alone.
+	finished := hookTestRun(t, db, "req-finished")
+	if err := store.SetStatus(ctx, "u1", finished.RunID, model.RunStatusFinished); err != nil {
+		t.Fatalf("SetStatus: %v", err)
+	}
+	if err := store.ClearFailedStatusForReplay(ctx, "u1", finished.RunID); err != nil {
+		t.Fatalf("ClearFailedStatusForReplay: %v", err)
+	}
+	if got := runStatus(t, db, finished.RunID); got != model.RunStatusFinished {
+		t.Fatalf("finished run status = %q, want untouched %q", got, model.RunStatusFinished)
+	}
+
+	// Another user's run_id must not be resettable.
+	owned := hookTestRun(t, db, "req-owned")
+	if err := store.SetStatus(ctx, "u1", owned.RunID, model.RunStatusFailed); err != nil {
+		t.Fatalf("SetStatus: %v", err)
+	}
+	if err := store.ClearFailedStatusForReplay(ctx, "someone-else", owned.RunID); err != nil {
+		t.Fatalf("ClearFailedStatusForReplay (foreign uid): %v", err)
+	}
+	if got := runStatus(t, db, owned.RunID); got != model.RunStatusFailed {
+		t.Fatalf("status = %q — a foreign uid must not reset another user's run", got)
+	}
+}

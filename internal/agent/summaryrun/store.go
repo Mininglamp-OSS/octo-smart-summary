@@ -261,6 +261,28 @@ func (s *Store) SetStatus(ctx context.Context, userID, runID, status string) err
 		Updates(map[string]interface{}{"status": status, "updated_at": now()}).Error
 }
 
+// ClearFailedStatusForReplay resets a run whose status was latched to failed by a
+// PREVIOUS attempt under the same idempotency tuple, so a fresh attempt starts
+// from a clean slate.
+//
+// Why this exists: the SS-07b fatal-tool marker lives in the per-runner hook
+// closure, so OnToolSuccess can only clear a marker set by the SAME runner. An
+// SSE downgrade (or any client retry) that reuses request_id resolves to the
+// existing run row via CreateOrGetRun, builds a NEW runner with an empty fatal
+// set, and therefore can never clear the failed status written by the previous
+// attempt — a clean regenerated summary was then disclosed as FAILED by the
+// finish gate. The run row is the only state shared across attempts, so the
+// reset has to happen here, at the moment a replay is recognised.
+//
+// Scoped deliberately: only failed → running, only for the owner's run. A run
+// already finished is left alone, and a genuine fatal error in the NEW attempt
+// re-marks it through the hook as usual.
+func (s *Store) ClearFailedStatusForReplay(ctx context.Context, userID, runID string) error {
+	return s.db.WithContext(ctx).Model(&model.AgentSummaryRun{}).
+		Where("run_id = ? AND user_id = ? AND status = ?", runID, userID, model.RunStatusFailed).
+		Updates(map[string]interface{}{"status": model.RunStatusRunning, "updated_at": now()}).Error
+}
+
 // SetFinishStatus records the finish-gate verdict (COMPLETE/PARTIAL/FAILED) on a
 // run. This is a terminal write (no optimistic CAS): the verdict is computed once
 // at finalize and does not race concurrent status transitions.

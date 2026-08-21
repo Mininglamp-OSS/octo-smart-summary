@@ -201,6 +201,24 @@ var refineRewriteToolNames = []string{
 	"summarize_chunk", "merge_summaries",
 }
 
+// refineHardStripEnforced decides whether a HardNoFetch verdict is ACTED ON
+// (tools physically removed) or merely computed and logged.
+//
+// It is false in this PR by design. HardNoFetch is the only decision in the V2
+// contract that a runtime mistake cannot undo — buildRunnerForProfile removes
+// list/narrow/find/peek/fetch/search/filter outright, so a misclassified request
+// for new data becomes impossible to satisfy with no recovery path. The
+// classifier that produces the verdict is still converging (see the SS-08/08b
+// follow-up PR), and the asymmetry is brutal: a false negative costs a few unused
+// tool schemas in the prompt, a false positive costs an unsatisfiable request.
+//
+// So the route is classified, persisted (fetch_expected) and logged on every
+// refine turn — which is what SS-11 and the finish gate consume — while the
+// physical strip stays off until the classifier's false-positive rate is measured
+// against real traffic rather than argued from examples. Flipping this to true is
+// the single switch that enables SS-08b enforcement.
+const refineHardStripEnforced = false
+
 // buildSummaryRegistryWithUID builds the full summary registry with uid injected.
 func (h *AgentChatHandler) buildSummaryRegistryWithUID(uid, sessionID string) (*agent.Registry, error) {
 	return h.buildRegistryWithUID(uid, sessionID, defaultSummaryToolNames)
@@ -469,6 +487,16 @@ func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid strin
 	if !created {
 		// Idempotent replay: the run already exists (e.g. SSE downgrade reusing
 		// the same request_id). Reuse its run_id; do not re-persist the spec.
+		//
+		// But DO clear a status=failed latched by the previous attempt. The
+		// SS-07b fatal marker lives in the per-runner hook closure, so the new
+		// attempt's OnToolSuccess cannot clear a marker it never set; without this
+		// reset a clean regenerated summary inherits the earlier attempt's failure
+		// and finalizeRun discloses FAILED for a good deliverable. Best-effort:
+		// a reset failure only costs the stale verdict, never the reply.
+		if err := h.runStore.ClearFailedStatusForReplay(ctx, uid, run.RunID); err != nil {
+			log.Printf("[agent] v2 clear failed status on replay (run=%s): %v", run.RunID, err)
+		}
 		return run.RunID
 	}
 
@@ -587,7 +615,7 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		runner = h.testRunner
 		system = h.testSystem
 	} else {
-		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID, refineActive && refineRoute.HardNoFetch)
+		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID, refineHardStripEnforced && refineActive && refineRoute.HardNoFetch)
 		if err != nil {
 			log.Printf("[agent] build runner for profile %q: %v", profileName, err)
 			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "failed to initialize agent", Detail: safeErrorDetail(err)})
@@ -878,7 +906,7 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		runner = h.testRunner
 		system = h.testSystem
 	} else {
-		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID, refineActive && refineRoute.HardNoFetch)
+		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID, refineHardStripEnforced && refineActive && refineRoute.HardNoFetch)
 		if err != nil {
 			log.Printf("[agent] build runner for profile %q: %v", profileName, err)
 			sink := &sseSink{w: c.Writer}
