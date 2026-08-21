@@ -320,40 +320,26 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		effectiveUID = userID
 	}
 
-	// Validate
-	if utf8.RuneCountInString(req.Title) > maxSummaryTopicRunes {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 2300 字符"})
-		return
-	}
-	if utf8.RuneCountInString(req.Topic) > maxSummaryTopicRunes {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "topic 不能超过 2300 字符"})
-		return
-	}
-	if req.OriginChannelID != "" && (req.OriginChannelType < model.OriginChannelGroup || req.OriginChannelType > model.OriginChannelDM) {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "origin_channel_type must be 1, 2, or 3 when origin_channel_id is set"})
-		return
-	}
-	if req.OriginChannelID == "" && req.OriginChannelType != 0 {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "origin_channel_id is required when origin_channel_type is set"})
-		return
-	}
+	// Auto-fill sources from origin_channel BEFORE validation so the
+	// scope-signal check sees the expanded source list. Note this runs even
+	// when origin_channel_type is out of range — the shared validator below
+	// still rejects the malformed origin_channel_type before any DB write.
 	if len(req.Sources) == 0 && req.OriginChannelID != "" && req.OriginChannelType >= model.OriginChannelGroup && req.OriginChannelType <= model.OriginChannelDM {
 		req.Sources = []sourceReq{{
 			SourceType: req.OriginChannelType,
 			SourceID:   req.OriginChannelID,
 		}}
 	}
-	if len(req.Sources) == 0 && req.Topic == "" && req.TimeRange == nil {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "至少提供 sources、topic 或 time_range 之一"})
-		return
-	}
 
-	summaryMode := model.ModeByPerson
-
-	// Resolve time range
+	// Resolve time range up-front so the shared validator sees the caller's
+	// intended range. Only pass a real range into the validator when the
+	// caller sent one — leaving TimeStart/TimeEnd zero on scopeInput keeps
+	// the pre-refactor behaviour where the server-computed default range
+	// never triggered the span check.
 	maxDays := pipeline.DefaultTimeRangeDays
 	var timeStart, timeEnd time.Time
-	if req.TimeRange != nil {
+	explicitTimeRange := req.TimeRange != nil
+	if explicitTimeRange {
 		timeStart = req.TimeRange.Start
 		timeEnd = req.TimeRange.End
 	} else {
@@ -361,10 +347,40 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		timeStart = timeEnd.Add(-time.Duration(maxDays) * 24 * time.Hour)
 	}
 
-	if timeEnd.Sub(timeStart) > time.Duration(maxDays)*24*time.Hour {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40002, Message: fmt.Sprintf("时间范围不能超过%d天", maxDays)})
+	// SUM-BE1 (revised per SUM-9): call the shared validator with the ACTUAL
+	// model.SnapshotScope the pipeline downstream will use. ChannelIDs come
+	// from req.Sources (post-origin-channel autofill above); TimeRange
+	// carries the caller-supplied range (only when explicit, so the default
+	// server-computed range still passes untouched). No parallel DTO — the
+	// shared model.SnapshotScope is the validation input.
+	scope := model.SnapshotScope{
+		ChannelIDs: channelIDsFromSources(req.Sources),
+	}
+	if explicitTimeRange {
+		scope.TimeRange = model.TimeRangeJSON{
+			Start: timeStart.Format(time.RFC3339),
+			End:   timeEnd.Format(time.RFC3339),
+		}
+	}
+	var validatorStart, validatorEnd time.Time
+	if explicitTimeRange {
+		validatorStart, validatorEnd = timeStart, timeEnd
+	}
+	if bizE := service.ValidatePersonalWorkflow(
+		userID,
+		req.Title, req.Topic,
+		scope,
+		len(req.Sources),
+		req.OriginChannelID, req.OriginChannelType,
+		explicitTimeRange,
+		validatorStart, validatorEnd,
+		maxDays,
+	); bizE != nil {
+		bizErr(c, bizE)
 		return
 	}
+
+	summaryMode := model.ModeByPerson
 
 	// Resolve sources: use user-specified sources directly.
 	// When no sources are specified, the pipeline Layer 3 (NarrowByTopic)
@@ -373,13 +389,6 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 	if len(req.Sources) > 0 {
 		sourceList = req.Sources
 	}
-	// Preserve the public API contract: the cap applies to submitted entries,
-	// before duplicate rows are collapsed for persistence.
-	if len(sourceList) > maxSourceCount {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40003, Message: fmt.Sprintf("信息来源不能超过%d个", maxSourceCount)})
-		return
-	}
-
 	// R10: dedup by (source_type, source_id) before insert.
 	// uk_summary_source_task_type_id (migration 20260814-01) would turn a
 	// duplicate client input into a 500; the create endpoint previously
