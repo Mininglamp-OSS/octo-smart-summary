@@ -53,3 +53,58 @@ func TestRefineRewriteRegistryExcludesFetch(t *testing.T) {
 		}
 	}
 }
+
+// TestRefineStripsFetchToolsGatesOnAllThreeTerms pins the #206 P2-1: the strip
+// decision is the behavioural change of this PR and had no test of its own.
+//
+// Nothing asserted that a HardNoFetch=true route actually reaches
+// buildRunnerForProfile with refineNoFetch=true, so an edit to the conjunction —
+// or a revert of refineHardStripEnforced — would have failed no test at all.
+func TestRefineStripsFetchToolsGatesOnAllThreeTerms(t *testing.T) {
+	confident := agent.RefineRoute{Intent: agent.RefineRewrite, HardNoFetch: true}
+	soft := agent.RefineRoute{Intent: agent.RefineRewrite, HardNoFetch: false}
+	augment := agent.RefineRoute{Intent: agent.RefineAugment, Fetch: true}
+
+	if got := refineStripsFetchTools(true, confident); got != refineHardStripEnforced {
+		t.Errorf("refine + confident rewrite: strip = %v, want %v (the enforcement constant)", got, refineHardStripEnforced)
+	}
+	// Every other combination must keep the tools regardless of the constant.
+	for _, tc := range []struct {
+		name         string
+		refineActive bool
+		route        agent.RefineRoute
+	}{
+		{"not a refine turn", false, confident},
+		{"soft rewrite keeps its tools so a mis-read can recover", true, soft},
+		{"an augment route fetches by definition", true, augment},
+	} {
+		if refineStripsFetchTools(tc.refineActive, tc.route) {
+			t.Errorf("%s: must NOT strip the fetch tools", tc.name)
+		}
+	}
+}
+
+// TestRefineStripReachesTheRunner closes the loop the previous test cannot: that
+// the decision actually changes the toolset the model receives.
+func TestRefineStripReachesTheRunner(t *testing.T) {
+	h := &AgentChatHandler{}
+	confident := agent.RefineRoute{Intent: agent.RefineRewrite, HardNoFetch: true}
+
+	stripped, _, err := h.buildRunnerForProfile("summary_refine", "u1", "s1", refineStripsFetchTools(true, confident))
+	if err != nil {
+		t.Fatalf("build stripped runner: %v", err)
+	}
+	kept, _, err := h.buildRunnerForProfile("summary_refine", "u1", "s1", false)
+	if err != nil {
+		t.Fatalf("build full runner: %v", err)
+	}
+
+	strippedHasFetch := schemaNameSet(stripped.ToolSchemas())["fetch_channel"]
+	if strippedHasFetch != !refineHardStripEnforced {
+		t.Errorf("confident-rewrite runner has fetch_channel = %v; with refineHardStripEnforced=%v it must be %v",
+			strippedHasFetch, refineHardStripEnforced, !refineHardStripEnforced)
+	}
+	if !schemaNameSet(kept.ToolSchemas())["fetch_channel"] {
+		t.Error("a non-stripped summary_refine runner must always keep fetch_channel")
+	}
+}

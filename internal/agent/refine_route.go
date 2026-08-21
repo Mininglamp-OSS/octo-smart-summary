@@ -4,6 +4,7 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // SS-08: deterministic 3-way refine routing (缺点十二 note + 原方案 §7 "Refine
@@ -161,8 +162,11 @@ var (
 		"外加", "外带", "此外", "加之", "捎带", "兼", "随后", "跟着", "以后", "之后", "要",
 		// "re-" modifiers
 		"重新", "重",
-		// artifact nouns (naming the thing being edited is not new data)
-		"摘要", "总结", "报告", "纪要", "正文", "全文", "文档", "文章", "这篇", "本文",
+		// artifact nouns — naming the thing being edited is not new data. The nouns
+		// themselves come from refineArtifactNouns (single source of truth, appended
+		// in the init below) so the filler pass and the positional container rule
+		// cannot drift apart; only the demonstratives are listed here.
+		"这篇", "本文",
 		// parts of an existing document (subtractive edits name these, never new data)
 		"段落", "段", "句子", "句", "行", "字词", "字", "词", "小标题", "标题", "开头", "结尾",
 		"末尾", "部分", "结论", "章节", "列表", "序号", "编号", "第", "篇幅",
@@ -295,9 +299,19 @@ var refineOriginContainers = []string{
 	"群消息", "对话记录", "聊天记录", "群聊", "频道", "子区", "会话", "对话", "消息", "群",
 }
 
-// refineArtifactNouns are the names of the thing being edited. A container that
-// MODIFIES one of these is structural (群总结 = "the summary of the group", not a
-// request to go read the group).
+// refineArtifactNouns are the names of the thing being edited, and the SINGLE
+// SOURCE OF TRUTH for that vocabulary: refineResidueFillers embeds this slice by
+// reference rather than repeating it.
+//
+// A container that MODIFIES one of these is structural (群总结 = "the summary of
+// the group", not a request to go read the group).
+//
+// The duplication this replaces was a live regression source: the positional rule
+// (stripModifierContainers) and the filler pass must agree on what an artifact
+// noun is, so adding 简报 to the filler list but not here would silently stop 群简报
+// from being recognised as a modifier construction, with no test failing. Rounds
+// 4-10 of #203 were almost entirely vocabulary churn, so the two lists are wired
+// together instead of being kept in sync by hand.
 var refineArtifactNouns = []string{
 	"摘要", "总结", "报告", "纪要", "正文", "全文", "文档", "文章",
 }
@@ -323,30 +337,65 @@ var refineOriginContainersByLen = sortByRuneLenDesc(refineOriginContainers)
 // The loop repeats to completion because removing one modifier can create a new
 // adjacency (群频道总结), and the direction of error is safe: a container left in
 // place only makes the residue non-empty, i.e. keeps the tools.
+// Single left-to-right pass. The modifier relation is resolved by a right-to-left
+// precomputation of "does a chain of containers / 的 particles starting here end in
+// an artifact noun", which is what makes chains like 群频道总结 resolve transitively.
+// The previous restart-from-zero fixpoint loop bought the same transitivity at
+// O(removals × len × |containers|) — 37ms of synchronous CPU at the handler's
+// 8192-rune cap, on an authenticated request path (#206 P2-3).
 func stripModifierContainers(s string) string {
-	for changed := true; changed; {
-		changed = false
+	if s == "" {
+		return s
+	}
+	const de = "的"
+	n := len(s)
+	// leadsToArtifact[i]: starting at byte i, the text is a (possibly empty) chain of
+	// containers and 的 particles that ends in an artifact noun.
+	leadsToArtifact := make([]bool, n+1)
+	// matchLen[i]: byte length of the container matched at i (0 = none). dropAt[i]:
+	// that container modifies an artifact noun and must be removed.
+	matchLen := make([]int, n+1)
+	dropAt := make([]bool, n+1)
+	for i := n - 1; i >= 0; i-- {
+		if hasPrefixAny(s[i:], refineArtifactNouns) {
+			leadsToArtifact[i] = true
+		}
+		if strings.HasPrefix(s[i:], de) && leadsToArtifact[i+len(de)] {
+			leadsToArtifact[i] = true
+		}
 		for _, c := range refineOriginContainersByLen {
-			for start := 0; ; {
-				off := strings.Index(s[start:], c)
-				if off < 0 {
-					break
-				}
-				idx := start + off
-				rest := s[idx+len(c):]
-				if hasPrefixAny(strings.TrimPrefix(rest, "的"), refineArtifactNouns) {
-					s = s[:idx] + rest
-					changed = true
-					break
-				}
-				start = idx + len(c)
+			if !strings.HasPrefix(s[i:], c) {
+				continue
 			}
-			if changed {
+			if matchLen[i] == 0 {
+				// Longest container at this position, kept so the emit loop can skip
+				// past it whole: an offset INSIDE a container the rule decided to keep
+				// must never be reconsidered as its own match.
+				matchLen[i] = len(c)
+			}
+			if leadsToArtifact[i+len(c)] {
+				leadsToArtifact[i] = true
+				matchLen[i] = len(c)
+				dropAt[i] = true
 				break
 			}
 		}
 	}
-	return s
+	var b strings.Builder
+	b.Grow(n)
+	for i := 0; i < n; {
+		if l := matchLen[i]; l > 0 {
+			if !dropAt[i] {
+				b.WriteString(s[i : i+l])
+			}
+			i += l
+			continue
+		}
+		_, size := utf8.DecodeRuneInString(s[i:])
+		b.WriteString(s[i : i+size])
+		i += size
+	}
+	return b.String()
 }
 
 func hasPrefixAny(s string, prefixes []string) bool {
@@ -389,16 +438,29 @@ func hasPrefixAny(s string, prefixes []string) bool {
 // Credit: proposed and hand-verified against the protection set by yujiawei in the
 // round-9 review.
 func rewriteResidueEmpty(s string) bool {
-	residue := s
+	// Container removal MUST run on the ORIGINAL text, before any keyword removal.
+	//
+	// The positional rule reads adjacency ("a container followed, optionally through
+	// 的, by an artifact noun is a modifier"), and adjacency is a property of what
+	// the user actually typed. Running it on a keyword-stripped string let the
+	// removal of whatever sat BETWEEN the container and the artifact noun
+	// manufacture an adjacency that never existed:
+	//
+	//	把群消息改写成总结  -→ (改写成 removed) → 把群消息总结 → 群消息 now
+	//	                          "modifies" 总结 → erased → residue empty → STRIP
+	//
+	// — i.e. exactly the compile-from-material class the rule exists to protect, and
+	// self-inconsistent with 改写第十群消息 being pinned as must-keep: appending a
+	// destination artifact makes a request MORE clearly a compile, not less.
+	// Judged on the source text, 群消息 is followed by 改写成, so it is material, it
+	// survives, and the tools stay. Found by yujiawei in the #206 review (160
+	// strings in a 把<container><rewrite-verb><artifact> sweep).
+	residue := stripModifierContainers(s)
 	// Rewrite keywords longest-first, so a compound like 翻译成英文 is removed whole
 	// before its substring 翻译 could leave 成英文 behind.
 	for _, kw := range refineRewriteKeywordsByLen {
 		residue = strings.ReplaceAll(residue, kw, "")
 	}
-	// Containers that modify an artifact noun are structural; standalone ones are
-	// the material and must survive. Runs before the filler pass, which is where
-	// the artifact nouns themselves are erased.
-	residue = stripModifierContainers(residue)
 	for _, f := range refineResidueFillersByLen {
 		residue = strings.ReplaceAll(residue, f, "")
 	}
@@ -419,7 +481,11 @@ var refineRewriteKeywordsByLen = sortByRuneLenDesc(refineRewriteKeywords)
 
 // refineResidueFillersByLen is refineResidueFillers longest-first, so a compound
 // filler (摘要) is removed before a single-rune filler (要) can split it.
-var refineResidueFillersByLen = sortByRuneLenDesc(refineResidueFillers)
+//
+// The artifact nouns are appended from refineArtifactNouns rather than repeated
+// in the literal above (P2-2): the filler pass and the positional container rule
+// must agree on that vocabulary, and a hand-kept copy silently breaks the rule.
+var refineResidueFillersByLen = sortByRuneLenDesc(append(append([]string(nil), refineResidueFillers...), refineArtifactNouns...))
 
 func sortByRuneLenDesc(in []string) []string {
 	out := append([]string(nil), in...)

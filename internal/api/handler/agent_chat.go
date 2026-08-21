@@ -444,6 +444,32 @@ func (h *AgentChatHandler) attachToolErrorHook(runner *agent.Runner, userID, run
 	}
 }
 
+// refineStripsFetchTools decides whether THIS turn hands the model the restricted
+// rewrite toolset. It is the single expression behind the SS-08b strip, extracted
+// so the behavioural change is testable and observable rather than being an
+// inline conjunction repeated on the two entry points (#206 P2-1).
+//
+// All three terms are load-bearing: V2 must be on and the turn must be a refine
+// (refineActive), the classifier must have reached a confident-rewrite verdict
+// (HardNoFetch), and enforcement must be enabled (refineHardStripEnforced).
+func refineStripsFetchTools(refineActive bool, route agent.RefineRoute) bool {
+	return refineHardStripEnforced && refineActive && route.HardNoFetch
+}
+
+// logRefineRoute records the route, and marks the turn distinctly when the fetch
+// tools were actually removed.
+//
+// The strip is the one decision here a runtime mistake cannot undo, and it is
+// otherwise invisible: fetch_expected is 0 on the rewrite path, so a wrongly
+// stripped turn cannot surface as PARTIAL/FAILED through the finish gate either
+// (#206 P2-4). This line is what makes the false-positive rate countable in
+// production — grep tools_stripped=true — which is the evidence #205 asked for
+// before enforcement was enabled.
+func logRefineRoute(sessionID string, route agent.RefineRoute, stripped bool) {
+	log.Printf("[agent] refine route session=%s intent=%s fetch=%t hardNoFetch=%t tools_stripped=%t",
+		sessionID, route.Intent, route.Fetch, route.HardNoFetch, stripped)
+}
+
 // refineFetchExpected reports whether the turn will actually gather data, which
 // is what the finish gate's FetchExpected must reflect. It is route.Fetch for a
 // refine turn and always true for a normal summary run. Keying this on
@@ -614,7 +640,7 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		runner = h.testRunner
 		system = h.testSystem
 	} else {
-		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID, refineHardStripEnforced && refineActive && refineRoute.HardNoFetch)
+		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID, refineStripsFetchTools(refineActive, refineRoute))
 		if err != nil {
 			log.Printf("[agent] build runner for profile %q: %v", profileName, err)
 			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "failed to initialize agent", Detail: safeErrorDetail(err)})
@@ -668,7 +694,7 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 	// byte-identical. Route was classified once above.
 	if refineActive {
 		system = system + agent.BuildRefineGuidance(refineRoute)
-		log.Printf("[agent] refine route session=%s intent=%s fetch=%t hardNoFetch=%t", req.SessionID, refineRoute.Intent, refineRoute.Fetch, refineRoute.HardNoFetch)
+		logRefineRoute(req.SessionID, refineRoute, refineStripsFetchTools(refineActive, refineRoute))
 	}
 
 	history = agent.TruncateHistory(history, h.window)
@@ -905,7 +931,7 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		runner = h.testRunner
 		system = h.testSystem
 	} else {
-		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID, refineHardStripEnforced && refineActive && refineRoute.HardNoFetch)
+		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID, refineStripsFetchTools(refineActive, refineRoute))
 		if err != nil {
 			log.Printf("[agent] build runner for profile %q: %v", profileName, err)
 			sink := &sseSink{w: c.Writer}
@@ -962,7 +988,7 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	// v2-gated → flag-off byte-identical. Route was classified once above.
 	if refineActive {
 		system = system + agent.BuildRefineGuidance(refineRoute)
-		log.Printf("[agent] refine route session=%s intent=%s fetch=%t hardNoFetch=%t", req.SessionID, refineRoute.Intent, refineRoute.Fetch, refineRoute.HardNoFetch)
+		logRefineRoute(req.SessionID, refineRoute, refineStripsFetchTools(refineActive, refineRoute))
 	}
 
 	history = agent.TruncateHistory(history, h.window)
