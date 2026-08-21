@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
 	"time"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -34,6 +37,12 @@ type Store struct {
 
 // NewStore builds a Store over the summary/application DB.
 func NewStore(db *gorm.DB) *Store { return &Store{db: db} }
+
+const freezeTransactionRetries = 3
+
+var freezeTransactionRetryDelay = func(attempt int) time.Duration {
+	return time.Duration(attempt+1) * 10 * time.Millisecond
+}
 
 // FreezeFromPool idempotently freezes the message pool for a run into an
 // immutable artifact revision + a citation manifest, returning them and whether
@@ -73,161 +82,215 @@ func (s *Store) FreezeFromPool(ctx context.Context, runID, userID, sessionID str
 		created  bool
 	)
 
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// Idempotent short-circuit: same pool already frozen for this run.
-		var existing model.AgentEvidenceArtifact
-		found := tx.Where("run_id = ? AND content_hash = ?", runID, hash).First(&existing).Error
-		if found == nil {
-			m, err := loadManifestTx(tx, userID, existing.ArtifactID, false)
-			if err != nil {
-				return err
-			}
-			artifact, manifest, created = &existing, m, false
-			return nil
-		}
-		if !errors.Is(found, gorm.ErrRecordNotFound) {
-			return found
-		}
-
-		// New content → new revision (max existing + 1, computed in-tx).
-		// Owner-scoped like every other read in this store, and a LOCKING
-		// read: under MySQL REPEATABLE READ a plain consistent read would use
-		// the transaction snapshot, so two concurrent freezers could both see
-		// the same max and allocate the same revision; FOR UPDATE reads the
-		// latest committed row and serializes the allocation per run.
-		// uk_artifact_run_rev is the schema backstop if the lock is ever
-		// bypassed.
-		var maxRev struct{ Max *int }
-		if err := tx.Model(&model.AgentEvidenceArtifact{}).
-			Clauses(clause.Locking{Strength: "UPDATE"}).
-			Select("MAX(revision) as max").
-			Where("run_id = ? AND user_id = ?", runID, userID).
-			Scan(&maxRev).Error; err != nil {
-			return err
-		}
-		revision := 1
-		if maxRev.Max != nil {
-			revision = *maxRev.Max + 1
-		}
-
-		ts := now()
-
-		// Insert the artifact, retrying on a lost REVISION race. Two distinct
-		// losers are possible with OnConflict{DoNothing} (any unique key →
-		// RowsAffected 0):
-		//   (a) another tx froze the SAME content first → adopt its row;
-		//   (b) another tx froze DIFFERENT content and claimed our revision
-		//       (uk_artifact_run_rev rejected us) → re-read max and retry.
-		// Without the retry, case (b) would surface as a spurious freeze error.
-		const revisionRetries = 3
-		won := false
-		for attempt := 0; attempt <= revisionRetries; attempt++ {
-			art := &model.AgentEvidenceArtifact{
-				ArtifactID:      uuid.NewString(),
-				RunID:           runID,
-				UserID:          userID,
-				SessionID:       sessionID,
-				Revision:        revision,
-				ContentHash:     hash,
-				MessageCount:    len(entries),
-				ChannelCount:    channelCount,
-				ActualTimeRange: string(timeRangeJSON),
-				FailedChannels:  string(failedJSON),
-				Truncated:       meta.Truncated,
-				CreatedAt:       ts,
-			}
-			res := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(art)
-			if res.Error != nil {
-				return res.Error
-			}
-
-			// Do not infer insert-vs-conflict from RowsAffected. GORM maps
-			// DoNothing to ON DUPLICATE KEY UPDATE on MySQL, and a DSN with
-			// clientFoundRows=true reports the conflict as one affected row.
-			// Read the unique content key back instead: our UUID means we won;
-			// another UUID means an identical-content writer won; no row means
-			// the conflict was only on (run_id, revision) and we must retry.
-			var persisted model.AgentEvidenceArtifact
-			perr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-				Where("run_id = ? AND content_hash = ?", runID, hash).
-				First(&persisted).Error
-			if perr == nil && persisted.ArtifactID == art.ArtifactID {
-				man := &model.AgentCitationManifest{
-					ManifestID: uuid.NewString(),
-					ArtifactID: art.ArtifactID,
-					RunID:      runID,
-					UserID:     userID,
-					Revision:   revision,
-					Entries:    entriesJSON,
-					EntryCount: len(entries),
-					CreatedAt:  ts,
-				}
-				if err := tx.Create(man).Error; err != nil {
-					return err
-				}
-				artifact, manifest, created = art, man, true
-				won = true
-				break
-			}
-			if perr == nil {
-				m, err := loadManifestTx(tx, userID, persisted.ArtifactID, true)
+	for txAttempt := 0; txAttempt <= freezeTransactionRetries; txAttempt++ {
+		artifact, manifest, created = nil, nil, false
+		err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			// Idempotent short-circuit: same pool already frozen for this run.
+			var existing model.AgentEvidenceArtifact
+			found := tx.Where("run_id = ? AND content_hash = ?", runID, hash).First(&existing).Error
+			if found == nil {
+				m, err := loadManifestTx(tx, userID, existing.ArtifactID, false)
 				if err != nil {
 					return err
 				}
-				artifact, manifest, created = &persisted, m, false
+				artifact, manifest, created = &existing, m, false
 				return nil
 			}
-			if !errors.Is(perr, gorm.ErrRecordNotFound) {
-				return perr
+			if !errors.Is(found, gorm.ErrRecordNotFound) {
+				return found
 			}
 
-			// Lost a race. Locking read for the recovery: under REPEATABLE
-			// READ a plain First would reuse the transaction snapshot taken
-			// before the winner committed and return ErrRecordNotFound,
-			// making the freeze fail silently.
-			var winner model.AgentEvidenceArtifact
-			werr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-				Where("run_id = ? AND content_hash = ?", runID, hash).
-				First(&winner).Error
-			if werr == nil {
-				m, err := loadManifestTx(tx, userID, winner.ArtifactID, true)
-				if err != nil {
-					return err
-				}
-				artifact, manifest, created = &winner, m, false
-				return nil
-			}
-			if !errors.Is(werr, gorm.ErrRecordNotFound) {
-				return werr
-			}
-			// Case (b): revision race — someone else owns our revision with
-			// different content. Re-read the max (locking, so the retry sees
-			// the newly committed row) and try the next revision.
-			if attempt == revisionRetries {
-				break
-			}
-			var nextMax struct{ Max *int }
+			// New content → new revision (max existing + 1, computed in-tx).
+			// Owner-scoped like every other read in this store, and a LOCKING
+			// read: under MySQL REPEATABLE READ a plain consistent read would use
+			// the transaction snapshot, so two concurrent freezers could both see
+			// the same max and allocate the same revision; FOR UPDATE reads the
+			// latest committed row and serializes the allocation per run.
+			// uk_artifact_run_rev is the schema backstop if the lock is ever
+			// bypassed.
+			var maxRev struct{ Max *int }
 			if err := tx.Model(&model.AgentEvidenceArtifact{}).
 				Clauses(clause.Locking{Strength: "UPDATE"}).
 				Select("MAX(revision) as max").
 				Where("run_id = ? AND user_id = ?", runID, userID).
-				Scan(&nextMax).Error; err != nil {
+				Scan(&maxRev).Error; err != nil {
 				return err
 			}
-			revision = 1
-			if nextMax.Max != nil {
-				revision = *nextMax.Max + 1
+			revision := 1
+			if maxRev.Max != nil {
+				revision = *maxRev.Max + 1
 			}
+
+			ts := now()
+
+			// Insert the artifact, retrying on a lost REVISION race. Two distinct
+			// losers are possible with OnConflict{DoNothing} (any unique key →
+			// RowsAffected 0):
+			//   (a) another tx froze the SAME content first → adopt its row;
+			//   (b) another tx froze DIFFERENT content and claimed our revision
+			//       (uk_artifact_run_rev rejected us) → re-read max and retry.
+			// Without the retry, case (b) would surface as a spurious freeze error.
+			const revisionRetries = 3
+			won := false
+			for attempt := 0; attempt <= revisionRetries; attempt++ {
+				art := &model.AgentEvidenceArtifact{
+					ArtifactID:      uuid.NewString(),
+					RunID:           runID,
+					UserID:          userID,
+					SessionID:       sessionID,
+					Revision:        revision,
+					ContentHash:     hash,
+					MessageCount:    len(entries),
+					ChannelCount:    channelCount,
+					ActualTimeRange: string(timeRangeJSON),
+					FailedChannels:  string(failedJSON),
+					Truncated:       meta.Truncated,
+					CreatedAt:       ts,
+				}
+				res := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(art)
+				if res.Error != nil {
+					return res.Error
+				}
+
+				// Do not infer insert-vs-conflict from RowsAffected. GORM maps
+				// DoNothing to ON DUPLICATE KEY UPDATE on MySQL, and a DSN with
+				// clientFoundRows=true reports the conflict as one affected row.
+				// Read the unique content key back instead: our UUID means we won;
+				// another UUID means an identical-content writer won; no row means
+				// the conflict was only on (run_id, revision) and we must retry.
+				var persisted model.AgentEvidenceArtifact
+				perr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+					Where("run_id = ? AND content_hash = ?", runID, hash).
+					First(&persisted).Error
+				if perr == nil && persisted.ArtifactID == art.ArtifactID {
+					man := &model.AgentCitationManifest{
+						ManifestID: uuid.NewString(),
+						ArtifactID: art.ArtifactID,
+						RunID:      runID,
+						UserID:     userID,
+						Revision:   revision,
+						Entries:    entriesJSON,
+						EntryCount: len(entries),
+						CreatedAt:  ts,
+					}
+					if err := tx.Create(man).Error; err != nil {
+						return err
+					}
+					artifact, manifest, created = art, man, true
+					won = true
+					break
+				}
+				if perr == nil {
+					m, err := loadManifestTx(tx, userID, persisted.ArtifactID, true)
+					if err != nil {
+						return err
+					}
+					artifact, manifest, created = &persisted, m, false
+					return nil
+				}
+				if !errors.Is(perr, gorm.ErrRecordNotFound) {
+					return perr
+				}
+
+				// Lost a race. Locking read for the recovery: under REPEATABLE
+				// READ a plain First would reuse the transaction snapshot taken
+				// before the winner committed and return ErrRecordNotFound,
+				// making the freeze fail silently.
+				var winner model.AgentEvidenceArtifact
+				werr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+					Where("run_id = ? AND content_hash = ?", runID, hash).
+					First(&winner).Error
+				if werr == nil {
+					m, err := loadManifestTx(tx, userID, winner.ArtifactID, true)
+					if err != nil {
+						return err
+					}
+					artifact, manifest, created = &winner, m, false
+					return nil
+				}
+				if !errors.Is(werr, gorm.ErrRecordNotFound) {
+					return werr
+				}
+				// Case (b): revision race — someone else owns our revision with
+				// different content. Re-read the max (locking, so the retry sees
+				// the newly committed row) and try the next revision.
+				if attempt == revisionRetries {
+					break
+				}
+				var nextMax struct{ Max *int }
+				if err := tx.Model(&model.AgentEvidenceArtifact{}).
+					Clauses(clause.Locking{Strength: "UPDATE"}).
+					Select("MAX(revision) as max").
+					Where("run_id = ? AND user_id = ?", runID, userID).
+					Scan(&nextMax).Error; err != nil {
+					return err
+				}
+				revision = 1
+				if nextMax.Max != nil {
+					revision = *nextMax.Max + 1
+				}
+			}
+			if !won {
+				return fmt.Errorf("freeze: lost revision race for run %s after %d retries", runID, revisionRetries)
+			}
+			return nil
+		})
+		if err == nil {
+			return artifact, manifest, created, nil
 		}
-		if !won {
-			return fmt.Errorf("freeze: lost revision race for run %s after %d retries", runID, revisionRetries)
+		if txAttempt == freezeTransactionRetries || !isRetryableFreezeTransactionError(err) {
+			return nil, nil, false, err
 		}
-		return nil
-	})
-	if err != nil {
-		return nil, nil, false, err
+		delay := freezeTransactionRetryDelay(txAttempt)
+		log.Printf("[artifact] freeze transaction lock conflict run=%s attempt=%d/%d retry_in=%s: %v", runID, txAttempt+1, freezeTransactionRetries+1, delay, err)
+		if delay <= 0 {
+			continue
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return nil, nil, false, ctx.Err()
+		case <-timer.C:
+		}
 	}
-	return artifact, manifest, created, nil
+	return nil, nil, false, err
+}
+
+func isRetryableFreezeTransactionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var myErr *mysqldriver.MySQLError
+	if errors.As(err, &myErr) {
+		return myErr.Number == 1213 || myErr.Number == 1205
+	}
+	low := strings.ToLower(err.Error())
+	return containsMySQLErrorCode(low, "1213") ||
+		strings.Contains(low, "deadlock found") ||
+		containsMySQLErrorCode(low, "1205") ||
+		strings.Contains(low, "lock wait timeout")
+}
+
+func containsMySQLErrorCode(msg, code string) bool {
+	prefix := "error " + code
+	from := 0
+	for {
+		i := strings.Index(msg[from:], prefix)
+		if i < 0 {
+			return false
+		}
+		end := from + i + len(prefix)
+		if end >= len(msg) || msg[end] < '0' || msg[end] > '9' {
+			return true
+		}
+		from = from + i + 1
+	}
 }
 
 // GetLatestArtifact returns the highest-revision artifact for a run,
@@ -296,9 +359,31 @@ func (s *Store) GetFrozenManifestByRun(ctx context.Context, userID, runID string
 	return &man, entries, true, nil
 }
 
-// GetLatestBySession returns the manifest of the most RECENTLY FROZEN artifact
-// for a (user, session), plus its decoded entries. found=false (nil error)
-// when the session has no frozen artifact. Owner-scoped by user_id.
+// GetLatestArtifactByRun returns the highest-revision artifact for a
+// (user, run), owner-scoped. found=false (nil error) when none exists.
+//
+// Save-time citation and evidence checks MUST use this run-scoped read:
+// a chat session can hold multiple runs (one per submit / request_id), each
+// freezing its own artifact. Reading by session can return a different run's
+// artifact and make the save path reason over the wrong evidence.
+func (s *Store) GetLatestArtifactByRun(ctx context.Context, userID, runID string) (*model.AgentEvidenceArtifact, bool, error) {
+	var art model.AgentEvidenceArtifact
+	err := s.db.WithContext(ctx).
+		Where("user_id = ? AND run_id = ?", userID, runID).
+		Order("revision DESC").
+		First(&art).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return &art, true, nil
+}
+
+// GetLatestBySession returns the manifest of the highest-revision artifact for a
+// (user, session), plus its decoded entries. found=false (nil error) when the
+// session has no frozen artifact. Owner-scoped by user_id.
 //
 // This is retained as SS-08 scaffolding and for migration tests only; no
 // production path calls it. Save-time adoption is request/run scoped through

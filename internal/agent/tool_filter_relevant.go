@@ -62,7 +62,7 @@ func FilterRelevantTool() (Tool, Handler) {
 
 		messages := messageCache.Retrieve(req.MessagesHandle, uid)
 		if messages == nil {
-			return "", fmt.Errorf("invalid messages_handle or access denied: %s", req.MessagesHandle)
+			return "", fmt.Errorf("invalid or expired messages_handle: %s", req.MessagesHandle)
 		}
 
 		filtered := pipeline.FilterMessagesByRelevance(messages, req.Topic, req.ParticipantUIDs, req.ParticipantNames)

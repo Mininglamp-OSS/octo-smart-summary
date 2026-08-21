@@ -45,8 +45,13 @@ func MergeSummariesTool() (Tool, Handler) {
 		// Combine all summaries
 		combined := strings.Join(req.Summaries, "\n\n--- Chunk Boundary ---\n\n")
 
+		// SS-06: load the run's SummarySpec-derived guidance so the Reduce
+		// respects the user's language / detail level / sections / exclusions
+		// instead of forcing a generic short-item JSON. Empty when V2 off.
+		specGuidance := loadRunSpecGuidance(ctx)
+
 		// Use LLM to merge and structure
-		merged, err := mergeSummariesWithLLM(ctx, combined)
+		merged, err := mergeSummariesWithLLM(ctx, combined, specGuidance)
 		if err != nil {
 			return "", fmt.Errorf("merge summaries: %w", err)
 		}
@@ -66,7 +71,12 @@ func MergeSummariesTool() (Tool, Handler) {
 }
 
 // mergeSummariesWithLLM uses LLM to merge and structure multiple summaries.
-func mergeSummariesWithLLM(ctx context.Context, combined string) (string, error) {
+//
+// specGuidance (SS-06) is appended when non-empty so the Reduce honors the
+// user's language / detail level / required sections / exclusions; the priority
+// note inside the guidance lets detail_level=detailed override the default
+// "每条不超过 50 字" compression. Empty (V2 off) → the exact legacy prompt.
+func mergeSummariesWithLLM(ctx context.Context, combined string, specGuidance string) (string, error) {
 	_, _, _, cfg := GetSummaryDeps()
 	client := service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, 30)
 
@@ -86,7 +96,7 @@ func mergeSummariesWithLLM(ctx context.Context, combined string) (string, error)
 - 去重合并相似内容
 - 保持简洁，每条不超过 50 字
 - 如果没有某类内容，返回空数组
-- 不要编造不存在的信息`
+- 不要编造不存在的信息` + specGuidance
 
 	msgs := []service.ChatMessage{
 		{Role: "system", Content: systemPrompt},

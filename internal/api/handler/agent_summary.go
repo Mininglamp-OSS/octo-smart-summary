@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/finishgate"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
@@ -478,6 +479,12 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	}
 
 	var createdTaskID int64
+	// SS-11: capture the SS-07 finish verdict + gaps out of the tx closure so the
+	// success response can disclose PARTIAL / coverage gaps to the client after
+	// the deliverable save commits.
+	var finishVerdict finishgate.Verdict
+	var finishGaps []finishgate.Gap
+	var savedCitations []model.Citation
 	err = h.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&task).Error; err != nil {
 			return fmt.Errorf("create summary_task: %w", err)
@@ -581,6 +588,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			}
 		}
 		creatorPR.SetCitations(cits)
+		savedCitations = cits
 		// Build v1 snapshot for agent-generated summary
 		snapshot := h.buildSnapshotV1(tx, req.SessionID, userID, &task, req.Sources)
 		creatorPR.SetSnapshot(snapshot)
@@ -670,20 +678,42 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		return
 	}
 
+	// SS-07: record the finish verdict only after the deliverable transaction has
+	// committed. This keeps the run row honest when a later save step rolls back.
+	// The verdict is an internal, non-blocking quality signal; off / missing or
+	// unknown request_id → no-op.
+	if agent.SummaryV2Enabled() {
+		if v, gaps := h.finalizeRun(c.Request.Context(), userID, req.SessionID, req.RequestID, content, savedCitations); v != "" {
+			log.Printf("[handler] agent summary finish verdict=%s gaps=%d session=%s request=%s (recorded, non-blocking)", v, len(gaps), req.SessionID, req.RequestID)
+			finishVerdict, finishGaps = v, gaps
+		}
+	}
+
 	log.Printf("[handler] CreateAgentSummary ok space=%s user=%s task_id=%d session=%s content_len=%d origin_channel=%s/%d",
 		spaceID, userID, createdTaskID, req.SessionID, len(content), finalChannelID, finalChannelType)
 
 	// Response shape is intentionally isomorphic to POST /summaries so the
 	// front-end can consume both endpoints with the same success handler.
+	respData := gin.H{
+		"task_id":    createdTaskID,
+		"task_no":    task.TaskNo,
+		"status":     task.Status,
+		"created_at": task.CreatedAt,
+	}
+	// SS-11: disclose the SS-07 finish verdict + coverage gaps so the client can
+	// render a PARTIAL warning + gap list. Omitted (V2 off / no run) → response
+	// byte-identical to pre-SS-11.
+	if finishVerdict != "" {
+		respData["finish_status"] = string(finishVerdict)
+		if finishGaps == nil {
+			finishGaps = []finishgate.Gap{}
+		}
+		respData["gaps"] = finishGaps
+	}
 	c.JSON(http.StatusOK, apiResponse{
 		Code:    0,
 		Message: "ok",
-		Data: gin.H{
-			"task_id":    createdTaskID,
-			"task_no":    task.TaskNo,
-			"status":     task.Status,
-			"created_at": task.CreatedAt,
-		},
+		Data:    respData,
 	})
 }
 

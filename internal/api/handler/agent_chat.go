@@ -1,7 +1,5 @@
 package handler
 
-import "sync"
-
 import (
 	"context"
 	"encoding/json"
@@ -11,6 +9,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
@@ -151,8 +150,10 @@ func NewAgentChatHandler(db *gorm.DB, llmApiURL, llmApiKey, llmModel string, llm
 }
 
 // buildRunnerForProfile constructs a runner for the given profile name.
-// If uid is non-empty and profile is "summary", it will be injected into tool handlers.
-func (h *AgentChatHandler) buildRunnerForProfile(profileName, uid, sessionID string) (*agent.Runner, string, error) {
+// If uid is non-empty and profile is "summary"/"summary_refine", it is injected
+// into tool handlers. refineNoFetch (SS-08b) restricts a summary_refine runner
+// to a fetch-free toolset for a confident rewrite (纯格式零 fetch).
+func (h *AgentChatHandler) buildRunnerForProfile(profileName, uid, sessionID string, refineNoFetch bool) (*agent.Runner, string, error) {
 	profile, err := agent.GetProfile(profileName)
 	if err != nil {
 		return nil, "", fmt.Errorf("load profile %q: %w", profileName, err)
@@ -163,9 +164,14 @@ func (h *AgentChatHandler) buildRunnerForProfile(profileName, uid, sessionID str
 	}
 
 	var reg *agent.Registry
-	if (profileName == "summary" || profileName == "summary_refine") && uid != "" {
+	switch {
+	case profileName == "summary_refine" && uid != "" && refineNoFetch:
+		// SS-08b: confident rewrite → no data-fetching tools, so the flow
+		// physically cannot pull new messages.
+		reg, err = h.buildRegistryWithUID(uid, sessionID, refineRewriteToolNames)
+	case (profileName == "summary" || profileName == "summary_refine") && uid != "":
 		reg, err = h.buildSummaryRegistryWithUID(uid, sessionID)
-	} else {
+	default:
 		reg, err = agent.BuildRegistry(profile.Tools)
 	}
 	if err != nil {
@@ -178,34 +184,57 @@ func (h *AgentChatHandler) buildRunnerForProfile(profileName, uid, sessionID str
 	return runner, system, nil
 }
 
-// buildSummaryRegistryWithUID builds a summary registry with uid injected into tool handlers.
+// defaultSummaryToolNames is the full summary/summary_refine toolset.
+var defaultSummaryToolNames = []string{
+	"get_current_time", "extract_time_range",
+	"list_channels", "narrow_channels_by_topic", "find_shared_channels",
+	"peek_channel", "fetch_channel", "search_messages",
+	"filter_relevant", "summarize_chunk", "merge_summaries",
+}
+
+// refineRewriteToolNames (SS-08b) is the restricted set for a confident rewrite:
+// the data-discovery/fetch tools (list/narrow/find/peek/fetch/search/filter) are
+// dropped, leaving only time + local summarize/merge, so a pure rewrite cannot
+// fetch new data. Citations are preserved via borrowCitationsFromReference.
+var refineRewriteToolNames = []string{
+	"get_current_time", "extract_time_range",
+	"summarize_chunk", "merge_summaries",
+}
+
+// refineHardStripEnforced decides whether a HardNoFetch verdict is ACTED ON
+// (tools physically removed) or merely computed and logged.
+//
+// It is false in this PR by design. HardNoFetch is the only decision in the V2
+// contract that a runtime mistake cannot undo — buildRunnerForProfile removes
+// list/narrow/find/peek/fetch/search/filter outright, so a misclassified request
+// for new data becomes impossible to satisfy with no recovery path. The
+// classifier that produces the verdict is still converging (see the SS-08/08b
+// follow-up PR), and the asymmetry is brutal: a false negative costs a few unused
+// tool schemas in the prompt, a false positive costs an unsatisfiable request.
+//
+// So the route is classified, persisted (fetch_expected) and logged on every
+// refine turn — which is what SS-11 and the finish gate consume — while the
+// physical strip stays off until the classifier's false-positive rate is measured
+// against real traffic rather than argued from examples. Flipping this to true is
+// the single switch that enables SS-08b enforcement.
+const refineHardStripEnforced = false
+
+// buildSummaryRegistryWithUID builds the full summary registry with uid injected.
 func (h *AgentChatHandler) buildSummaryRegistryWithUID(uid, sessionID string) (*agent.Registry, error) {
+	return h.buildRegistryWithUID(uid, sessionID, defaultSummaryToolNames)
+}
+
+// buildRegistryWithUID registers the named tools with uid + sessionID injected
+// into each handler's context. Injecting into the time tools too is harmless
+// (they ignore it) and keeps one code path.
+func (h *AgentChatHandler) buildRegistryWithUID(uid, sessionID string, toolNames []string) (*agent.Registry, error) {
 	reg := agent.NewRegistry()
-
-	// Non-summary tools (no uid injection needed)
-	for _, name := range []string{"get_current_time", "extract_time_range"} {
-		factory, ok := agent.GetToolFactory(name)
-		if !ok {
-			return nil, fmt.Errorf("unknown tool %q", name)
-		}
-		schema, handler := factory()
-		reg.Register(schema, handler)
-	}
-
-	// Summary tools: wrap handlers to inject uid via context
-	summaryTools := []string{
-		"list_channels", "narrow_channels_by_topic", "find_shared_channels",
-		"peek_channel", "fetch_channel", "search_messages",
-		"filter_relevant", "summarize_chunk", "merge_summaries",
-	}
-	for _, name := range summaryTools {
+	for _, name := range toolNames {
 		factory, ok := agent.GetToolFactory(name)
 		if !ok {
 			return nil, fmt.Errorf("unknown tool %q", name)
 		}
 		schema, origHandler := factory()
-
-		// Wrap handler to inject uid and sessionID into context
 		wrappedHandler := func(ctx context.Context, args json.RawMessage) (string, error) {
 			ctx = context.WithValue(ctx, agent.ContextKeyUID, uid)
 			ctx = context.WithValue(ctx, agent.ContextKeySessionID, sessionID)
@@ -213,7 +242,6 @@ func (h *AgentChatHandler) buildSummaryRegistryWithUID(uid, sessionID string) (*
 		}
 		reg.Register(schema, wrappedHandler)
 	}
-
 	return reg, nil
 }
 
@@ -340,6 +368,94 @@ func truncateRunes(s string, max int) string {
 	return string(runes[:max])
 }
 
+// attachToolErrorHook installs the SS-07b runner hooks that track fatal tool
+// failures against the run, so the finish gate returns FAILED at save time
+// (defect #5). No-op when there is no run or no store.
+//
+// The marker is RECOVERABLE, per (tool, target). A fatal error records the tool
+// name and its target (channel/chunk); a later success by that same tool+target
+// removes it, and the run returns to whatever status it had. This is deliberately
+// not "one more transient string in the classifier": the classifier has been
+// wrong in both directions on the same error (mysql's "invalid connection" was
+// first swallowed as a bad argument, then promoted to fatal), and no list of
+// substrings distinguishes "this failure ended the run" from "this failure was
+// retried away". A subsequent success is that distinction, observed rather than
+// predicted.
+//
+// Concretely, the case this closes: a stale pooled connection kills a redundant
+// second fetch_channel, the model re-calls it and it works, the summary is
+// complete — and the user was shown finish_status=FAILED on a good deliverable.
+//
+// The hooks run concurrently from the tool worker pool, so state is mutex-guarded
+// and DB writes use a fresh context (the request context may already be canceled
+// by the very error being reported); SetStatus is a plain idempotent UPDATE.
+func (h *AgentChatHandler) attachToolErrorHook(runner *agent.Runner, userID, runID string) {
+	if runner == nil || userID == "" || runID == "" || h.runStore == nil {
+		return
+	}
+	store := h.runStore
+	var mu sync.Mutex
+	// Keyed on (tool, target): fetch_channel / summarize_chunk run once per
+	// channel / chunk through the worker pool, so a fatal marker keyed on the tool
+	// NAME alone let chunk B's success clear chunk A's fatal marker in the same
+	// step — verdict-by-scheduling. The target (channel_id / messages_handle) is
+	// supplied by the runner from the call arguments; single-target tools use "".
+	type fatalKey struct{ tool, target string }
+	fatalTools := map[fatalKey]bool{}
+
+	// syncStatus writes the status implied by the current fatal set. Called with mu
+	// held so concurrent tool completions cannot interleave into the wrong order.
+	syncStatus := func(status string) {
+		if err := store.SetStatus(context.Background(), userID, runID, status); err != nil {
+			log.Printf("[agent] v2 set run status=%s (run=%s): %v", status, runID, err)
+		}
+	}
+
+	runner.OnToolError = func(toolName, target string, env agent.ToolErrorEnvelope) {
+		if !env.Fatal {
+			return
+		}
+		key := fatalKey{toolName, target}
+		mu.Lock()
+		defer mu.Unlock()
+		if fatalTools[key] {
+			return
+		}
+		fatalTools[key] = true
+		syncStatus(model.RunStatusFailed)
+	}
+
+	runner.OnToolSuccess = func(toolName, target string) {
+		key := fatalKey{toolName, target}
+		mu.Lock()
+		defer mu.Unlock()
+		if !fatalTools[key] {
+			return
+		}
+		delete(fatalTools, key)
+		if len(fatalTools) > 0 {
+			// Another tool/target is still in a fatal state; the run stays failed.
+			return
+		}
+		// Every tool+target that failed fatally has since succeeded. Back to running
+		// — the terminal verdict is the finish gate's call at save time, not this
+		// hook's.
+		syncStatus(model.RunStatusRunning)
+		log.Printf("[agent] v2 run recovered after fatal tool error (run=%s tool=%s target=%s)", runID, toolName, target)
+	}
+}
+
+// refineFetchExpected reports whether the turn will actually gather data, which
+// is what the finish gate's FetchExpected must reflect. It is route.Fetch for a
+// refine turn and always true for a normal summary run. Keying this on
+// route.HardNoFetch instead (the previous behaviour) persisted fetch_expected=1
+// for a SOFT rewrite — Fetch=false, HardNoFetch=false — while the guidance told
+// the model not to fetch, so finalizeRun disclosed a false PARTIAL "coverage was
+// not measured" on every soft rewrite. See RefineRoute.HardNoFetch.
+func refineFetchExpected(refineActive bool, route agent.RefineRoute) bool {
+	return !refineActive || route.Fetch
+}
+
 // maybePersistSummaryRun records the SummaryRun / SummarySpec for this request
 // when AGENT_SUMMARY_V2_MODE != off (SS-03) and returns the resolved run_id (""
 // when there is no run to act on). The run_id is injected into the tool context
@@ -351,7 +467,7 @@ func truncateRunes(s string, max int) string {
 //
 // A request without request_id (legacy client) or without a runStore (test
 // constructor) is a no-op returning "" — we never 400 on the missing field.
-func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid string, req agentChatRequest) string {
+func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid string, req agentChatRequest, fetchExpected bool) string {
 	if h.runStore == nil || req.RequestID == "" {
 		return ""
 	}
@@ -363,7 +479,7 @@ func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid strin
 		scopePolicy = model.ScopePolicyClosed
 	}
 
-	run, created, err := h.runStore.CreateOrGetRun(ctx, uid, req.SessionID, req.RequestID, scopePolicy)
+	run, created, err := h.runStore.CreateOrGetRunWithFetchExpectation(ctx, uid, req.SessionID, req.RequestID, scopePolicy, fetchExpected)
 	if err != nil {
 		log.Printf("[agent] v2 create/get run failed (session=%s): %v", req.SessionID, err)
 		return ""
@@ -371,6 +487,16 @@ func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid strin
 	if !created {
 		// Idempotent replay: the run already exists (e.g. SSE downgrade reusing
 		// the same request_id). Reuse its run_id; do not re-persist the spec.
+		//
+		// But DO clear a status=failed latched by the previous attempt. The
+		// SS-07b fatal marker lives in the per-runner hook closure, so the new
+		// attempt's OnToolSuccess cannot clear a marker it never set; without this
+		// reset a clean regenerated summary inherits the earlier attempt's failure
+		// and finalizeRun discloses FAILED for a good deliverable. Best-effort:
+		// a reset failure only costs the stale verdict, never the reply.
+		if err := h.runStore.ClearFailedStatusForReplay(ctx, uid, run.RunID); err != nil {
+			log.Printf("[agent] v2 clear failed status on replay (run=%s): %v", run.RunID, err)
+		}
 		return run.RunID
 	}
 
@@ -443,6 +569,15 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		return
 	}
 
+	// SS-08/08b: classify the refine route once (v2 + summary_refine only) so the
+	// runner's toolset (08b: a confident rewrite drops the fetch tools) and the
+	// injected guidance (08) share one decision.
+	refineActive := agent.SummaryV2Enabled() && profileName == "summary_refine"
+	var refineRoute agent.RefineRoute
+	if refineActive {
+		refineRoute = agent.ClassifyRefine(req.Message)
+	}
+
 	// Inject session_id into context for tool handlers (evidence persistence, Stage 3 Blocker C).
 	ctx := context.WithValue(c.Request.Context(), agent.ContextKeySessionID, req.SessionID)
 
@@ -459,9 +594,16 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 	// (byte-identical to pre-SS-03). Best-effort; never blocks the reply. The
 	// returned run_id is injected into the tool context so the citation pass can
 	// freeze/read this run's manifest (SS-05).
+	var v2RunID string
 	if agent.SummaryV2Enabled() {
-		if runID := h.maybePersistSummaryRun(ctx, uid, req); runID != "" {
-			ctx = context.WithValue(ctx, agent.ContextKeyRunID, runID)
+		// fetch_expected must track whether THIS turn will actually gather data
+		// (refineFetchExpected → route.Fetch), not whether a confident rewrite
+		// hard-stripped the tools. Keying it on HardNoFetch persisted
+		// fetch_expected=1 for a soft rewrite while the guidance told the model NOT
+		// to fetch, so finalizeRun reported a false PARTIAL "coverage was not
+		// measured" on every soft rewrite.
+		if v2RunID = h.maybePersistSummaryRun(ctx, uid, req, refineFetchExpected(refineActive, refineRoute)); v2RunID != "" {
+			ctx = context.WithValue(ctx, agent.ContextKeyRunID, v2RunID)
 		}
 	}
 
@@ -473,7 +615,7 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		runner = h.testRunner
 		system = h.testSystem
 	} else {
-		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID)
+		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID, refineHardStripEnforced && refineActive && refineRoute.HardNoFetch)
 		if err != nil {
 			log.Printf("[agent] build runner for profile %q: %v", profileName, err)
 			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "failed to initialize agent", Detail: safeErrorDetail(err)})
@@ -481,6 +623,9 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		}
 	}
 	ctx, system = applySelectedChannelContext(ctx, system, req.SelectedChannels)
+
+	// SS-07b: fatal tool errors mark the run failed → finish gate FAILED at save.
+	h.attachToolErrorHook(runner, uid, v2RunID)
 
 	// 读多轮历史并滑窗截断。owner-scoped：只加载当前 uid 归属的记录，
 	// 跨用户猜到相同 session_id 也只会得到空历史（SUM-158 blocker 1）。
@@ -518,6 +663,15 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		}
 	}
 
+	// SS-08: inject the deterministic refine route as guidance so the model
+	// follows a decided path (rewrite/augment/extend) instead of re-guessing.
+	// v2-gated → flag-off keeps the pure-prompt summary_refine behavior
+	// byte-identical. Route was classified once above.
+	if refineActive {
+		system = system + agent.BuildRefineGuidance(refineRoute)
+		log.Printf("[agent] refine route session=%s intent=%s fetch=%t hardNoFetch=%t", req.SessionID, refineRoute.Intent, refineRoute.Fetch, refineRoute.HardNoFetch)
+	}
+
 	history = agent.TruncateHistory(history, h.window)
 
 	reply, newMsgs, err := runner.RunWithHistory(ctx, system, history, req.Message)
@@ -537,11 +691,17 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		log.Printf("[agent] append messages error: %v", err)
 	}
 
-	c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok", Data: gin.H{
+	respData := gin.H{
 		"reply":      reply,
 		"session_id": req.SessionID,
 		"profile":    profileName,
-	}})
+	}
+	// SS-11: surface run_id (SS-03) so the client can correlate/continue the run.
+	// Empty (V2 off / no run) → omitted, keeping the legacy response byte-identical.
+	if v2RunID != "" {
+		respData["run_id"] = v2RunID
+	}
+	c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok", Data: respData})
 }
 
 // historyBubble 是只读历史接口返回的单条可展示气泡：只含 role + content，
@@ -688,6 +848,13 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		return
 	}
 
+	// SS-08/08b: classify the refine route once (see Chat()).
+	refineActive := agent.SummaryV2Enabled() && profileName == "summary_refine"
+	var refineRoute agent.RefineRoute
+	if refineActive {
+		refineRoute = agent.ClassifyRefine(req.Message)
+	}
+
 	// Set SSE headers
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
@@ -718,9 +885,16 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 
 	// SS-03: persist run/spec when V2 mode is enabled (see Chat). Off → skipped.
 	// The returned run_id is injected into the tool context for the citation pass.
+	var v2RunID string
 	if agent.SummaryV2Enabled() {
-		if runID := h.maybePersistSummaryRun(ctx, uid, req); runID != "" {
-			ctx = context.WithValue(ctx, agent.ContextKeyRunID, runID)
+		// fetch_expected must track whether THIS turn will actually gather data
+		// (refineFetchExpected → route.Fetch), not whether a confident rewrite
+		// hard-stripped the tools. Keying it on HardNoFetch persisted
+		// fetch_expected=1 for a soft rewrite while the guidance told the model NOT
+		// to fetch, so finalizeRun reported a false PARTIAL "coverage was not
+		// measured" on every soft rewrite.
+		if v2RunID = h.maybePersistSummaryRun(ctx, uid, req, refineFetchExpected(refineActive, refineRoute)); v2RunID != "" {
+			ctx = context.WithValue(ctx, agent.ContextKeyRunID, v2RunID)
 		}
 	}
 
@@ -732,7 +906,7 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		runner = h.testRunner
 		system = h.testSystem
 	} else {
-		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID)
+		runner, system, err = h.buildRunnerForProfile(profileName, uid, req.SessionID, refineHardStripEnforced && refineActive && refineRoute.HardNoFetch)
 		if err != nil {
 			log.Printf("[agent] build runner for profile %q: %v", profileName, err)
 			sink := &sseSink{w: c.Writer}
@@ -741,6 +915,9 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		}
 	}
 	ctx, system = applySelectedChannelContext(ctx, system, req.SelectedChannels)
+
+	// SS-07b: fatal tool errors mark the run failed → finish gate FAILED at save.
+	h.attachToolErrorHook(runner, uid, v2RunID)
 
 	// Create per-request SSE sink for thread-safe concurrent writes
 	sink := &sseSink{w: c.Writer}
@@ -782,6 +959,13 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		}
 	}
 
+	// SS-08: inject the deterministic refine route as guidance (see Chat()).
+	// v2-gated → flag-off byte-identical. Route was classified once above.
+	if refineActive {
+		system = system + agent.BuildRefineGuidance(refineRoute)
+		log.Printf("[agent] refine route session=%s intent=%s fetch=%t hardNoFetch=%t", req.SessionID, refineRoute.Intent, refineRoute.Fetch, refineRoute.HardNoFetch)
+	}
+
 	history = agent.TruncateHistory(history, h.window)
 
 	// Run agent with history
@@ -798,7 +982,7 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	}
 
 	// Emit done event with final reply
-	h.writeSSEDoneViaSink(sink, reply, req.SessionID)
+	h.writeSSEDoneViaSink(sink, reply, req.SessionID, v2RunID)
 }
 
 // writeSSEProgressViaSink writes a progress SSE event via the provided sink.
@@ -829,10 +1013,16 @@ func (h *AgentChatHandler) writeSSEProgressViaSink(sink *sseSink, phase string, 
 }
 
 // writeSSEDoneViaSink writes a done SSE event via the provided sink.
-func (h *AgentChatHandler) writeSSEDoneViaSink(sink *sseSink, reply, sessionID string) {
+func (h *AgentChatHandler) writeSSEDoneViaSink(sink *sseSink, reply, sessionID, runID string) {
 	data := map[string]interface{}{
 		"reply":      reply,
 		"session_id": sessionID,
+	}
+	// SS-11: surface run_id so the client can correlate/continue the persisted
+	// run (SS-03). Empty (V2 off / no run) → omitted, so the done frame stays
+	// byte-identical to pre-SS-11 for legacy clients.
+	if runID != "" {
+		data["run_id"] = runID
 	}
 	jsonData, err := json.Marshal(data)
 	if err != nil {

@@ -52,6 +52,43 @@ type AgentSummaryRun struct {
 	Status       string `gorm:"column:status;type:varchar(32);not null;default:'created'" json:"status"`
 	FinishStatus string `gorm:"column:finish_status;type:varchar(16);not null;default:''" json:"finish_status"`
 
+	// Coverage is persisted on the run rather than inferred from artifact rows.
+	// An artifact's ChannelCount counts channels that produced messages; it cannot
+	// represent a successfully-fetched quiet channel, nor distinguish zero from
+	// "never measured". These fields preserve the actual fetch attempts.
+	//
+	// The three channel sets are nullable in MySQL (20260820-01): JSON columns take
+	// no DEFAULT literal, so ADD COLUMN ... JSON NOT NULL fails on a table that
+	// already has rows. decodeChannels treats NULL/"" as the empty set and
+	// CreateOrGetRun writes "[]" for every new row, so the nullability is never
+	// observable above the store. DroppedMessages stays NOT NULL DEFAULT 0 because
+	// AddDroppedMessages increments it in SQL and NULL + n would be NULL.
+	CoverageMeasured  bool   `gorm:"column:coverage_measured;not null;default:false" json:"coverage_measured"`
+	AttemptedChannels string `gorm:"column:attempted_channels;type:json" json:"attempted_channels"`
+	SucceededChannels string `gorm:"column:succeeded_channels;type:json" json:"succeeded_channels"`
+	FailedChannels    string `gorm:"column:failed_channels;type:json" json:"failed_channels"`
+	CoverageTruncated bool   `gorm:"column:coverage_truncated;not null;default:false" json:"coverage_truncated"`
+	DroppedMessages   int    `gorm:"column:dropped_messages;not null;default:0" json:"dropped_messages"`
+
+	// FetchExpected records whether this turn was supposed to gather data at all.
+	// A confident rewrite (SS-08b) has the fetch tools physically removed, so it
+	// can never set CoverageMeasured; without this distinction the finish gate
+	// reported a coverage gap on precisely the turns whose zero-fetch was correct.
+	// Set at run creation from the resolved profile/route, not inferred later.
+	//
+	// Deliberately NO gorm `default` tag, unlike the columns above: GORM omits a
+	// zero-value field from the INSERT when the tag declares a default, so
+	// `false` would silently come back as the column default `1` and every
+	// confident rewrite would be coverage-judged after all. The SQL default in
+	// 20260820-01 still applies — it is there for rows that predate the column.
+	FetchExpected bool `gorm:"column:fetch_expected;not null" json:"fetch_expected"`
+
+	// DiscoveredChannels are the in-scope channels the run learned about (via
+	// list_channels et al.) but that no UI selection pinned. For an open-scope run
+	// ExpectedChannels is empty, so this is the only signal that distinguishes
+	// "fetched everything in scope" from "fetched 2 of the 12 it found".
+	DiscoveredChannels string `gorm:"column:discovered_channels;type:json" json:"discovered_channels"`
+
 	// Version is the optimistic-lock counter for serialized run updates.
 	Version int `gorm:"column:version;not null;default:0" json:"version"`
 
