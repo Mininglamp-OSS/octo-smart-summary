@@ -580,3 +580,59 @@ func TestRefineAugmentWithATimeWordStillExtends(t *testing.T) {
 		}
 	}
 }
+
+// TestRefineStripNeedsResidueAndQuantifierTogether pins the round-10 P1-1
+// (yujiawei): the residue test and the ∀-clause quantifier are CONJUNCTS, and
+// neither subsumes the other.
+//
+// At the previous head the strip was residue-only, and 15 instructions that had
+// kept their tools one commit earlier began hard-stripping: 总结 is also the
+// primary Chinese verb "to summarize" and 整理/组织 the primary verbs for
+// "compile from source material", so "compile + <container>" — the canonical way
+// to ask for a fetch — reduced to an empty residue. The quantifier catches those
+// because the compile clause carries no rewrite keyword of its own.
+func TestRefineStripNeedsResidueAndQuantifierTogether(t *testing.T) {
+	t.Run("a compile verb over a container keeps its tools", func(t *testing.T) {
+		for _, instruction := range []string{
+			"帮我精简一下，再总结一下会话",
+			"精简一下，另外总结第二群",
+			"压缩篇幅，同时整理频道消息",
+			"重新组织，把消息调整一下",
+			"润色一下，整理对话",
+			"翻译成英文，整理一下子区",
+			"精简，总结一下对话记录",
+			"只保留结论，整理群",
+			"去掉第三段，总结消息",
+			"改语气，组织一下群消息",
+			"翻译成英文，调一下频道",
+			"排版，整理聊天记录",
+			// The quantifier alone cannot see these three: one clause, and it does
+			// carry a rewrite keyword. The container is the OBJECT of the rewrite
+			// verb rather than a modifier of an artifact noun, so it survives the
+			// residue as material — which is what keeps the tools.
+			"翻译频道消息",
+			"改写第十群消息",
+			"请整理第三子区内的聊天记录并重写总结",
+		} {
+			if got := ClassifyRefine(instruction); got.HardNoFetch {
+				t.Errorf("ClassifyRefine(%q) strips the fetch tools; asking to compile a container is a request for material: %+v", instruction, got)
+			}
+		}
+	})
+
+	// The other direction: a container that MODIFIES an artifact noun is
+	// structural, and those requests must still strip. A flat filler list cannot
+	// satisfy both halves — a word is either filler or it is not — so the
+	// container rule is positional (stripModifierContainers).
+	t.Run("a container modifying an artifact noun still strips", func(t *testing.T) {
+		for _, instruction := range []string{
+			"把这份群总结翻译成英文",
+			"精简一下群消息总结",
+			"对话记录的总结润色一下",
+		} {
+			if got := ClassifyRefine(instruction); !got.HardNoFetch {
+				t.Errorf("ClassifyRefine(%q): naming the artifact's origin is not a retrieval request: %+v", instruction, got)
+			}
+		}
+	})
+}

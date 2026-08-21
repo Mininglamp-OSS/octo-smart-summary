@@ -204,20 +204,19 @@ var refineRewriteToolNames = []string{
 // refineHardStripEnforced decides whether a HardNoFetch verdict is ACTED ON
 // (tools physically removed) or merely computed and logged.
 //
-// It is false in this PR by design. HardNoFetch is the only decision in the V2
+// The core PR landed this false: HardNoFetch is the only decision in the V2
 // contract that a runtime mistake cannot undo — buildRunnerForProfile removes
 // list/narrow/find/peek/fetch/search/filter outright, so a misclassified request
-// for new data becomes impossible to satisfy with no recovery path. The
-// classifier that produces the verdict is still converging (see the SS-08/08b
-// follow-up PR), and the asymmetry is brutal: a false negative costs a few unused
-// tool schemas in the prompt, a false positive costs an unsatisfiable request.
+// for new data becomes impossible to satisfy with no recovery path — and the
+// classifier was still converging.
 //
-// So the route is classified, persisted (fetch_expected) and logged on every
-// refine turn — which is what SS-11 and the finish gate consume — while the
-// physical strip stays off until the classifier's false-positive rate is measured
-// against real traffic rather than argued from examples. Flipping this to true is
-// the single switch that enables SS-08b enforcement.
-const refineHardStripEnforced = false
+// It is true here because the classifier's decision now rests on two independent
+// conjuncts that must agree (rewriteResidueEmpty ∧ allClausesCarryARewriteKeyword,
+// see ClassifyRefine), each closing a class the other provably cannot, plus the
+// positional container rule. The judgement set is pinned in refine_route_test.go:
+// every must-keep string from rounds 4-10 and every must-strip string, both
+// directions, in one suite that any vocabulary change has to pass.
+const refineHardStripEnforced = true
 
 // buildSummaryRegistryWithUID builds the full summary registry with uid injected.
 func (h *AgentChatHandler) buildSummaryRegistryWithUID(uid, sessionID string) (*agent.Registry, error) {
