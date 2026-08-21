@@ -416,6 +416,30 @@ func TestRefineStripRequiresEveryClauseToBeARewrite(t *testing.T) {
 			"压缩篇幅，另外核实一下数字",
 			"重新组织，并把相关的讨论都汇总进来",
 			"改语气，再把反对意见也写上",
+			// Round-8 blocker: the same obligations without punctuation, or with a
+			// plain space, must not collapse into one rewrite-qualified clause.
+			"润色并补一些运营数据",
+			"精简一下另外补一点客户意见",
+			"翻译成英文再列一下张三的原话",
+			"格式改一下把王五的原话引上",
+			"排版调整再提一提测试结果",
+			"改成中文另外提及销售数字",
+			"润色一下再加些运维细节",
+			"只保留结论另外统计一下参与人数",
+			"重新组织并把相关的讨论都汇总进来",
+			"改语气再把反对意见也写上",
+			"翻译成英文同时补一些客户反馈",
+			"精简一下顺便提一下运维的问题",
+			"润色一下而且把李四的观点也写上",
+			"润色一下 再补点运营数据",
+			"翻译成英文 并列一下张三的原话",
+			"精简一下 顺便提一下客户意见",
+			"排版调整 再提一提测试结果",
+			"润色 补一些运营数据",
+			"精简再列一下张三原话",
+			"改成中文另外统计参与人数",
+			"排版同时引入销售群原话",
+			"压缩篇幅顺便汇总客服群讨论",
 		} {
 			if got := ClassifyRefine(instruction); got.HardNoFetch {
 				t.Errorf("ClassifyRefine(%q) strips the fetch tools, so the request is impossible to satisfy: %+v", instruction, got)

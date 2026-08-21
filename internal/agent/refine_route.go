@@ -1,6 +1,9 @@
 package agent
 
-import "strings"
+import (
+	"strings"
+	"unicode"
+)
 
 // SS-08: deterministic 3-way refine routing (缺点十二 note + 原方案 §7 "Refine
 // 三分流"). Today's summary_refine is entirely prompt-driven: the model guesses
@@ -157,6 +160,14 @@ var (
 		"看看", "看下", "看一下", "查一下", "查下", "查查", "翻一下", "找一下", "找找",
 		"核实", "确认一下", "还有没有", "有没有别的", "新动态", "后续进展", "新情况",
 	}
+	// refineRewriteClauseBoundaries are ONLY for the HardNoFetch ∀-clause test.
+	// Do not reuse them for containsAddition: that matcher intentionally preserves
+	// whitespace and conjunction-glued 把…加进 constructions so it can still see
+	// the object and destination in one local clause.
+	refineRewriteClauseBoundaries = []string{
+		"并且", "顺便", "顺带", "另外", "同时", "而且", "然后", "以及", "还有", "接着", "外加",
+		"并", "再", "把", "将",
+	}
 )
 
 // ClassifyRefine classifies a refine instruction into an explicit route.
@@ -228,7 +239,7 @@ func ClassifyRefine(instruction string) RefineRoute {
 //
 // Credit: proposed and measured by yujiawei in the round-7 review.
 func allClausesRewrite(s string) bool {
-	clauses := splitRefineClauses(s)
+	clauses := splitRewriteClauses(s)
 	if len(clauses) == 0 {
 		return false
 	}
@@ -243,6 +254,53 @@ func allClausesRewrite(s string) bool {
 		}
 	}
 	return true
+}
+
+// splitRewriteClauses splits the instruction for the ∀-rewrite test used by
+// HardNoFetch. It is intentionally stricter than splitRefineClauses: punctuation,
+// whitespace, coordinating conjunctions, and object markers can all introduce a
+// separate obligation. Adding boundaries only ever turns HardNoFetch OFF, the
+// safe direction, because every resulting clause must still be rewrite-qualified.
+func splitRewriteClauses(s string) []string {
+	fields := strings.FieldsFunc(s, func(r rune) bool {
+		if unicode.IsSpace(r) {
+			return true
+		}
+		switch r {
+		case '，', ',', '。', '.', '；', ';', '、', '！', '!', '？', '?', '\n', '\r', '：', ':':
+			return true
+		}
+		return false
+	})
+	out := make([]string, 0, len(fields))
+	for _, field := range fields {
+		out = appendSplitRewriteBoundaries(out, field)
+	}
+	return out
+}
+
+func appendSplitRewriteBoundaries(out []string, s string) []string {
+	for s != "" {
+		cut, cutLen := -1, 0
+		for _, sep := range refineRewriteClauseBoundaries {
+			if idx := strings.Index(s, sep); idx >= 0 && (cut < 0 || idx < cut || idx == cut && len(sep) > cutLen) {
+				cut, cutLen = idx, len(sep)
+			}
+		}
+		if cut < 0 {
+			return appendNonEmpty(out, s)
+		}
+		out = appendNonEmpty(out, s[:cut])
+		s = s[cut+cutLen:]
+	}
+	return out
+}
+
+func appendNonEmpty(out []string, s string) []string {
+	if s == "" {
+		return out
+	}
+	return append(out, s)
 }
 
 // containsAddition reports whether s asks for content to be added INTO the

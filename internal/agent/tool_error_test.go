@@ -23,7 +23,7 @@ func TestClassifyToolError(t *testing.T) {
 		{"http 5xx", "fetch_channel", errors.New("LLM API error: status=503 body=busy"), "UPSTREAM_ERROR", true, false},
 		{"network", "fetch_channel", errors.New("network boom"), "TRANSIENT_TOOL_ERROR", true, false},
 		{"db connection", "fetch_channel", errors.New("driver: bad connection"), "TRANSIENT_TOOL_ERROR", true, false},
-		{"permission", "fetch_channel", errors.New("channel not accessible by user"), "PERMISSION_DENIED", false, true},
+		{"channel-scoped permission", "fetch_channel", errors.New("channel not accessible by user"), "PERMISSION_DENIED", false, false},
 		{"identity", "summarize_chunk", errors.New("missing user identity in context"), "PERMISSION_DENIED", false, true},
 		{"invalid args", "fetch_channel", errors.New("parse args: bad json"), "INVALID_ARGUMENT", true, false},
 		{"empty time_start (issue C)", "fetch_channel", errors.New("parse time_start: parsing time \"\" as \"2006-01-02T15:04:05Z07:00\": cannot parse \"\" as \"2006\""), "INVALID_ARGUMENT", true, false},
@@ -70,7 +70,7 @@ func TestRunnerToolErrorEnvelope(t *testing.T) {
 		reg.Register(
 			Tool{Type: "function", Function: ToolFunction{Name: "fetch_channel"}},
 			func(ctx context.Context, args json.RawMessage) (string, error) {
-				return "", errors.New("channel not accessible by user")
+				return "", errors.New("persist evidence: db down")
 			},
 		)
 		fc := &fakeClient{turns: []AssistantTurn{
@@ -89,8 +89,8 @@ func TestRunnerToolErrorEnvelope(t *testing.T) {
 		if _, err := r.Run(context.Background(), "sys", "go"); err != nil {
 			t.Fatalf("run: %v", err)
 		}
-		if len(*got) != 1 || !(*got)[0].Fatal || (*got)[0].ErrorCode != "PERMISSION_DENIED" {
-			t.Fatalf("OnToolError not fired with fatal permission error: %+v", *got)
+		if len(*got) != 1 || !(*got)[0].Fatal || (*got)[0].ErrorCode != "EVIDENCE_WRITE_FAILED" {
+			t.Fatalf("OnToolError not fired with fatal evidence-write error: %+v", *got)
 		}
 	})
 
@@ -206,12 +206,11 @@ func TestClassifyToolErrorStaleHandleIsNotFatalPermission(t *testing.T) {
 	}
 }
 
-// TestClassifyToolErrorPermissionBeatsWeakTransientTerms pins the round-4
-// branch-ordering nit: `permission denied; please try again later` carries both a
-// permission word and the weak transient term "try again". The permission branch
-// must win — a stale permission is fatal and no amount of retrying clears it —
-// while a genuine transient with no permission wording still classifies retryable.
-func TestClassifyToolErrorPermissionBeatsWeakTransientTerms(t *testing.T) {
+// TestClassifyToolErrorPermissionAndIdentityTransientOrdering pins the branch
+// ordering around weak transient terms. A channel-scoped permission denial stays
+// non-retryable, but a genuine identity-service outage must not be swallowed by
+// the bare "identity" permission branch.
+func TestClassifyToolErrorPermissionAndIdentityTransientOrdering(t *testing.T) {
 	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
 
 	env := classifyToolError("fetch_channel", errors.New("permission denied; please try again later"))
@@ -220,7 +219,12 @@ func TestClassifyToolErrorPermissionBeatsWeakTransientTerms(t *testing.T) {
 			env.ErrorCode, env.Retryable, env.Fatal)
 	}
 
-	for _, msg := range []string{"backend service unavailable", "transient hiccup, try again"} {
+	for _, msg := range []string{
+		"backend service unavailable",
+		"transient hiccup, try again",
+		"identity service unavailable, retry later",
+		"identity provider returned 503",
+	} {
 		env := classifyToolError("fetch_channel", errors.New(msg))
 		if env.ErrorCode != "TRANSIENT_TOOL_ERROR" || env.Fatal || !env.Retryable {
 			t.Errorf("classifyToolError(%q) = %s retryable=%t fatal=%t, want retryable TRANSIENT_TOOL_ERROR",
@@ -283,22 +287,26 @@ func TestFatalIsNotSelfSealing(t *testing.T) {
 
 	// A permission denial can never be retried into success, so it stays
 	// non-retryable — and therefore its fatal marker is unclearable BY
-	// CONSTRUCTION. That is exactly why it must not be fatal on a tool whose
-	// failure costs the deliverable nothing.
-	t.Run("permission is fatal only where it costs the deliverable", func(t *testing.T) {
-		for _, tool := range []string{"peek_channel", "list_channels", "narrow_channels_by_topic"} {
+	// CONSTRUCTION. Channel/handle-scoped denials must not be fatal; the finish
+	// gate already has the failed target and will report PARTIAL with a gap.
+	t.Run("channel-scoped permission is not run-fatal", func(t *testing.T) {
+		for _, tool := range []string{"peek_channel", "list_channels", "narrow_channels_by_topic", "fetch_channel", "search_messages"} {
 			env := classifyToolError(tool, errors.New("channel 12345 not accessible by user u-88"))
 			if env.Fatal {
-				t.Errorf("a permission denial on %s must not mark the whole run FAILED: %+v", tool, env)
+				t.Errorf("a channel-scoped permission denial on %s must not mark the whole run FAILED: %+v", tool, env)
 			}
 			if env.Retryable {
 				t.Errorf("a permission denial is never retryable: %+v", env)
 			}
 		}
 
-		// On a critical tool it is still fatal: that one does cost completeness.
-		if env := classifyToolError("fetch_channel", errors.New("channel not accessible by user")); !env.Fatal {
-			t.Errorf("a permission denial on fetch_channel must stay fatal: %+v", env)
+		if env := classifyToolError("search_messages", errors.New("permission denied")); env.Fatal || env.Retryable {
+			t.Errorf("search_messages permission denial is scoped to a handle/search target, want non-fatal/non-retryable: %+v", env)
+		}
+
+		// A run-scoped identity/auth failure is still fatal.
+		if env := classifyToolError("summarize_chunk", errors.New("missing user identity in context")); !env.Fatal {
+			t.Errorf("run-scoped identity failure must stay fatal: %+v", env)
 		}
 	})
 }

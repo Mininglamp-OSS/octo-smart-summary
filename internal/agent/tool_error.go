@@ -106,18 +106,23 @@ func classifyToolError(toolName string, err error) ToolErrorEnvelope {
 		// re-calling succeeds, and one stale handle must not mark the whole run
 		// FAILED and suppress the retry whose success would clear it.
 		env.ErrorCode, env.Retryable, env.Fatal = "INVALID_ARGUMENT", true, false
+	case isTransientIdentityOutage(low):
+		// `identity` can be either a real authorization invariant ("missing user
+		// identity in context") or an upstream identity-service outage. The outage
+		// spelling must be classified before the bare identity permission branch, or
+		// a transient 503 becomes the last fatal+non-retryable self-sealing case.
+		env.ErrorCode, env.Retryable, env.Fatal = "TRANSIENT_TOOL_ERROR", true, false
 	case strings.Contains(low, "not accessible") || strings.Contains(low, "permission") ||
 		strings.Contains(low, "access denied") || strings.Contains(low, "identity") ||
 		strings.Contains(low, "unauthor") || strings.Contains(low, "forbidden"):
 		// Never retryable — a permission denial cannot be retried into success —
-		// but fatal ONLY on a tool whose failure actually compromises the
-		// deliverable. peek_channel / list_channels touching one channel the user
-		// was just removed from costs the run nothing, yet a run-level fatal marker
-		// here is unclearable BY CONSTRUCTION (the mitigation is "the same tool
-		// later succeeds", and this one never will), so a complete, correct summary
-		// over the other four channels was reported FAILED — the strongest label
-		// the contract has. On a non-critical tool it degrades to a per-channel gap.
-		env.ErrorCode, env.Retryable, env.Fatal = "PERMISSION_DENIED", false, criticalTools[toolName]
+		// but fatal only for RUN-scoped permission/auth failures. A channel/handle
+		// permission denial is already captured by coverage as a failed target and
+		// belongs in the finish gate as PARTIAL + GapChannel, not as a run-level
+		// FAILED marker. That marker is unclearable by construction: a denied
+		// channel will not later succeed, while other channels' successes use
+		// different targets and correctly do not clear it.
+		env.ErrorCode, env.Retryable, env.Fatal = "PERMISSION_DENIED", false, criticalTools[toolName] && !isChannelScopedPermissionDenial(toolName, low)
 	case strings.Contains(low, "service unavailable") || strings.Contains(low, "try again"):
 		// Weak transient terms, checked only after permission: a genuine
 		// "service temporarily unavailable, try again" with no permission wording
@@ -157,6 +162,40 @@ func classifyToolError(toolName string, err error) ToolErrorEnvelope {
 		}
 	}
 	return env
+}
+
+func isTransientIdentityOutage(msg string) bool {
+	if !strings.Contains(msg, "identity") {
+		return false
+	}
+	return strings.Contains(msg, "service unavailable") ||
+		strings.Contains(msg, "try again") ||
+		strings.Contains(msg, "retry later") ||
+		containsReturned5xx(msg)
+}
+
+func containsReturned5xx(msg string) bool {
+	for _, marker := range []string{"500", "501", "502", "503", "504", "505", "506", "507", "508", "510", "511"} {
+		if strings.Contains(msg, "returned "+marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isChannelScopedPermissionDenial(toolName, msg string) bool {
+	switch toolName {
+	case "fetch_channel":
+		return strings.Contains(msg, "channel") && strings.Contains(msg, "not accessible")
+	case "search_messages":
+		return strings.Contains(msg, "channel") ||
+			strings.Contains(msg, "messages_handle") ||
+			strings.Contains(msg, "permission denied") ||
+			strings.Contains(msg, "access denied") ||
+			strings.Contains(msg, "not accessible")
+	default:
+		return false
+	}
 }
 
 func containsHTTP5xx(msg string) bool {
