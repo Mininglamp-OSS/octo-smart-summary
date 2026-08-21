@@ -228,7 +228,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 		Type: "function",
 		Function: ToolFunction{
 			Name:        "summarize_chunk",
-			Description: "对缓存中的一批消息进行局部总结（Map 阶段）。返回结构化摘要文本。",
+			Description: "对缓存中的一批消息进行局部总结（Map 阶段）。正文保存在本次请求内，返回 summary_handle 和覆盖统计；后续 merge_summaries 必须传 handle，不要复制正文。",
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -278,7 +278,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 			// Same result shape as the normal path (PR #196 review P2-5,
 			// closed in round-3): the planner must see one stable contract on
 			// both branches, so the empty branch carries chunk_size too.
-			return `{"summary":"无可总结内容","chunk_count":0,"input_count":0,"processed_count":0,"dropped_count":0,"oversized_message_count":0,"truncated":false,"chunk_size":0}`, nil
+			return marshalSummarizeChunkResult(ctx, "无可总结内容", 0, chunkCoverage{})
 		}
 
 		// Get the global message pool for the session and pre-assign CitationIndex.
@@ -320,23 +320,14 @@ func SummarizeChunkTool() (Tool, Handler) {
 		if len(messages) == 0 {
 			if manifestMisses > 0 {
 				recordDroppedMessages(ctx, uid, runID, manifestMisses)
-				result := map[string]interface{}{
-					"summary":                 "无可总结内容",
-					"chunk_count":             0,
-					"input_count":             inputCount,
-					"processed_count":         0,
-					"dropped_count":           manifestMisses,
-					"oversized_message_count": 0,
-					"truncated":               true,
-					"chunk_size":              clampChunkSize(req.ChunkSize),
-				}
-				resultJSON, err := json.Marshal(result)
-				if err != nil {
-					return "", fmt.Errorf("marshal result: %w", err)
-				}
-				return string(resultJSON), nil
+				return marshalSummarizeChunkResult(ctx, "无可总结内容", 0, chunkCoverage{
+					InputCount:   inputCount,
+					DroppedCount: manifestMisses,
+					Truncated:    true,
+					ChunkSize:    clampChunkSize(req.ChunkSize),
+				})
 			}
-			return "{\"summary\":\"无可总结内容\",\"chunk_count\":0}", nil
+			return marshalSummarizeChunkResult(ctx, "无可总结内容", 0, chunkCoverage{})
 		}
 
 		// Convert to map format for the token-budget splitter.
@@ -380,28 +371,46 @@ func SummarizeChunkTool() (Tool, Handler) {
 		recordDroppedMessages(ctx, uid, runID, cov.DroppedCount)
 
 		combinedSummary := strings.Join(summaries, "\n\n---\n\n")
-		result := map[string]interface{}{
-			"summary":                 combinedSummary,
-			"chunk_count":             len(chunks),
-			"input_count":             cov.InputCount,
-			"processed_count":         cov.ProcessedCount,
-			"dropped_count":           cov.DroppedCount,
-			"oversized_message_count": cov.OversizedMessageCount,
-			"truncated":               cov.Truncated,
-			// chunk_size is now emitted (PR #196 review P2-5): it is the
-			// clamped value actually applied, not the raw model request.
-			"chunk_size": cov.ChunkSize,
-		}
-
-		// Marshal result
-		resultJSON, err := json.Marshal(result)
-		if err != nil {
-			return "", fmt.Errorf("marshal result: %w", err)
-		}
-		return string(resultJSON), nil
+		return marshalSummarizeChunkResult(ctx, combinedSummary, len(chunks), cov)
 	}
 
 	return schema, handler
+}
+
+type summarizeChunkToolResult struct {
+	SummaryHandle         string `json:"summary_handle"`
+	ChunkCount            int    `json:"chunk_count"`
+	InputCount            int    `json:"input_count"`
+	ProcessedCount        int    `json:"processed_count"`
+	DroppedCount          int    `json:"dropped_count"`
+	OversizedMessageCount int    `json:"oversized_message_count"`
+	Truncated             bool   `json:"truncated"`
+	ChunkSize             int    `json:"chunk_size"`
+}
+
+func marshalSummarizeChunkResult(ctx context.Context, summary string, chunkCount int, cov chunkCoverage) (string, error) {
+	store, err := summaryHandleStoreFromContext(ctx)
+	if err != nil {
+		return "", err
+	}
+	handle, err := store.PutAtStep(summary, chunkCount, summaryToolStepFromContext(ctx))
+	if err != nil {
+		return "", fmt.Errorf("store summary result: %w", err)
+	}
+	data, err := json.Marshal(summarizeChunkToolResult{
+		SummaryHandle:         handle,
+		ChunkCount:            chunkCount,
+		InputCount:            cov.InputCount,
+		ProcessedCount:        cov.ProcessedCount,
+		DroppedCount:          cov.DroppedCount,
+		OversizedMessageCount: cov.OversizedMessageCount,
+		Truncated:             cov.Truncated,
+		ChunkSize:             cov.ChunkSize,
+	})
+	if err != nil {
+		return "", fmt.Errorf("marshal result: %w", err)
+	}
+	return string(data), nil
 }
 
 func recordDroppedMessages(ctx context.Context, uid, runID string, count int) {

@@ -96,10 +96,9 @@ func classifyToolError(toolName string, err error) ToolErrorEnvelope {
 		// `permission denied; please try again later` carries both, and a stale
 		// permission is fatal — retrying "try again" text can never clear it.
 		env.ErrorCode, env.Retryable, env.Fatal = "TRANSIENT_TOOL_ERROR", true, false
-	case strings.Contains(low, "messages_handle"):
-		// A dropped/expired message-cache handle (`invalid or expired
-		// messages_handle: h-123`, emitted on a plain cache miss by
-		// tool_search_messages / tool_filter_relevant / tool_summarize_chunk).
+	case strings.Contains(low, "messages_handle") || strings.Contains(low, "summary_handle"):
+		// A dropped/expired message-cache handle (`messages_handle`) or a bad
+		// request-scoped Map result handle (`summary_handle`).
 		// It is NOT a permission failure — the handle simply aged out of the
 		// cache — so it must be caught before the permission branch below.
 		// Retryable + non-fatal: re-minting the handle (list/fetch again) and
@@ -160,6 +159,13 @@ func classifyToolError(toolName string, err error) ToolErrorEnvelope {
 		} else {
 			env.ErrorCode, env.Retryable, env.Fatal = "TOOL_ERROR", true, false
 		}
+	}
+	// Reduce is the completeness boundary. Any merge_summaries failure leaves
+	// successful Map output without a validated final synthesis, so it must latch
+	// the run as failed until a later merge succeeds. Retryability still follows
+	// the classification above; OnToolSuccess clears the fatal marker.
+	if toolName == "merge_summaries" {
+		env.Fatal = true
 	}
 	return env
 }

@@ -420,8 +420,8 @@ func TestCallMap_PropagatesTokenLimitError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error to propagate for token limit exhaustion")
 	}
-	if !strings.Contains(err.Error(), "reasoning budget exhausted") {
-		t.Errorf("expected reasoning budget exhausted error, got: %v", err)
+	if !strings.Contains(err.Error(), "output truncated") {
+		t.Errorf("expected output truncated error, got: %v", err)
 	}
 }
 

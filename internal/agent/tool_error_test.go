@@ -26,6 +26,8 @@ func TestClassifyToolError(t *testing.T) {
 		{"channel-scoped permission", "fetch_channel", errors.New("channel not accessible by user"), "PERMISSION_DENIED", false, false},
 		{"identity", "summarize_chunk", errors.New("missing user identity in context"), "PERMISSION_DENIED", false, true},
 		{"invalid args", "fetch_channel", errors.New("parse args: bad json"), "INVALID_ARGUMENT", true, false},
+		{"merge invalid args is completeness-fatal", "merge_summaries", errors.New("parse args: unexpected end of JSON input"), "INVALID_ARGUMENT", true, true},
+		{"merge timeout is completeness-fatal", "merge_summaries", context.DeadlineExceeded, "TIMEOUT", true, true},
 		{"empty time_start (issue C)", "fetch_channel", errors.New("parse time_start: parsing time \"\" as \"2006-01-02T15:04:05Z07:00\": cannot parse \"\" as \"2006\""), "INVALID_ARGUMENT", true, false},
 		{"specific required arg", "fetch_channel", errors.New("channel_type is required (1=DM, 2=Group, 5=Thread)"), "INVALID_ARGUMENT", true, false},
 		// The critical-tool default is fatal AND retryable. The two fields answer
@@ -153,9 +155,23 @@ func TestClassifyToolErrorAnchorsHTTPStatuses(t *testing.T) {
 
 	// Real statuses must still classify.
 	for _, msg := range []string{"LLM API error: status=503 body=upstream busy", "http 429 too many"} {
-		env = classifyToolError("merge_summaries", errors.New(msg))
+		env = classifyToolError("fetch_channel", errors.New(msg))
 		if env.Fatal || !env.Retryable {
 			t.Errorf("classifyToolError(%q) = %s fatal=%t, want retryable", msg, env.ErrorCode, env.Fatal)
+		}
+	}
+}
+
+func TestMergeSummariesErrorsAreAlwaysFatalUntilRecovered(t *testing.T) {
+	for _, err := range []error{
+		errors.New("parse args: unexpected end of JSON input"),
+		context.DeadlineExceeded,
+		errors.New("LLM API error: status=503 body=busy"),
+		errors.New("invalid or expired summary_handle: map_old_1"),
+	} {
+		env := classifyToolError("merge_summaries", err)
+		if !env.Fatal {
+			t.Errorf("merge_summaries error %q must be fatal until a successful retry: %+v", err, env)
 		}
 	}
 }

@@ -93,11 +93,17 @@ func (r *Runner) Run(ctx context.Context, system, userInput string) (string, err
 // 返回最终回复 + 本回合新产生的消息（user + assistant(含 tool_calls) + tool），供上层落库；
 // 新消息不含 system，也不含传入的 history。
 func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Message, userInput string) (string, []Message, error) {
+	// Keep Map output out of the planner transcript. Every run gets an isolated,
+	// request-scoped store shared by summarize_chunk and merge_summaries through
+	// the tool context. It deliberately shadows any store on the parent context so
+	// a reused context cannot leak handles or pending state across runner calls.
+	ctx = withSummaryHandleStore(ctx)
+
 	userMsg := Message{Role: "user", Content: userInput}
 
 	msgs := make([]Message, 0, len(history)+2)
 	msgs = append(msgs, Message{Role: "system", Content: system})
-	msgs = append(msgs, history...)
+	msgs = append(msgs, compactSummaryToolHistory(history)...)
 	msgs = append(msgs, userMsg)
 
 	// newMsgs 只累积本回合新增（user + 各 assistant + 各 tool），供落库；不含 system/history。
@@ -137,6 +143,32 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 			return "", nil, err
 		}
 		totalTokens += turn.Tokens
+
+		// A final answer is not valid while this request still has Map outputs that
+		// have not passed through one successful Reduce covering every handle. The
+		// model can otherwise skip merge_summaries (or ignore its parse error) and
+		// confidently answer from partial Map text. Nudge it without persisting the
+		// rejected draft; at the final step fail closed.
+		if len(turn.ToolCalls) == 0 {
+			store, storeErr := summaryHandleStoreFromContext(ctx)
+			if storeErr == nil && (store.PendingMapFailures() > 0 || store.NeedsReduce()) {
+				pendingMaps := store.PendingMapFailures()
+				log.Printf("[agent] step %d/%d: final answer attempted with pending summary work (map_failures=%d reduce_needed=%t)",
+					step+1, r.policy.MaxSteps, pendingMaps, store.NeedsReduce())
+				if step >= r.policy.MaxSteps-1 {
+					return "", nil, errors.New("successful Map retries and Reduce required before final answer")
+				}
+				instruction := "本次请求仍有未合并的 Map 结果。请先调用 merge_summaries，并在 summary_handles 中原样传入本次请求产生的全部 summary_handle；不要复制摘要正文，也不要直接输出最终答案。"
+				if pendingMaps > 0 {
+					instruction = "本次请求仍有失败的 summarize_chunk。请先使用原 messages_handle 重试每个失败的 Map 调用。不同 handle 不能证明覆盖同一批消息；若原 handle 已失效，本轮必须失败并由用户重新发起请求。全部 Map 成功后，再调用 merge_summaries 合并全部 summary_handle；不要直接输出最终答案。"
+				}
+				msgs = append(msgs, Message{
+					Role:    "user",
+					Content: instruction,
+				})
+				continue
+			}
+		}
 
 		// SUM-158 blocker follow-up: 无工具调用 且 有 content = 模型给出最终答案，正常出口。
 		// 但如果 tool_calls 空 且 content 也空/空白，不能视为正常终止：
@@ -219,9 +251,18 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 		// 预算触顶：注入收尾指令，逼模型下一轮直接给答案。
 		// 这条纯运行时提示，不并入 newMsgs（不落库，避免污染历史）。
 		if totalTokens >= r.policy.MaxTokens {
+			instruction := "已达token预算，请基于现有信息直接给出最终答案，不要再调用工具。"
+			if store, storeErr := summaryHandleStoreFromContext(ctx); storeErr == nil && store.PendingMapFailures() > 0 {
+				instruction = "已达token预算，但仍有失败的 summarize_chunk。下一步只重试失败的 Map；全部成功后调用 merge_summaries，Reduce 成功后再直接输出最终答案。"
+			} else if storeErr == nil && store.NeedsReduce() {
+				// Never contradict the Reduce gate. A direct-answer instruction here
+				// makes the next planner turn skip merge_summaries, wasting one full
+				// LLM call before the gate can nudge it back.
+				instruction = "已达token预算，但本次请求仍有未合并的 Map 结果。下一步只调用 merge_summaries，传入全部 summary_handle；Reduce 成功后再直接输出最终答案。"
+			}
 			msgs = append(msgs, Message{
 				Role:    "user",
-				Content: "已达token预算，请基于现有信息直接给出最终答案，不要再调用工具。",
+				Content: instruction,
 			})
 		}
 	}
@@ -249,7 +290,21 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 				})
 			}
 
-			out, err := r.reg.Dispatch(ctx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+			toolCtx := withSummaryToolStep(ctx, step)
+			out, err := r.reg.Dispatch(toolCtx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+			if tc.Function.Name == "summarize_chunk" {
+				if store, storeErr := summaryHandleStoreFromContext(ctx); storeErr == nil {
+					target := toolCallTarget(tc.Function.Arguments)
+					if target == "" {
+						target = "tool_call_id=" + tc.ID
+					}
+					if err != nil {
+						store.MarkMapFailed(target, step)
+					} else {
+						store.MarkMapSucceeded(target, step)
+					}
+				}
+			}
 
 			toolElapsed := time.Since(toolStart).Milliseconds()
 

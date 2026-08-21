@@ -184,7 +184,7 @@ func TestMergeSummariesToolSchema(t *testing.T) {
 		t.Fatal("parameters should be map[string]interface{}")
 	}
 
-	checkRequiredFields(t, params, "summaries")
+	checkRequiredFields(t, params, "summary_handles")
 }
 
 func TestTruncateStr(t *testing.T) {

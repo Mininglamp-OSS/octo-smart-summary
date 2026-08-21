@@ -3,6 +3,7 @@ package agent
 import (
 	"os"
 	"strconv"
+	"strings"
 )
 
 // DefaultHistoryWindow 是滑窗默认保留的"轮"数（env AGENT_HISTORY_WINDOW 覆盖）。
@@ -45,4 +46,52 @@ func TruncateHistory(history []Message, n int) []Message {
 		return history
 	}
 	return history[idx:]
+}
+
+const (
+	compactedMapHistoryResult    = `{"history_compacted":true,"note":"Map summary body omitted; historical handles are expired"}`
+	compactedReduceHistoryResult = `{"history_compacted":true,"note":"Reduce result omitted; use the final assistant message from that turn"}`
+	compactedReduceHistoryArgs   = `{"history_compacted":true}`
+)
+
+// compactSummaryToolHistory removes duplicate/expired summary payloads from
+// PREVIOUS turns before they are sent back to the planner. Legacy sessions may
+// contain tens of thousands of characters both in summarize_chunk tool results
+// and in merge_summaries arguments. The final assistant message already carries
+// the durable user-facing summary, so retaining those intermediate copies only
+// recreates the post-Map latency this handle protocol is meant to remove.
+//
+// Tool call IDs and result messages are preserved so the OpenAI tool protocol
+// remains paired. Structured/legacy error results stay intact for diagnostics.
+func compactSummaryToolHistory(history []Message) []Message {
+	if len(history) == 0 {
+		return history
+	}
+	out := make([]Message, len(history))
+	for i, message := range history {
+		out[i] = message
+		if len(message.ToolCalls) > 0 {
+			out[i].ToolCalls = append([]ToolCall(nil), message.ToolCalls...)
+			for j := range out[i].ToolCalls {
+				if out[i].ToolCalls[j].Function.Name == "merge_summaries" {
+					out[i].ToolCalls[j].Function.Arguments = compactedReduceHistoryArgs
+				}
+			}
+		}
+		if message.Role != "tool" || isHistoricalToolError(message.Content) {
+			continue
+		}
+		switch message.Name {
+		case "summarize_chunk":
+			out[i].Content = compactedMapHistoryResult
+		case "merge_summaries":
+			out[i].Content = compactedReduceHistoryResult
+		}
+	}
+	return out
+}
+
+func isHistoricalToolError(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	return strings.HasPrefix(trimmed, "错误:") || strings.Contains(trimmed, `"ok":false`)
 }

@@ -68,6 +68,7 @@ type chatResponse struct {
 			Content   string     `json:"content"`
 			ToolCalls []ToolCall `json:"tool_calls"`
 		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage struct {
 		TotalTokens int `json:"total_tokens"`
@@ -167,7 +168,13 @@ func (c *Client) attemptChat(ctx context.Context, model string, msgs []Message, 
 	if len(cr.Choices) == 0 {
 		return AssistantTurn{}, llmfallback.Terminal, fmt.Errorf("empty choices in response")
 	}
-	msg := cr.Choices[0].Message
+	choice := cr.Choices[0]
+	if choice.FinishReason == "length" {
+		// Tool-call arguments can be syntactically present but cut off mid-JSON.
+		// Never dispatch a truncated planner turn as if it were valid.
+		return AssistantTurn{}, false, fmt.Errorf("LLM response truncated: finish_reason=length")
+	}
+	msg := choice.Message
 	return AssistantTurn{
 		Content:   msg.Content,
 		ToolCalls: msg.ToolCalls,

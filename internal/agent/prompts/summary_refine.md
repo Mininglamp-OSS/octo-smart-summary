@@ -51,6 +51,12 @@
    - 但**永远不要**因为「看不到原始消息」就反问 —— 需要就自己调工具去拉
    - 也**永远不要**反问用户提供 JSON
 
+6. **Map/Reduce handle 规则**
+   - `summarize_chunk` 只返回本次请求有效的 `summary_handle`，局部总结正文由后端保存
+   - 等全部 Map 调用完成后，再调用 `merge_summaries`；在 `summary_handles` 中原样传入本次请求产生的全部 handle
+   - 不复制局部总结正文，不复用历史 handle，不在同一批并发工具调用中同时执行 Map 和 Reduce
+   - 调用过 `summarize_chunk` 时，必须成功 Reduce 后才能输出最终产物
+
 ---
 
 **产出结构**必须与首次生成一致:`{content, citations}`,citations 字段严格对齐 `model.Citation`。

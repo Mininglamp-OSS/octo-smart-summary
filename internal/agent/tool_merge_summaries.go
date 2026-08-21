@@ -15,35 +15,50 @@ func MergeSummariesTool() (Tool, Handler) {
 		Type: "function",
 		Function: ToolFunction{
 			Name:        "merge_summaries",
-			Description: "将多个局部总结合并为最终的结构化摘要（Reduce 阶段）。提取关键点、决策、待办事项。",
+			Description: "将本次请求中 summarize_chunk 返回的全部 summary_handle 合并为最终结构化摘要（Reduce 阶段）。只传 handle，不要复制摘要正文。",
 			Parameters: map[string]interface{}{
-				"type": "object",
+				"type":                 "object",
+				"additionalProperties": false,
 				"properties": map[string]interface{}{
-					"summaries": map[string]interface{}{
+					"summary_handles": map[string]interface{}{
 						"type":        "array",
 						"items":       map[string]interface{}{"type": "string"},
-						"description": "局部总结文本列表，由 summarize_chunk 返回",
+						"minItems":    1,
+						"uniqueItems": true,
+						"description": "本次请求内 summarize_chunk 返回的全部 summary_handle，按工具结果顺序传入",
 					},
 				},
-				"required": []string{"summaries"},
+				"required": []string{"summary_handles"},
 			},
 		},
 	}
 
 	handler := func(ctx context.Context, args json.RawMessage) (string, error) {
 		var req struct {
-			Summaries []string `json:"summaries"`
+			SummaryHandles []string `json:"summary_handles"`
 		}
 		if err := json.Unmarshal(args, &req); err != nil {
 			return "", fmt.Errorf("parse args: %w", err)
 		}
 
-		if len(req.Summaries) == 0 {
-			return "{\"highlights\":[\"无内容可合并\"]}", nil
+		store, err := summaryHandleStoreFromContext(ctx)
+		if err != nil {
+			return "", err
+		}
+		resolved, err := store.ResolveAllBefore(req.SummaryHandles, summaryToolStepFromContext(ctx))
+		if err != nil {
+			return "", err
 		}
 
-		// Combine all summaries
-		combined := strings.Join(req.Summaries, "\n\n--- Chunk Boundary ---\n\n")
+		// The planner only sees short handles. The full Map text is joined here,
+		// inside the backend, and sent directly to the Reduce LLM.
+		summaries := make([]string, 0, len(resolved.Entries))
+		chunkCount := 0
+		for _, entry := range resolved.Entries {
+			summaries = append(summaries, entry.Text)
+			chunkCount += entry.ChunkCount
+		}
+		combined := strings.Join(summaries, "\n\n--- Chunk Boundary ---\n\n")
 
 		// SS-06: load the run's SummarySpec-derived guidance so the Reduce
 		// respects the user's language / detail level / sections / exclusions
@@ -51,24 +66,30 @@ func MergeSummariesTool() (Tool, Handler) {
 		specGuidance := loadRunSpecGuidance(ctx)
 
 		// Use LLM to merge and structure
-		merged, err := mergeSummariesWithLLM(ctx, combined, specGuidance)
+		merged, err := mergeSummariesLLM(ctx, combined, specGuidance)
 		if err != nil {
 			return "", fmt.Errorf("merge summaries: %w", err)
+		}
+		if strings.TrimSpace(merged) == "" {
+			return "", fmt.Errorf("merge summaries: empty Reduce result")
 		}
 
 		result := map[string]interface{}{
 			"merged_summary": merged,
-			"chunk_count":    len(req.Summaries),
+			"chunk_count":    chunkCount,
 		}
 		data, err := json.Marshal(result)
 		if err != nil {
 			return "", fmt.Errorf("marshal result: %w", err)
 		}
+		store.MarkReduced(resolved.Generation)
 		return string(data), nil
 	}
 
 	return schema, handler
 }
+
+var mergeSummariesLLM = mergeSummariesWithLLM
 
 // mergeSummariesWithLLM uses LLM to merge and structure multiple summaries.
 //

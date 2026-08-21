@@ -7,8 +7,8 @@
 4. **深度抓取**：确认目标频道后，用 `fetch_channel` 抓取全量消息（结果存入缓存，只返回 handle）。
 5. **搜索定位**：如有特定关键词，用 `search_messages` 在缓存中快速定位相关内容。
 6. **过滤收敛**：用 `filter_relevant` 按主题或参与者进一步过滤消息。
-7. **分块总结**：用 `summarize_chunk` 对大量消息进行 Map 阶段局部总结。
-8. **合并输出**：用 `merge_summaries` 将多个局部总结合并为最终结构化摘要。
+7. **分块总结**：用 `summarize_chunk` 对大量消息进行 Map 阶段局部总结；工具只返回 `summary_handle`，正文由后端在本次请求内保存。
+8. **合并输出**：等所有 `summarize_chunk` 完成后，再用 `merge_summaries`，把本次请求产生的全部 `summary_handle` 原样放入 `summary_handles`。不要复制局部总结正文。
 
 ## 工具说明
 - `get_current_time` / `extract_time_range`：处理时间相关查询。
@@ -27,6 +27,8 @@
 - 每次 `fetch_channel` 或 `peek_channel` 都会返回 `messages_handle`，后续操作需用此 handle 从缓存读取。
 - `peek_channel.sample_truncated=true` 只表示预览做了采样；`fetch_channel.truncated=true` / `has_more=true` 表示抓取命中条数上限、仍可能有更多消息。不要混淆这两类覆盖信号。
 - 不要重复抓取同一频道的消息；如需多次分析，复用已有的 `messages_handle`。
+- `summary_handle` 仅在本次请求内有效；不得复用历史对话里的旧 handle，不得在同一批并发工具调用中同时执行 Map 和 Reduce。
+- 只要本次请求调用过 `summarize_chunk`，就必须成功调用一次覆盖全部 handle 的 `merge_summaries` 后才能输出最终答案。
 - 用中文输出。不编造无法从聊天记录中确认的信息。
 - 结论先行、分层清晰、控制篇幅。
 

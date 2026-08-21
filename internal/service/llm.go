@@ -143,6 +143,7 @@ type chatResponseWithTools struct {
 			ReasoningContent string `json:"reasoning_content"`
 			Reasoning        string `json:"reasoning"`
 		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage struct {
 		TotalTokens int `json:"total_tokens"`
@@ -279,8 +280,8 @@ func (c *LLMClient) CallWithModel(ctx context.Context, messages []ChatMessage, t
 				reasoningLen, chatResp.Choices[0].FinishReason, chatResp.Usage.CompletionTokens)
 			return result{tokens: chatResp.Usage.TotalTokens}, llmfallback.Terminal, ErrReasoningBudgetExhausted
 		}
-		if content == "" && chatResp.Choices[0].FinishReason == "length" {
-			log.Printf("[llm] WARNING: content is empty and finish_reason=length, completion_tokens=%d", chatResp.Usage.CompletionTokens)
+		if chatResp.Choices[0].FinishReason == "length" {
+			log.Printf("[llm] WARNING: response truncated with finish_reason=length, completion_tokens=%d", chatResp.Usage.CompletionTokens)
 			return result{tokens: chatResp.Usage.TotalTokens}, llmfallback.Terminal, ErrTokenLimitExhausted
 		}
 		return result{content: content, tokens: chatResp.Usage.TotalTokens}, llmfallback.Success, nil
@@ -435,7 +436,7 @@ func (c *LLMClient) CallStreamWithModel(ctx context.Context, messages []ChatMess
 		if content == "" && reasoningLen > 0 {
 			return result{tokens: totalTokens}, llmfallback.Terminal, ErrReasoningBudgetExhausted
 		}
-		if content == "" && finishReason == "length" {
+		if finishReason == "length" {
 			return result{tokens: totalTokens}, llmfallback.Terminal, ErrTokenLimitExhausted
 		}
 		if content == "" {
@@ -538,6 +539,10 @@ func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, t
 		}
 		if len(chatResp.Choices) == 0 {
 			return result{}, llmfallback.RetrySameModel, fmt.Errorf("LLM returned no choices")
+		}
+		if chatResp.Choices[0].FinishReason == "length" {
+			return result{tokens: chatResp.Usage.TotalTokens}, llmfallback.Terminal,
+				fmt.Errorf("LLM tool response truncated due to token limit")
 		}
 		if len(chatResp.Choices[0].Message.ToolCalls) == 0 {
 			reasoningPresent := chatResp.Choices[0].Message.ReasoningContent != "" || chatResp.Choices[0].Message.Reasoning != ""
@@ -692,7 +697,10 @@ func (c *LLMClient) CallMapWithModel(ctx context.Context, formattedMessages stri
 		return content, tokens, usedModel, nil
 	}
 	log.Printf("[llm] Map chunk %d failed: %s", chunkIndex, llmfallback.SafeErrorForLog(err, 200))
-	if errors.Is(err, ErrReasoningBudgetExhausted) || errors.Is(err, ErrTokenLimitExhausted) {
+	if errors.Is(err, ErrTokenLimitExhausted) {
+		return "", tokens, usedModel, fmt.Errorf("output truncated on chunk %d: %w", chunkIndex, err)
+	}
+	if errors.Is(err, ErrReasoningBudgetExhausted) {
 		return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d: %w", chunkIndex, err)
 	}
 	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, c.model, nil
@@ -761,7 +769,10 @@ func (c *LLMClient) CallMapStreamWithModel(ctx context.Context, formattedMessage
 	if emitted {
 		return content, tokens, usedModel, err
 	}
-	if errors.Is(err, ErrReasoningBudgetExhausted) || errors.Is(err, ErrTokenLimitExhausted) {
+	if errors.Is(err, ErrTokenLimitExhausted) {
+		return "", tokens, usedModel, fmt.Errorf("output truncated on chunk %d: %w", chunkIndex, err)
+	}
+	if errors.Is(err, ErrReasoningBudgetExhausted) {
 		return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d: %w", chunkIndex, err)
 	}
 	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, c.model, nil
