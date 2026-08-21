@@ -702,3 +702,92 @@ func TestRefineContainerAdjacencyIsJudgedOnSourceText(t *testing.T) {
 		}
 	})
 }
+
+// TestRefineDocumentPartIsNotAnAdjacencyTarget pins the #206 round-2 P1-1
+// (yujiawei): 正文 / 全文 are document PART nouns, not artifact names, so they
+// must not serve as the right-hand side of the positional container rule.
+//
+// refineArtifactNouns has two jobs — residue filler, and adjacency target in
+// stripModifierContainers — and they need different vocabularies. As fillers the
+// two words behave identically either way (翻译正文 still strips); as adjacency
+// targets they are wrong, because "<container>全文" is the full text OF the
+// container, i.e. the raw material, not an artifact derived from it. Treating
+// them as targets erased the container and hard-stripped 2352 requests for
+// source material, contradicting this file's own must-keep table:
+//
+//	翻译频道消息      keep (pinned above)
+//	翻译频道消息全文   stripped ← appending 全文 makes it MORE clearly material
+func TestRefineDocumentPartIsNotAnAdjacencyTarget(t *testing.T) {
+	t.Run("reported strings keep their tools", func(t *testing.T) {
+		for _, instruction := range []string{
+			"翻译消息全文",
+			"翻译对话记录全文",
+			"翻译群消息全文",
+			"翻译频道消息全文",
+			"用英文重写聊天记录正文",
+			"翻译群消息正文",
+			"把群消息全文翻译成英文",
+			"精简对话全文",
+			"改写第十群消息全文",
+		} {
+			if got := ClassifyRefine(instruction); got.HardNoFetch {
+				t.Errorf("ClassifyRefine(%q): 全文/正文 names a PART of the container, so this asks for the material itself: %+v", instruction, got)
+			}
+		}
+	})
+
+	// A container in front of a document part must never be erased, across the
+	// whole frame space. Pinned as a sweep because three consecutive rounds found
+	// families that example-by-example pinning did not predict.
+	t.Run("<container><part> never strips", func(t *testing.T) {
+		containers := []string{"群消息", "对话记录", "聊天记录", "群聊", "频道", "子区", "会话", "对话", "消息", "群", "频道消息", "子区消息"}
+		parts := []string{"正文", "全文"}
+		verbs := []string{"翻译", "精简", "简化", "缩短", "压缩", "删减", "润色", "排版", "重写", "改写", "提炼", "重新组织", "翻译成英文", "用英文重写"}
+		for _, c := range containers {
+			for _, p := range parts {
+				for _, v := range verbs {
+					for _, instruction := range []string{
+						v + c + p, "把" + c + p + v, "帮我" + v + c + p, v + "一下" + c + p,
+						"请" + v + c + p, v + c + p + "吧", "把" + c + p + v + "成英文",
+					} {
+						if got := ClassifyRefine(instruction); got.HardNoFetch {
+							t.Errorf("ClassifyRefine(%q) strips the fetch tools: %+v", instruction, got)
+						}
+					}
+				}
+			}
+		}
+	})
+
+	// The other direction: with no container in front, a document part is an
+	// ordinary filler and the request is pure text, so it must still strip.
+	t.Run("a bare document part still strips", func(t *testing.T) {
+		for _, instruction := range []string{
+			"翻译正文", "润色一下正文", "把全文翻译成英文", "精简全文",
+		} {
+			if got := ClassifyRefine(instruction); !got.HardNoFetch {
+				t.Errorf("ClassifyRefine(%q) is a pure-text edit of the artifact: %+v", instruction, got)
+			}
+		}
+	})
+}
+
+// TestRefineArtifactNounsAreValidAdjacencyTargets covers the half of
+// refineArtifactNouns' contract that nothing tested before (#206 round-2
+// suggestion 2): the single-source-of-truth refactor made that list load-bearing
+// in TWO places, and only the filler half had coverage.
+//
+// Every member must work as an adjacency target — <container><artifact> is a
+// modifier construction and strips — which is exactly the property 正文 / 全文
+// failed. A future addition to this list is only legitimate if it satisfies this.
+func TestRefineArtifactNounsAreValidAdjacencyTargets(t *testing.T) {
+	for _, artifact := range refineArtifactNouns {
+		for _, container := range []string{"群", "频道", "对话记录"} {
+			instruction := "把这份" + container + artifact + "翻译成英文"
+			if got := ClassifyRefine(instruction); !got.HardNoFetch {
+				t.Errorf("ClassifyRefine(%q): %q is in refineArtifactNouns, so a container modifying it must be structural: %+v",
+					instruction, artifact, got)
+			}
+		}
+	}
+}

@@ -2,6 +2,8 @@ package agent
 
 import (
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 )
@@ -38,3 +40,32 @@ func SummaryV2Mode() string {
 
 // SummaryV2Enabled reports whether any non-off mode is active.
 func SummaryV2Enabled() bool { return SummaryV2Mode() != V2ModeOff }
+
+// HardStripEnvVar is the runtime kill switch for the SS-08b tool strip.
+const HardStripEnvVar = "AGENT_SUMMARY_HARD_STRIP"
+
+// RefineHardStripEnabled reports whether a HardNoFetch verdict may be ACTED ON
+// (fetch tools physically removed) rather than merely computed and logged.
+//
+// Default false, and deliberately an ENV read rather than a compile-time const:
+// the strip is the one decision in this contract that a runtime mistake cannot
+// undo — buildRunnerForProfile removes list/narrow/find/peek/fetch/search/filter
+// outright, so a misclassified request for new data becomes impossible to satisfy
+// with no recovery path, and it is silent (fetch_expected=0 on the rewrite path,
+// so the finish gate has nothing to flag). Reverting it must not require a
+// rebuild.
+//
+// It additionally requires mode == on, so `shadow` stays a true observe-only
+// stage: classify + persist + log tools_stripped=, never strip. That is the
+// rollout order this work committed to — measure the false-positive rate on real
+// traffic, then flip — rather than arguing it from a pinned example set. Three
+// consecutive review rounds each found a NEW systematic false-positive family
+// that the pinned suite did not predict, which is the empirical case for keeping
+// the switch off by default.
+func RefineHardStripEnabled() bool {
+	if SummaryV2Mode() != V2ModeOn {
+		return false
+	}
+	enabled, err := strconv.ParseBool(strings.TrimSpace(os.Getenv(HardStripEnvVar)))
+	return err == nil && enabled
+}

@@ -59,16 +59,17 @@ func TestRefineRewriteRegistryExcludesFetch(t *testing.T) {
 //
 // Nothing asserted that a HardNoFetch=true route actually reaches
 // buildRunnerForProfile with refineNoFetch=true, so an edit to the conjunction —
-// or a revert of refineHardStripEnforced — would have failed no test at all.
+// or a change to the enforcement switch — would have failed no test at all.
 func TestRefineStripsFetchToolsGatesOnAllThreeTerms(t *testing.T) {
 	confident := agent.RefineRoute{Intent: agent.RefineRewrite, HardNoFetch: true}
 	soft := agent.RefineRoute{Intent: agent.RefineRewrite, HardNoFetch: false}
 	augment := agent.RefineRoute{Intent: agent.RefineAugment, Fetch: true}
 
-	if got := refineStripsFetchTools(true, confident); got != refineHardStripEnforced {
-		t.Errorf("refine + confident rewrite: strip = %v, want %v (the enforcement constant)", got, refineHardStripEnforced)
+	enableHardStrip(t)
+	if !refineStripsFetchTools(true, confident) {
+		t.Error("refine + confident rewrite + enforcement on: must strip the fetch tools")
 	}
-	// Every other combination must keep the tools regardless of the constant.
+	// Every other combination must keep the tools even with enforcement ON.
 	for _, tc := range []struct {
 		name         string
 		refineActive bool
@@ -84,27 +85,70 @@ func TestRefineStripsFetchToolsGatesOnAllThreeTerms(t *testing.T) {
 	}
 }
 
-// TestRefineStripReachesTheRunner closes the loop the previous test cannot: that
-// the decision actually changes the toolset the model receives.
+// TestRefineStripIsOffByDefault pins the rollout contract: enforcement is opt-in
+// at runtime, and `shadow` stays a true observe-only stage (classify + log,
+// never strip). A confident-rewrite verdict is computed identically in every
+// case below — only whether it is ACTED ON changes.
+func TestRefineStripIsOffByDefault(t *testing.T) {
+	confident := agent.RefineRoute{Intent: agent.RefineRewrite, HardNoFetch: true}
+
+	for _, tc := range []struct {
+		name, mode, strip string
+	}{
+		{"unset env with v2 on", "on", ""},
+		{"explicitly disabled", "on", "false"},
+		{"malformed value fails safe", "on", "yes-please"},
+		{"shadow is observe-only even when asked to strip", "shadow", "true"},
+		{"off mode never strips", "off", "true"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("AGENT_SUMMARY_V2_MODE", tc.mode)
+			t.Setenv(agent.HardStripEnvVar, tc.strip)
+			if refineStripsFetchTools(true, confident) {
+				t.Error("the tool strip must not fire; it is opt-in and requires mode=on")
+			}
+		})
+	}
+}
+
+// enableHardStrip turns enforcement on for one test, restored automatically.
+func enableHardStrip(t *testing.T) {
+	t.Helper()
+	t.Setenv("AGENT_SUMMARY_V2_MODE", agent.V2ModeOn)
+	t.Setenv(agent.HardStripEnvVar, "true")
+}
+
+// TestRefineStripReachesTheRunner closes the loop the previous tests cannot:
+// that the decision actually changes the toolset the model receives.
 func TestRefineStripReachesTheRunner(t *testing.T) {
 	h := &AgentChatHandler{}
 	confident := agent.RefineRoute{Intent: agent.RefineRewrite, HardNoFetch: true}
 
+	enableHardStrip(t)
 	stripped, _, err := h.buildRunnerForProfile("summary_refine", "u1", "s1", refineStripsFetchTools(true, confident))
 	if err != nil {
 		t.Fatalf("build stripped runner: %v", err)
 	}
+	if schemaNameSet(stripped.ToolSchemas())["fetch_channel"] {
+		t.Error("enforcement is on and the verdict is a confident rewrite: fetch_channel must be gone")
+	}
+
 	kept, _, err := h.buildRunnerForProfile("summary_refine", "u1", "s1", false)
 	if err != nil {
 		t.Fatalf("build full runner: %v", err)
 	}
-
-	strippedHasFetch := schemaNameSet(stripped.ToolSchemas())["fetch_channel"]
-	if strippedHasFetch != !refineHardStripEnforced {
-		t.Errorf("confident-rewrite runner has fetch_channel = %v; with refineHardStripEnforced=%v it must be %v",
-			strippedHasFetch, refineHardStripEnforced, !refineHardStripEnforced)
-	}
 	if !schemaNameSet(kept.ToolSchemas())["fetch_channel"] {
 		t.Error("a non-stripped summary_refine runner must always keep fetch_channel")
+	}
+
+	// And with enforcement off — the default — the same verdict leaves the
+	// toolset intact, which is what makes the observation window safe.
+	t.Setenv(agent.HardStripEnvVar, "false")
+	observeOnly, _, err := h.buildRunnerForProfile("summary_refine", "u1", "s1", refineStripsFetchTools(true, confident))
+	if err != nil {
+		t.Fatalf("build observe-only runner: %v", err)
+	}
+	if !schemaNameSet(observeOnly.ToolSchemas())["fetch_channel"] {
+		t.Error("with enforcement off the verdict is recorded only; fetch_channel must remain")
 	}
 }

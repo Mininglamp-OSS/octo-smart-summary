@@ -168,6 +168,17 @@ var (
 		// cannot drift apart; only the demonstratives are listed here.
 		"这篇", "本文",
 		// parts of an existing document (subtractive edits name these, never new data)
+		//
+		// 正文 / 全文 live HERE, not in refineArtifactNouns, and the distinction is
+		// load-bearing. As a filler they behave identically (翻译正文 / 把全文翻译成英文
+		// still strip), but refineArtifactNouns is ALSO the right-hand side of the
+		// adjacency test in stripModifierContainers, and there they are wrong: they
+		// name a PART of a document, not a produced artifact. "<container>全文" means
+		// "the full text OF the container" — the raw material — not "the artifact
+		// derived from it", so treating them as adjacency targets erased the container
+		// and hard-stripped 2352 requests for source material (翻译频道消息全文 stripped
+		// while 翻译频道消息, pinned must-keep, did not). Found by yujiawei, #206 round 2.
+		"正文", "全文",
 		"段落", "段", "句子", "句", "行", "字词", "字", "词", "小标题", "标题", "开头", "结尾",
 		"末尾", "部分", "结论", "章节", "列表", "序号", "编号", "第", "篇幅",
 		// NOTE: the origin containers (群 / 频道 / 子区 / 消息 / 对话记录 …) are deliberately
@@ -299,21 +310,32 @@ var refineOriginContainers = []string{
 	"群消息", "对话记录", "聊天记录", "群聊", "频道", "子区", "会话", "对话", "消息", "群",
 }
 
-// refineArtifactNouns are the names of the thing being edited, and the SINGLE
+// refineArtifactNouns are the names of the PRODUCED ARTIFACT, and the SINGLE
 // SOURCE OF TRUTH for that vocabulary: refineResidueFillers embeds this slice by
 // reference rather than repeating it.
 //
-// A container that MODIFIES one of these is structural (群总结 = "the summary of
-// the group", not a request to go read the group).
+// This list has TWO jobs, and membership must satisfy both:
+//
+//  1. residue filler — naming the thing being edited is not new data;
+//  2. adjacency target in stripModifierContainers — a container that MODIFIES one
+//     of these is structural (群总结 = "the summary of the group", not a request to
+//     go read the group).
+//
+// Job 2 is the strict one. Only nouns that name the OUTPUT belong here. Document
+// PART nouns (正文 / 全文 / 段落 / 章节 …) are fillers too, but they are NOT valid
+// adjacency targets: "<container>全文" is the full text OF the container — raw
+// material — so treating them as targets erases the container and strips a
+// request that can only be satisfied by fetching. They live in the
+// document-parts block of refineResidueFillers instead.
 //
 // The duplication this replaces was a live regression source: the positional rule
-// (stripModifierContainers) and the filler pass must agree on what an artifact
-// noun is, so adding 简报 to the filler list but not here would silently stop 群简报
-// from being recognised as a modifier construction, with no test failing. Rounds
-// 4-10 of #203 were almost entirely vocabulary churn, so the two lists are wired
-// together instead of being kept in sync by hand.
+// and the filler pass must agree on what an artifact noun is, so adding 简报 to the
+// filler list but not here would silently stop 群简报 from being recognised as a
+// modifier construction, with no test failing. Rounds 4-12 of this work were
+// almost entirely vocabulary churn, so the two lists are wired together instead of
+// being kept in sync by hand.
 var refineArtifactNouns = []string{
-	"摘要", "总结", "报告", "纪要", "正文", "全文", "文档", "文章",
+	"摘要", "总结", "报告", "纪要", "文档", "文章",
 }
 
 var refineOriginContainersByLen = sortByRuneLenDesc(refineOriginContainers)
