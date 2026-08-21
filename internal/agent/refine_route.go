@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"sort"
 	"strings"
 	"unicode"
 )
@@ -101,8 +102,8 @@ var (
 	// routes to augment. The object decides, not the verb.
 	refineSourceScopedAddVerbs = []string{"覆盖", "同步"}
 	// refineSourceNouns name places MATERIAL COMES FROM. Used for routing only —
-	// never for the tool strip, which is ∀-based (see allClausesRewrite). A routing
-	// mistake costs one extra fetch; that is the cheap direction.
+	// never for the tool strip, which is residue-based (see rewriteResidueEmpty). A
+	// routing mistake costs one extra fetch; that is the cheap direction.
 	refineSourceNouns = []string{"群", "频道", "子区", "会话", "聊天记录", "对话记录"}
 	// refineAddTargets are the things an add verb can name as its destination.
 	refineAddTargets = []string{"总结", "摘要", "报告", "纪要", "段落", "开头", "结尾", "末尾", "正文", "内容", "里面", "里头", "文中", "小标题", "标题", "列表", "章节"}
@@ -131,7 +132,7 @@ var (
 	refineRewriteKeywords = []string{
 		"翻译", "精简", "简化", "缩短", "压缩", "删减",
 		"润色", "排版", "格式", "改语气", "语气", "重新组织", "重组",
-		"提炼", "换成", "改写成", "说了什么", "说了啥", "什么意思",
+		"提炼", "换成", "改写成", "改写", "重写", "说了什么", "说了啥", "什么意思",
 		"讲了什么", "只保留", "去掉", "删掉",
 		// Anchored language phrasings. Round 1 removed bare 英文/中文 because they
 		// collided with 精英文化 / 整理中文档, which lost the two commonest rewrite
@@ -141,32 +142,40 @@ var (
 		"翻译成英文", "输出英文", "用英文", "改成英文", "英文版", "英文输出",
 		"翻译成中文", "输出中文", "用中文", "改成中文", "中文版", "中文输出",
 	}
-	// refineDataRetrievalVerbs disqualify a clause from counting as a rewrite
-	// clause in allClausesRewrite, even when it also matches a rewrite keyword.
-	//
-	// Needed because some rewrite keywords are Q&A-over-the-old-summary phrases
-	// (说了什么, 讲了什么) that read identically inside a genuine retrieval
-	// request: "用中文重写，并查一下客服群刚才说了什么" has a rewrite keyword in
-	// BOTH clauses, so ∀ alone authorised the strip and the model could not go
-	// look. The retrieval verb is the disambiguator: 查一下/看看 asks to GO AND GET,
-	// which no amount of text transformation can satisfy.
-	//
-	// Deliberately verbs only — NOT source nouns. An earlier version of this list
-	// vetoed on 群/频道/对话, which in a group-chat summarizer appear in ordinary
-	// pure-text requests ("把这份群总结翻译成英文") and switched SS-08b's zero-fetch
-	// enforcement off for most real instructions. ∀ over clauses already handles the
-	// compound "rewrite + name a channel" shape, so the nouns are redundant here.
-	refineDataRetrievalVerbs = []string{
-		"看看", "看下", "看一下", "查一下", "查下", "查查", "翻一下", "找一下", "找找",
-		"核实", "确认一下", "还有没有", "有没有别的", "新动态", "后续进展", "新情况",
-	}
-	// refineRewriteClauseBoundaries are ONLY for the HardNoFetch ∀-clause test.
-	// Do not reuse them for containsAddition: that matcher intentionally preserves
-	// whitespace and conjunction-glued 把…加进 constructions so it can still see
-	// the object and destination in one local clause.
-	refineRewriteClauseBoundaries = []string{
-		"并且", "顺便", "顺带", "另外", "同时", "而且", "然后", "以及", "还有", "接着", "外加",
-		"并", "再", "把", "将",
+	// refineResidueFillers are the semantically-empty words removed, along with the
+	// matched rewrite keywords, before the HardNoFetch residue test (see
+	// rewriteResidueEmpty). Every entry is a word that a request for NEW DATA never
+	// consists of: politeness/quantity particles, grammatical glue, the artifact
+	// nouns, the names of PARTS of an existing document, locatives, and Chinese
+	// numerals/ordinals. Adding one can only ever turn HardNoFetch ON for a string
+	// whose only remaining content was structural — it can never erase an addition
+	// or a retrieval verb, because those are not in this list. It is consulted ONLY
+	// inside the confident-rewrite branch (a rewrite keyword already matched), so it
+	// cannot affect a bare artifact reference like "这份摘要", which never reaches it.
+	refineResidueFillers = []string{
+		// politeness / quantity
+		"帮我", "麻烦", "请", "一下", "一点", "一些", "这份", "这段", "这个", "那段", "那个", "些", "点",
+		// grammatical glue and coordinating conjunctions (an addition survives them)
+		"的", "了", "吧", "呀", "啊", "把", "将", "也", "并且", "并", "再", "而且", "一并",
+		"顺便", "顺带", "顺路", "另外", "另", "同时", "然后", "以及", "还有", "还要", "接着",
+		"外加", "外带", "此外", "加之", "捎带", "兼", "随后", "跟着", "以后", "之后", "要",
+		// "re-" modifiers
+		"重新", "重",
+		// artifact nouns (naming the thing being edited is not new data)
+		"摘要", "总结", "报告", "纪要", "正文", "全文", "文档", "文章", "这篇", "本文",
+		// parts of an existing document (subtractive edits name these, never new data)
+		"段落", "段", "句子", "句", "行", "字词", "字", "词", "小标题", "标题", "开头", "结尾",
+		"末尾", "部分", "结论", "章节", "列表", "序号", "编号", "第", "篇幅",
+		// origin containers — WHERE material lives, structural like the artifact nouns.
+		// An addition that names a container also names its content (a channel name, a
+		// data kind), and that content noun is NOT a filler, so it survives the residue.
+		"群消息", "群", "频道", "子区", "会话", "对话记录", "聊天记录", "对话", "消息",
+		// pure-adjustment verbs that are not themselves rewrite keywords
+		"调整", "调", "整理", "组织",
+		// locatives
+		"里面", "里头", "里", "中", "内", "文中", "当中", "之中",
+		// Chinese numerals / ordinals
+		"一", "二", "两", "三", "四", "五", "六", "七", "八", "九", "十", "零", "百", "千",
 	}
 )
 
@@ -196,14 +205,13 @@ func ClassifyRefine(instruction string) RefineRoute {
 	case containsAny(s, refineAugmentKeywords) || hasAddition:
 		return RefineRoute{Intent: RefineAugment, Fetch: true, ReuseTimeRange: true, ReuseCitations: false}
 	case hasRewrite:
-		// Confident rewrite: an explicit pure-text keyword matched, so it is safe
+		// Confident rewrite: an explicit pure-text keyword matched, so it MAY be safe
 		// to strip the fetch tools (HardNoFetch) — 纯格式零 fetch.
 		//
-		// The strip requires EVERY clause to be a rewrite clause, not just one. See
-		// allClausesRewrite: this is the quantifier, and it is the whole fix.
-		// A time word additionally vetoes it, because then the request is only
-		// *probably* a rewrite.
-		hardNoFetch := allClausesRewrite(s) && !containsAny(s, refineExtendKeywords)
+		// The strip fires only when NOTHING content-bearing is left after the rewrite
+		// keywords are removed (rewriteResidueEmpty). A time word additionally vetoes
+		// it, because then the request is only *probably* a rewrite.
+		hardNoFetch := rewriteResidueEmpty(s) && !containsAny(s, refineExtendKeywords)
 		return RefineRoute{Intent: RefineRewrite, Fetch: false, ReuseTimeRange: false, ReuseCitations: true, HardNoFetch: hardNoFetch}
 	default:
 		// Ambiguous fallback: still the rewrite path (cheapest, no fetch by
@@ -213,94 +221,71 @@ func ClassifyRefine(instruction string) RefineRoute {
 	}
 }
 
-// allClausesRewrite reports whether EVERY clause of s is itself a rewrite clause.
+// rewriteResidueEmpty reports whether, after deleting every matched rewrite
+// keyword plus the closed set of structural fillers (refineResidueFillers) and
+// all digits / punctuation / whitespace, NOTHING content-bearing remains.
 //
-// This is the quantifier that closes the hard-strip class, and it is the one
-// change in this file that is not about vocabulary. HardNoFetch is the only
-// decision in this PR a runtime mistake cannot undo — buildRunnerForProfile
-// removes list/narrow/find/peek/fetch/search/filter outright, so a request for
-// new data becomes silently impossible to satisfy and unrecoverable.
+// This replaces the ∀-over-clauses test for the HardNoFetch decision. HardNoFetch
+// is the only irreversible decision in this PR — buildRunnerForProfile removes
+// list/narrow/find/peek/fetch/search/filter outright, so a request for new data
+// becomes silently impossible to satisfy — and rounds 4-9 proved that guessing it
+// from vocabulary or clause boundaries does not converge: clause segmentation in
+// unpunctuated Chinese is not a finite-list problem, so each round a new
+// no-connective phrasing ("翻译成英文补一些运营数据") landed on the wrong side.
 //
-// Rounds 4, 5, 6 and 7 each found a NEW family on the wrong side of that line.
-// Every one of those fixes, including my own previous "data signal" veto, was an
-// EXISTENTIAL test: strip when SOME part of the instruction looks like a rewrite
-// (and, in the veto's case, when no part looks like data). Under ∃ an
-// unrecognised addition is silently harmless to the decision — the recognised
-// rewrite clause next to it still authorises the strip — so every new phrasing
-// of "and also add X" produced a new unsatisfiable request. Widening the veto
-// list could only ever chase that.
+// The residue is a property of what the instruction asks for AFTER the recognised
+// rewrite verbs are removed, not of any conjunction/boundary vocabulary. If
+// anything content-bearing survives, that leftover is an obligation the rewrite
+// verbs cannot satisfy (an addition, a retrieval, a channel/topic to go and get),
+// so the tools MUST stay. An UNRECOGNISED addition can no longer hide next to a
+// recognised rewrite, because it survives into the residue rather than being
+// ignored by a vocabulary test. Every filler is structural (particles, artifact
+// nouns, document parts, containers, numerals); no content noun (运营数据 / 客户反馈
+// / 张三的原话 / a channel name) is a filler, so an addition's content always
+// survives. The asymmetry is deliberate: a false negative here costs a few unused
+// tool schemas in the prompt; a false positive costs an unsatisfiable request with
+// no recovery, so leftover-means-keep is the safe default.
 //
-// Under ∀ the default for unrecognised text flips. A clause nobody taught this
-// function about now BLOCKS the strip instead of being ignored by it, so the
-// failure mode of an unknown phrasing is "kept tools it does not use" (free)
-// rather than "cannot do what was asked" (unrecoverable). That is a property of
-// the instruction's SHAPE rather than its vocabulary, which is why it does not
-// need a new entry the next time a user phrases an addition differently.
+//	"翻译成英文"             -> residue "" -> strip
+//	"翻译成英文补一些运营数据"  -> residue "补运营数据" -> keep tools
 //
-// Credit: proposed and measured by yujiawei in the round-7 review.
-func allClausesRewrite(s string) bool {
-	clauses := splitRewriteClauses(s)
-	if len(clauses) == 0 {
-		return false
+// Credit: proposed and hand-verified against the protection set by yujiawei in the
+// round-9 review.
+func rewriteResidueEmpty(s string) bool {
+	residue := s
+	// Rewrite keywords longest-first, so a compound like 翻译成英文 is removed whole
+	// before its substring 翻译 could leave 成英文 behind.
+	for _, kw := range refineRewriteKeywordsByLen {
+		residue = strings.ReplaceAll(residue, kw, "")
 	}
-	for _, clause := range clauses {
-		if !containsAny(clause, refineRewriteKeywords) {
-			return false
+	for _, f := range refineResidueFillersByLen {
+		residue = strings.ReplaceAll(residue, f, "")
+	}
+	// Content-bearing iff any rune survives that is not a digit, space, punctuation
+	// or symbol.
+	for _, r := range residue {
+		if unicode.IsDigit(r) || unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r) {
+			continue
 		}
-		// A retrieval verb disqualifies the clause even when a rewrite keyword also
-		// matched — see refineDataRetrievalVerbs.
-		if containsAny(clause, refineDataRetrievalVerbs) {
-			return false
-		}
+		return false
 	}
 	return true
 }
 
-// splitRewriteClauses splits the instruction for the ∀-rewrite test used by
-// HardNoFetch. It is intentionally stricter than splitRefineClauses: punctuation,
-// whitespace, coordinating conjunctions, and object markers can all introduce a
-// separate obligation. Adding boundaries only ever turns HardNoFetch OFF, the
-// safe direction, because every resulting clause must still be rewrite-qualified.
-func splitRewriteClauses(s string) []string {
-	fields := strings.FieldsFunc(s, func(r rune) bool {
-		if unicode.IsSpace(r) {
-			return true
-		}
-		switch r {
-		case '，', ',', '。', '.', '；', ';', '、', '！', '!', '？', '?', '\n', '\r', '：', ':':
-			return true
-		}
-		return false
+// refineRewriteKeywordsByLen is refineRewriteKeywords ordered by descending rune
+// length so rewriteResidueEmpty removes the longest match first.
+var refineRewriteKeywordsByLen = sortByRuneLenDesc(refineRewriteKeywords)
+
+// refineResidueFillersByLen is refineResidueFillers longest-first, so a compound
+// filler (摘要) is removed before a single-rune filler (要) can split it.
+var refineResidueFillersByLen = sortByRuneLenDesc(refineResidueFillers)
+
+func sortByRuneLenDesc(in []string) []string {
+	out := append([]string(nil), in...)
+	sort.SliceStable(out, func(i, j int) bool {
+		return len([]rune(out[i])) > len([]rune(out[j]))
 	})
-	out := make([]string, 0, len(fields))
-	for _, field := range fields {
-		out = appendSplitRewriteBoundaries(out, field)
-	}
 	return out
-}
-
-func appendSplitRewriteBoundaries(out []string, s string) []string {
-	for s != "" {
-		cut, cutLen := -1, 0
-		for _, sep := range refineRewriteClauseBoundaries {
-			if idx := strings.Index(s, sep); idx >= 0 && (cut < 0 || idx < cut || idx == cut && len(sep) > cutLen) {
-				cut, cutLen = idx, len(sep)
-			}
-		}
-		if cut < 0 {
-			return appendNonEmpty(out, s)
-		}
-		out = appendNonEmpty(out, s[:cut])
-		s = s[cut+cutLen:]
-	}
-	return out
-}
-
-func appendNonEmpty(out []string, s string) []string {
-	if s == "" {
-		return out
-	}
-	return append(out, s)
 }
 
 // containsAddition reports whether s asks for content to be added INTO the

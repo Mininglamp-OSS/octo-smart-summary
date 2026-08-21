@@ -207,27 +207,50 @@ func TestClassifyToolErrorStaleHandleIsNotFatalPermission(t *testing.T) {
 }
 
 // TestClassifyToolErrorPermissionAndIdentityTransientOrdering pins the branch
-// ordering around weak transient terms. A channel-scoped permission denial stays
-// non-retryable, but a genuine identity-service outage must not be swallowed by
-// the bare "identity" permission branch.
+// ordering around permission vs weak transient terms, plus the round-9 P1-2 / P2-1
+// carve-outs.
 func TestClassifyToolErrorPermissionAndIdentityTransientOrdering(t *testing.T) {
 	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
 
-	env := classifyToolError("fetch_channel", errors.New("permission denied; please try again later"))
+	// Ordering: a permission-worded "try again" must classify as a non-retryable
+	// PERMISSION_DENIED, not flip to a retryable transient. On a RUN-scoped critical
+	// tool (no per-channel coverage recorder) it is also fatal.
+	env := classifyToolError("summarize_chunk", errors.New("permission denied; please try again later"))
 	if env.ErrorCode != "PERMISSION_DENIED" || !env.Fatal || env.Retryable {
-		t.Errorf("permission-worded 'try again' = %s retryable=%t fatal=%t, want fatal PERMISSION_DENIED",
+		t.Errorf("run-scoped permission 'try again' = %s retryable=%t fatal=%t, want fatal PERMISSION_DENIED",
 			env.ErrorCode, env.Retryable, env.Fatal)
 	}
 
+	// P1-2: the SAME wording on fetch_channel is channel-scoped — still a
+	// non-retryable PERMISSION_DENIED, but NON-fatal (recorded as a failed target,
+	// disclosed by the finish gate as PARTIAL + GapChannel).
+	env = classifyToolError("fetch_channel", errors.New("permission denied; please try again later"))
+	if env.ErrorCode != "PERMISSION_DENIED" || env.Fatal || env.Retryable {
+		t.Errorf("channel-scoped permission 'try again' = %s retryable=%t fatal=%t, want non-fatal non-retryable PERMISSION_DENIED",
+			env.ErrorCode, env.Retryable, env.Fatal)
+	}
+
+	// P2-1: a permanent permission denial that merely mentions identity + a weak
+	// transient term must NOT be swallowed as a transient outage — it stays a
+	// PERMISSION_DENIED (fatal on a run-scoped tool), or the model retries a denial
+	// that can never succeed.
+	env = classifyToolError("summarize_chunk", errors.New("identity: permission denied, please try again later"))
+	if env.ErrorCode != "PERMISSION_DENIED" || !env.Fatal || env.Retryable {
+		t.Errorf("identity+permission 'try again' = %s retryable=%t fatal=%t, want fatal PERMISSION_DENIED",
+			env.ErrorCode, env.Retryable, env.Fatal)
+	}
+
+	// A genuine identity-service OUTAGE (no permission word) must be retryable and
+	// non-fatal, whichever transient shape it takes.
 	for _, msg := range []string{
 		"backend service unavailable",
 		"transient hiccup, try again",
 		"identity service unavailable, retry later",
-		"identity provider returned 503",
+		"identity provider returned 503", // caught as a 5xx (returned NNN) → UPSTREAM_ERROR
 	} {
 		env := classifyToolError("fetch_channel", errors.New(msg))
-		if env.ErrorCode != "TRANSIENT_TOOL_ERROR" || env.Fatal || !env.Retryable {
-			t.Errorf("classifyToolError(%q) = %s retryable=%t fatal=%t, want retryable TRANSIENT_TOOL_ERROR",
+		if env.Fatal || !env.Retryable {
+			t.Errorf("classifyToolError(%q) = %s retryable=%t fatal=%t, want a retryable non-fatal transient",
 				msg, env.ErrorCode, env.Retryable, env.Fatal)
 		}
 	}
@@ -287,10 +310,13 @@ func TestFatalIsNotSelfSealing(t *testing.T) {
 
 	// A permission denial can never be retried into success, so it stays
 	// non-retryable — and therefore its fatal marker is unclearable BY
-	// CONSTRUCTION. Channel/handle-scoped denials must not be fatal; the finish
-	// gate already has the failed target and will report PARTIAL with a gap.
+	// CONSTRUCTION. A denial scoped to ONE channel must not be fatal; fetch_channel
+	// records the failed target and the finish gate reports PARTIAL with a gap.
 	t.Run("channel-scoped permission is not run-fatal", func(t *testing.T) {
-		for _, tool := range []string{"peek_channel", "list_channels", "narrow_channels_by_topic", "fetch_channel", "search_messages"} {
+		// fetch_channel is the critical tool whose every error path records the
+		// failed channel, so its permission denial is channel-scoped; the rest are
+		// non-critical, so permission is non-fatal for them anyway.
+		for _, tool := range []string{"peek_channel", "list_channels", "narrow_channels_by_topic", "fetch_channel"} {
 			env := classifyToolError(tool, errors.New("channel 12345 not accessible by user u-88"))
 			if env.Fatal {
 				t.Errorf("a channel-scoped permission denial on %s must not mark the whole run FAILED: %+v", tool, env)
@@ -300,11 +326,27 @@ func TestFatalIsNotSelfSealing(t *testing.T) {
 			}
 		}
 
-		if env := classifyToolError("search_messages", errors.New("permission denied")); env.Fatal || env.Retryable {
-			t.Errorf("search_messages permission denial is scoped to a handle/search target, want non-fatal/non-retryable: %+v", env)
+		// fetch_channel's OTHER per-channel permission paths (all call recordFetch)
+		// are covered by the same tool-identity carve-out, not by matching each
+		// spelling (round-9 P1-2, the under-inclusive half).
+		for _, msg := range []string{
+			"get user channels: permission denied for channel 12345",
+			"fetch messages: forbidden",
+		} {
+			if env := classifyToolError("fetch_channel", errors.New(msg)); env.Fatal {
+				t.Errorf("fetch_channel per-channel permission path must not be run-fatal: %q → %+v", msg, env)
+			}
 		}
 
-		// A run-scoped identity/auth failure is still fatal.
+		// search_messages has NO coverage recorder, so its ONE real permission-branch
+		// string — a run-scoped identity failure — must stay fatal (round-9 P1-2, the
+		// over-inclusive half: the previous arm pinned strings search_messages cannot
+		// emit and would have let the gate report COMPLETE).
+		if env := classifyToolError("search_messages", errors.New("missing user identity in context")); !env.Fatal {
+			t.Errorf("search_messages run-scoped identity failure must stay fatal: %+v", env)
+		}
+
+		// A run-scoped identity/auth failure is still fatal on any critical tool.
 		if env := classifyToolError("summarize_chunk", errors.New("missing user identity in context")); !env.Fatal {
 			t.Errorf("run-scoped identity failure must stay fatal: %+v", env)
 		}

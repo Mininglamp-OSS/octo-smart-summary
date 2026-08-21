@@ -183,11 +183,10 @@ func TestRefineImplicitDestinationAddIsAugment(t *testing.T) {
 	// not be read as an ADDITION: no 把, no destination noun after 带上 ⇒ rewrite.
 	//
 	// It no longer keeps HardNoFetch, and that is a deliberate, priced trade. Under
-	// the ∀-quantifier (allClausesRewrite) the clause 带上下文 carries no rewrite
-	// keyword, so it blocks the strip. The cost is one turn that keeps tools it then
-	// does not use; the benefit is that every UNRECOGNISED clause now fails in that
-	// same harmless direction instead of producing an unsatisfiable request. Round 7
-	// measured this exact swap and accepted it.
+	// the residue test (rewriteResidueEmpty) the leftover 下文 is content-bearing, so
+	// it blocks the strip. The cost is one turn that keeps tools it then does not
+	// use; the benefit is that every UNRECOGNISED leftover fails in that same
+	// harmless direction instead of producing an unsatisfiable request.
 	if got := ClassifyRefine("翻译成英文，带上下文"); got.Intent != RefineRewrite {
 		t.Errorf("ClassifyRefine(翻译成英文，带上下文) = %+v, want a rewrite", got)
 	}
@@ -386,22 +385,20 @@ func TestRefineArtifactNounDoesNotAuthorizeTheStrip(t *testing.T) {
 	}
 }
 
-// TestRefineStripRequiresEveryClauseToBeARewrite pins the round-7 quantifier fix.
+// TestRefineStripRequiresEveryClauseToBeARewrite pins the hard-strip precision.
 //
-// Rounds 4, 5, 6 and 7 each found a NEW family of phrasings whose fetch tools were
-// physically removed. Every fix up to and including my own "data signal" veto was
-// an EXISTENTIAL test — strip when SOME part of the instruction looks like a
-// rewrite — under which an unrecognised addition is silently harmless to the
-// decision, because the recognised rewrite clause beside it still authorises the
-// strip. That is why each round produced a new unsatisfiable family and why
-// widening a keyword list could only ever chase it.
+// Rounds 4-9 each found a NEW family of phrasings whose fetch tools were
+// physically removed. Every keyword/clause-boundary fix was a vocabulary guess,
+// and clause segmentation in unpunctuated Chinese is not a finite-list problem, so
+// each round a new no-connective phrasing landed on the wrong side. The strip is
+// now decided by rewriteResidueEmpty: strip ONLY when nothing content-bearing
+// remains after the rewrite keywords and a closed set of structural fillers are
+// removed. An unrecognised addition survives into the residue instead of being
+// ignored by a vocabulary test, so it can no longer hide beside a recognised
+// rewrite — a property of the residue, not of any conjunction list.
 //
-// Under ∀ the default for unrecognised text flips: a clause nobody taught this
-// function about BLOCKS the strip, so an unknown phrasing fails as "kept tools it
-// does not use" (free) instead of "cannot do what was asked" (unrecoverable).
-//
-// The fifteen strings below are yujiawei's round-7 measurement set, none of them
-// taken from any earlier round.
+// The strings below (punctuated, spaced, listed- and unlisted-connective, and
+// no-connective) all leave a content-bearing residue, so none may strip.
 func TestRefineStripRequiresEveryClauseToBeARewrite(t *testing.T) {
 	t.Run("a rewrite clause beside a request for material must not strip", func(t *testing.T) {
 		for _, instruction := range []string{
@@ -440,6 +437,37 @@ func TestRefineStripRequiresEveryClauseToBeARewrite(t *testing.T) {
 			"改成中文另外统计参与人数",
 			"排版同时引入销售群原话",
 			"压缩篇幅顺便汇总客服群讨论",
+			// Round-9 blocker set (yujiawei): NO connective at all — the default way
+			// Chinese chains two short imperatives. A conjunction list could never
+			// reach these; the residue test does, because the addition/retrieval verb
+			// and its content noun survive keyword removal.
+			"翻译成英文补一些运营数据",
+			"润色一下补点客户意见",
+			"只保留结论统计一下参与人数",
+			"去掉第三段列一下张三的原话",
+			"压缩篇幅提一提客服群的投诉",
+			"改语气写上反对意见",
+			"润色引用王五的原话",
+			"翻译成英文引上销售数据",
+			"排版调整提一提测试结果",
+			"改成中文提及销售数字",
+			"删掉第二段引用李四的原话",
+			"重新组织汇总相关讨论",
+			"精简一下统计参与人数",
+			// Round-9: connectives near-synonymous with a listed one but not themselves
+			// listed — the exact class a closed conjunction set kept missing.
+			"润色一下也补点客户意见",
+			"翻译成英文还要补一些运营数据",
+			"翻译成英文顺手补点运营数据",
+			"精简一下此外补一点客户意见",
+			"排版调整另补一些测试结果",
+			"改成中文捎带统计一下参与人数",
+			"翻译成英文兼列一下张三的原话",
+			"精简一下随后提一提运维问题",
+			"润色一下跟着补点运营数据",
+			"翻译成英文外带列一下李四的原话",
+			"润色一下顺路提一下运维",
+			"翻译成英文加之列一下原话",
 		} {
 			if got := ClassifyRefine(instruction); got.HardNoFetch {
 				t.Errorf("ClassifyRefine(%q) strips the fetch tools, so the request is impossible to satisfy: %+v", instruction, got)
@@ -447,25 +475,25 @@ func TestRefineStripRequiresEveryClauseToBeARewrite(t *testing.T) {
 		}
 	})
 
-	// The other half of the rule: ∀ must not be so strict that SS-08b's zero-fetch
-	// enforcement stops firing for the requests it exists for.
-	t.Run("every clause a rewrite clause still strips", func(t *testing.T) {
+	// The other half of the rule: the residue test must not be so strict that
+	// SS-08b's zero-fetch enforcement stops firing for the requests it exists for.
+	t.Run("pure text in every clause still strips", func(t *testing.T) {
 		for _, instruction := range []string{
 			"翻译成英文并精简",
 			"精简一下，去掉第三段",
 			"把这份总结翻译成英文，排版也调一下",
 		} {
 			if got := ClassifyRefine(instruction); !got.HardNoFetch {
-				t.Errorf("ClassifyRefine(%q) is pure text in every clause and must enforce zero fetch: %+v", instruction, got)
+				t.Errorf("ClassifyRefine(%q) is pure text and must enforce zero fetch: %+v", instruction, got)
 			}
 		}
 	})
 
-	// A retrieval verb disqualifies a clause even when a rewrite keyword also
-	// matched. 说了什么 is a rewrite keyword (Q&A over the old summary) that reads
-	// identically inside a genuine retrieval request, so ∀ alone authorised the
-	// strip on this one — found by the round-6 pinning test, not by inspection.
-	t.Run("a retrieval verb disqualifies its clause", func(t *testing.T) {
+	// A retrieval verb leaves a content-bearing residue even when a rewrite keyword
+	// also matched. 说了什么 is a rewrite keyword (Q&A over the old summary) that
+	// reads identically inside a genuine retrieval request, but 查一下客服群 survives
+	// keyword removal, so the residue is non-empty and the tools stay.
+	t.Run("a retrieval request keeps its tools", func(t *testing.T) {
 		if got := ClassifyRefine("用中文重写，并查一下客服群刚才说了什么"); got.HardNoFetch {
 			t.Errorf("查一下 asks the model to GO AND GET; no text transformation satisfies it: %+v", got)
 		}

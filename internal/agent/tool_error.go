@@ -168,34 +168,43 @@ func isTransientIdentityOutage(msg string) bool {
 	if !strings.Contains(msg, "identity") {
 		return false
 	}
+	// A permanent permission denial that merely mentions identity together with a
+	// weak transient term ("identity: permission denied, please try again later")
+	// is NOT a transient outage. Classifying it transient makes the model retry a
+	// denial that can never succeed until MaxSteps — the exact self-sealing case the
+	// permission branch ordering exists to prevent (round-9 P2-1). Require the
+	// ABSENCE of any permission word.
+	if strings.Contains(msg, "permission") || strings.Contains(msg, "denied") ||
+		strings.Contains(msg, "unauthor") || strings.Contains(msg, "forbidden") ||
+		strings.Contains(msg, "not accessible") {
+		return false
+	}
 	return strings.Contains(msg, "service unavailable") ||
 		strings.Contains(msg, "try again") ||
 		strings.Contains(msg, "retry later") ||
-		containsReturned5xx(msg)
+		containsHTTP5xx(msg)
 }
 
-func containsReturned5xx(msg string) bool {
-	for _, marker := range []string{"500", "501", "502", "503", "504", "505", "506", "507", "508", "510", "511"} {
-		if strings.Contains(msg, "returned "+marker) {
-			return true
-		}
-	}
-	return false
-}
-
+// isChannelScopedPermissionDenial reports whether a permission-branch error is
+// scoped to a single channel (→ non-fatal, disclosed by the finish gate as
+// PARTIAL + GapChannel) rather than to the whole run.
+//
+// It is keyed on a FACT, not on error wording: fetch_channel is the only critical
+// tool with a coverage recorder behind it, and EVERY fetch_channel error path
+// calls recordFetch(false, …) (tool_fetch_channel.go), so a denied channel is
+// always captured as a failed target. The tool identity is therefore the sound
+// signal — `channel X not accessible`, `get user channels: permission denied`, and
+// `fetch messages: forbidden` are all one denied channel, and keying on the tool
+// covers them all without chasing each spelling.
+//
+// search_messages is deliberately excluded: it has NO coverage recorder, so a
+// non-fatal-and-unrecorded classification would let the gate report COMPLETE —
+// strictly worse than the FAILED it would replace (round-9 P1-2).
+//
+// A genuine RUN-scoped auth failure stays fatal: "missing user identity in
+// context" is the whole run's identity, not one channel, so it is excluded.
 func isChannelScopedPermissionDenial(toolName, msg string) bool {
-	switch toolName {
-	case "fetch_channel":
-		return strings.Contains(msg, "channel") && strings.Contains(msg, "not accessible")
-	case "search_messages":
-		return strings.Contains(msg, "channel") ||
-			strings.Contains(msg, "messages_handle") ||
-			strings.Contains(msg, "permission denied") ||
-			strings.Contains(msg, "access denied") ||
-			strings.Contains(msg, "not accessible")
-	default:
-		return false
-	}
+	return toolName == "fetch_channel" && !strings.Contains(msg, "identity")
 }
 
 func containsHTTP5xx(msg string) bool {
@@ -208,11 +217,13 @@ func containsHTTP5xx(msg string) bool {
 }
 
 // containsHTTPStatus reports whether msg carries `code` as an HTTP status rather
-// than as an incidental number. It requires both a status-ish prefix AND that the
-// code is not part of a longer number: `status 5000` is not a 500, and a channel
-// id containing 429 is not a throttle.
+// than as an incidental number. It requires both a status-ish prefix (including
+// `returned `, folded in from the old containsReturned5xx so identity/upstream
+// outages spelled `... returned 503` are one list) AND that the code is not part
+// of a longer number: `status 5000` is not a 500, and a channel id containing 429
+// is not a throttle.
 func containsHTTPStatus(msg, code string) bool {
-	for _, prefix := range []string{"status=", "status ", "http ", "statuscode=", "status code ", "status_code="} {
+	for _, prefix := range []string{"status=", "status ", "http ", "statuscode=", "status code ", "status_code=", "returned "} {
 		from := 0
 		for {
 			i := strings.Index(msg[from:], prefix+code)
