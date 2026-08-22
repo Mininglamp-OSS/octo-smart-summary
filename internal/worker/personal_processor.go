@@ -1045,7 +1045,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 				timing.RecordLLMSince(taskNo, fmt.Sprintf("Map: 分块总结 chunk#%d", idx), callStart, tokens)
 				if err != nil {
 					log.Printf("[personal-worker] Map chunk %d failed: %v", idx, err)
-					isFatal := strings.Contains(err.Error(), "reasoning budget exhausted")
+					isFatal := errors.Is(err, service.ErrReasoningBudgetExhausted) || errors.Is(err, service.ErrTokenLimitExhausted)
 					results[idx] = chunkResult{failed: true, fatal: isFatal}
 				} else {
 					results[idx] = chunkResult{summary: summary, tokens: tokens, model: usedModel}
@@ -1110,9 +1110,6 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 			if err != nil {
 				return "", nil, 0, 0, "", fmt.Errorf("reduce: %w", err)
 			}
-		}
-		if strings.TrimSpace(finalContent) == "" {
-			return "", nil, 0, 0, "", fmt.Errorf("summary generation returned empty content")
 		}
 		totalTokens += reduceTokens
 		timing.Observe(taskNo, "llm_reduce_summary", reduceStart)

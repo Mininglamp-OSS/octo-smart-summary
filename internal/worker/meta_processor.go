@@ -7,7 +7,6 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -249,13 +248,6 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 
 			teamCitations = extractTeamCitations(finalContent, indexed)
 		}
-		if strings.TrimSpace(finalContent) == "" {
-			log.Printf("[meta-worker] empty summary task=%d", taskID)
-			finishTeamError("team summary generation returned empty content")
-			closeTeamStream()
-			return
-		}
-
 		now := timezone.Now()
 
 		// Count total messages across all submitted personal results

@@ -147,13 +147,17 @@ func (c *Client) attemptChat(ctx context.Context, model string, msgs []Message, 
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		outcome := llmfallback.Terminal
-		if resp.StatusCode >= http.StatusBadRequest {
-			outcome = llmfallback.ClassifyStatus(resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return AssistantTurn{}, llmfallback.ClassifyNonOKStatus(resp.StatusCode),
+			fmt.Errorf("http status %d: %s", resp.StatusCode, llmfallback.SafeTextForLog(string(body), 200))
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		if ctx.Err() != nil {
+			return AssistantTurn{}, llmfallback.Terminal, ctx.Err()
 		}
-		return AssistantTurn{}, outcome, fmt.Errorf("http status %d: %s", resp.StatusCode, llmfallback.SafeTextForLog(string(body), 200))
+		return AssistantTurn{}, llmfallback.RetrySameModel, fmt.Errorf("read response: %w", err)
 	}
 
 	var cr chatResponse

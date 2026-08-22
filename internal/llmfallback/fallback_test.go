@@ -35,6 +35,26 @@ func TestClassifyStatus(t *testing.T) {
 	}
 }
 
+func TestClassifyNonOKStatus(t *testing.T) {
+	cases := []struct {
+		code int
+		want Outcome
+	}{
+		{202, Terminal},
+		{204, Terminal},
+		{302, Terminal},
+		{401, Terminal},
+		{403, TryNextModel},
+		{429, RetrySameModel},
+		{503, RetrySameModel},
+	}
+	for _, c := range cases {
+		if got := ClassifyNonOKStatus(c.code); got != c.want {
+			t.Errorf("ClassifyNonOKStatus(%d)=%v want %v", c.code, got, c.want)
+		}
+	}
+}
+
 func TestRun_TerminalPreservesPartialValue(t *testing.T) {
 	partial := "already streamed"
 	val, used, err := Run(context.Background(), Config{Models: []string{"primary", "backup"}, MaxAttempts: 1}, func(_ context.Context, model string) (string, Outcome, error) {

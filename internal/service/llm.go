@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +21,15 @@ import (
 const MapFailedMarker = "总结失败"
 
 const kimiRequiredTemperature = 0.6
+
+const maxLLMErrorBodyBytes = 4096
+
+// ErrReasoningBudgetExhausted marks a response whose reasoning consumed the
+// output budget before producing user-visible content.
+var ErrReasoningBudgetExhausted = errors.New("LLM returned empty content: reasoning consumed entire max_tokens budget")
+
+// ErrTokenLimitExhausted marks an empty response terminated by the token cap.
+var ErrTokenLimitExhausted = errors.New("LLM returned empty content due to token limit")
 
 // LLMClient handles calls to a chat-completions-compatible LLM API.
 type LLMClient struct {
@@ -184,15 +194,9 @@ func (c *LLMClient) buildThinkingConfig(model string) (*ThinkingParam, map[strin
 	return nil, nil
 }
 
-// classifyNonOKStatus preserves the service client's historical contract:
-// only HTTP 200 is a successful chat completion. Retry/fallback classification
-// applies to HTTP errors; non-200 2xx/3xx responses are terminal protocol
-// errors instead of silent successes.
-func classifyNonOKStatus(code int) llmfallback.Outcome {
-	if code >= http.StatusBadRequest {
-		return llmfallback.ClassifyStatus(code)
-	}
-	return llmfallback.Terminal
+func readErrorBody(body io.Reader) string {
+	b, _ := io.ReadAll(io.LimitReader(body, maxLLMErrorBodyBytes))
+	return llmfallback.SafeTextForLog(string(b), 200)
 }
 
 // Call makes a chat completion request. Returns (content, tokenUsed, error).
@@ -249,20 +253,23 @@ func (c *LLMClient) CallWithModel(ctx context.Context, messages []ChatMessage, t
 			return result{}, llmfallback.RetrySameModel, err
 		}
 		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return result{}, llmfallback.ClassifyNonOKStatus(resp.StatusCode),
+				fmt.Errorf("LLM API error: status=%d body=%s", resp.StatusCode, readErrorBody(resp.Body))
+		}
 		respBody, err := io.ReadAll(resp.Body)
 		if err != nil {
+			if ctx.Err() != nil {
+				return result{}, llmfallback.Terminal, ctx.Err()
+			}
 			return result{}, llmfallback.RetrySameModel, err
-		}
-		if resp.StatusCode != http.StatusOK {
-			return result{}, classifyNonOKStatus(resp.StatusCode),
-				fmt.Errorf("LLM API error: status=%d body=%s", resp.StatusCode, llmfallback.SafeTextForLog(string(respBody), 200))
 		}
 		var chatResp chatResponse
 		if err := json.Unmarshal(respBody, &chatResp); err != nil {
-			return result{}, llmfallback.Terminal, fmt.Errorf("unmarshal LLM response: %w", err)
+			return result{}, llmfallback.RetrySameModel, fmt.Errorf("unmarshal LLM response: %w", err)
 		}
 		if len(chatResp.Choices) == 0 {
-			return result{}, llmfallback.Terminal, fmt.Errorf("LLM returned no choices")
+			return result{}, llmfallback.RetrySameModel, fmt.Errorf("LLM returned no choices")
 		}
 		content := chatResp.Choices[0].Message.Content
 		reasoningPresent := chatResp.Choices[0].Message.ReasoningContent != "" || chatResp.Choices[0].Message.Reasoning != ""
@@ -270,13 +277,11 @@ func (c *LLMClient) CallWithModel(ctx context.Context, messages []ChatMessage, t
 			reasoningLen := len(chatResp.Choices[0].Message.ReasoningContent) + len(chatResp.Choices[0].Message.Reasoning)
 			log.Printf("[llm] WARNING: content is empty but reasoning present (%d chars), finish_reason=%s, completion_tokens=%d. Reasoning consumed entire budget.",
 				reasoningLen, chatResp.Choices[0].FinishReason, chatResp.Usage.CompletionTokens)
-			return result{tokens: chatResp.Usage.TotalTokens}, llmfallback.Terminal,
-				fmt.Errorf("LLM returned empty content: reasoning consumed entire max_tokens budget")
+			return result{tokens: chatResp.Usage.TotalTokens}, llmfallback.Terminal, ErrReasoningBudgetExhausted
 		}
 		if content == "" && chatResp.Choices[0].FinishReason == "length" {
 			log.Printf("[llm] WARNING: content is empty and finish_reason=length, completion_tokens=%d", chatResp.Usage.CompletionTokens)
-			return result{tokens: chatResp.Usage.TotalTokens}, llmfallback.Terminal,
-				fmt.Errorf("LLM returned empty content due to token limit")
+			return result{tokens: chatResp.Usage.TotalTokens}, llmfallback.Terminal, ErrTokenLimitExhausted
 		}
 		return result{content: content, tokens: chatResp.Usage.TotalTokens}, llmfallback.Success, nil
 	})
@@ -361,9 +366,8 @@ func (c *LLMClient) CallStreamWithModel(ctx context.Context, messages []ChatMess
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			respBody, _ := io.ReadAll(resp.Body)
-			return result{}, classifyNonOKStatus(resp.StatusCode),
-				fmt.Errorf("LLM stream API error: status=%d body=%s", resp.StatusCode, llmfallback.SafeTextForLog(string(respBody), 200))
+			return result{}, llmfallback.ClassifyNonOKStatus(resp.StatusCode),
+				fmt.Errorf("LLM stream API error: status=%d body=%s", resp.StatusCode, readErrorBody(resp.Body))
 		}
 
 		var sb strings.Builder
@@ -377,7 +381,7 @@ func (c *LLMClient) CallStreamWithModel(ctx context.Context, messages []ChatMess
 			if emitted {
 				return res, llmfallback.Terminal, err
 			}
-			return res, llmfallback.TryNextModel, err
+			return res, llmfallback.RetrySameModel, err
 		}
 		scanner := bufio.NewScanner(resp.Body)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -429,12 +433,10 @@ func (c *LLMClient) CallStreamWithModel(ctx context.Context, messages []ChatMess
 		}
 		content := sb.String()
 		if content == "" && reasoningLen > 0 {
-			return result{tokens: totalTokens}, llmfallback.Terminal,
-				fmt.Errorf("LLM returned empty streamed content: reasoning consumed output budget")
+			return result{tokens: totalTokens}, llmfallback.Terminal, ErrReasoningBudgetExhausted
 		}
 		if content == "" && finishReason == "length" {
-			return result{tokens: totalTokens}, llmfallback.Terminal,
-				fmt.Errorf("LLM returned empty streamed content due to token limit")
+			return result{tokens: totalTokens}, llmfallback.Terminal, ErrTokenLimitExhausted
 		}
 		if content == "" {
 			return streamFailure(fmt.Errorf("LLM returned empty streamed content"))
@@ -515,14 +517,19 @@ func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, t
 			}
 			return result{}, llmfallback.RetrySameModel, fmt.Errorf("network error: %w", err)
 		}
+		if resp.StatusCode != http.StatusOK {
+			errBody := readErrorBody(resp.Body)
+			resp.Body.Close()
+			return result{}, llmfallback.ClassifyNonOKStatus(resp.StatusCode),
+				fmt.Errorf("LLM API error: status=%d body=%s", resp.StatusCode, errBody)
+		}
 		respBody, rerr := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if rerr != nil {
+			if ctx.Err() != nil {
+				return result{}, llmfallback.Terminal, ctx.Err()
+			}
 			return result{}, llmfallback.RetrySameModel, fmt.Errorf("read response body: %w", rerr)
-		}
-		if resp.StatusCode != http.StatusOK {
-			return result{}, classifyNonOKStatus(resp.StatusCode),
-				fmt.Errorf("LLM API error: status=%d body=%s", resp.StatusCode, llmfallback.SafeTextForLog(string(respBody), 200))
 		}
 
 		var chatResp chatResponseWithTools
@@ -685,9 +692,8 @@ func (c *LLMClient) CallMapWithModel(ctx context.Context, formattedMessages stri
 		return content, tokens, usedModel, nil
 	}
 	log.Printf("[llm] Map chunk %d failed: %s", chunkIndex, llmfallback.SafeErrorForLog(err, 200))
-	errMsg := err.Error()
-	if strings.Contains(errMsg, "reasoning consumed") || strings.Contains(errMsg, "empty content due to token limit") {
-		return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d", chunkIndex)
+	if errors.Is(err, ErrReasoningBudgetExhausted) || errors.Is(err, ErrTokenLimitExhausted) {
+		return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d: %w", chunkIndex, err)
 	}
 	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, c.model, nil
 }
@@ -755,9 +761,8 @@ func (c *LLMClient) CallMapStreamWithModel(ctx context.Context, formattedMessage
 	if emitted {
 		return content, tokens, usedModel, err
 	}
-	errMsg := err.Error()
-	if strings.Contains(errMsg, "reasoning consumed") || strings.Contains(errMsg, "empty content") {
-		return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d", chunkIndex)
+	if errors.Is(err, ErrReasoningBudgetExhausted) || errors.Is(err, ErrTokenLimitExhausted) {
+		return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d: %w", chunkIndex, err)
 	}
 	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, c.model, nil
 }

@@ -65,6 +65,16 @@ func ClassifyStatus(code int) Outcome {
 	}
 }
 
+// ClassifyNonOKStatus classifies an HTTP response after the caller has
+// established that it is not 200 OK. Non-200 2xx and 3xx responses are
+// protocol failures, not successful chat completions.
+func ClassifyNonOKStatus(code int) Outcome {
+	if code >= http.StatusBadRequest {
+		return ClassifyStatus(code)
+	}
+	return Terminal
+}
+
 // Attempt performs a single upstream request against model. It returns the
 // value, the Outcome classification and the underlying error (nil on Success).
 // It must not implement its own retry/backoff/model-switch — Run owns that.
