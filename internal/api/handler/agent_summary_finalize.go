@@ -25,12 +25,12 @@ package handler
 import (
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -97,36 +97,23 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 	}
 	frozenMessageID := frozen.MaxID
 
-	// One active Finalize Run per session (docs §3.4): reject if a finalize task
-	// for this session is not yet terminal (Pending before the poller claims it,
-	// Processing while the worker runs).
-	var inflight int64
-	if err := h.db.WithContext(c.Request.Context()).
-		Model(&model.SummaryTask{}).
-		Where("creator_id = ? AND agent_session_id = ? AND trigger_type = ? AND status IN ?",
-			userID, req.SessionID, model.TriggerAgentFinalize,
-			[]int{model.StatusPending, model.StatusProcessing}).
-		Count(&inflight).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "check in-flight finalize failed"})
-		return
-	}
-	if inflight > 0 {
-		c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "本次会话的定稿正在生成中,请稍候"})
-		return
-	}
-
-	// Best-effort origin channel resolution from the session (same helper the
-	// sync path uses); a failure just leaves origin empty — the deliverable does
-	// not depend on it.
-	var originID string
-	var originType int
-	if resolvedID, resolvedType, rerr := h.resolveOriginChannelFromSession(c.Request.Context(), req.SessionID, userID); rerr == nil {
-		originID, originType = resolvedID, resolvedType
-	}
-
 	title := strings.TrimSpace(req.Title)
 
 	// --- SUM-BE2 idempotency preflight (Idempotency-Key = finalize_request_id) ---
+	//
+	// This runs BEFORE the in-flight guard below and BEFORE origin resolution, and
+	// both orderings are load-bearing:
+	//
+	//   - before the in-flight guard, because the single most likely reason a
+	//     client retries with the same key is that it never received the first
+	//     202. At that moment the first task is Pending/Processing, so a guard
+	//     placed first would 409 exactly the replay this preflight exists to
+	//     serve, making the whole idempotency path dead code in its own window.
+	//   - before origin resolution, because canonicalAgentSaveRequestHash's
+	//     contract is that the hash is computed from REQUEST-OWNED fields only.
+	//     resolveOriginChannelFromSession reads mutable session state and can
+	//     fail transiently, so folding its result in would let a byte-identical
+	//     retry hash differently and 409 a request the client never changed.
 	idempotencyKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
 	var requestHash string
 	if idempotencyKey != "" {
@@ -134,7 +121,7 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "valid Idempotency-Key header is required"})
 			return
 		}
-		requestHash = canonicalAgentSaveRequestHash(userID, finalizeHashReq(req, title, originID, originType))
+		requestHash = canonicalAgentSaveRequestHash(userID, finalizeHashReq(req, title))
 		existing, mismatched, ok, stale, ferr := findAgentSaveIdempotentTaskWithHash(
 			c.Request.Context(), h.db, spaceID, userID, idempotencyKey, requestHash)
 		if ferr != nil {
@@ -154,6 +141,53 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 				"status":  "GENERATING",
 			}})
 			return
+		}
+	}
+
+	// One active Finalize Run per session (docs §3.4): reject if a finalize task
+	// for this session is not yet terminal (Pending before the poller claims it,
+	// Processing while the worker runs).
+	//
+	// Deliberately AFTER the idempotency preflight: a same-key retry must replay
+	// its own task, not be rejected by it. Soft-deleted tasks are excluded because
+	// the poller skips them (processor.go), so a soft-deleted Pending finalize
+	// would otherwise stay "in flight" forever and permanently 409 the session.
+	var inflight int64
+	if err := h.db.WithContext(c.Request.Context()).
+		Model(&model.SummaryTask{}).
+		Where("creator_id = ? AND agent_session_id = ? AND trigger_type = ? AND status IN ? AND deleted_at IS NULL",
+			userID, req.SessionID, model.TriggerAgentFinalize,
+			[]int{model.StatusPending, model.StatusProcessing}).
+		Count(&inflight).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "check in-flight finalize failed"})
+		return
+	}
+	if inflight > 0 {
+		c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "本次会话的定稿正在生成中,请稍候"})
+		return
+	}
+
+	// Origin channel is resolved AFTER the request hash (see above): it reads
+	// mutable session state, so it must not influence the replay key.
+	//
+	// resolveOriginChannelFromSession returns the STORAGE-layer channel_type
+	// (1=DM, 2=Group, 5=Thread) recovered from the fetch_channel tool args, but
+	// SummaryTask.OriginChannelType stores the APPLICATION-layer value
+	// (1=Group, 2=Thread, 3=DM). Without this translation DM sessions get written
+	// as Group and Thread (5) falls outside the 1..3 validation window entirely —
+	// the same defect SUM-158 blocker 4 fixed on the sync path.
+	//
+	// Unlike the sync path this stays best-effort: origin is decoration on a
+	// finalize deliverable, not a precondition, so an unrecognized type drops the
+	// origin instead of rejecting a request the user can do nothing about.
+	var originID string
+	var originType int
+	if resolvedID, resolvedType, rerr := h.resolveOriginChannelFromSession(c.Request.Context(), req.SessionID, userID); rerr == nil {
+		if appOrigin, ok := storageChannelTypeToAppOrigin(resolvedType); ok {
+			originID, originType = resolvedID, appOrigin
+		} else {
+			log.Printf("[handler] FinalizeAgentSummary: unrecognized storage channel_type=%d session=%s (channel_id=%s); dropping origin",
+				resolvedType, req.SessionID, resolvedID)
 		}
 	}
 
@@ -211,7 +245,8 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 			}
 		}
 
-		// Creator participant + a Processing PersonalResult the worker will fill.
+		// Creator participant + a Pending PersonalResult the worker will claim
+		// (Pending→Processing) and fill.
 		creatorP := model.SummaryParticipant{
 			TaskID:      createdTaskID,
 			UserID:      userID,
@@ -247,12 +282,13 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 				TaskID:         task.ID,
 				CreatedAt:      now,
 			}
-			insert := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&binding)
-			if insert.Error != nil {
-				return fmt.Errorf("create agent save idempotency: %w", insert.Error)
-			}
-			if insert.RowsAffected == 0 {
-				return errAgentSaveIdempotencyConflict
+			// Use the shared helper, NOT RowsAffected: GORM maps DoNothing to a
+			// MySQL no-op update and clientFoundRows=true reports that conflict as
+			// one affected row, so the loser of a concurrent same-key race would
+			// commit a SECOND task + participant + personal_result (two finalize
+			// runs, two LLM calls) while the binding still points at the first.
+			if berr := createAgentSaveIdempotencyBinding(tx, &binding); berr != nil {
+				return berr
 			}
 		}
 		return nil
@@ -278,7 +314,7 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 		return
 	}
 
-	// 202 Accepted: the worker poller claims the Processing task and runs
+	// 202 Accepted: the worker poller claims the Pending task and runs
 	// executeAgentFinalize. The client polls task status for COMPLETED.
 	c.JSON(http.StatusAccepted, apiResponse{Code: 0, Message: "ok", Data: gin.H{
 		"task_id": createdTaskID,
@@ -293,14 +329,23 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 // ExpectedSessionRevision has no field on createAgentSummaryReq, so it rides in
 // SnapshotVersion: both are optimistic-concurrency tokens and neither path
 // populates the other, so the hash stays injective per route.
-func finalizeHashReq(req finalizeAgentSummaryReq, title, originID string, originType int) createAgentSummaryReq {
-	origin := originID
+func finalizeHashReq(req finalizeAgentSummaryReq, title string) createAgentSummaryReq {
+	// finalizeRouteMarker discriminates this route inside the shared idempotency
+	// namespace. summary_agent_save_idempotency is keyed only on
+	// (space_id, user_id, idempotency_key), and finalizeHashReq leaves fields the
+	// sync path legally leaves empty too (AgentMessageID=0, RequestID="",
+	// Participants=nil), so without a marker a client reusing one key across both
+	// endpoints gets a CROSS-ROUTE replay: /finalize returning 202 for a Completed
+	// sync task no worker will touch, or /summaries/agent returning a queued async
+	// task with no content.
+	const finalizeRouteMarker = "agent-finalize/v0"
 	return createAgentSummaryReq{
-		SessionID:         req.SessionID,
-		OriginChannelID:   &origin,
-		OriginChannelType: originType,
-		Title:             title,
-		Sources:           req.Sources,
+		SessionID: req.SessionID,
+		Title:     title,
+		Sources:   req.Sources,
+		// RequestID is request-owned and unused by the finalize route, so it is
+		// free to carry the route discriminator into the canonical payload.
+		RequestID:         finalizeRouteMarker,
 		ReferencedTaskIDs: req.ReferencedTaskIDs,
 		SnapshotVersion:   req.ExpectedSessionRevision,
 	}

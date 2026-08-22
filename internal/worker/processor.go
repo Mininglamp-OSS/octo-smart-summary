@@ -265,7 +265,20 @@ func (p *Processor) processTask(task model.SummaryTask) {
 		Message:  "开始处理",
 	})
 
+	// Session-Finalize v0 (TriggerAgentFinalize) consolidates the agent's already
+	// produced replies; it has no channels to discover and no messages to fetch.
+	// Running executePipeline for it would perform channel discovery, participant
+	// intersection, a full intent-recognition tool call, and a message fetch over
+	// a zero-width time range — paying exactly the latency and cost this feature
+	// exists to avoid, and letting a finalize FAIL for reasons that have nothing
+	// to do with finalizing (e.g. an imDB channel-discovery error).
+	//
+	// The test seam still wins when injected, so existing pipeline tests are
+	// unaffected.
 	exec := p.executePipeline
+	if task.TriggerType == model.TriggerAgentFinalize {
+		exec = p.executeFinalizeTask
+	}
 	if p.executePipelineFn != nil {
 		exec = p.executePipelineFn
 	}

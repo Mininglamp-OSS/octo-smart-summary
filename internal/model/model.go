@@ -80,7 +80,7 @@ const (
 	TriggerBot = 4
 	// TriggerAgentFinalize marks a Session-Finalize v0 task: an async summary
 	// whose body is CONSOLIDATED from the agent conversation's already-produced
-	// assistant replies (not re-fetched/re-summarized). Born status=Processing
+	// assistant replies (not re-fetched/re-summarized). Born status=Pending
 	// and completed by the worker via executeAgentFinalize; distinct from the
 	// legacy synchronous TriggerAgent path.
 	TriggerAgentFinalize = 5
