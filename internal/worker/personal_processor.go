@@ -650,12 +650,34 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 	log.Printf("[personal-worker] task=%d marked failed (terminal), sanitizedMsg=%s", pr.TaskID, sanitized)
 }
 
+// isFatalMapError decides whether ONE chunk's Map failure should abort the whole
+// task instead of degrading that chunk.
+//
+// The match is deliberately narrow. It used to test the bare substring
+// "truncated", but internal/service/llm.go interpolates the upstream response
+// body verbatim into API errors ("LLM API error: status=400 body=..."), so any
+// upstream payload that merely CONTAINED the word — an error message, a field
+// name, a quoted snippet of the request — escalated one chunk's transient blip
+// into a task-wide abort. Only the two errors the Map wrapper itself produces
+// after exhausting its retries mean irrecoverable coverage loss:
+//
+//	service.ErrOutputTruncated / service.ErrStreamOutputTruncated, wrapped by
+//	  CallMap / CallMapStream as "output truncated on chunk N"
+//	"reasoning budget exhausted on chunk N"
+//
+// Everything else is a per-chunk failure the pipeline already handles.
+//
+// The truncation half is matched by errors.Is on the service sentinels rather
+// than by text, so it stays correct no matter how the wrapper's wording is
+// edited, and an unrelated error that merely quotes the word cannot satisfy it.
 func isFatalMapError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "reasoning budget exhausted") || strings.Contains(msg, "truncated")
+	if errors.Is(err, service.ErrOutputTruncated) || errors.Is(err, service.ErrStreamOutputTruncated) {
+		return true
+	}
+	return strings.Contains(err.Error(), "reasoning budget exhausted")
 }
 
 func (p *Processor) executePersonalPipeline(ctx context.Context, task model.SummaryTask, userID string, reportStage func(string), streamDelta func(string) error) (string, []model.Citation, int, int, string, error) {

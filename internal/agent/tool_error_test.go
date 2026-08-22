@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -41,6 +42,39 @@ func TestClassifyToolError(t *testing.T) {
 		{"bare required does not classify as argument", "fetch_channel", errors.New("required backend unavailable"), "CRITICAL_TOOL_ERROR", true, true},
 		{"evidence", "fetch_channel", errors.New("persist evidence: db down"), "EVIDENCE_WRITE_FAILED", false, true},
 		{"critical default", "summarize_chunk", errors.New("something odd"), "CRITICAL_TOOL_ERROR", true, true},
+		// PR #208 round-5 P2-4. These are per-request store caps: the store only
+		// grows within a request, so a retry hits the identical cap. Classified
+		// retryable (via the critical-tool default, because the message spells
+		// "summary handle" with a space and missed the "summary_handle" branch),
+		// they made the runner nudge an identical retry every step until MaxSteps
+		// and end the request with ZERO output.
+		{
+			"store handle-count cap is a deterministic dead end",
+			"summarize_chunk",
+			fmt.Errorf("store summary result: %w", fmt.Errorf("%w: too many summary handles in one request (max 128)", ErrSummaryHandleCapacity)),
+			"RESOURCE_EXHAUSTED", false, true,
+		},
+		{
+			"store text-size cap is a deterministic dead end",
+			"summarize_chunk",
+			fmt.Errorf("store summary result: %w", fmt.Errorf("%w: summary handle text exceeds per-request limit (8388608 bytes)", ErrSummaryHandleCapacity)),
+			"RESOURCE_EXHAUSTED", false, true,
+		},
+		{
+			"store cap on a non-critical tool is not fatal",
+			"peek_channel",
+			fmt.Errorf("%w: too many summary handles in one request (max 128)", ErrSummaryHandleCapacity),
+			"RESOURCE_EXHAUSTED", false, false,
+		},
+		// The model passing more handles than can exist is NOT a capacity dead
+		// end: it can fix its own arguments, so it keeps the retryable handle
+		// classification.
+		{
+			"too many handles in the ARGUMENTS stays retryable",
+			"merge_summaries",
+			errors.New("too many summary_handles (max 128)"),
+			"INVALID_ARGUMENT", true, true,
+		},
 		{"noncritical default", "get_current_time", errors.New("something odd"), "TOOL_ERROR", true, false},
 		// A permission denial is fatal only where it costs the deliverable something.
 		{"permission on a non-critical tool is not fatal", "peek_channel", errors.New("channel 12345 not accessible by user u-88"), "PERMISSION_DENIED", false, false},

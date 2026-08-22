@@ -2,12 +2,26 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 
 	"github.com/google/uuid"
 )
+
+// ErrSummaryHandleCapacity marks a request-scoped store cap that has been hit.
+// It is a typed sentinel rather than another error-string pattern on purpose:
+// these messages spell "summary handle" with a SPACE, while the tool-error
+// classifier matched "summary_handle" with an UNDERSCORE, so capacity failures
+// silently fell through to the critical-tool default (retryable=true) and the
+// nudged retry hit the identical cap every step until MaxSteps, ending the run
+// with zero output. Adding a second substring pattern would fix today's spelling
+// and leave the same trap armed for the next one; errors.Is cannot drift.
+//
+// Semantics: a deterministic dead end for THIS request. Retrying changes
+// nothing — the caps are per-request and the store only grows.
+var ErrSummaryHandleCapacity = errors.New("summary handle capacity exceeded")
 
 const (
 	maxSummaryHandles         = 128
@@ -90,10 +104,10 @@ func (s *summaryHandleStore) PutAtStep(text string, chunkCount, mapStep int) (st
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.items) >= maxSummaryHandles {
-		return "", fmt.Errorf("too many summary handles in one request (max %d)", maxSummaryHandles)
+		return "", fmt.Errorf("%w: too many summary handles in one request (max %d)", ErrSummaryHandleCapacity, maxSummaryHandles)
 	}
 	if s.totalTextBytes+len(text) > maxSummaryHandleText {
-		return "", fmt.Errorf("summary handle text exceeds per-request limit (%d bytes)", maxSummaryHandleText)
+		return "", fmt.Errorf("%w: summary handle text exceeds per-request limit (%d bytes)", ErrSummaryHandleCapacity, maxSummaryHandleText)
 	}
 
 	s.next++
@@ -122,6 +136,8 @@ func (s *summaryHandleStore) ResolveAllBefore(handles []string, reduceStep int) 
 		return summaryHandleResolution{}, fmt.Errorf("summary_handles must contain at least one handle")
 	}
 	if len(handles) > maxSummaryHandles {
+		// NOT ErrSummaryHandleCapacity: this is the model handing over more
+		// handles than can exist, which it CAN fix by passing the real set.
 		return summaryHandleResolution{}, fmt.Errorf("too many summary_handles (max %d)", maxSummaryHandles)
 	}
 

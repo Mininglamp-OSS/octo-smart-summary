@@ -38,6 +38,8 @@ var criticalTools = map[string]bool{
 //   - context deadline / canceled            → retryable, not fatal
 //   - 429 / 5xx / network / DB connection    → retryable, not fatal
 //   - stale/expired messages_handle           → retryable, not fatal (cache miss)
+//   - request-scoped store capacity (typed)    → never retryable; fatal on a
+//     critical tool (the cap is per-request, so no retry can clear it)
 //   - permission / access / identity / auth  → never retryable; fatal only on a
 //     critical tool (elsewhere it is a per-channel gap, not a failed run)
 //   - explicit invalid args / parse           → retryable, not fatal
@@ -96,6 +98,19 @@ func classifyToolError(toolName string, err error) ToolErrorEnvelope {
 		// `permission denied; please try again later` carries both, and a stale
 		// permission is fatal — retrying "try again" text can never clear it.
 		env.ErrorCode, env.Retryable, env.Fatal = "TRANSIENT_TOOL_ERROR", true, false
+	case errors.Is(err, ErrSummaryHandleCapacity):
+		// A per-request store cap (handle count / total text bytes). Unlike every
+		// other branch here this is matched by identity, not by substring, because
+		// substring matching is what broke it: the store spells "summary handle"
+		// with a space, the branch below matches "summary_handle" with an
+		// underscore, so capacity errors fell through to the critical-tool default
+		// and came back retryable=true. The nudged retry re-ran the same Map into
+		// the same full store, every step, until MaxSteps ended the run with zero
+		// output. NON-retryable because the caps are per-request and the store only
+		// grows: no retry within this request can succeed. Fatal on a critical tool
+		// because the chunk it could not store is coverage that is genuinely lost —
+		// the run should end reporting that, not spin.
+		env.ErrorCode, env.Retryable, env.Fatal = "RESOURCE_EXHAUSTED", false, criticalTools[toolName]
 	case strings.Contains(low, "messages_handle") || strings.Contains(low, "summary_handle"):
 		// A dropped/expired message-cache handle (`messages_handle`) or a bad
 		// request-scoped Map result handle (`summary_handle`).

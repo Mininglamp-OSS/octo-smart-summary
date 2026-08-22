@@ -2,10 +2,54 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
 )
+
+// PR #208 round-5 P2-4. The capacity messages spell "summary handle" with a
+// SPACE, so classifyToolError's "summary_handle" substring branch never matched
+// them and they fell through to the retryable critical-tool default. A typed
+// sentinel is what makes the classification immune to that class of drift, so
+// pin that these errors actually carry it — and that the store's OTHER errors
+// deliberately do not.
+func TestSummaryHandleStoreCapacityErrorsAreTyped(t *testing.T) {
+	store := newSummaryHandleStore()
+	for i := 0; i < maxSummaryHandles; i++ {
+		if _, err := store.Put("x", 0); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+	_, err := store.Put("one too many", 0)
+	if !errors.Is(err, ErrSummaryHandleCapacity) {
+		t.Fatalf("handle-count cap err = %v, want ErrSummaryHandleCapacity", err)
+	}
+	if !strings.Contains(err.Error(), "too many summary handles in one request") {
+		t.Fatalf("err = %q, want the operator-readable wording preserved", err)
+	}
+
+	big := newSummaryHandleStore()
+	if _, err := big.Put(strings.Repeat("x", maxSummaryHandleText), 0); err != nil {
+		t.Fatalf("Put at the byte limit: %v", err)
+	}
+	_, err = big.Put("x", 0)
+	if !errors.Is(err, ErrSummaryHandleCapacity) {
+		t.Fatalf("text-size cap err = %v, want ErrSummaryHandleCapacity", err)
+	}
+
+	// An empty body is the model's mistake, fixable by retrying — it must NOT be
+	// classified as a request-scoped dead end.
+	if _, err := newSummaryHandleStore().Put("   ", 0); err == nil || errors.Is(err, ErrSummaryHandleCapacity) {
+		t.Fatalf("empty-text err = %v, want a plain non-capacity error", err)
+	}
+	// Same for the model passing an impossible handle COUNT: it can pass fewer.
+	small := newSummaryHandleStore()
+	handles := make([]string, maxSummaryHandles+1)
+	if _, err := small.ResolveAll(handles); err == nil || errors.Is(err, ErrSummaryHandleCapacity) {
+		t.Fatalf("oversized argument list err = %v, want a plain non-capacity error", err)
+	}
+}
 
 func TestSummaryHandleStoreResolveAll(t *testing.T) {
 	store := newSummaryHandleStore()
