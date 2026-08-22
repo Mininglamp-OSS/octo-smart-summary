@@ -705,11 +705,11 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 
 	history = agent.TruncateHistory(history, h.window)
 
-	// SS-12-b: run, then bounded self-repair for expected channels the agent never
-	// fetched. Degenerates to a plain RunWithHistory when v2 is off / the scope is
-	// open / repair rounds are 0, so the flag-off path is unchanged.
-	reply, newMsgs, err := h.runWithRepair(ctx, runner, system, history, req.Message,
-		uid, v2RunID, closedScopeForRequest(req), nil)
+	// SS-12-b coverage enforcement is NOT here: it lives inside summarize_chunk,
+	// before the citation manifest freezes (internal/agent/coverage_gate.go). A
+	// post-answer repair round fetches after the freeze, so its messages are not
+	// citable and get dropped — see that file for the full argument.
+	reply, newMsgs, err := runner.RunWithHistory(ctx, system, history, req.Message)
 	if err != nil {
 		// 真实错误只记服务端日志，避免向调用方泄漏上游 LLM 地址/网络/内部细节。
 		// Detail 走白名单：仅 context deadline / max steps / empty response 等
@@ -1006,14 +1006,9 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 
 	history = agent.TruncateHistory(history, h.window)
 
-	// Run agent with history, plus SS-12-b bounded self-repair (see Chat()).
-	// A repair round is a real extra agent turn, so the client is told one is
-	// happening rather than watching the stream sit idle after the first answer.
-	reply, newMsgs, err := h.runWithRepair(ctx, runner, system, history, req.Message,
-		uid, v2RunID, closedScopeForRequest(req),
-		func(round int, missing []summaryspec.Channel) {
-			h.writeSSEProgressViaSink(sink, "retrieve", round, 0, len(missing), 0)
-		})
+	// Run agent with history. Coverage enforcement happens inside the run
+	// (summarize_chunk's pre-freeze gate), not around it — see Chat().
+	reply, newMsgs, err := runner.RunWithHistory(ctx, system, history, req.Message)
 	if err != nil {
 		log.Printf("[agent] chat runner error: %v", err)
 		h.writeSSEErrorViaSinkWithDetail(sink, 50000, "agent chat failed", safeErrorDetail(err))
