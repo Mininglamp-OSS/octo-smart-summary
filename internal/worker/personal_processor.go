@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citation"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
@@ -1111,44 +1110,12 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		log.Printf("[personal-worker] Reduce phase took %dms", time.Since(reduceStart).Milliseconds())
 	}
 
-	// Enforce the per-claim citation cap on the FINAL body, before citations
-	// are built from it.
-	//
-	// Why here and not (only) on each Map chunk: on this path the Reduce
-	// prompt explicitly instructs the model to "合并相同要点时，合并其引用编号"
-	// — merging is where two capped 3-marker claims become one 6-marker claim,
-	// so a Map-only cap is guaranteed to be re-exceeded by design. Capping the
-	// final body is what actually bounds what the user sees and what
-	// buildCitations then has to resolve.
-	//
-	// Placed BEFORE buildCitations deliberately: citations are derived from
-	// the markers present in the text, so capping first means the Citation
-	// rows and the body agree. Capping after would leave orphan Citation rows
-	// for markers no longer in the body.
-	//
-	// Operates on model output only. Message bodies reached the model through
-	// escapeCitationMarkers (line 23), which rewrote any literal `[12]` in
-	// content to `(12)`; MarkerRe does not match that form, so a literal
-	// bracketed number quoted from a chat message cannot be mistaken for a
-	// citation here.
-	if maxCites := p.cfg.ResolveMaxCitationsPerClaim(); maxCites > 0 {
-		capped, st := citation.CapRuns(finalContent, maxCites)
-		if st.Changed() {
-			log.Printf("[personal-worker] citation cap max=%d runs=%d capped_runs=%d markers=%d->%d dedup=%d cap=%d longest_run=%d->%d marks (%d->%d chars) bytes=%d->%d",
-				maxCites, st.Runs, st.CappedRuns, st.MarkersBefore, st.MarkersAfter,
-				st.RemovedByDedup, st.RemovedByCap,
-				st.LongestRunBefore, st.LongestRunAfter,
-				st.LongestRunCharsBefore, st.LongestRunCharsAfter,
-				st.BytesBefore, st.BytesAfter)
-		}
-		finalContent = capped
-	}
-
-	// Build citations from final content
+	// Build citations from the final body. The cap is part of this step and
+	// runs LAST inside it — see finalizeCitations for why the obvious order
+	// (cap first) silently produced uncited claims.
 	citationStart := time.Now()
-	citations := buildCitations(finalContent, userMessages, messages, nameMap)
-	finalContent, citations = dedupCitations(finalContent, citations)
-	finalContent = stripOrphanCitations(finalContent, citations)
+	finalContent, citations := finalizeCitations(
+		finalContent, userMessages, messages, nameMap, p.cfg.ResolveMaxCitationsPerClaim())
 	timing.Observe(taskNo, "build_citations", citationStart)
 	log.Printf("[personal-worker] Citation build took %dms (%d citations)",
 		time.Since(citationStart).Milliseconds(), len(citations))

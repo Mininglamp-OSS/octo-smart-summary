@@ -2,6 +2,7 @@ package worker
 
 import (
 	"fmt"
+	"log"
 	"regexp"
 	"sort"
 	"strconv"
@@ -382,4 +383,88 @@ func stripOrphanCitations(text string, citations []model.Citation) string {
 		return ""
 	})
 	return strings.TrimSpace(multiSpaceRe.ReplaceAllString(result, " "))
+}
+
+// finalizeCitations is the ONE definition of the worker's final citation
+// pipeline: derive rows, dedup, strip orphans, then cap. It exists as a
+// function so a test cannot exercise a different order than production does —
+// the previous test stopped at buildCitations, and that one-call gap between
+// the test's order and production's order hid a default-on regression for a
+// whole review round.
+//
+// maxCites <= 0 disables the cap (citation.Disabled), in which case this is
+// byte-for-byte the pre-cap pipeline.
+//
+// # Why the cap runs LAST
+//
+// dedupCitations ends with a whole-document dedup: for each [n] it keeps only
+// the FIRST occurrence anywhere in the body and deletes every later repeat.
+// citation.CapRuns keeps the HEAD of each run. Head-keeping is the worst
+// possible survivor policy against a first-occurrence global dedup — the
+// markers the cap preserves are precisely the ones an earlier claim has
+// already consumed, and the tail markers it deletes are the ones that would
+// have survived the dedup.
+//
+// Two claims citing the same source is not a corner case. It is what a real
+// summary looks like: one decisive message supports several conclusions.
+// Capping BEFORE the dedup therefore stripped claims down to zero citations:
+//
+//	in:          结论一：范围已确认[1][2][3]
+//	             结论二：负责人已定[1][2][3][10][11][12]
+//	cap off:     结论二：负责人已定[10][11][12]     <- cited
+//	cap=3 first: 结论二：负责人已定                 <- ZERO citations
+//
+// The cap destroyed a citation that exists without the cap. That violates
+// citation.CapRuns' own stated invariant ("an uncited claim is worse than an
+// over-cited one" — true inside CapRuns, false two calls later), and the Map
+// prompt's "没有引用的结论不允许输出".
+//
+// # Why capping last does not leave orphan Citation rows
+//
+// That concern is real and is what put the cap first to begin with. It is
+// handled by RE-DERIVING: buildCitations is a pure function of (text,
+// messages, allMessages, nameMap) — it reads no state and mutates nothing —
+// so running it again over the capped body returns exactly the rows whose
+// markers are still present.
+//
+// The subtle part is dedupCitations' remap, which rewrites marker NUMBERS
+// when two citations share (sender, content). Re-deriving after it is still
+// correct because the remap has already been applied to the body: the
+// remapped-away numbers are gone from the text, so buildCitations never sees
+// them and cannot resurrect a row for one. TestCapLastSurvivesCitationRemap
+// pins this by asserting the re-derived rows equal dedupCitations' rows minus
+// exactly what the cap removed.
+//
+// And the cap only ever DELETES markers, never adds or renumbers, so it
+// cannot introduce a marker with no backing row either.
+func finalizeCitations(
+	text string,
+	userMessages []pipeline.Message,
+	allMessages []pipeline.Message,
+	nameMap map[string]string,
+	maxCites int,
+) (string, []model.Citation) {
+	citations := buildCitations(text, userMessages, allMessages, nameMap)
+	text, citations = dedupCitations(text, citations)
+	text = stripOrphanCitations(text, citations)
+
+	if maxCites <= 0 {
+		return text, citations
+	}
+
+	capped, st := citation.CapRuns(text, maxCites)
+	if !st.Changed() {
+		// Nothing removed: the body and rows are already consistent, and
+		// skipping the re-derive keeps the no-op path allocation-free and
+		// provably identical to the disabled path.
+		return text, citations
+	}
+	log.Printf("[personal-worker] citation cap max=%d runs=%d capped_runs=%d markers=%d->%d dedup=%d cap=%d longest_run=%d->%d marks (%d->%d chars) bytes=%d->%d",
+		maxCites, st.Runs, st.CappedRuns, st.MarkersBefore, st.MarkersAfter,
+		st.RemovedByDedup, st.RemovedByCap,
+		st.LongestRunBefore, st.LongestRunAfter,
+		st.LongestRunCharsBefore, st.LongestRunCharsAfter,
+		st.BytesBefore, st.BytesAfter)
+
+	return capped, buildCitations(capped, userMessages, allMessages, nameMap)
 }
