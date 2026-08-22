@@ -62,6 +62,20 @@ func classifyToolError(toolName string, err error) ToolErrorEnvelope {
 	low := strings.ToLower(msg)
 	env := ToolErrorEnvelope{OK: false, Message: msg}
 
+	// SS-12-b coverage gate FIRST, on the typed error, before any substring
+	// matching. summarize_chunk is a criticalTool, so a misclassification here
+	// would mark the run FAILED and trade "incomplete summary" for "no summary".
+	// Keying on the type rather than on the text also means a channel NAME
+	// containing "permission" / "timeout" / "unauthorized" cannot steer the
+	// verdict — the instruction embeds user-controlled channel names verbatim.
+	// Retryable + NON-fatal is the contract the SS-12 §5 prompt acts on: the
+	// planner fetches the named channels and re-calls this same tool.
+	var gate *CoverageGateError
+	if errors.As(err, &gate) {
+		env.ErrorCode, env.Retryable, env.Fatal = "COVERAGE_INCOMPLETE", true, false
+		return env
+	}
+
 	switch {
 	case strings.Contains(low, "panicked"):
 		env.ErrorCode, env.Retryable, env.Fatal = "INTERNAL_ERROR", false, true

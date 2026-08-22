@@ -124,10 +124,13 @@ type Config struct {
 	// Default 30. Values <=0 fall back to the default in handler.
 	SummaryCustomTemplateLimit int
 
-	// SummaryRepairMaxRounds bounds the SS-12 self-repair loop: after the agent
-	// answers, each round re-asks it to fetch an expected-but-unfetched channel
-	// and regenerate. Each round is a full agent turn, so this is a latency and
-	// cost ceiling, not just a safety one. 0 disables repair entirely.
+	// SummaryRepairMaxRounds bounds the SS-12 coverage gate: how many times
+	// summarize_chunk may refuse to freeze the citation manifest while an
+	// expected channel has never been fetched. Each block costs the planner a
+	// fetch+retry step, so this is a latency and step-budget ceiling as well as a
+	// termination guarantee for a channel that simply cannot be fetched. After
+	// the cap the freeze proceeds and the run still delivers a summary with the
+	// gap disclosed by the finish gate. 0 disables the gate entirely.
 	SummaryRepairMaxRounds int
 
 	// Fetch concurrency for parallel channel message retrieval

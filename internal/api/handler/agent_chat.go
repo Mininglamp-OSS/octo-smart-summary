@@ -333,17 +333,15 @@ func buildSelectedChannelsPrompt(selected []selectedChannel) string {
 	return b.String()
 }
 
+// toolChannelType is the handler-local alias for agent.ToolChannelType, the ONE
+// definition of the chat-type string → fetch_channel integer mapping. It stays a
+// thin forwarder (rather than the mapping itself) because the SS-12-b coverage
+// gate lives in internal/agent and prints the same value in the same argument
+// slot: two copies is precisely how the gate ended up emitting the Spec's STRING
+// type into an INTEGER parameter, which fetch_channel rejects during argument
+// decoding — before recordFetch runs, so the channel stayed "never attempted".
 func toolChannelType(chatType string) int {
-	switch chatType {
-	case "direct":
-		return 1
-	case "group":
-		return 2
-	case "thread":
-		return 5
-	default:
-		return 0
-	}
+	return agent.ToolChannelType(chatType)
 }
 
 func truncateRunes(s string, max int) string {
