@@ -1,8 +1,12 @@
 package llmfallback
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -18,7 +22,7 @@ func TestClassifyStatus(t *testing.T) {
 		{429, RetrySameModel},
 		{500, RetrySameModel},
 		{503, RetrySameModel},
-		{401, TryNextModel},
+		{401, Terminal},
 		{403, TryNextModel}, // Bedrock SCP-deny must escalate to a fallback provider
 		{400, Terminal},
 		{404, Terminal},
@@ -28,6 +32,71 @@ func TestClassifyStatus(t *testing.T) {
 		if got := ClassifyStatus(c.code); got != c.want {
 			t.Errorf("ClassifyStatus(%d)=%v want %v", c.code, got, c.want)
 		}
+	}
+}
+
+func TestRun_TerminalPreservesPartialValue(t *testing.T) {
+	partial := "already streamed"
+	val, used, err := Run(context.Background(), Config{Models: []string{"primary", "backup"}, MaxAttempts: 1}, func(_ context.Context, model string) (string, Outcome, error) {
+		return partial, Terminal, errors.New("stream interrupted")
+	})
+	if err == nil || val != partial || used != "primary" {
+		t.Fatalf("got (%q,%q,%v), want preserved partial value and primary model", val, used, err)
+	}
+}
+
+func TestRun_401IsTerminal(t *testing.T) {
+	var tried []string
+	_, _, err := Run(context.Background(), Config{Models: []string{"primary", "backup"}, MaxAttempts: 3, Backoff: noBackoff}, func(_ context.Context, model string) (string, Outcome, error) {
+		tried = append(tried, model)
+		return "", ClassifyStatus(http.StatusUnauthorized), errors.New("unauthorized")
+	})
+	if err == nil || len(tried) != 1 || tried[0] != "primary" {
+		t.Fatalf("401 must stop at primary, tried=%v err=%v", tried, err)
+	}
+}
+
+func TestRun_FallbackLogIsBoundedAndSingleLine(t *testing.T) {
+	var buf bytes.Buffer
+	oldWriter := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(oldWriter) })
+
+	longErr := errors.New("denied\n" + strings.Repeat("x", 400))
+	_, _, _ = Run(context.Background(), Config{Models: []string{"primary", "backup"}, MaxAttempts: 1}, func(_ context.Context, model string) (string, Outcome, error) {
+		if model == "primary" {
+			return "", TryNextModel, longErr
+		}
+		return "ok", Success, nil
+	})
+	got := buf.String()
+	if strings.Contains(got, "denied\n") || !strings.Contains(got, "...(truncated)") || len([]rune(got)) > 320 {
+		t.Fatalf("fallback log must be bounded and single-line, got %q", got)
+	}
+}
+
+func TestRun_DeadlineCheckHappensBeforeBackoff(t *testing.T) {
+	var tried []string
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	val, used, err := Run(ctx, Config{
+		Models:          []string{"primary", "backup"},
+		PerModelTimeout: 100 * time.Millisecond,
+		MaxAttempts:     2,
+		Backoff:         func(int) time.Duration { return 100 * time.Millisecond },
+	}, func(_ context.Context, model string) (string, Outcome, error) {
+		tried = append(tried, model)
+		if model == "primary" {
+			return "", RetrySameModel, errors.New("temporary")
+		}
+		return "ok", Success, nil
+	})
+	if err != nil || val != "ok" || used != "backup" {
+		t.Fatalf("got (%q,%q,%v), tried=%v", val, used, err, tried)
+	}
+	if elapsed := time.Since(start); elapsed >= 100*time.Millisecond {
+		t.Fatalf("deadline check ran after backoff; elapsed=%v", elapsed)
 	}
 }
 

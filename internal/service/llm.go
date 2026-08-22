@@ -38,8 +38,8 @@ type LLMClient struct {
 //
 // fallbackModels (typically sourced from LLM_FALLBACK_MODELS) are tried in
 // order when the primary model fails in a way a different model/provider may
-// survive — 429/5xx (after retries) and, critically, 401/403 account-level
-// denials such as a Bedrock SCP explicit-deny, which the gateway can route to
+// survive — 429/5xx (after retries) and, critically, 403 account-level denials
+// such as a Bedrock SCP explicit-deny, which the gateway can route to
 // a different provider (issue #211). A nil/empty slice preserves single-model
 // behaviour. The primary model, empty entries and duplicates are dropped.
 func NewLLMClient(apiURL, apiKey, model string, timeoutSec, maxTokens int, enableThinking bool, toolCallTimeoutSec int, fallbackModels []string) *LLMClient {
@@ -171,14 +171,14 @@ type chatResponse struct {
 
 // buildThinkingConfig returns model-specific thinking parameters.
 // For Kimi: top-level thinking field. For Qwen/DeepSeek: chat_template_kwargs.
-func (c *LLMClient) buildThinkingConfig() (*ThinkingParam, map[string]interface{}) {
+func (c *LLMClient) buildThinkingConfig(model string) (*ThinkingParam, map[string]interface{}) {
 	if c.enableThinking {
 		return nil, nil
 	}
-	if config.IsKimiModel(c.model) {
+	if config.IsKimiModel(model) {
 		return &ThinkingParam{Type: "disabled"}, nil
 	}
-	if config.IsQwenOrDeepSeekModel(c.model) {
+	if config.IsQwenOrDeepSeekModel(model) {
 		return nil, map[string]interface{}{"enable_thinking": false}
 	}
 	return nil, nil
@@ -207,7 +207,7 @@ func (c *LLMClient) Call(ctx context.Context, messages []ChatMessage, temperatur
 			Temperature: temp,
 			MaxTokens:   c.maxTokens,
 		}
-		thinking, kwargs := c.buildThinkingConfig()
+		thinking, kwargs := c.buildThinkingConfig(model)
 		reqBody.Thinking = thinking
 		reqBody.ChatTemplateKwargs = kwargs
 
@@ -288,10 +288,10 @@ func (c *LLMClient) CallStream(ctx context.Context, messages []ChatMessage, temp
 		tokens  int
 	}
 	// Cross-model fallback is only safe BEFORE the stream starts emitting: once
-	// a 200 response begins delivering deltas (via onDelta) we are committed to
-	// that model — a fallback would double-emit. So only pre-stream failures
-	// (transport / non-200) are classified for fallback; everything after the
-	// 200 is Terminal. MaxAttempts:1 — outer Map/Reduce loops own same-model retries.
+	// onDelta receives content we are committed to that model, because switching
+	// would double-emit. Failures after HTTP 200 but before the first delivered
+	// delta may still try the next model. MaxAttempts:1 — outer Map/Reduce loops
+	// own same-model retries.
 	res, _, err := llmfallback.Run(ctx, llmfallback.Config{
 		Models:      c.models(),
 		MaxAttempts: 1,
@@ -310,7 +310,7 @@ func (c *LLMClient) CallStream(ctx context.Context, messages []ChatMessage, temp
 			Stream:        true,
 			StreamOptions: &streamOptions{IncludeUsage: true},
 		}
-		thinking, kwargs := c.buildThinkingConfig()
+		thinking, kwargs := c.buildThinkingConfig(model)
 		reqBody.Thinking = thinking
 		reqBody.ChatTemplateKwargs = kwargs
 
@@ -340,12 +340,19 @@ func (c *LLMClient) CallStream(ctx context.Context, messages []ChatMessage, temp
 				fmt.Errorf("LLM stream API error: status=%d body=%s", resp.StatusCode, string(respBody))
 		}
 
-		// Committed to this model from here on — all failures are Terminal.
 		var sb strings.Builder
 		var totalTokens int
 		var reasoningLen int
+		emitted := false
 		terminalSeen := false
 		finishReason := ""
+		streamFailure := func(err error) (result, llmfallback.Outcome, error) {
+			res := result{content: sb.String(), tokens: totalTokens}
+			if emitted {
+				return res, llmfallback.Terminal, err
+			}
+			return res, llmfallback.TryNextModel, err
+		}
 		scanner := bufio.NewScanner(resp.Body)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
@@ -363,7 +370,7 @@ func (c *LLMClient) CallStream(ctx context.Context, messages []ChatMessage, temp
 			}
 			var chunk chatStreamResponse
 			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-				return result{content: sb.String(), tokens: totalTokens}, llmfallback.Terminal, fmt.Errorf("unmarshal LLM stream chunk: %w", err)
+				return streamFailure(fmt.Errorf("unmarshal LLM stream chunk: %w", err))
 			}
 			if chunk.Usage.TotalTokens > 0 {
 				totalTokens = chunk.Usage.TotalTokens
@@ -382,26 +389,27 @@ func (c *LLMClient) CallStream(ctx context.Context, messages []ChatMessage, temp
 			}
 			sb.WriteString(delta)
 			if onDelta != nil {
+				emitted = true
 				if err := onDelta(delta); err != nil {
 					return result{content: sb.String(), tokens: totalTokens}, llmfallback.Terminal, err
 				}
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			return result{content: sb.String(), tokens: totalTokens}, llmfallback.Terminal, fmt.Errorf("read LLM stream: %w", err)
+			return streamFailure(fmt.Errorf("read LLM stream: %w", err))
 		}
 		if !terminalSeen {
-			return result{content: sb.String(), tokens: totalTokens}, llmfallback.Terminal, fmt.Errorf("LLM stream ended without terminal marker")
+			return streamFailure(fmt.Errorf("LLM stream ended without terminal marker"))
 		}
 		content := sb.String()
 		if content == "" && reasoningLen > 0 {
-			return result{tokens: totalTokens}, llmfallback.Terminal, fmt.Errorf("LLM returned empty streamed content: reasoning consumed output budget")
+			return streamFailure(fmt.Errorf("LLM returned empty streamed content: reasoning consumed output budget"))
 		}
 		if content == "" && finishReason == "length" {
-			return result{tokens: totalTokens}, llmfallback.Terminal, fmt.Errorf("LLM returned empty streamed content due to token limit")
+			return streamFailure(fmt.Errorf("LLM returned empty streamed content due to token limit"))
 		}
 		if content == "" {
-			return result{tokens: totalTokens}, llmfallback.Terminal, fmt.Errorf("LLM returned empty streamed content")
+			return streamFailure(fmt.Errorf("LLM returned empty streamed content"))
 		}
 		return result{content: content, tokens: totalTokens}, llmfallback.Success, nil
 	})
@@ -428,7 +436,7 @@ func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, t
 	start := time.Now()
 	// MaxAttempts:3 preserves CallWithTools' original per-model retry budget;
 	// the runner adds cross-model fallback once those are exhausted (or on a
-	// 401/403 account denial, which escalates immediately — issue #211).
+	// 403 account denial, which escalates immediately — issue #211).
 	res, _, err := llmfallback.Run(ctx, llmfallback.Config{
 		Models:          c.models(),
 		PerModelTimeout: c.toolCallTimeout,
@@ -454,7 +462,7 @@ func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, t
 			Tools:       tools,
 			ToolChoice:  toolChoice,
 		}
-		thinking, kwargs := c.buildThinkingConfig()
+		thinking, kwargs := c.buildThinkingConfig(model)
 		reqBody.Thinking = thinking
 		reqBody.ChatTemplateKwargs = kwargs
 

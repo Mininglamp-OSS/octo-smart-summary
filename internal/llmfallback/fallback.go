@@ -10,8 +10,9 @@
 // explicitly denying bedrock:InvokeModel for the caller's IAM user): every
 // request to that account returns HTTP 403, and retrying the same model is
 // pointless, but a fallback model the gateway routes to a different provider
-// (e.g. gpt-4.1 / Kimi) can still succeed. That is why 401/403 map to
-// TryNextModel here rather than Terminal.
+// (e.g. gpt-4.1 / Kimi) can still succeed. A 401 remains terminal because all
+// models share the gateway credential, so trying more models only multiplies
+// denied-auth traffic.
 package llmfallback
 
 import (
@@ -20,6 +21,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -33,7 +35,7 @@ const (
 	// same model may succeed; Run retries with backoff before falling back.
 	RetrySameModel
 	// TryNextModel: this model/provider is unavailable in a way retrying the
-	// same model will not fix (401 / 403 — auth or account-level denial), but
+	// same model will not fix (403 — account-level denial), but
 	// a fallback routed to a different backend may work. Run skips the
 	// remaining same-model retries and switches to the next model immediately.
 	TryNextModel
@@ -47,8 +49,8 @@ const (
 //
 //	< 400            → Success
 //	429, 5xx         → RetrySameModel (transient overload / outage)
-//	401, 403         → TryNextModel   (auth / account denial; a different
-//	                   backend may succeed — see the Bedrock SCP-deny case)
+//	403              → TryNextModel   (account denial; a different backend
+//	                   may succeed — see the Bedrock SCP-deny case)
 //	other 4xx        → Terminal       (bad request / contract mismatch)
 func ClassifyStatus(code int) Outcome {
 	switch {
@@ -56,7 +58,7 @@ func ClassifyStatus(code int) Outcome {
 		return Success
 	case code == http.StatusTooManyRequests || code >= 500:
 		return RetrySameModel
-	case code == http.StatusUnauthorized || code == http.StatusForbidden:
+	case code == http.StatusForbidden:
 		return TryNextModel
 	default:
 		return Terminal
@@ -93,9 +95,9 @@ func (c Config) backoff(attempt int) time.Duration {
 }
 
 // Run tries the configured models in order and returns the value, the model
-// that produced it, and an error. A single configured model preserves the
-// underlying single-model error verbatim (so log/alert patterns keep working);
-// multiple models wrap the last error with a count when all fail.
+// that produced it, and an error. Terminal failures preserve any partial value
+// returned by the attempt (notably streamed content and token accounting).
+// Multiple models wrap the final error with the number of models attempted.
 func Run[T any](ctx context.Context, cfg Config, attempt Attempt[T]) (T, string, error) {
 	var zero T
 	maxAttempts := cfg.MaxAttempts
@@ -116,8 +118,8 @@ func Run[T any](ctx context.Context, cfg Config, attempt Attempt[T]) (T, string,
 			return zero, "", err
 		}
 		if i > 0 {
-			log.Printf("[llmfallback] falling back from %q to %q: %v",
-				cfg.Models[i-1], model, lastErr)
+			log.Printf("[llmfallback] falling back from %q to %q: %s",
+				cfg.Models[i-1], model, safeErrorForLog(lastErr, 200))
 		}
 		hasNext := i < len(cfg.Models)-1
 
@@ -126,7 +128,7 @@ func Run[T any](ctx context.Context, cfg Config, attempt Attempt[T]) (T, string,
 		case Success:
 			return val, model, nil
 		case Terminal:
-			return zero, "", err
+			return val, model, err
 		}
 		// runModel exhausted retries or hit TryNextModel → advance.
 		lastErr = err
@@ -147,21 +149,27 @@ func runModel[T any](ctx context.Context, model string, maxAttempts int, hasNext
 	var lastErr error
 	for a := 0; a < maxAttempts; a++ {
 		if a > 0 {
+			delay := cfg.backoff(a)
+			// Reserve both the backoff and one complete attempt for a fallback.
+			// Checking before sleep prevents the backoff itself from consuming
+			// the budget that this branch exists to protect. If the context will
+			// expire during the backoff itself, let cancellation win instead of
+			// starting another doomed fallback request.
+			if hasNext && cfg.PerModelTimeout > 0 {
+				if dl, ok := ctx.Deadline(); ok {
+					remaining := time.Until(dl)
+					if remaining > delay && remaining < delay+cfg.PerModelTimeout {
+						if lastErr == nil {
+							lastErr = fmt.Errorf("insufficient budget for another %s attempt on %q", cfg.PerModelTimeout, model)
+						}
+						return zero, TryNextModel, lastErr
+					}
+				}
+			}
 			select {
 			case <-ctx.Done():
 				return zero, TryNextModel, ctx.Err()
-			case <-time.After(cfg.backoff(a)):
-			}
-			// Deadline-aware early escalation: if another full attempt cannot
-			// fit before the parent deadline and a fallback is waiting, stop
-			// retrying this model so the fallback gets a real budget.
-			if hasNext {
-				if dl, ok := ctx.Deadline(); ok && time.Until(dl) < cfg.PerModelTimeout {
-					if lastErr == nil {
-						lastErr = fmt.Errorf("insufficient budget for another %s attempt on %q", cfg.PerModelTimeout, model)
-					}
-					return zero, TryNextModel, lastErr
-				}
+			case <-time.After(delay):
 			}
 		}
 		val, outcome, err := attempt(ctx, model)
@@ -169,7 +177,7 @@ func runModel[T any](ctx context.Context, model string, maxAttempts int, hasNext
 		case Success:
 			return val, Success, nil
 		case Terminal:
-			return zero, Terminal, err
+			return val, Terminal, err
 		case TryNextModel:
 			return zero, TryNextModel, err
 		case RetrySameModel:
@@ -177,4 +185,16 @@ func runModel[T any](ctx context.Context, model string, maxAttempts int, hasNext
 		}
 	}
 	return zero, TryNextModel, fmt.Errorf("model %q failed after %d attempt(s): %w", model, maxAttempts, lastErr)
+}
+
+func safeErrorForLog(err error, maxRunes int) string {
+	if err == nil {
+		return "unknown error"
+	}
+	s := strings.NewReplacer("\r", " ", "\n", " ", "\t", " ").Replace(err.Error())
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes]) + "...(truncated)"
 }

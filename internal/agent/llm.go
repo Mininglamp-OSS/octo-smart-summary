@@ -74,39 +74,22 @@ type chatResponse struct {
 	} `json:"usage"`
 }
 
-// truncateForLog caps a string to n runes and appends an ellipsis marker when
-// truncated. Used to keep upstream error bodies out of long-lived logs while
-// still surfacing enough context to diagnose retry-vs-fallback decisions.
-// See issue #179's leakage criterion.
-func truncateForLog(s string, n int) string {
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
-	}
-	return string(runes[:n]) + "...(truncated)"
-}
-
 // Chat 发起一次多轮回喂中的单跳请求。
 //
 // Retry / fallback policy:
 //   - Per-model: up to 3 attempts with exponential backoff (1s, 2s). Network
-//     errors, HTTP 5xx and 429 are retryable; 4xx (non-429) and JSON decode
-//     errors are terminal for that model.
+//     errors, HTTP 5xx and 429 are retryable. HTTP 403 switches immediately
+//     to the next model; 401, other 4xx and decode errors are terminal.
 //   - Across models: when the primary model exhausts its retry budget with a
 //     retryable error, and Client has fallbackModels configured, the request
 //     is replayed against each fallback in order (with a fresh 3-attempt
-//     budget). A terminal error (4xx / decode / empty choices) never triggers
-//     fallback — those signal a caller-side or contract problem the next
-//     model would hit too.
-//   - Deadline-aware escalation: before each per-model attempt, chatOneModel
-//     checks how much of the parent step deadline remains. If less than one
-//     full c.timeout remains AND there are still untried fallback models,
-//     the loop bails out early so the fallback gets a real chance instead
-//     of being cut off by an already-dead parent context (issue #179 P1).
+//     budget). Terminal failures do not trigger fallback.
+//   - Deadline-aware escalation: before a same-model backoff, the shared
+//     runner reserves the backoff plus one full request timeout for the next
+//     fallback so it is not starved by the primary (issue #179 P1).
 //
-// A log line is emitted on every model switch to make silent quality drift
-// observable during incidents. Upstream response bodies are truncated to
-// avoid leaking gateway payloads into stdout on the success path.
+// A bounded, single-line log is emitted on every model switch to make silent
+// quality drift observable without dumping full upstream response bodies.
 func (c *Client) Chat(ctx context.Context, msgs []Message, tools []Tool) (AssistantTurn, error) {
 	models := append([]string{c.model}, c.fallbackModels...)
 	turn, _, err := llmfallback.Run(ctx, llmfallback.Config{
@@ -127,8 +110,8 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, tools []Tool) (Assist
 //   - parent-context cancellation -> Terminal (surface the cancel; do not
 //     spend a doomed round-trip on a fallback, issue #179 P2)
 //   - transport error -> RetrySameModel (a local timeout is worth retrying)
-//   - HTTP >=400 -> ClassifyStatus (429/5xx retry same model; 401/403 escalate
-//     to the next model — the Bedrock SCP-deny case, #211; other 4xx terminal)
+//   - HTTP >=400 -> ClassifyStatus (429/5xx retry same model; 403 escalates to
+//     the next model — the Bedrock SCP-deny case, #211; other 4xx terminal)
 //   - decode error / empty choices -> Terminal
 func (c *Client) attemptChat(ctx context.Context, model string, msgs []Message, tools []Tool) (AssistantTurn, llmfallback.Outcome, error) {
 	reqBody := chatRequest{

@@ -15,9 +15,9 @@ import (
 
 // LLM fallback: when the primary model exhausts its per-model retry budget on
 // retryable failures (5xx / 429 / network), Chat should switch to each
-// configured fallback model in order and try again. On terminal errors
-// (4xx / decode / empty choices) Chat must not escalate to fallback — those
-// signal a caller-side problem the next model would hit too.
+// configured fallback model in order and try again. HTTP 403 escalates
+// immediately; other terminal errors (including 401, other 4xx, decode and
+// empty choices) must not reach the fallback.
 //
 // Motivation: issue #179.
 
@@ -325,30 +325,6 @@ func TestChat_ParentContextCancelledIsNotMasqueradedAsFallback(t *testing.T) {
 		if m == fallback {
 			t.Errorf("fallback %q was contacted after parent context cancel (seen=%v)", fallback, seenCopy)
 			break
-		}
-	}
-}
-
-// TestTruncateForLog covers the helper that keeps upstream error bodies out
-// of the fallback log line on the success path (issue #179 P2 - leakage).
-// Behaviour is trivial but the log line's shape is a contract for anyone
-// grepping incident logs, so pin it.
-func TestTruncateForLog(t *testing.T) {
-	cases := []struct {
-		in   string
-		n    int
-		want string
-	}{
-		{"", 10, ""},
-		{"short", 10, "short"},
-		{"exactly-10", 10, "exactly-10"},
-		{"a bit too long", 5, "a bit...(truncated)"},
-		{"日本語テスト長い文字列", 4, "日本語テ...(truncated)"},
-	}
-	for _, tc := range cases {
-		got := truncateForLog(tc.in, tc.n)
-		if got != tc.want {
-			t.Errorf("truncateForLog(%q,%d) = %q, want %q", tc.in, tc.n, got, tc.want)
 		}
 	}
 }
