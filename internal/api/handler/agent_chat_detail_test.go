@@ -43,6 +43,20 @@ func TestSafeErrorDetail(t *testing.T) {
 			"LLM returned empty response with no tool_calls at final step",
 		},
 		{
+			// PR #208 round-5 P2-10. The Reduce completeness gate is a run
+			// outcome the user can act on ("the model never merged its Map
+			// results"), not a server fault. Collapsing it to "internal error"
+			// told them nothing.
+			"reduce completeness gate is whitelisted",
+			errors.New("successful Map retries and Reduce required before final answer"),
+			"successful Map retries and Reduce required before final answer",
+		},
+		{
+			"wrapped reduce completeness gate is whitelisted",
+			fmt.Errorf("agent run: %w", errors.New("successful Map retries and Reduce required before final answer")),
+			"successful Map retries and Reduce required before final answer",
+		},
+		{
 			"unknown profile is whitelisted",
 			errors.New(`unknown agent profile "summary_x"`),
 			"unknown agent profile",

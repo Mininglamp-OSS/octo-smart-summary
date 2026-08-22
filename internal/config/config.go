@@ -78,6 +78,13 @@ type Config struct {
 	WorkerInternalPort        string
 	WorkerListenAllInterfaces string
 
+	// AgentMapConcurrency bounds how many Map-phase chunk summaries a single
+	// summarize_chunk tool call runs in parallel (agent path). Deliberately
+	// SEPARATE from WorkerMapConcurrency: the agent path already runs up to 4
+	// tool calls concurrently (agent.NewPool(4) in agent_chat.go), so the two
+	// knobs multiply and must be tuned independently.
+	AgentMapConcurrency int
+
 	// Worker
 	WorkerMaxConcurrent  int
 	WorkerMapConcurrency int
@@ -202,6 +209,8 @@ func Load() *Config {
 
 		WorkerInternalPort:        envStr("WORKER_INTERNAL_PORT", "8082"),
 		WorkerListenAllInterfaces: envStr("WORKER_LISTEN_ADDR", "0.0.0.0"),
+
+		AgentMapConcurrency: envInt("AGENT_MAP_CONCURRENCY", defaultAgentMapConcurrency),
 
 		WorkerMaxConcurrent:        envInt("WORKER_MAX_CONCURRENT_TASKS", 20),
 		WorkerMapConcurrency:       envInt("WORKER_MAP_CONCURRENCY", 5),
@@ -353,6 +362,40 @@ var modelMapThresholds = []modelThreshold{
 }
 
 const defaultMapMaxTokens = 100000
+
+const (
+	// defaultAgentMapConcurrency is the agent Map-phase fan-out default.
+	//
+	// 3, not the worker path's 5: the agent runner executes up to 4 tool calls
+	// from one LLM turn concurrently (agent.NewPool(4)), and each of those can
+	// be a summarize_chunk. The knobs multiply, so the real ceiling of in-flight
+	// Map calls is poolSize * AgentMapConcurrency = 12 at this default. The
+	// worker path has no such outer fan-out, which is why its default can be
+	// higher.
+	defaultAgentMapConcurrency = 3
+	// maxAgentMapConcurrency caps operator input. Above this the gateway sees
+	// 4*N concurrent completions from a single user request.
+	maxAgentMapConcurrency = 5
+)
+
+// ResolveAgentMapConcurrency returns the effective agent Map fan-out, clamped
+// to [1, maxAgentMapConcurrency].
+//
+// 1 is the serial fallback: it makes the concurrent path byte-equivalent to the
+// pre-change loop (one worker, one in-flight call, same order, same error), so
+// an operator can revert the behaviour with an env var instead of a rollback.
+// Values <= 0 (unset / malformed / explicitly disabled) resolve to the default
+// rather than to 0, which would deadlock a zero-capacity semaphore.
+func (c *Config) ResolveAgentMapConcurrency() int {
+	n := c.AgentMapConcurrency
+	if n <= 0 {
+		n = defaultAgentMapConcurrency
+	}
+	if n > maxAgentMapConcurrency {
+		n = maxAgentMapConcurrency
+	}
+	return n
+}
 
 // ResolveCharsPerTokenCJK returns the CJK chars-per-token ratio.
 // For qwen/deepseek/kimi models, defaults to 2 if not explicitly configured.

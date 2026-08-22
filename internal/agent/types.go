@@ -40,6 +40,18 @@ type AssistantTurn struct {
 	Content   string
 	ToolCalls []ToolCall
 	Tokens    int
+
+	// Truncated reports that this turn's content was cut off by
+	// finish_reason=length. It is only ever set on a CONTENT-ONLY turn, i.e. the
+	// planner's final user-facing answer: a truncated tool-call turn is rejected
+	// outright (its arguments may be cut mid-JSON) and an empty truncated turn is
+	// an error, so neither reaches a caller.
+	//
+	// Carried as a structural field rather than left implicit in the appended
+	// prose notice so the runner can record the degradation as a run fact. The
+	// prose alone is not enough: it lives inside model-authored text and can be
+	// rewritten away downstream.
+	Truncated bool
 }
 
 // ContextKeyUID is the context key for storing user ID in request context.

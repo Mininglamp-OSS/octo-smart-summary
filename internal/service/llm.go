@@ -31,6 +31,21 @@ var ErrReasoningBudgetExhausted = errors.New("LLM returned empty content: reason
 // ErrTokenLimitExhausted marks an empty response terminated by the token cap.
 var ErrTokenLimitExhausted = errors.New("LLM returned empty content due to token limit")
 
+type tokenLimitError struct {
+	message string
+}
+
+func (e *tokenLimitError) Error() string { return e.message }
+
+// Is preserves the token-limit identity introduced on main while allowing
+// callers to distinguish streaming from non-streaming truncation.
+func (e *tokenLimitError) Is(target error) bool { return target == ErrTokenLimitExhausted }
+
+var (
+	ErrOutputTruncated       = &tokenLimitError{message: "LLM response truncated due to token limit"}
+	ErrStreamOutputTruncated = &tokenLimitError{message: "LLM streamed response truncated due to token limit"}
+)
+
 // LLMClient handles calls to a chat-completions-compatible LLM API.
 type LLMClient struct {
 	apiURL          string
@@ -143,6 +158,7 @@ type chatResponseWithTools struct {
 			ReasoningContent string `json:"reasoning_content"`
 			Reasoning        string `json:"reasoning"`
 		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage struct {
 		TotalTokens int `json:"total_tokens"`
@@ -199,19 +215,54 @@ func readErrorBody(body io.Reader) string {
 	return llmfallback.SafeTextForLog(string(b), 200)
 }
 
-// Call makes a chat completion request. Returns (content, tokenUsed, error).
+// TruncationNotice is the single disclosure wording used whenever a degraded but
+// usable length-truncated result is handed to the user instead of being
+// discarded. Streaming and non-streaming paths share one convention.
+const TruncationNotice = "\n\n> 输出因长度限制被截断，请缩小范围或降低详细程度后重试。"
+
+type truncationPolicy int
+
+const (
+	truncateAllow truncationPolicy = iota
+	truncateReject
+	truncateDisclose
+)
+
+// Call makes a general chat completion request. A non-empty content response
+// remains usable when the provider reports finish_reason=length, preserving the
+// pre-existing behavior for refine and topic-narrowing callers.
 func (c *LLMClient) Call(ctx context.Context, messages []ChatMessage, temperature float64) (string, int, error) {
-	content, tokens, _, err := c.CallWithModel(ctx, messages, temperature)
+	content, _, tokens, _, err := c.callWithPolicyAndModel(ctx, messages, temperature, truncateAllow)
 	return content, tokens, err
+}
+
+// CallStrict rejects any length-truncated response. Map/Reduce callers use this
+// path because a partial intermediate result can silently drop coverage.
+func (c *LLMClient) CallStrict(ctx context.Context, messages []ChatMessage, temperature float64) (string, int, error) {
+	content, _, tokens, _, err := c.callWithPolicyAndModel(ctx, messages, temperature, truncateReject)
+	return content, tokens, err
+}
+
+// CallDisclosingTruncation keeps a usable terminal result and marks it as
+// degraded; empty truncation still fails because there is nothing to deliver.
+func (c *LLMClient) CallDisclosingTruncation(ctx context.Context, messages []ChatMessage, temperature float64) (content string, truncated bool, tokens int, err error) {
+	content, truncated, tokens, _, err = c.callWithPolicyAndModel(ctx, messages, temperature, truncateDisclose)
+	return content, truncated, tokens, err
 }
 
 // CallWithModel makes a chat completion request and also returns the model
 // that produced the response. Callers that persist model attribution should
 // use this method instead of ModelVersion.
 func (c *LLMClient) CallWithModel(ctx context.Context, messages []ChatMessage, temperature float64) (string, int, string, error) {
+	content, _, tokens, usedModel, err := c.callWithPolicyAndModel(ctx, messages, temperature, truncateAllow)
+	return content, tokens, usedModel, err
+}
+
+func (c *LLMClient) callWithPolicyAndModel(ctx context.Context, messages []ChatMessage, temperature float64, policy truncationPolicy) (string, bool, int, string, error) {
 	type result struct {
-		content string
-		tokens  int
+		content   string
+		truncated bool
+		tokens    int
 	}
 	// Keep retry ownership in the shared runner: exhaust transient failures on
 	// one model before switching to the next model.
@@ -273,19 +324,22 @@ func (c *LLMClient) CallWithModel(ctx context.Context, messages []ChatMessage, t
 		}
 		content := chatResp.Choices[0].Message.Content
 		reasoningPresent := chatResp.Choices[0].Message.ReasoningContent != "" || chatResp.Choices[0].Message.Reasoning != ""
-		if content == "" && reasoningPresent {
+		if strings.TrimSpace(content) == "" && reasoningPresent {
 			reasoningLen := len(chatResp.Choices[0].Message.ReasoningContent) + len(chatResp.Choices[0].Message.Reasoning)
 			log.Printf("[llm] WARNING: content is empty but reasoning present (%d chars), finish_reason=%s, completion_tokens=%d. Reasoning consumed entire budget.",
 				reasoningLen, chatResp.Choices[0].FinishReason, chatResp.Usage.CompletionTokens)
 			return result{tokens: chatResp.Usage.TotalTokens}, llmfallback.Terminal, ErrReasoningBudgetExhausted
 		}
-		if content == "" && chatResp.Choices[0].FinishReason == "length" {
-			log.Printf("[llm] WARNING: content is empty and finish_reason=length, completion_tokens=%d", chatResp.Usage.CompletionTokens)
-			return result{tokens: chatResp.Usage.TotalTokens}, llmfallback.Terminal, ErrTokenLimitExhausted
+		if chatResp.Choices[0].FinishReason == "length" {
+			log.Printf("[llm] WARNING: response truncated with finish_reason=length, completion_tokens=%d", chatResp.Usage.CompletionTokens)
+			if strings.TrimSpace(content) == "" || policy == truncateReject {
+				return result{tokens: chatResp.Usage.TotalTokens}, llmfallback.Terminal, ErrOutputTruncated
+			}
+			return result{content: content, truncated: true, tokens: chatResp.Usage.TotalTokens}, llmfallback.Success, nil
 		}
 		return result{content: content, tokens: chatResp.Usage.TotalTokens}, llmfallback.Success, nil
 	})
-	return res.content, res.tokens, usedModel, err
+	return res.content, res.truncated, res.tokens, usedModel, err
 }
 
 type chatStreamResponse struct {
@@ -303,17 +357,30 @@ type chatStreamResponse struct {
 	} `json:"usage"`
 }
 
-// CallStream makes a chat completion streaming request. onDelta is called for
-// each user-visible content delta. It returns the accumulated full content so
-// downstream citation building and DB persistence remain source-of-truth.
+// CallStream makes a general streaming request and preserves the historical
+// behavior for non-empty length-truncated content: what was already delivered
+// remains the returned/persisted source of truth.
 func (c *LLMClient) CallStream(ctx context.Context, messages []ChatMessage, temperature float64, onDelta func(string) error) (string, int, error) {
-	content, tokens, _, err := c.CallStreamWithModel(ctx, messages, temperature, onDelta)
+	content, tokens, _, err := c.callStreamWithModel(ctx, messages, temperature, onDelta, false)
+	return content, tokens, err
+}
+
+// callStreamWithTruncationNotice is used by user-visible Map/Reduce streams.
+// Once deltas have been emitted they cannot be retracted, so a usable partial
+// result is completed with an explicit notice instead of returning an error
+// after the client has already rendered content.
+func (c *LLMClient) callStreamWithTruncationNotice(ctx context.Context, messages []ChatMessage, temperature float64, onDelta func(string) error) (string, int, error) {
+	content, tokens, _, err := c.callStreamWithModel(ctx, messages, temperature, onDelta, true)
 	return content, tokens, err
 }
 
 // CallStreamWithModel is CallStream with the actual producing model included
 // for persistence and audit attribution.
 func (c *LLMClient) CallStreamWithModel(ctx context.Context, messages []ChatMessage, temperature float64, onDelta func(string) error) (string, int, string, error) {
+	return c.callStreamWithModel(ctx, messages, temperature, onDelta, false)
+}
+
+func (c *LLMClient) callStreamWithModel(ctx context.Context, messages []ChatMessage, temperature float64, onDelta func(string) error, discloseTruncation bool) (string, int, string, error) {
 	type result struct {
 		content string
 		tokens  int
@@ -432,14 +499,22 @@ func (c *LLMClient) CallStreamWithModel(ctx context.Context, messages []ChatMess
 			return streamFailure(fmt.Errorf("LLM stream ended without terminal marker"))
 		}
 		content := sb.String()
-		if content == "" && reasoningLen > 0 {
+		if strings.TrimSpace(content) == "" && reasoningLen > 0 {
 			return result{tokens: totalTokens}, llmfallback.Terminal, ErrReasoningBudgetExhausted
 		}
-		if content == "" && finishReason == "length" {
-			return result{tokens: totalTokens}, llmfallback.Terminal, ErrTokenLimitExhausted
-		}
-		if content == "" {
+		if strings.TrimSpace(content) == "" {
+			if finishReason == "length" {
+				return result{tokens: totalTokens}, llmfallback.Terminal, ErrStreamOutputTruncated
+			}
 			return streamFailure(fmt.Errorf("LLM returned empty streamed content"))
+		}
+		if finishReason == "length" && discloseTruncation {
+			if onDelta != nil {
+				if err := onDelta(TruncationNotice); err != nil {
+					return result{content: content, tokens: totalTokens}, llmfallback.Terminal, err
+				}
+			}
+			content += TruncationNotice
 		}
 		return result{content: content, tokens: totalTokens}, llmfallback.Success, nil
 	})
@@ -538,6 +613,10 @@ func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, t
 		}
 		if len(chatResp.Choices) == 0 {
 			return result{}, llmfallback.RetrySameModel, fmt.Errorf("LLM returned no choices")
+		}
+		if chatResp.Choices[0].FinishReason == "length" {
+			return result{tokens: chatResp.Usage.TotalTokens}, llmfallback.Terminal,
+				fmt.Errorf("LLM tool response truncated due to token limit")
 		}
 		if len(chatResp.Choices[0].Message.ToolCalls) == 0 {
 			reasoningPresent := chatResp.Choices[0].Message.ReasoningContent != "" || chatResp.Choices[0].Message.Reasoning != ""
@@ -684,15 +763,18 @@ func (c *LLMClient) CallMapWithModel(ctx context.Context, formattedMessages stri
 	userPrompt := fmt.Sprintf("来源：%s\n时间范围：%s ~ %s\n消息数：%d 条\n\n聊天记录：\n%s",
 		sourceName, timeStart, timeEnd, msgCount, formattedMessages)
 
-	content, tokens, usedModel, err := c.CallWithModel(ctx, []ChatMessage{
+	content, _, tokens, usedModel, err := c.callWithPolicyAndModel(ctx, []ChatMessage{
 		{Role: "system", Content: systemPrompt},
 		{Role: "user", Content: userPrompt},
-	}, 0.1)
+	}, 0.1, truncateReject)
 	if err == nil {
 		return content, tokens, usedModel, nil
 	}
 	log.Printf("[llm] Map chunk %d failed: %s", chunkIndex, llmfallback.SafeErrorForLog(err, 200))
-	if errors.Is(err, ErrReasoningBudgetExhausted) || errors.Is(err, ErrTokenLimitExhausted) {
+	if errors.Is(err, ErrOutputTruncated) {
+		return "", tokens, usedModel, fmt.Errorf("output truncated on chunk %d: %w", chunkIndex, err)
+	}
+	if errors.Is(err, ErrReasoningBudgetExhausted) {
 		return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d: %w", chunkIndex, err)
 	}
 	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, c.model, nil
@@ -720,10 +802,21 @@ func (c *LLMClient) CallReduceWithModel(ctx context.Context, chunkSummaries []st
 	userPrompt := fmt.Sprintf("信息来源：%s\n时间范围：%s ~ %s\n消息总量：%d 条\n\n以下是各分片的总结，请合并：\n\n%s",
 		sourceNames, startTime, endTime, totalMsgCount, summariesText)
 
-	return c.CallWithModel(ctx, []ChatMessage{
+	return c.callDisclosingTerminalReduceWithModel(ctx, []ChatMessage{
 		{Role: "system", Content: system},
 		{Role: "user", Content: userPrompt},
-	}, 0.1)
+	})
+}
+
+func (c *LLMClient) callDisclosingTerminalReduceWithModel(ctx context.Context, msgs []ChatMessage) (string, int, string, error) {
+	content, truncated, tokens, usedModel, err := c.callWithPolicyAndModel(ctx, msgs, 0.1, truncateDisclose)
+	if err != nil {
+		return "", tokens, usedModel, err
+	}
+	if truncated {
+		content += TruncationNotice
+	}
+	return content, tokens, usedModel, nil
 }
 
 // CallMapStream runs the Map phase for a user-visible single chunk and streams
@@ -750,10 +843,10 @@ func (c *LLMClient) CallMapStreamWithModel(ctx context.Context, formattedMessage
 		}
 		return onDelta(delta)
 	}
-	content, tokens, usedModel, err := c.CallStreamWithModel(ctx, []ChatMessage{
+	content, tokens, usedModel, err := c.callStreamWithModel(ctx, []ChatMessage{
 		{Role: "system", Content: systemPrompt},
 		{Role: "user", Content: userPrompt},
-	}, 0.1, wrappedDelta)
+	}, 0.1, wrappedDelta, true)
 	if err == nil {
 		return content, tokens, usedModel, nil
 	}
@@ -761,7 +854,10 @@ func (c *LLMClient) CallMapStreamWithModel(ctx context.Context, formattedMessage
 	if emitted {
 		return content, tokens, usedModel, err
 	}
-	if errors.Is(err, ErrReasoningBudgetExhausted) || errors.Is(err, ErrTokenLimitExhausted) {
+	if errors.Is(err, ErrStreamOutputTruncated) {
+		return "", tokens, usedModel, fmt.Errorf("output truncated on chunk %d: %w", chunkIndex, err)
+	}
+	if errors.Is(err, ErrReasoningBudgetExhausted) {
 		return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d: %w", chunkIndex, err)
 	}
 	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, c.model, nil
@@ -792,10 +888,10 @@ func (c *LLMClient) CallReduceStreamWithModel(ctx context.Context, chunkSummarie
 	userPrompt := fmt.Sprintf("信息来源：%s\n时间范围：%s ~ %s\n消息总量：%d 条\n\n以下是各分片的总结，请合并：\n\n%s",
 		sourceNames, startTime, endTime, totalMsgCount, summariesText)
 
-	return c.CallStreamWithModel(ctx, []ChatMessage{
+	return c.callStreamWithModel(ctx, []ChatMessage{
 		{Role: "system", Content: system},
 		{Role: "user", Content: userPrompt},
-	}, 0.1, onDelta)
+	}, 0.1, onDelta, true)
 }
 
 func buildReduceByPersonMessages(participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string) []ChatMessage {
@@ -825,22 +921,23 @@ func buildReduceByPersonMessages(participantSummaries []struct{ Name, Summary st
 // CallReduceByPerson merges participant-level summaries.
 // Each participant is assigned a [Pn] tag that the LLM should reference in the output.
 func (c *LLMClient) CallReduceByPerson(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string) (string, int, error) {
-	return c.Call(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1)
+	content, tokens, _, err := c.callDisclosingTerminalReduceWithModel(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic))
+	return content, tokens, err
 }
 
 // CallReduceByPersonWithModel is CallReduceByPerson with the actual producing model included.
 func (c *LLMClient) CallReduceByPersonWithModel(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string) (string, int, string, error) {
-	return c.CallWithModel(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1)
+	return c.callDisclosingTerminalReduceWithModel(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic))
 }
 
 // CallReduceByPersonStream merges participant-level summaries and streams the
 // final team summary. Each participant is assigned a [Pn] tag that the LLM should
 // reference in the output.
 func (c *LLMClient) CallReduceByPersonStream(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string, onDelta func(string) error) (string, int, error) {
-	return c.CallStream(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1, onDelta)
+	return c.callStreamWithTruncationNotice(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1, onDelta)
 }
 
 // CallReduceByPersonStreamWithModel is CallReduceByPersonStream with the actual producing model included.
 func (c *LLMClient) CallReduceByPersonStreamWithModel(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string, onDelta func(string) error) (string, int, string, error) {
-	return c.CallStreamWithModel(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1, onDelta)
+	return c.callStreamWithModel(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1, onDelta, true)
 }

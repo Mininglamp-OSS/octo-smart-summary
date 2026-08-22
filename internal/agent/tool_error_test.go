@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestClassifyToolError(t *testing.T) {
@@ -26,6 +29,8 @@ func TestClassifyToolError(t *testing.T) {
 		{"channel-scoped permission", "fetch_channel", errors.New("channel not accessible by user"), "PERMISSION_DENIED", false, false},
 		{"identity", "summarize_chunk", errors.New("missing user identity in context"), "PERMISSION_DENIED", false, true},
 		{"invalid args", "fetch_channel", errors.New("parse args: bad json"), "INVALID_ARGUMENT", true, false},
+		{"merge invalid args is completeness-fatal", "merge_summaries", errors.New("parse args: unexpected end of JSON input"), "INVALID_ARGUMENT", true, true},
+		{"merge timeout is completeness-fatal", "merge_summaries", context.DeadlineExceeded, "TIMEOUT", true, true},
 		{"empty time_start (issue C)", "fetch_channel", errors.New("parse time_start: parsing time \"\" as \"2006-01-02T15:04:05Z07:00\": cannot parse \"\" as \"2006\""), "INVALID_ARGUMENT", true, false},
 		{"specific required arg", "fetch_channel", errors.New("channel_type is required (1=DM, 2=Group, 5=Thread)"), "INVALID_ARGUMENT", true, false},
 		// The critical-tool default is fatal AND retryable. The two fields answer
@@ -37,6 +42,39 @@ func TestClassifyToolError(t *testing.T) {
 		{"bare required does not classify as argument", "fetch_channel", errors.New("required backend unavailable"), "CRITICAL_TOOL_ERROR", true, true},
 		{"evidence", "fetch_channel", errors.New("persist evidence: db down"), "EVIDENCE_WRITE_FAILED", false, true},
 		{"critical default", "summarize_chunk", errors.New("something odd"), "CRITICAL_TOOL_ERROR", true, true},
+		// PR #208 round-5 P2-4. These are per-request store caps: the store only
+		// grows within a request, so a retry hits the identical cap. Classified
+		// retryable (via the critical-tool default, because the message spells
+		// "summary handle" with a space and missed the "summary_handle" branch),
+		// they made the runner nudge an identical retry every step until MaxSteps
+		// and end the request with ZERO output.
+		{
+			"store handle-count cap is a deterministic dead end",
+			"summarize_chunk",
+			fmt.Errorf("store summary result: %w", fmt.Errorf("%w: too many summary handles in one request (max 128)", ErrSummaryHandleCapacity)),
+			"RESOURCE_EXHAUSTED", false, true,
+		},
+		{
+			"store text-size cap is a deterministic dead end",
+			"summarize_chunk",
+			fmt.Errorf("store summary result: %w", fmt.Errorf("%w: summary handle text exceeds per-request limit (8388608 bytes)", ErrSummaryHandleCapacity)),
+			"RESOURCE_EXHAUSTED", false, true,
+		},
+		{
+			"store cap on a non-critical tool is not fatal",
+			"peek_channel",
+			fmt.Errorf("%w: too many summary handles in one request (max 128)", ErrSummaryHandleCapacity),
+			"RESOURCE_EXHAUSTED", false, false,
+		},
+		// The model passing more handles than can exist is NOT a capacity dead
+		// end: it can fix its own arguments, so it keeps the retryable handle
+		// classification.
+		{
+			"too many handles in the ARGUMENTS stays retryable",
+			"merge_summaries",
+			errors.New("too many summary_handles (max 128)"),
+			"INVALID_ARGUMENT", true, true,
+		},
 		{"noncritical default", "get_current_time", errors.New("something odd"), "TOOL_ERROR", true, false},
 		// A permission denial is fatal only where it costs the deliverable something.
 		{"permission on a non-critical tool is not fatal", "peek_channel", errors.New("channel 12345 not accessible by user u-88"), "PERMISSION_DENIED", false, false},
@@ -153,9 +191,23 @@ func TestClassifyToolErrorAnchorsHTTPStatuses(t *testing.T) {
 
 	// Real statuses must still classify.
 	for _, msg := range []string{"LLM API error: status=503 body=upstream busy", "http 429 too many"} {
-		env = classifyToolError("merge_summaries", errors.New(msg))
+		env = classifyToolError("fetch_channel", errors.New(msg))
 		if env.Fatal || !env.Retryable {
 			t.Errorf("classifyToolError(%q) = %s fatal=%t, want retryable", msg, env.ErrorCode, env.Fatal)
+		}
+	}
+}
+
+func TestMergeSummariesErrorsAreAlwaysFatalUntilRecovered(t *testing.T) {
+	for _, err := range []error{
+		errors.New("parse args: unexpected end of JSON input"),
+		context.DeadlineExceeded,
+		errors.New("LLM API error: status=503 body=busy"),
+		errors.New("invalid or expired summary_handle: map_old_1"),
+	} {
+		env := classifyToolError("merge_summaries", err)
+		if !env.Fatal {
+			t.Errorf("merge_summaries error %q must be fatal until a successful retry: %+v", err, env)
 		}
 	}
 }
@@ -275,6 +327,103 @@ func TestRunnerReportsToolSuccess(t *testing.T) {
 
 	if len(succeeded) != 1 || succeeded[0] != "fetch_channel" {
 		t.Fatalf("OnToolSuccess not fired for a successful call, got %v", succeeded)
+	}
+}
+
+// TestRunnerSameStepSuccessWinsRegardlessCompletionOrder pins PR #208 round-3
+// B1. Duplicate merge_summaries calls share one (tool, target) fatal-marker key.
+// A successful full Reduce in the same planner step must win over a failed
+// sibling regardless of which worker returns last; otherwise callback scheduling
+// can turn a saved deliverable into a false FAILED verdict.
+func TestRunnerSameStepSuccessWinsRegardlessCompletionOrder(t *testing.T) {
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+
+	for _, first := range []string{"success", "failure"} {
+		t.Run(first+" completes first", func(t *testing.T) {
+			started := make(chan string, 2)
+			finished := make(chan string, 2)
+			release := map[string]chan struct{}{
+				"success": make(chan struct{}),
+				"failure": make(chan struct{}),
+			}
+
+			reg := NewRegistry()
+			reg.Register(Tool{Type: "function", Function: ToolFunction{Name: "merge_summaries"}},
+				func(_ context.Context, args json.RawMessage) (string, error) {
+					var req struct {
+						Outcome string `json:"outcome"`
+					}
+					if err := json.Unmarshal(args, &req); err != nil {
+						return "", err
+					}
+					started <- req.Outcome
+					<-release[req.Outcome]
+					finished <- req.Outcome
+					if req.Outcome == "failure" {
+						return "", errors.New("reduce failed")
+					}
+					return `{"merged_summary":"complete"}`, nil
+				})
+
+			r := NewRunner(nil, reg, NewPool(2), Policy{})
+			var mu sync.Mutex
+			failed := false
+			errorsSeen := 0
+			successesSeen := 0
+			r.OnToolError = func(_, _ string, env ToolErrorEnvelope) {
+				mu.Lock()
+				defer mu.Unlock()
+				errorsSeen++
+				if env.Fatal {
+					failed = true
+				}
+			}
+			r.OnToolSuccess = func(_, _ string) {
+				mu.Lock()
+				defer mu.Unlock()
+				successesSeen++
+				failed = false
+			}
+
+			calls := []ToolCall{
+				mkToolCall("reduce-success", "merge_summaries", `{"outcome":"success"}`),
+				mkToolCall("reduce-failure", "merge_summaries", `{"outcome":"failure"}`),
+			}
+			done := make(chan struct{})
+			go func() {
+				r.runTools(context.Background(), calls, 1, 1)
+				close(done)
+			}()
+
+			<-started
+			<-started
+			close(release[first])
+			if got := <-finished; got != first {
+				t.Fatalf("first completed worker = %q, want %q", got, first)
+			}
+			// Give the first Dispatch return and its callback time to complete before
+			// releasing the sibling. This makes both historical callback orders
+			// deterministic while the production fix itself does not rely on timing.
+			time.Sleep(20 * time.Millisecond)
+			second := "success"
+			if first == "success" {
+				second = "failure"
+			}
+			close(release[second])
+			if got := <-finished; got != second {
+				t.Fatalf("second completed worker = %q, want %q", got, second)
+			}
+			<-done
+
+			mu.Lock()
+			defer mu.Unlock()
+			if errorsSeen != 1 || successesSeen != 1 {
+				t.Fatalf("callbacks = errors:%d successes:%d, want 1 each", errorsSeen, successesSeen)
+			}
+			if failed {
+				t.Fatal("same-step successful Reduce must clear its duplicate sibling failure")
+			}
+		})
 	}
 }
 

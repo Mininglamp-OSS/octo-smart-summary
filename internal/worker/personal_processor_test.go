@@ -3,6 +3,8 @@
 package worker
 
 import (
+	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -11,9 +13,49 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
+
+func TestIsFatalMapError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "reasoning budget", err: errors.New("reasoning budget exhausted on chunk 2"), want: true},
+		{name: "non-stream truncation", err: fmt.Errorf("output truncated on chunk 3: %w", service.ErrOutputTruncated), want: true},
+		{name: "stream truncation", err: fmt.Errorf("output truncated on chunk 3: %w", service.ErrStreamOutputTruncated), want: true},
+		{name: "transient network", err: errors.New("connection reset by peer"), want: false},
+		// PR #208 round-5 P2-5. isFatalMapError used to match the bare substring
+		// "truncated". internal/service/llm.go interpolates the upstream response
+		// body VERBATIM into API errors, so an upstream 400 whose body merely
+		// mentions truncation aborted the entire task instead of degrading one
+		// chunk. This is a per-chunk blip: the pipeline retries and, worst case,
+		// records one failed chunk.
+		{
+			name: "upstream body merely containing the word is not fatal",
+			err:  errors.New(`LLM API error: status=400 body={"error":{"message":"input was truncated by the gateway","type":"invalid_request_error"}}`),
+			want: false,
+		},
+		{
+			name: "upstream body naming a truncated field is not fatal",
+			err:  errors.New(`LLM API error: status=502 body={"detail":"upstream sent a truncated chunked response"}`),
+			want: false,
+		},
+		// The raw sentinel arriving unwrapped still counts: it is the same
+		// irrecoverable finish_reason=length, just not yet labelled with a chunk.
+		{name: "unwrapped truncation sentinel", err: service.ErrOutputTruncated, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isFatalMapError(tc.err); got != tc.want {
+				t.Fatalf("isFatalMapError(%v) = %t, want %t", tc.err, got, tc.want)
+			}
+		})
+	}
+}
 
 func TestDecidePersonalMessages_NoTarget_AllMessages(t *testing.T) {
 	all := []pipeline.Message{

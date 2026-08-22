@@ -7,6 +7,8 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
@@ -226,7 +228,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 		Type: "function",
 		Function: ToolFunction{
 			Name:        "summarize_chunk",
-			Description: "对缓存中的一批消息进行局部总结（Map 阶段）。返回结构化摘要文本。",
+			Description: "对缓存中的一批消息进行局部总结（Map 阶段）。正文保存在本次请求内，返回 summary_handle 和覆盖统计；后续 merge_summaries 必须传 handle，不要复制正文。",
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -276,7 +278,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 			// Same result shape as the normal path (PR #196 review P2-5,
 			// closed in round-3): the planner must see one stable contract on
 			// both branches, so the empty branch carries chunk_size too.
-			return `{"summary":"无可总结内容","chunk_count":0,"input_count":0,"processed_count":0,"dropped_count":0,"oversized_message_count":0,"truncated":false,"chunk_size":0}`, nil
+			return marshalSummarizeChunkResult(ctx, "无可总结内容", 0, chunkCoverage{})
 		}
 
 		// Get the global message pool for the session and pre-assign CitationIndex.
@@ -318,23 +320,14 @@ func SummarizeChunkTool() (Tool, Handler) {
 		if len(messages) == 0 {
 			if manifestMisses > 0 {
 				recordDroppedMessages(ctx, uid, runID, manifestMisses)
-				result := map[string]interface{}{
-					"summary":                 "无可总结内容",
-					"chunk_count":             0,
-					"input_count":             inputCount,
-					"processed_count":         0,
-					"dropped_count":           manifestMisses,
-					"oversized_message_count": 0,
-					"truncated":               true,
-					"chunk_size":              clampChunkSize(req.ChunkSize),
-				}
-				resultJSON, err := json.Marshal(result)
-				if err != nil {
-					return "", fmt.Errorf("marshal result: %w", err)
-				}
-				return string(resultJSON), nil
+				return marshalSummarizeChunkResult(ctx, "无可总结内容", 0, chunkCoverage{
+					InputCount:   inputCount,
+					DroppedCount: manifestMisses,
+					Truncated:    true,
+					ChunkSize:    clampChunkSize(req.ChunkSize),
+				})
 			}
-			return "{\"summary\":\"无可总结内容\",\"chunk_count\":0}", nil
+			return marshalSummarizeChunkResult(ctx, "无可总结内容", 0, chunkCoverage{})
 		}
 
 		// Convert to map format for the token-budget splitter.
@@ -369,43 +362,55 @@ func SummarizeChunkTool() (Tool, Handler) {
 		// call summarizes toward the user's actual requirements. Empty when V2 is
 		// off / no run / no spec → legacy generic prompt.
 		specGuidance := loadRunSpecGuidance(ctx)
-		var summaries []string
-		for _, chunk := range chunks {
-			summary, processed, oversized, err := summarizeMessagesChunk(ctx, chunk, specGuidance)
-			if err != nil {
-				return "", fmt.Errorf("summarize chunk: %w", err)
-			}
-			summaries = append(summaries, summary)
-			cov.ProcessedCount += processed
-			cov.OversizedMessageCount += oversized
+		summaries, err := summarizeChunksConcurrently(ctx, chunks, specGuidance, &cov)
+		if err != nil {
+			return "", err
 		}
 		cov.DroppedCount = cov.InputCount - cov.ProcessedCount
 		cov.Truncated = cov.DroppedCount > 0
 		recordDroppedMessages(ctx, uid, runID, cov.DroppedCount)
 
 		combinedSummary := strings.Join(summaries, "\n\n---\n\n")
-		result := map[string]interface{}{
-			"summary":                 combinedSummary,
-			"chunk_count":             len(chunks),
-			"input_count":             cov.InputCount,
-			"processed_count":         cov.ProcessedCount,
-			"dropped_count":           cov.DroppedCount,
-			"oversized_message_count": cov.OversizedMessageCount,
-			"truncated":               cov.Truncated,
-			// chunk_size is now emitted (PR #196 review P2-5): it is the
-			// clamped value actually applied, not the raw model request.
-			"chunk_size": cov.ChunkSize,
-		}
-
-		// Marshal result
-		resultJSON, err := json.Marshal(result)
-		if err != nil {
-			return "", fmt.Errorf("marshal result: %w", err)
-		}
-		return string(resultJSON), nil
+		return marshalSummarizeChunkResult(ctx, combinedSummary, len(chunks), cov)
 	}
 
 	return schema, handler
+}
+
+type summarizeChunkToolResult struct {
+	SummaryHandle         string `json:"summary_handle"`
+	ChunkCount            int    `json:"chunk_count"`
+	InputCount            int    `json:"input_count"`
+	ProcessedCount        int    `json:"processed_count"`
+	DroppedCount          int    `json:"dropped_count"`
+	OversizedMessageCount int    `json:"oversized_message_count"`
+	Truncated             bool   `json:"truncated"`
+	ChunkSize             int    `json:"chunk_size"`
+}
+
+func marshalSummarizeChunkResult(ctx context.Context, summary string, chunkCount int, cov chunkCoverage) (string, error) {
+	store, err := summaryHandleStoreFromContext(ctx)
+	if err != nil {
+		return "", err
+	}
+	handle, err := store.PutAtStep(summary, chunkCount, summaryToolStepFromContext(ctx))
+	if err != nil {
+		return "", fmt.Errorf("store summary result: %w", err)
+	}
+	data, err := json.Marshal(summarizeChunkToolResult{
+		SummaryHandle:         handle,
+		ChunkCount:            chunkCount,
+		InputCount:            cov.InputCount,
+		ProcessedCount:        cov.ProcessedCount,
+		DroppedCount:          cov.DroppedCount,
+		OversizedMessageCount: cov.OversizedMessageCount,
+		Truncated:             cov.Truncated,
+		ChunkSize:             cov.ChunkSize,
+	})
+	if err != nil {
+		return "", fmt.Errorf("marshal result: %w", err)
+	}
+	return string(data), nil
 }
 
 func recordDroppedMessages(ctx context.Context, uid, runID string, count int) {
@@ -479,7 +484,7 @@ func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{},
 		{Role: "user", Content: formatted},
 	}
 
-	content, _, err := client.Call(ctx, msgs, 0.3)
+	content, _, err := client.CallStrict(ctx, msgs, 0.3)
 	if err != nil {
 		return "", processed, oversized, fmt.Errorf("call LLM: %w", err)
 	}
@@ -520,4 +525,131 @@ func assignCitationIndexes(messages []pipeline.Message, citationMap map[string]i
 		kept = append(kept, messages[i])
 	}
 	return kept, manifestMisses
+}
+
+// summarizeChunkFn is the Map call seam. Production always uses
+// summarizeMessagesChunk; tests swap it to drive concurrency/order/error
+// behaviour deterministically without a live LLM. It is only reassigned from
+// tests, before any goroutine starts, so it needs no synchronisation.
+var summarizeChunkFn = summarizeMessagesChunk
+
+// chunkMapOutcome is one Map call's result, held in a slot indexed by chunk
+// position. Every field is written by exactly one goroutine and read only after
+// wg.Wait(), so no field needs synchronisation of its own.
+type chunkMapOutcome struct {
+	summary   string
+	processed int
+	oversized int
+	err       error
+}
+
+// summarizeChunksConcurrently runs the Map phase over chunks with bounded
+// concurrency and returns the summaries in ORIGINAL chunk order, aggregating
+// coverage counters into cov.
+//
+// Why this is not a plain `go` over the old loop body:
+//
+//   - Order. Callers join the summaries into one document and the [n] citation
+//     markers inside them index a frozen manifest, so a completion-ordered
+//     append would reorder the deliverable. Results land in outcomes[i], never
+//     appended, so output order is independent of completion order.
+//   - Coverage counters. The serial loop incremented cov.ProcessedCount /
+//     cov.OversizedMessageCount inside the loop body. Those are plain ints on a
+//     shared struct; incrementing them from N goroutines is a data race and
+//     would silently under-count coverage — the exact class of defect SS-01
+//     exists to prevent. They are accumulated here, after Wait, in index order.
+//   - Error determinism. The serial loop failed on the first chunk by position.
+//     With concurrency, "first error to arrive" varies run to run, so the same
+//     input could surface different errors. This waits for every started
+//     goroutine and reports the LOWEST-INDEX error, preserving the old
+//     behaviour exactly.
+//   - Cancellation. Acquiring the semaphore selects on ctx.Done(): when the
+//     request deadline fires, queued chunks abort immediately instead of
+//     waiting for an in-flight LLM call to release a slot.
+//   - Panic containment. Registry.Dispatch deliberately converts handler
+//     panics into tool errors. Map workers run below that recovery boundary, so
+//     each worker must recover locally to preserve the same process-safety
+//     contract as the old serial loop.
+//
+// Concurrency 1 takes a dedicated serial path (see below) rather than a
+// one-permit semaphore, so it is a true rollback switch.
+func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]interface{}, specGuidance string, cov *chunkCoverage) ([]string, error) {
+	_, _, _, cfg := GetSummaryDeps()
+	concurrency := cfg.ResolveAgentMapConcurrency()
+	start := time.Now()
+
+	// Concurrency 1 is the documented rollback setting, so it must reproduce the
+	// pre-change loop EXACTLY — including dispatch order. A 1-permit semaphore
+	// would still only run one call at a time, but the goroutines race for that
+	// permit, so chunk 3 could be sent to the model before chunk 0. Output order
+	// would survive (indexed slots), but "identical to before" would not: an
+	// operator flipping this to 1 to debug a model-side ordering effect would
+	// still not be running the old code path. Short-circuit instead.
+	if concurrency <= 1 {
+		summaries := make([]string, 0, len(chunks))
+		for i, chunk := range chunks {
+			summary, processed, oversized, err := summarizeChunkFn(ctx, chunk, specGuidance)
+			if err != nil {
+				return nil, fmt.Errorf("summarize chunk %d: %w", i, err)
+			}
+			summaries = append(summaries, summary)
+			cov.ProcessedCount += processed
+			cov.OversizedMessageCount += oversized
+		}
+		log.Printf("[summarize_chunk] map phase: chunks=%d concurrency=1 elapsed=%dms",
+			len(chunks), time.Since(start).Milliseconds())
+		return summaries, nil
+	}
+
+	outcomes := make([]chunkMapOutcome, len(chunks))
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+
+	for i, chunk := range chunks {
+		wg.Add(1)
+		go func(idx int, c []map[string]interface{}) {
+			defer wg.Done()
+			defer func() {
+				if p := recover(); p != nil {
+					outcomes[idx] = chunkMapOutcome{err: fmt.Errorf("map chunk %d panicked: %v", idx, p)}
+				}
+			}()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				outcomes[idx] = chunkMapOutcome{err: ctx.Err()}
+				return
+			}
+			defer func() { <-sem }()
+
+			// Re-check after acquiring. select picks uniformly among READY cases,
+			// so a goroutine can win the permit released by a call that just
+			// aborted on cancellation — dispatching a fresh LLM request for a
+			// request the client already gave up on. Without this guard a
+			// cancelled run still burns up to `concurrency` extra completions.
+			if err := ctx.Err(); err != nil {
+				outcomes[idx] = chunkMapOutcome{err: err}
+				return
+			}
+
+			summary, processed, oversized, err := summarizeChunkFn(ctx, c, specGuidance)
+			outcomes[idx] = chunkMapOutcome{summary: summary, processed: processed, oversized: oversized, err: err}
+		}(i, chunk)
+	}
+	wg.Wait()
+
+	log.Printf("[summarize_chunk] map phase: chunks=%d concurrency=%d elapsed=%dms",
+		len(chunks), concurrency, time.Since(start).Milliseconds())
+
+	summaries := make([]string, 0, len(chunks))
+	for i, o := range outcomes {
+		if o.err != nil {
+			// Lowest-index error wins (see doc comment): deterministic across runs.
+			return nil, fmt.Errorf("summarize chunk %d: %w", i, o.err)
+		}
+		summaries = append(summaries, o.summary)
+		cov.ProcessedCount += o.processed
+		cov.OversizedMessageCount += o.oversized
+	}
+	return summaries, nil
 }
