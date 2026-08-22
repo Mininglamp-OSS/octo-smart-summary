@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citation"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/gin-gonic/gin"
@@ -183,56 +184,23 @@ func stripCitationTokens(content string, plain []model.Citation, team []model.Te
 //   - fenced code regions (``` ... ```) are passed through untouched;
 //   - ordinary bracketed integers are preserved unless the exact token exists
 //     in markers;
-//   - markdown links [1](url) and reference-style links [1][label] are
-//     content, never markers (same rule as stripCitationTokens).
+//   - markdown links [1](url), reference-style links [1][label] and footnote
+//     definitions [1]: url are content, never markers.
+//
+// R4 (PR #209): the SCOPING half of those rules now lives in
+// internal/citation.RewriteMarkers, because the Session-Finalize worker had to
+// answer the identical question and internal/worker cannot import this package
+// (this package already imports internal/worker). The marker-set SEMANTICS stay
+// here; only the syntax is shared. Behaviour is unchanged — share_test.go and
+// citation_marker_strip_test.go pin it byte-for-byte.
 func stripUnresolvedCitationMarkers(content string, markers citationMarkerSet) string {
 	if len(markers) == 0 {
 		return strings.TrimSpace(content)
 	}
-	lines := strings.Split(content, "\n")
-	inFence := false
-	for i, line := range lines {
-		if strings.HasPrefix(strings.TrimLeft(line, " 	"), "```") {
-			inFence = !inFence
-			continue
-		}
-		if !inFence {
-			lines[i] = stripCitationMarkersInLine(line, markers)
-		}
-	}
-	return strings.TrimSpace(strings.Join(lines, "\n"))
-}
-
-// stripCitationMarkersInLine strips dangling citation markers from a single
-// non-fenced line. See stripUnresolvedCitationMarkers for the scoping rules.
-func stripCitationMarkersInLine(line string, markers citationMarkerSet) string {
-	var b strings.Builder
-	for i := 0; i < len(line); {
-		if line[i] != '[' {
-			b.WriteByte(line[i])
-			i++
-			continue
-		}
-		end := strings.IndexByte(line[i:], ']')
-		if end < 0 {
-			b.WriteString(line[i:])
-			break
-		}
-		end += i
-		token := line[i+1 : end]
+	return strings.TrimSpace(citation.RewriteMarkers(content, func(token string) (string, bool) {
 		_, isCitation := markers[token]
-		// A numeric markdown link [1](url) or reference-style link
-		// [1][label] is content, not a citation.
-		isLink := end+1 < len(line) && line[end+1] == '('
-		isRefLink := end+1 < len(line) && line[end+1] == '['
-		if isCitation && !isLink && !isRefLink {
-			i = end + 1 // drop the marker entirely
-			continue
-		}
-		b.WriteString(line[i : end+1])
-		i = end + 1
-	}
-	return b.String()
+		return "", isCitation
+	}))
 }
 
 func isPlainDigits(s string) bool {
