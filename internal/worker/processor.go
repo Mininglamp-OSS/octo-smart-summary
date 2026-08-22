@@ -45,6 +45,11 @@ type Processor struct {
 	// get dispatched) is observable without running the LLM personal pipeline.
 	// Production leaves it nil and the real pool/processPersonalSummary is used.
 	dispatchPersonalFn func(taskID, participantRefID int64)
+	// finalizeLLMFn, when non-nil, replaces p.llm for the Session-Finalize
+	// consolidation call. Test-only seam (same shape as executePipelineFn) so
+	// executeAgentFinalize — the production core — is reachable from tests
+	// without a live LLM gateway. Production leaves it nil.
+	finalizeLLMFn finalizeLLMClient
 	// notifier delivers the terminal-state (Completed/Failed) IM-bot notification
 	// after a task's status is durably committed. nil = disabled (OnTaskTerminal
 	// is a no-op), so it is safe to call unconditionally.
