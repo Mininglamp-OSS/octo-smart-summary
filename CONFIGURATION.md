@@ -39,6 +39,8 @@ All configuration is done via environment variables.
 | `MAX_MESSAGES_PER_PARTICIPANT` | Max messages per participant in map phase | No | `5000` |
 | `MAX_MESSAGES_PER_CHANNEL` | Max messages per channel (-1 = no limit) | No | `-1` |
 | `MAP_MAX_TOKENS` | Override map-phase token budget (0 = auto) | No | `0` |
+| `SUMMARY_MAX_CITATIONS_PER_CLAIM` | Maximum number of `[n]` citation markers a single claim may carry. A "claim" is a maximal consecutive marker run (`[3][7][12]`, spaces/tabs tolerated); a newline starts a new claim. Enforced by post-processing model output on the agent Map path and on the worker's final body, and stated in the Map prompts so the model is asked for the same number that is enforced. Duplicate markers inside one claim are removed first (lossless) and only then is the cap applied; a capped claim always keeps at least one marker. `0` or negative disables capping entirely and restores the previous behavior byte-for-byte, prompt included. | No | `3` |
+| `AGENT_TRACE` | Emit a per-request agent latency trace (`[agent-trace]` log lines): total wall clock split into planning / tools / unaccounted, per-step planner latency and prompt size, slowest tool spans, and the citation cap's effect. Roughly a few dozen lines per request, so it is off by default and intended for diagnosing a specific slow request. Logs sizes, counts, durations, step numbers and tool names only — never message content, prompt text, tool arguments, or user/channel names. | No | `false` |
 | `CHARS_PER_TOKEN_CJK` | Characters per token for CJK text | No | `1` |
 | `CHARS_PER_TOKEN_ASCII` | Characters per token for ASCII text | No | `4` |
 | `SUMMARY_CHAT_CANDIDATE_LIMIT` | Candidate query limit (-1 = no limit) | No | `-1` |

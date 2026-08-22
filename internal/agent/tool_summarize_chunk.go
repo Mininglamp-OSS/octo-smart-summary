@@ -7,6 +7,7 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citation"
@@ -371,6 +372,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 		// off / no run / no spec → legacy generic prompt.
 		specGuidance := loadRunSpecGuidance(ctx)
 		var summaries []string
+		mapStart := time.Now()
 		for _, chunk := range chunks {
 			summary, processed, oversized, err := summarizeMessagesChunk(ctx, chunk, specGuidance)
 			if err != nil {
@@ -380,6 +382,11 @@ func SummarizeChunkTool() (Tool, Handler) {
 			cov.ProcessedCount += processed
 			cov.OversizedMessageCount += oversized
 		}
+		// summarize_chunk is itself an LLM pipeline, so its own cost needs a
+		// breakdown in the run trace — otherwise it shows up as one opaque
+		// tool span and a slow Map is indistinguishable from a slow planner.
+		TraceFromContext(ctx).AddSubPhase(fmt.Sprintf("map(%dchunks)", len(chunks)),
+			time.Since(mapStart).Milliseconds())
 		cov.DroppedCount = cov.InputCount - cov.ProcessedCount
 		cov.Truncated = cov.DroppedCount > 0
 		recordDroppedMessages(ctx, uid, runID, cov.DroppedCount)
@@ -505,6 +512,11 @@ func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{},
 	// never on `formatted`, which is rendered prompt input whose bracketed
 	// numbers are message-body content.
 	capped, st := citation.CapRuns(strings.TrimSpace(content), maxCites)
+	// Fold into the run trace so the reduction and its downstream effect
+	// (later steps' prompt sizes) appear in the same report — the point of
+	// shipping the instrumentation alongside the cap.
+	TraceFromContext(ctx).AddCitationCap(st.MarkersBefore, st.MarkersAfter,
+		st.RemovedByDedup, st.RemovedByCap, st.BytesBefore, st.BytesAfter, st.LongestRunBefore)
 	if st.Changed() {
 		log.Printf("[summarize_chunk] citation cap max=%d runs=%d capped_runs=%d markers=%d->%d dedup=%d cap=%d longest_run=%d->%d marks (%d->%d chars) bytes=%d->%d",
 			maxCites, st.Runs, st.CappedRuns, st.MarkersBefore, st.MarkersAfter,

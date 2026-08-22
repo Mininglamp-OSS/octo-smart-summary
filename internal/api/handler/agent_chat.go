@@ -705,8 +705,14 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 
 	history = agent.TruncateHistory(history, h.window)
 
+	// Per-request latency trace (AGENT_TRACE; no-op when off). Reported on
+	// BOTH paths: a timed-out run is exactly the one whose phase split needs
+	// explaining.
+	ctx, trace := agent.StartTrace(ctx, req.SessionID)
+
 	reply, newMsgs, err := runner.RunWithHistory(ctx, system, history, req.Message)
 	if err != nil {
+		trace.Report("error")
 		// 真实错误只记服务端日志，避免向调用方泄漏上游 LLM 地址/网络/内部细节。
 		// Detail 走白名单：仅 context deadline / max steps / empty response 等
 		// 明确不含内部地址/IP/token 的 error 会被透传给客户端，其它一律为
@@ -718,6 +724,7 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 
 	// 成功回复后才落库；落库失败不阻断本次回复（宁可丢本回合历史，也不只落 user 造脏历史）。
 	// user_id 与 LoadHistory 保持一致，杜绝跨用户污染（SUM-158 blocker 1）。
+	trace.Report("ok")
 	if err := h.store.AppendMessages(ctx, req.SessionID, uid, newMsgs); err != nil {
 		log.Printf("[agent] append messages error: %v", err)
 	}
@@ -1002,13 +1009,20 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 
 	history = agent.TruncateHistory(history, h.window)
 
+	// Per-request latency trace (AGENT_TRACE; no-op when off). Reported on
+	// BOTH paths: a timed-out run is exactly the one whose phase split needs
+	// explaining.
+	ctx, trace := agent.StartTrace(ctx, req.SessionID)
+
 	// Run agent with history
 	reply, newMsgs, err := runner.RunWithHistory(ctx, system, history, req.Message)
 	if err != nil {
+		trace.Report("error")
 		log.Printf("[agent] chat runner error: %v", err)
 		h.writeSSEErrorViaSinkWithDetail(sink, 50000, "agent chat failed", safeErrorDetail(err))
 		return
 	}
+	trace.Report("ok")
 
 	// Persist messages on success (same as Chat). owner-scoped by uid（SUM-158 blocker 1）。
 	if err := h.store.AppendMessages(ctx, req.SessionID, uid, newMsgs); err != nil {
