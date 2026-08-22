@@ -124,6 +124,12 @@ type Config struct {
 	// Default 30. Values <=0 fall back to the default in handler.
 	SummaryCustomTemplateLimit int
 
+	// SummaryRepairMaxRounds bounds the SS-12 self-repair loop: after the agent
+	// answers, each round re-asks it to fetch an expected-but-unfetched channel
+	// and regenerate. Each round is a full agent turn, so this is a latency and
+	// cost ceiling, not just a safety one. 0 disables repair entirely.
+	SummaryRepairMaxRounds int
+
 	// Fetch concurrency for parallel channel message retrieval
 	FetchConcurrency int
 
@@ -226,6 +232,8 @@ func Load() *Config {
 		CandidateQueryLimit: envInt("SUMMARY_CHAT_CANDIDATE_LIMIT", -1),
 
 		SummaryCustomTemplateLimit: envInt("SUMMARY_CUSTOM_TEMPLATE_LIMIT", 30),
+
+		SummaryRepairMaxRounds: envInt("SUMMARY_REPAIR_MAX_ROUNDS", 2),
 
 		FetchConcurrency: envInt("FETCH_CONCURRENCY", 10),
 
