@@ -134,19 +134,18 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "valid Idempotency-Key header is required"})
 			return
 		}
-		requestHash = canonicalAgentSaveRequestHash(
-			req.SessionID, title, originID, originType,
-			0, req.ExpectedSessionRevision, req.Sources, req.ReferencedTaskIDs,
-		)
-		existing, mismatched, ok, ferr := findAgentSaveIdempotentTaskWithHash(
+		requestHash = canonicalAgentSaveRequestHash(userID, finalizeHashReq(req, title, originID, originType))
+		existing, mismatched, ok, stale, ferr := findAgentSaveIdempotentTaskWithHash(
 			c.Request.Context(), h.db, spaceID, userID, idempotencyKey, requestHash)
 		if ferr != nil {
 			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "idempotency lookup failed"})
 			return
 		}
 		if ok {
-			if mismatched {
-				c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "same Idempotency-Key with a different request"})
+			if stale || mismatched {
+				// Reuse the sync path's 40009 envelope so the client gets the
+				// same reason/recovery_action contract on both save routes.
+				writeAgentSaveIdempotencyResponse(c, existing, mismatched, stale)
 				return
 			}
 			// Same-body replay: return the already-created task.
@@ -261,11 +260,11 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 	if err != nil {
 		// Lost the idempotency race: re-read and replay/mismatch.
 		if errors.Is(err, errAgentSaveIdempotencyConflict) && idempotencyKey != "" {
-			existing, mismatched, ok, ferr := findAgentSaveIdempotentTaskWithHash(
+			existing, mismatched, ok, stale, ferr := findAgentSaveIdempotentTaskWithHash(
 				c.Request.Context(), h.db, spaceID, userID, idempotencyKey, requestHash)
 			if ferr == nil && ok {
-				if mismatched {
-					c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "same Idempotency-Key with a different request"})
+				if stale || mismatched {
+					writeAgentSaveIdempotencyResponse(c, existing, mismatched, stale)
 					return
 				}
 				c.JSON(http.StatusAccepted, apiResponse{Code: 0, Message: "ok", Data: gin.H{
@@ -285,4 +284,24 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 		"task_id": createdTaskID,
 		"status":  "GENERATING",
 	}})
+}
+
+// finalizeHashReq projects a finalize request onto the canonical save-request
+// shape that canonicalAgentSaveRequestHash consumes after #202 collapsed the
+// old positional signature into (userID, createAgentSummaryReq).
+//
+// ExpectedSessionRevision has no field on createAgentSummaryReq, so it rides in
+// SnapshotVersion: both are optimistic-concurrency tokens and neither path
+// populates the other, so the hash stays injective per route.
+func finalizeHashReq(req finalizeAgentSummaryReq, title, originID string, originType int) createAgentSummaryReq {
+	origin := originID
+	return createAgentSummaryReq{
+		SessionID:         req.SessionID,
+		OriginChannelID:   &origin,
+		OriginChannelType: originType,
+		Title:             title,
+		Sources:           req.Sources,
+		ReferencedTaskIDs: req.ReferencedTaskIDs,
+		SnapshotVersion:   req.ExpectedSessionRevision,
+	}
 }
