@@ -437,6 +437,14 @@ func stripOrphanCitations(text string, citations []model.Citation) string {
 //
 // And the cap only ever DELETES markers, never adds or renumbers, so it
 // cannot introduce a marker with no backing row either.
+//
+// # What this does NOT bound
+//
+// It does not bound what a STREAMING client sees first. Deltas are emitted
+// straight from the model (CallMapStream / CallReduceStream); every stage in
+// this function runs after the last delta. The live view is reconciled by
+// publishing the final body as a streaming snapshot before Done — see
+// finishStreamDone in personal_processor.go.
 func finalizeCitations(
 	text string,
 	userMessages []pipeline.Message,

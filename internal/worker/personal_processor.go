@@ -265,8 +265,32 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 		}
 		return streamSender
 	}
-	finishStreamDone := func(status int) {
+	// finishStreamDone terminates the stream, publishing the FINAL persisted
+	// body as a snapshot first.
+	//
+	// Why the snapshot is not optional: deltas are emitted straight from the
+	// model as it generates (CallMapStream / CallReduceStream), so a live
+	// client renders the raw model output. Everything the citation pipeline
+	// does afterwards — dedupCitations, stripOrphanCitations, and now the
+	// per-claim cap — rewrites that body AFTER the last delta. Without a
+	// reconciliation frame the user reads markers that have no backing
+	// Citation row, and the text silently changes under them on refresh.
+	//
+	// Post-stream mutation is not new (dedup/strip always did it) but the
+	// MAGNITUDE is: the cap removes a large fraction of markers from an
+	// over-cited body, which turns a cosmetic edge case into a systematic one.
+	//
+	// EventSnapshot is used rather than adding a body to Done because it is
+	// already in the wire protocol and already handled end to end: the hub
+	// replaces its accumulated snapshot with the event's Content
+	// (streaming/hub.go), api forwards it to live SSE clients verbatim
+	// (handler/stream.go), and the subsequent Done carries that same
+	// reconciled snapshot as its Content. So this costs no protocol change
+	// and no octo-web change — a client that ignores `snapshot` mid-stream is
+	// no worse off than before, and one that honours it converges.
+	finishStreamDone := func(status int, finalBody string) {
 		if streamSender != nil && !streamFinalized {
+			streamSender.Snapshot(finalBody)
 			streamSender.Done(status)
 			streamFinalized = true
 		}
@@ -405,19 +429,19 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 			Progress: 100,
 			Message:  "总结完成",
 		})
-		finishStreamDone(model.StatusCompleted)
+		finishStreamDone(model.StatusCompleted, content)
 		// Task durably reached Completed above (saveLatestResultAndCompleteTask /
 		// completeTaskWithoutNewResult succeeded). Fire the terminal notification.
 		p.notifyTaskTerminal(taskID, model.StatusCompleted)
 		log.Printf("[personal-worker] task %d single-person completed directly", taskID)
 	} else if allowCompletedTask && taskCheck.Status == model.StatusCompleted {
-		finishStreamDone(model.StatusCompleted)
+		finishStreamDone(model.StatusCompleted, content)
 		// Personal-only regenerate: keep the team summary as-is until the user
 		// explicitly submits this regenerated personal result. Submit will revive
 		// the task and trigger meta recompute.
 		log.Printf("[personal-worker] task=%d user=%s personal regenerate completed; waiting for submit", taskID, participant.UserID)
 	} else {
-		finishStreamDone(model.StatusProcessing)
+		finishStreamDone(model.StatusProcessing, content)
 		// Multi-person mode: trigger meta-summary to check if all participants completed.
 		//
 		// System back-fill of submitted_at: the meta completion gate

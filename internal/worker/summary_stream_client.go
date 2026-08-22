@@ -151,6 +151,13 @@ func (s *summaryStreamSender) Delta(delta string) error {
 	return nil
 }
 
+func (s *summaryStreamSender) Snapshot(content string) {
+	if content == "" {
+		return
+	}
+	s.Send(streaming.Event{Type: streaming.EventSnapshot, Content: content})
+}
+
 func (s *summaryStreamSender) Done(status int) {
 	s.Send(streaming.Event{Type: streaming.EventDone, Status: status})
 }
