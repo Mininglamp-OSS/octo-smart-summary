@@ -174,12 +174,16 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 
 		var finalContent string
 		var totalTokens int
+		modelVersion := m.proc.llm.ModelVersion()
 		var teamCitations []model.TeamCitation
 
 		if len(submitted) == 1 {
 			// Single submission: copy content directly, no LLM call
 			finalContent = submitted[0].Content
 			totalTokens = 0
+			if submitted[0].ModelVersion != "" {
+				modelVersion = submitted[0].ModelVersion
+			}
 			_ = teamStream.Delta(finalContent)
 
 			var participant model.SummaryParticipant
@@ -228,7 +232,7 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 
 			generationTopic := m.proc.generationTopic(task)
 			reduceStart := time.Now()
-			content, tokens, err := m.proc.llm.CallReduceByPersonStream(ctx, participantSummaries, startTime, endTime, generationTopic, teamStream.Delta)
+			content, tokens, usedModel, err := m.proc.llm.CallReduceByPersonStreamWithModel(ctx, participantSummaries, startTime, endTime, generationTopic, teamStream.Delta)
 			reportKey := "team#" + strconv.FormatInt(taskID, 10)
 			timing.RecordLLMSince(reportKey, "团队汇总: 合并各成员总结", reduceStart, tokens)
 			timing.FlushReport(reportKey, time.Since(reduceStart).Milliseconds(), nil)
@@ -240,10 +244,10 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 			}
 			finalContent = content
 			totalTokens = tokens
+			modelVersion = usedModel
 
 			teamCitations = extractTeamCitations(finalContent, indexed)
 		}
-
 		now := timezone.Now()
 
 		// Count total messages across all submitted personal results
@@ -257,7 +261,7 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 			Content:        finalContent,
 			TotalMsgCount:  totalMsgCount,
 			TotalTokenUsed: totalTokens,
-			ModelVersion:   m.proc.llm.ModelVersion(),
+			ModelVersion:   modelVersion,
 			GeneratedAt:    now,
 		}
 		result.SetTeamCitations(teamCitations)

@@ -18,7 +18,7 @@ func TestKimiThinkingDisabled_Call(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 30, 4096, false, 30)
+	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 30, 4096, false, 30, nil)
 	content, tokens, err := client.Call(context.Background(), []ChatMessage{{Role: "user", Content: "hi"}}, 0.1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -62,7 +62,7 @@ func TestKimiThinkingDisabled_CallWithTools(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 30, 4096, false, 30)
+	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 30, 4096, false, 30, nil)
 	args, tokens, err := client.CallWithTools(
 		context.Background(),
 		[]ChatMessage{{Role: "user", Content: "analyze"}},
@@ -116,7 +116,7 @@ func TestNonKimiModel_NoThinking(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewLLMClient(srv.URL, "key", "claude-sonnet-4-6", 30, 4096, false, 30)
+	client := NewLLMClient(srv.URL, "key", "claude-sonnet-4-6", 30, 4096, false, 30, nil)
 	_, _, err := client.Call(context.Background(), []ChatMessage{{Role: "user", Content: "hi"}}, 0.1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -141,7 +141,7 @@ func TestQwenModel_ChatTemplateKwargs(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewLLMClient(srv.URL, "key", "qwen3.6-flash", 30, 4096, false, 30)
+	client := NewLLMClient(srv.URL, "key", "qwen3.6-flash", 30, 4096, false, 30, nil)
 	_, _, err := client.Call(context.Background(), []ChatMessage{{Role: "user", Content: "hi"}}, 0.1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -172,7 +172,7 @@ func TestKimiThinkingEnabled_NoInjection(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 30, 4096, true, 30)
+	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 30, 4096, true, 30, nil)
 	_, _, err := client.Call(context.Background(), []ChatMessage{{Role: "user", Content: "hi"}}, 0.1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -192,7 +192,7 @@ func TestKimiContentEmpty_ReasoningPresent(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 30, 4096, false, 30)
+	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 30, 4096, false, 30, nil)
 	_, _, err := client.Call(context.Background(), []ChatMessage{{Role: "user", Content: "hi"}}, 0.1)
 	if err == nil {
 		t.Fatal("expected error when content is empty but reasoning present")
@@ -209,7 +209,7 @@ func TestKimiContentEmpty_ReasoningField(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 30, 4096, false, 30)
+	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 30, 4096, false, 30, nil)
 	_, _, err := client.Call(context.Background(), []ChatMessage{{Role: "user", Content: "hi"}}, 0.1)
 	if err == nil {
 		t.Fatal("expected error when content is empty but reasoning present")
@@ -225,7 +225,7 @@ func TestKimiCallWithTools_ReasoningBudgetExhausted(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 5, 4096, false, 5)
+	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 5, 4096, false, 5, nil)
 	_, _, err := client.CallWithTools(
 		context.Background(),
 		[]ChatMessage{{Role: "user", Content: "analyze"}},
@@ -285,7 +285,7 @@ func TestKimiToolChoice_FunctionNameValidation(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 5, 4096, false, 5)
+	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 5, 4096, false, 5, nil)
 	result, _, err := client.CallWithTools(
 		context.Background(),
 		[]ChatMessage{{Role: "user", Content: "analyze"}},
@@ -312,7 +312,7 @@ func TestNonKimiModel_ForcedToolChoice(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewLLMClient(srv.URL, "key", "qwen3.6-flash", 30, 4096, false, 30)
+	client := NewLLMClient(srv.URL, "key", "qwen3.6-flash", 30, 4096, false, 30, nil)
 	_, _, err := client.CallWithTools(
 		context.Background(),
 		[]ChatMessage{{Role: "user", Content: "analyze"}},
@@ -345,7 +345,7 @@ func TestKimiToolChoice_AllRetriesFail(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 5, 4096, false, 5)
+	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 5, 4096, false, 5, nil)
 	_, _, err := client.CallWithTools(
 		context.Background(),
 		[]ChatMessage{{Role: "user", Content: "analyze"}},
@@ -363,7 +363,7 @@ func TestCallWithTools_ReasoningFieldGatewayProxy(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 5, 4096, false, 5)
+	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 5, 4096, false, 5, nil)
 	_, _, err := client.CallWithTools(
 		context.Background(),
 		[]ChatMessage{{Role: "user", Content: "analyze"}},
@@ -384,7 +384,7 @@ func TestCallMap_PropagatesReasoningBudgetError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 5, 4096, false, 5)
+	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 5, 4096, false, 5, nil)
 	_, _, err := client.CallMap(
 		context.Background(),
 		"[1] user1: hello\n[2] user2: world",
@@ -409,7 +409,7 @@ func TestCallMap_PropagatesTokenLimitError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 5, 4096, false, 5)
+	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 5, 4096, false, 5, nil)
 	_, _, err := client.CallMap(
 		context.Background(),
 		"[1] user1: hello",
@@ -432,7 +432,7 @@ func TestCallMap_TransientErrorFallsBackToMarker(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 5, 4096, false, 5)
+	client := NewLLMClient(srv.URL, "key", "tencent/kimi-k2.6", 5, 4096, false, 5, nil)
 	result, _, err := client.CallMap(
 		context.Background(),
 		"[1] user1: hello",

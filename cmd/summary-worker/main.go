@@ -76,7 +76,7 @@ func main() {
 	}
 
 	// Init LLM client
-	llm := service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, cfg.ToolCallTimeout)
+	llm := service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, cfg.ToolCallTimeout, cfg.LLMFallbackModels)
 
 	// Set up user/source name resolvers (same as API process)
 	service.SetUserNameResolver(func(uid string) string {

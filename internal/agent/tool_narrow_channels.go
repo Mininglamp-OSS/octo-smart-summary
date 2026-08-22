@@ -51,7 +51,7 @@ func NarrowChannelsByTopicTool() (Tool, Handler) {
 		}
 
 		llmFn := func(ctx context.Context, prompt string) (string, error) {
-			client := service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, 30)
+			client := service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, 30, cfg.LLMFallbackModels)
 			msgs := []service.ChatMessage{{Role: "user", Content: prompt}}
 			content, _, err := client.Call(ctx, msgs, 0.3)
 			return content, err

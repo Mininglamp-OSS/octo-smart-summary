@@ -274,7 +274,7 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 
 	llmCtx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
 	defer cancel()
-	newContent, tokens, err := h.llm.Call(llmCtx, []service.ChatMessage{
+	newContent, tokens, usedModel, err := h.llm.CallWithModel(llmCtx, []service.ChatMessage{
 		{Role: "system", Content: buildRefineSystemPrompt()},
 		{Role: "user", Content: fmt.Sprintf("当前总结：\n%s\n\n用户修改意见：\n%s", baseResult.Content, feedback)},
 	}, 0.1)
@@ -304,7 +304,7 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 		Content:        newContent,
 		TotalMsgCount:  baseResult.TotalMsgCount,
 		TotalTokenUsed: baseResult.TotalTokenUsed + tokens,
-		ModelVersion:   h.llm.ModelVersion(),
+		ModelVersion:   usedModel,
 		OperationType:  "refine",
 		OperationNote:  feedback,
 		ParentResultID: &baseResult.ID,
@@ -440,7 +440,7 @@ func (h *EditHandler) RefineSummaryStream(c *gin.Context) {
 
 	llmCtx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
 	defer cancel()
-	newContent, tokens, err := h.llm.CallStream(llmCtx, []service.ChatMessage{
+	newContent, tokens, usedModel, err := h.llm.CallStreamWithModel(llmCtx, []service.ChatMessage{
 		{Role: "system", Content: buildRefineSystemPrompt()},
 		{Role: "user", Content: fmt.Sprintf("当前总结：\n%s\n\n用户修改意见：\n%s", baseResult.Content, feedback)},
 	}, 0.1, func(delta string) error {
@@ -479,7 +479,7 @@ func (h *EditHandler) RefineSummaryStream(c *gin.Context) {
 		Content:        newContent,
 		TotalMsgCount:  baseResult.TotalMsgCount,
 		TotalTokenUsed: baseResult.TotalTokenUsed + tokens,
-		ModelVersion:   h.llm.ModelVersion(),
+		ModelVersion:   usedModel,
 		OperationType:  "refine",
 		OperationNote:  feedback,
 		ParentResultID: &baseResult.ID,

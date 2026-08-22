@@ -78,7 +78,7 @@ func MergeSummariesTool() (Tool, Handler) {
 // "每条不超过 50 字" compression. Empty (V2 off) → the exact legacy prompt.
 func mergeSummariesWithLLM(ctx context.Context, combined string, specGuidance string) (string, error) {
 	_, _, _, cfg := GetSummaryDeps()
-	client := service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, 30)
+	client := service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, 30, cfg.LLMFallbackModels)
 
 	systemPrompt := `你是专业的工作内容整理助手。请将多个局部总结合并为一个结构化摘要：
 

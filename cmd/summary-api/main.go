@@ -113,7 +113,7 @@ func main() {
 	// without LLM envs, while /summaries/:id/refine returns 503 until configured.
 	var refineLLM *service.LLMClient
 	if cfg.LLMApiURL != "" && cfg.LLMApiKey != "" && cfg.LLMModel != "" {
-		refineLLM = service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, cfg.ToolCallTimeout)
+		refineLLM = service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, cfg.ToolCallTimeout, cfg.LLMFallbackModels)
 	}
 	// 合并上游后统一签名：上游 streamHub(SSE)+ 上游模板参数 + agent handler 所需的原始 LLM 配置
 	// + 变参 refineLLM(上游 refine/personal 用)。

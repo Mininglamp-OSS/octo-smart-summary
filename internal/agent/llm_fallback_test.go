@@ -15,9 +15,9 @@ import (
 
 // LLM fallback: when the primary model exhausts its per-model retry budget on
 // retryable failures (5xx / 429 / network), Chat should switch to each
-// configured fallback model in order and try again. On terminal errors
-// (4xx / decode / empty choices) Chat must not escalate to fallback — those
-// signal a caller-side problem the next model would hit too.
+// configured fallback model in order and try again. HTTP 403 escalates
+// immediately; other terminal errors (including 401, other 4xx, decode and
+// empty choices) must not reach the fallback.
 //
 // Motivation: issue #179.
 
@@ -329,26 +329,53 @@ func TestChat_ParentContextCancelledIsNotMasqueradedAsFallback(t *testing.T) {
 	}
 }
 
-// TestTruncateForLog covers the helper that keeps upstream error bodies out
-// of the fallback log line on the success path (issue #179 P2 - leakage).
-// Behaviour is trivial but the log line's shape is a contract for anyone
-// grepping incident logs, so pin it.
-func TestTruncateForLog(t *testing.T) {
-	cases := []struct {
-		in   string
-		n    int
-		want string
-	}{
-		{"", 10, ""},
-		{"short", 10, "short"},
-		{"exactly-10", 10, "exactly-10"},
-		{"a bit too long", 5, "a bit...(truncated)"},
-		{"日本語テスト長い文字列", 4, "日本語テ...(truncated)"},
-	}
-	for _, tc := range cases {
-		got := truncateForLog(tc.in, tc.n)
-		if got != tc.want {
-			t.Errorf("truncateForLog(%q,%d) = %q, want %q", tc.in, tc.n, got, tc.want)
+// TestChat_403EscalatesToFallback pins the #211 fix: an account-level denial
+// (HTTP 403, e.g. a Bedrock SCP explicit-deny of bedrock:InvokeModel) must
+// escalate to the fallback model — which the gateway can route to a different
+// provider — instead of being treated as terminal. Before #211 a 403 was
+// classified terminal (retry := status>=500 || status==429), so Chat returned
+// the failure without ever contacting the fallback. The primary must be tried
+// exactly once (no wasteful same-model retries on a denial).
+func TestChat_403EscalatesToFallback(t *testing.T) {
+	primary := "claude-sonnet-4-6"
+	fallback := "gpt-4.1"
+
+	var mu sync.Mutex
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Model string `json:"model"`
 		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		seen = append(seen, body.Model)
+		mu.Unlock()
+		if body.Model == primary {
+			http.Error(w, "AccessDeniedException: explicit deny in a service control policy", http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"choices":[{"message":{"content":"reply from %s","tool_calls":null}}],"usage":{"total_tokens":10}}`, body.Model)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "test-key", primary, 5, 512, []string{fallback})
+	c.http = &http.Client{Timeout: 2 * time.Second}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	turn, err := c.Chat(ctx, []Message{{Role: "user", Content: "hi"}}, nil)
+	if err != nil {
+		t.Fatalf("403 on primary must escalate to fallback %q, got err: %v (seen=%v)", fallback, err, seen)
+	}
+	if !strings.Contains(turn.Content, fallback) {
+		t.Errorf("expected reply from fallback %q, got %q", fallback, turn.Content)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	// primary once (403 is not retried on the same model), then fallback once.
+	if len(seen) != 2 || seen[0] != primary || seen[1] != fallback {
+		t.Fatalf("expected [primary, fallback], got %v", seen)
 	}
 }

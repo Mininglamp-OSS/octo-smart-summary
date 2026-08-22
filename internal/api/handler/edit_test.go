@@ -604,7 +604,7 @@ func newTestRefineLLM(t *testing.T, content string) (*service.LLMClient, func())
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{"choices":[{"message":{"content":%q},"finish_reason":"stop"}],"usage":{"total_tokens":7,"completion_tokens":3}}`, content)
 	}))
-	return service.NewLLMClient(srv.URL, "test-key", "test-model", 5, 256, false, 5), srv.Close
+	return service.NewLLMClient(srv.URL, "test-key", "test-model", 5, 256, false, 5, nil), srv.Close
 }
 
 func seedVersionCitationPrivacyTask(t *testing.T, db *gorm.DB) (taskID int64, resultID int64) {

@@ -107,7 +107,7 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 
 	llmCtx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
 	defer cancel()
-	newContent, tokens, err := h.llm.Call(llmCtx, []service.ChatMessage{
+	newContent, tokens, usedModel, err := h.llm.CallWithModel(llmCtx, []service.ChatMessage{
 		{Role: "system", Content: buildRefineSystemPrompt()},
 		{Role: "user", Content: fmt.Sprintf("当前总结：\n%s\n\n用户修改意见：\n%s", pr.Content, feedback)},
 	}, 0.1)
@@ -168,7 +168,7 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 			CitationsJSON:    citationsJSON,
 			MsgCount:         latestPR.MsgCount,
 			TotalTokenUsed:   latestPR.TotalTokenUsed + tokens,
-			ModelVersion:     h.llm.ModelVersion(),
+			ModelVersion:     usedModel,
 			Version:          nextVer,
 			OperationType:    "refine",
 			OperationNote:    feedback,
@@ -185,7 +185,7 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 				"content":            newContent,
 				"citations_json":     citationsJSON,
 				"total_token_used":   latestPR.TotalTokenUsed + tokens,
-				"model_version":      h.llm.ModelVersion(),
+				"model_version":      usedModel,
 				"current_version_id": newVersion.ID,
 				"generated_at":       now,
 				"edited_at":          now,
@@ -332,7 +332,7 @@ func (h *PersonalHandler) RefinePersonalSummaryStream(c *gin.Context) {
 
 	llmCtx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
 	defer cancel()
-	newContent, tokens, err := h.llm.CallStream(llmCtx, []service.ChatMessage{
+	newContent, tokens, usedModel, err := h.llm.CallStreamWithModel(llmCtx, []service.ChatMessage{
 		{Role: "system", Content: buildRefineSystemPrompt()},
 		{Role: "user", Content: fmt.Sprintf("当前总结：\n%s\n\n用户修改意见：\n%s", pr.Content, feedback)},
 	}, 0.1, func(delta string) error {
@@ -402,7 +402,7 @@ func (h *PersonalHandler) RefinePersonalSummaryStream(c *gin.Context) {
 			CitationsJSON:    citationsJSON,
 			MsgCount:         latestPR.MsgCount,
 			TotalTokenUsed:   latestPR.TotalTokenUsed + tokens,
-			ModelVersion:     h.llm.ModelVersion(),
+			ModelVersion:     usedModel,
 			Version:          nextVer,
 			OperationType:    "refine",
 			OperationNote:    feedback,
@@ -419,7 +419,7 @@ func (h *PersonalHandler) RefinePersonalSummaryStream(c *gin.Context) {
 				"content":            newContent,
 				"citations_json":     citationsJSON,
 				"total_token_used":   latestPR.TotalTokenUsed + tokens,
-				"model_version":      h.llm.ModelVersion(),
+				"model_version":      usedModel,
 				"current_version_id": newVersion.ID,
 				"generated_at":       now,
 				"edited_at":          now,

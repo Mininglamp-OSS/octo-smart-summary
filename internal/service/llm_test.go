@@ -6,7 +6,7 @@ import (
 )
 
 func TestChatTemplateKwargs_QwenWithThinkingDisabled(t *testing.T) {
-	client := NewLLMClient("http://localhost", "test-fake-api-key", "qwen3.6-max", 30, 4096, false, 30)
+	client := NewLLMClient("http://localhost", "test-fake-api-key", "qwen3.6-max", 30, 4096, false, 30, nil)
 
 	reqBody := chatRequest{
 		Model:       client.model,
@@ -14,7 +14,7 @@ func TestChatTemplateKwargs_QwenWithThinkingDisabled(t *testing.T) {
 		Temperature: 0.3,
 		MaxTokens:   client.maxTokens,
 	}
-	thinking, kwargs := client.buildThinkingConfig()
+	thinking, kwargs := client.buildThinkingConfig(client.model)
 	reqBody.Thinking = thinking
 	reqBody.ChatTemplateKwargs = kwargs
 
@@ -42,7 +42,7 @@ func TestChatTemplateKwargs_QwenWithThinkingDisabled(t *testing.T) {
 }
 
 func TestChatTemplateKwargs_DeepseekV4WithThinkingDisabled(t *testing.T) {
-	client := NewLLMClient("http://localhost", "test-fake-api-key", "deepseek-v4-flash", 30, 4096, false, 30)
+	client := NewLLMClient("http://localhost", "test-fake-api-key", "deepseek-v4-flash", 30, 4096, false, 30, nil)
 
 	reqBody := chatRequest{
 		Model:       client.model,
@@ -50,7 +50,7 @@ func TestChatTemplateKwargs_DeepseekV4WithThinkingDisabled(t *testing.T) {
 		Temperature: 0.3,
 		MaxTokens:   client.maxTokens,
 	}
-	thinking, kwargs := client.buildThinkingConfig()
+	thinking, kwargs := client.buildThinkingConfig(client.model)
 	reqBody.Thinking = thinking
 	reqBody.ChatTemplateKwargs = kwargs
 
@@ -78,7 +78,7 @@ func TestChatTemplateKwargs_DeepseekV4WithThinkingDisabled(t *testing.T) {
 }
 
 func TestChatTemplateKwargs_DeepseekV4WithThinkingEnabled(t *testing.T) {
-	client := NewLLMClient("http://localhost", "test-fake-api-key", "deepseek-v4-flash", 30, 4096, true, 30)
+	client := NewLLMClient("http://localhost", "test-fake-api-key", "deepseek-v4-flash", 30, 4096, true, 30, nil)
 
 	reqBody := chatRequest{
 		Model:       client.model,
@@ -86,7 +86,7 @@ func TestChatTemplateKwargs_DeepseekV4WithThinkingEnabled(t *testing.T) {
 		Temperature: 0.3,
 		MaxTokens:   client.maxTokens,
 	}
-	thinking, kwargs := client.buildThinkingConfig()
+	thinking, kwargs := client.buildThinkingConfig(client.model)
 	reqBody.Thinking = thinking
 	reqBody.ChatTemplateKwargs = kwargs
 
@@ -106,7 +106,7 @@ func TestChatTemplateKwargs_DeepseekV4WithThinkingEnabled(t *testing.T) {
 }
 
 func TestChatTemplateKwargs_ClaudeModel(t *testing.T) {
-	client := NewLLMClient("http://localhost", "test-fake-api-key", "claude-haiku-4-5", 30, 4096, false, 30)
+	client := NewLLMClient("http://localhost", "test-fake-api-key", "claude-haiku-4-5", 30, 4096, false, 30, nil)
 
 	reqBody := chatRequest{
 		Model:       client.model,
@@ -114,7 +114,7 @@ func TestChatTemplateKwargs_ClaudeModel(t *testing.T) {
 		Temperature: 0.3,
 		MaxTokens:   client.maxTokens,
 	}
-	thinking, kwargs := client.buildThinkingConfig()
+	thinking, kwargs := client.buildThinkingConfig(client.model)
 	reqBody.Thinking = thinking
 	reqBody.ChatTemplateKwargs = kwargs
 
@@ -134,7 +134,7 @@ func TestChatTemplateKwargs_ClaudeModel(t *testing.T) {
 }
 
 func TestChatTemplateKwargs_QwenWithThinkingEnabled(t *testing.T) {
-	client := NewLLMClient("http://localhost", "test-fake-api-key", "qwen3.6-plus", 30, 4096, true, 30)
+	client := NewLLMClient("http://localhost", "test-fake-api-key", "qwen3.6-plus", 30, 4096, true, 30, nil)
 
 	reqBody := chatRequest{
 		Model:       client.model,
@@ -142,7 +142,7 @@ func TestChatTemplateKwargs_QwenWithThinkingEnabled(t *testing.T) {
 		Temperature: 0.3,
 		MaxTokens:   client.maxTokens,
 	}
-	thinking, kwargs := client.buildThinkingConfig()
+	thinking, kwargs := client.buildThinkingConfig(client.model)
 	reqBody.Thinking = thinking
 	reqBody.ChatTemplateKwargs = kwargs
 
@@ -162,7 +162,7 @@ func TestChatTemplateKwargs_QwenWithThinkingEnabled(t *testing.T) {
 }
 
 func TestChatTemplateKwargs_CallWithTools_Qwen(t *testing.T) {
-	client := NewLLMClient("http://localhost", "test-fake-api-key", "qwen3.6-flash", 30, 4096, false, 30)
+	client := NewLLMClient("http://localhost", "test-fake-api-key", "qwen3.6-flash", 30, 4096, false, 30, nil)
 
 	reqBody := chatRequestWithTools{
 		Model:       client.model,
@@ -172,7 +172,7 @@ func TestChatTemplateKwargs_CallWithTools_Qwen(t *testing.T) {
 		Tools:       []Tool{{Type: "function", Function: ToolFunction{Name: "test", Description: "test", Parameters: nil}}},
 		ToolChoice:  ToolChoice{Type: "function", Function: ToolChoiceFunction{Name: "test"}},
 	}
-	thinking, kw := client.buildThinkingConfig()
+	thinking, kw := client.buildThinkingConfig(client.model)
 	reqBody.Thinking = thinking
 	reqBody.ChatTemplateKwargs = kw
 
