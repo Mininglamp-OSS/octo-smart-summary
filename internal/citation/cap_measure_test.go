@@ -17,6 +17,16 @@ import (
 // The generator is seeded and deterministic. It is NOT a captured production
 // body — no user content is committed — but it reproduces the two properties
 // that drive the cost: total marker volume and the long unbroken runs.
+//
+// LIMITATION, stated because it hid a bug for a review round: repeats are
+// inserted NEAR their original (`at := src + 1 + rng.Intn(6)`), so they land
+// inside the same claim's run and two claims almost never share a source.
+// This corpus therefore cannot exhibit CROSS-CLAIM SOURCE REUSE — one
+// decisive message supporting several conclusions — which is what a real
+// summary looks like and what is required to surface the interaction between
+// the cap and the whole-document dedup. That case is measured against the
+// real three-stage pipeline in worker.TestMeasuredUncitedClaims, which needs
+// buildCitations/dedupCitations and so cannot live in this package.
 func syntheticPathologicalBody() string {
 	const (
 		totalMarkers  = 1227
@@ -117,9 +127,12 @@ func TestMeasuredReduction(t *testing.T) {
 		dedupOnly.BytesBefore, dedupOnly.BytesAfter, dedupOnly.BytesBefore-dedupOnly.BytesAfter,
 		pctOf(dedupOnly.BytesBefore-dedupOnly.BytesAfter, dedupOnly.BytesBefore))
 
+	baseUncited := uncitedClaims(body)
+	t.Logf("BEFORE: uncited claims = %d", baseUncited)
+
 	for _, max := range []int{5, 3, 2, 1} {
 		out, st := CapRuns(body, max)
-		t.Logf("CAP=%d: markers %d -> %d (-%d total: dedup -%d, cap -%d) | bytes %d -> %d (-%d, %.1f%%) | longest run %d -> %d marks (%d -> %d chars) | capped_runs %d/%d",
+		t.Logf("CAP=%d: markers %d -> %d (-%d total: dedup -%d, cap -%d) | bytes %d -> %d (-%d, %.1f%%) | longest run %d -> %d marks (%d -> %d chars) | capped_runs %d/%d | uncited_claims %d -> %d",
 			max,
 			st.MarkersBefore, st.MarkersAfter, st.MarkersBefore-st.MarkersAfter,
 			st.RemovedByDedup, st.RemovedByCap,
@@ -127,7 +140,16 @@ func TestMeasuredReduction(t *testing.T) {
 			pctOf(st.BytesBefore-st.BytesAfter, st.BytesBefore),
 			st.LongestRunBefore, st.LongestRunAfter,
 			st.LongestRunCharsBefore, st.LongestRunCharsAfter,
-			st.CappedRuns, st.Runs)
+			st.CappedRuns, st.Runs,
+			baseUncited, uncitedClaims(out))
+
+		// Citation COVERAGE is a quality metric the cap can regress, it is
+		// cheap to compute, and it belongs next to the byte counts. Bytes
+		// bought at the price of an uncited claim are not a win.
+		if got := uncitedClaims(out); got > baseUncited {
+			t.Errorf("cap=%d left %d uncited claims, up from %d: the cap destroyed "+
+				"citations that exist without it", max, got, baseUncited)
+		}
 
 		// Invariants that must hold at every cap value.
 		if runs, _, _ := findRuns(out); true {
@@ -217,4 +239,20 @@ func TestMutationCapDisabledFailsEnforcement(t *testing.T) {
 func mustChars(body string, max int) int {
 	_, st := CapRuns(body, max)
 	return st.LongestRunCharsAfter
+}
+
+// uncitedClaims counts claim lines that carry no citable marker. A claim line
+// is any line the generator emits with a marker run; a line that never had one
+// is not a claim and is skipped, so this measures LOSS rather than prose.
+func uncitedClaims(text string) int {
+	n := 0
+	for _, line := range strings.Split(text, "\n") {
+		if !strings.HasPrefix(line, "- ") {
+			continue
+		}
+		if len(Numbers(line)) == 0 {
+			n++
+		}
+	}
+	return n
 }
