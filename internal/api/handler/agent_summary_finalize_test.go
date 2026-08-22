@@ -8,6 +8,7 @@ package handler
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -29,6 +30,12 @@ func setupFinalizeRouter(h *AgentSummaryHandler) *gin.Engine {
 	return r
 }
 
+// finalizeKeySeq gives each doFinalize call a distinct default Idempotency-Key.
+// The header is MANDATORY on this route (it is what settles the double-click
+// race), so a test that does not care about idempotency still has to send one —
+// and it must be DISTINCT per call, or every call would replay the first.
+var finalizeKeySeq int
+
 func doFinalize(t *testing.T, r http.Handler, body map[string]interface{}, headers map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
 	buf, err := json.Marshal(body)
@@ -42,6 +49,10 @@ func doFinalize(t *testing.T, r http.Handler, body map[string]interface{}, heade
 	req.Header.Set("X-Space-Id", "test-space")
 	for k, v := range headers {
 		req.Header.Set(k, v)
+	}
+	if req.Header.Get("Idempotency-Key") == "" {
+		finalizeKeySeq++
+		req.Header.Set("Idempotency-Key", fmt.Sprintf("auto-key-%d", finalizeKeySeq))
 	}
 	r.ServeHTTP(w, req)
 	return w
@@ -174,18 +185,28 @@ func TestFinalize_IdempotentReplayBeatsInFlightGuard(t *testing.T) {
 	}
 }
 
-// Without a key there is nothing to replay, so the in-flight guard is the only
-// thing standing between a double-click and two concurrent finalize runs.
-func TestFinalize_InFlightGuardBlocksSecondRunWithoutKey(t *testing.T) {
+// A double-click now sends the SAME key and is settled by the idempotency
+// binding (see TestFinalize_IdempotentReplayBeatsInFlightGuard). Two DIFFERENT
+// keys on the same session are a different request, and the in-flight guard is
+// what stops them becoming two finalize runs.
+//
+// HONEST LIMIT: this is the SEQUENTIAL case. The guard COUNTs outside the
+// transaction and the task INSERT commits inside it, so two different-key
+// requests that arrive CONCURRENTLY both observe inflight == 0 and both commit.
+// The mandatory header closes the double-click vector, not this one; a DB-level
+// partial unique constraint over active finalize tasks is the durable fix and is
+// deferred out of v0 to avoid a schema change.
+func TestFinalize_InFlightGuardBlocksSecondRunWithDifferentKey(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
 	h := NewAgentSummaryHandler(db, db, "", "", "", 0, 0)
 	r := setupFinalizeRouter(h)
 
 	seedAssistantMessage(t, db, "test-user", "sess-fin-5", "内容")
-	if w := doFinalize(t, r, map[string]interface{}{"session_id": "sess-fin-5"}, nil); w.Code != http.StatusAccepted {
-		t.Fatalf("first status = %d, want 202", w.Code)
+	body := map[string]interface{}{"session_id": "sess-fin-5"}
+	if w := doFinalize(t, r, body, map[string]string{"Idempotency-Key": "fin5-key-a"}); w.Code != http.StatusAccepted {
+		t.Fatalf("first status = %d, want 202 (body=%s)", w.Code, w.Body.String())
 	}
-	w := doFinalize(t, r, map[string]interface{}{"session_id": "sess-fin-5"}, nil)
+	w := doFinalize(t, r, body, map[string]string{"Idempotency-Key": "fin5-key-b"})
 	if w.Code != http.StatusConflict {
 		t.Fatalf("second status = %d, want 409 while the first run is still in flight", w.Code)
 	}
@@ -246,6 +267,61 @@ func TestFinalizeHashReq_DiscriminatesFromSyncSaveRoute(t *testing.T) {
 	})
 	if finalizeHash == syncHash {
 		t.Fatal("finalize and sync save hashed identically — one key reused across routes would cross-replay")
+	}
+}
+
+// --- BLOCKING 3: the Idempotency-Key header is mandatory ------------------
+
+// The in-flight guard COUNTs outside the transaction and the task INSERT
+// commits inside it, with no unique constraint and no lock in between. Two
+// concurrent key-less requests (a double-click) would both see inflight == 0
+// and both commit a Pending task: two LLM runs, two deliverables, violating
+// §3.4 "单会话单 Run". Requiring the key makes a double-click carry the SAME
+// key, which the unique idempotency binding settles atomically.
+func TestFinalize_MissingIdempotencyKeyIsRejected(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	h := NewAgentSummaryHandler(db, db, "", "", "", 0, 0)
+	r := setupFinalizeRouter(h)
+
+	seedAssistantMessage(t, db, "test-user", "sess-fin-key", "内容")
+
+	// Bypass doFinalize's auto-key: send the request with no header at all.
+	buf, _ := json.Marshal(map[string]interface{}{"session_id": "sess-fin-key"})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/v1/summaries/agent/finalize", bytes.NewReader(buf))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Token", "test-user")
+	req.Header.Set("X-Space-Id", "test-space")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 — Idempotency-Key is mandatory (body=%s)", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Code int `json:"code"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Code != 40005 {
+		t.Fatalf("code = %d, want 40005", resp.Code)
+	}
+	var count int64
+	db.Model(&model.SummaryTask{}).Count(&count)
+	if count != 0 {
+		t.Fatalf("a rejected request created %d task(s)", count)
+	}
+}
+
+// A blank / whitespace-only key is the same as no key.
+func TestFinalize_BlankIdempotencyKeyIsRejected(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	h := NewAgentSummaryHandler(db, db, "", "", "", 0, 0)
+	r := setupFinalizeRouter(h)
+
+	seedAssistantMessage(t, db, "test-user", "sess-fin-blank", "内容")
+	w := doFinalize(t, r, map[string]interface{}{"session_id": "sess-fin-blank"},
+		map[string]string{"Idempotency-Key": "   "})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a blank key (body=%s)", w.Code, w.Body.String())
 	}
 }
 

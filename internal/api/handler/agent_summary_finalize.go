@@ -109,31 +109,45 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 	//     fail transiently, so folding its result in would let a byte-identical
 	//     retry hash differently and 409 a request the client never changed.
 	//
+	// The Idempotency-Key header is MANDATORY on this route — see below.
 	idempotencyKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
-	var requestHash string
-	if idempotencyKey != "" {
-		if !validAgentSaveIdempotencyKey(idempotencyKey) {
-			c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "valid Idempotency-Key header is required"})
+	// Mandatory, not optional. The in-flight guard below COUNTs outside the
+	// transaction and the task INSERT happens inside it, with no unique constraint
+	// and no lock in between, so two concurrent key-less requests (a double-click)
+	// both observe inflight == 0 and both commit a Pending task: two consolidation
+	// LLM runs and two deliverables for one session, violating §3.4
+	// "单会话单 Run … 不排队不并发". With the key required, a double-click sends the
+	// SAME key and the unique idempotency binding settles the race atomically
+	// (insert + locked read-back), which is the vector that actually occurs.
+	//
+	// BE HONEST ABOUT THE RESIDUAL: two DIFFERENT keys for the same session still
+	// race past the COUNT and still produce two tasks. This closes the
+	// double-click vector, NOT the general one. The durable fix is a DB-level
+	// constraint (a partial unique index over active finalize tasks per
+	// (creator_id, agent_session_id)), deferred out of v0 to avoid a schema
+	// change. Until then the "one active run per session" contract is enforced
+	// for well-behaved clients, not by the database.
+	if idempotencyKey == "" || !validAgentSaveIdempotencyKey(idempotencyKey) {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "valid Idempotency-Key header is required"})
+		return
+	}
+	requestHash := canonicalAgentSaveRequestHash(userID, finalizeHashReq(req, title))
+	existing, mismatched, ok, stale, ferr := findAgentSaveIdempotentTaskWithHash(
+		c.Request.Context(), h.db, spaceID, userID, idempotencyKey, requestHash)
+	if ferr != nil {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "idempotency lookup failed"})
+		return
+	}
+	if ok {
+		if stale || mismatched {
+			// Reuse the sync path's 40009 envelope so the client gets the
+			// same reason/recovery_action contract on both save routes.
+			writeAgentSaveIdempotencyResponse(c, existing, mismatched, stale)
 			return
 		}
-		requestHash = canonicalAgentSaveRequestHash(userID, finalizeHashReq(req, title))
-		existing, mismatched, ok, stale, ferr := findAgentSaveIdempotentTaskWithHash(
-			c.Request.Context(), h.db, spaceID, userID, idempotencyKey, requestHash)
-		if ferr != nil {
-			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "idempotency lookup failed"})
-			return
-		}
-		if ok {
-			if stale || mismatched {
-				// Reuse the sync path's 40009 envelope so the client gets the
-				// same reason/recovery_action contract on both save routes.
-				writeAgentSaveIdempotencyResponse(c, existing, mismatched, stale)
-				return
-			}
-			// Same-body replay: return the already-created task.
-			writeFinalizeReplayResponse(c, existing)
-			return
-		}
+		// Same-body replay: return the already-created task.
+		writeFinalizeReplayResponse(c, existing)
+		return
 	}
 
 	// The session must have usable assistant content to consolidate, AND we
@@ -291,29 +305,27 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 		}
 
 		// SUM-BE2 idempotency binding (same tx as the task).
-		if idempotencyKey != "" {
-			binding := model.SummaryAgentSaveIdempotency{
-				SpaceID:        spaceID,
-				UserID:         userID,
-				IdempotencyKey: idempotencyKey,
-				RequestHash:    requestHash,
-				TaskID:         task.ID,
-				CreatedAt:      now,
-			}
-			// Use the shared helper, NOT RowsAffected: GORM maps DoNothing to a
-			// MySQL no-op update and clientFoundRows=true reports that conflict as
-			// one affected row, so the loser of a concurrent same-key race would
-			// commit a SECOND task + participant + personal_result (two finalize
-			// runs, two LLM calls) while the binding still points at the first.
-			if berr := createAgentSaveIdempotencyBinding(tx, &binding); berr != nil {
-				return berr
-			}
+		binding := model.SummaryAgentSaveIdempotency{
+			SpaceID:        spaceID,
+			UserID:         userID,
+			IdempotencyKey: idempotencyKey,
+			RequestHash:    requestHash,
+			TaskID:         task.ID,
+			CreatedAt:      now,
+		}
+		// Use the shared helper, NOT RowsAffected: GORM maps DoNothing to a
+		// MySQL no-op update and clientFoundRows=true reports that conflict as
+		// one affected row, so the loser of a concurrent same-key race would
+		// commit a SECOND task + participant + personal_result (two finalize
+		// runs, two LLM calls) while the binding still points at the first.
+		if berr := createAgentSaveIdempotencyBinding(tx, &binding); berr != nil {
+			return berr
 		}
 		return nil
 	})
 	if err != nil {
 		// Lost the idempotency race: re-read and replay/mismatch.
-		if errors.Is(err, errAgentSaveIdempotencyConflict) && idempotencyKey != "" {
+		if errors.Is(err, errAgentSaveIdempotencyConflict) {
 			existing, mismatched, ok, stale, ferr := findAgentSaveIdempotentTaskWithHash(
 				c.Request.Context(), h.db, spaceID, userID, idempotencyKey, requestHash)
 			if ferr == nil && ok {
