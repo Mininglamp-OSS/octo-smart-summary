@@ -402,6 +402,116 @@ func TestFinalize_ReplayReportsRealTaskStatus(t *testing.T) {
 	}
 }
 
+// R4 blocking 3 (both reviewers): the fresh 202 and the replay 202 must agree on
+// the JSON TYPE of data.status, and on their field set.
+//
+// The divergence lands on precisely the case the mandatory Idempotency-Key
+// exists to serve — first 202 lost in transit, client retries the same key. A
+// client written the obvious way against the fresh envelope,
+// `if (data.status === 'GENERATING') startPolling()`, takes no branch on the
+// replay, never polls, and the summary silently never appears even though the
+// worker completed it.
+func TestFinalize_FreshAndReplayEnvelopesAgree(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	h := NewAgentSummaryHandler(db, db, "", "", "", 0, 0)
+	r := setupFinalizeRouter(h)
+
+	seedAssistantMessage(t, db, "test-user", "sess-fin-env", "内容")
+	body := map[string]interface{}{"session_id": "sess-fin-env"}
+	hdr := map[string]string{"Idempotency-Key": "env-key-1"}
+
+	decode := func(w *httptest.ResponseRecorder) map[string]interface{} {
+		t.Helper()
+		var resp struct {
+			Data map[string]interface{} `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return resp.Data
+	}
+
+	fresh := decode(doFinalize(t, r, body, hdr))
+	replay := decode(doFinalize(t, r, body, hdr))
+
+	if _, ok := fresh["status"].(float64); !ok {
+		t.Fatalf("fresh status = %#v (%T), want the same numeric task status the replay and the sync route return",
+			fresh["status"], fresh["status"])
+	}
+	if _, ok := replay["status"].(float64); !ok {
+		t.Fatalf("replay status = %#v (%T), want numeric", replay["status"], replay["status"])
+	}
+	for _, k := range []string{"task_id", "task_no", "status", "created_at", "replayed"} {
+		if _, ok := fresh[k]; !ok {
+			t.Errorf("fresh envelope missing %q; a client must not have to probe for keys", k)
+		}
+		if _, ok := replay[k]; !ok {
+			t.Errorf("replay envelope missing %q", k)
+		}
+	}
+	if fresh["replayed"] != false {
+		t.Errorf("fresh replayed = %v, want false", fresh["replayed"])
+	}
+	if replay["replayed"] != true {
+		t.Errorf("replay replayed = %v, want true", replay["replayed"])
+	}
+}
+
+// R4 P2-3: len(req.Sources) must be bounded by the SAME constant every other
+// create path uses. Each entry costs an IM-DB name lookup plus a row insert
+// inside the creation transaction, so an uncapped list is an unbounded
+// transaction an authenticated caller controls.
+func TestFinalize_RejectsTooManySources(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	h := NewAgentSummaryHandler(db, db, "", "", "", 0, 0)
+	r := setupFinalizeRouter(h)
+
+	seedAssistantMessage(t, db, "test-user", "sess-fin-src", "内容")
+	srcs := make([]map[string]interface{}, 0, maxSourceCount+1)
+	for i := 0; i <= maxSourceCount; i++ {
+		srcs = append(srcs, map[string]interface{}{"source_type": 1, "source_id": fmt.Sprintf("c%d", i)})
+	}
+	w := doFinalize(t, r, map[string]interface{}{"session_id": "sess-fin-src", "sources": srcs},
+		map[string]string{"Idempotency-Key": "src-key-1"})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for %d sources (max %d)", w.Code, len(srcs), maxSourceCount)
+	}
+}
+
+// R4 P2-6: a wedged finalize blocks BOTH save paths until the stuck scan or
+// WorkerMaxRetry fires. A 409 that says only "请稍候" leaves the user with no
+// action, so it must name the blocking task and the cancel route that clears it.
+func TestFinalize_InFlight409NamesTheTaskAndRecovery(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	h := NewAgentSummaryHandler(db, db, "", "", "", 0, 0)
+	r := setupFinalizeRouter(h)
+
+	seedAssistantMessage(t, db, "test-user", "sess-fin-409", "内容")
+	first := doFinalize(t, r, map[string]interface{}{"session_id": "sess-fin-409"},
+		map[string]string{"Idempotency-Key": "c409-key-1"})
+	blockingID := finalizeTaskID(t, first)
+
+	// A DIFFERENT key: not a replay, so the in-flight guard is what answers.
+	w := doFinalize(t, r, map[string]interface{}{"session_id": "sess-fin-409"},
+		map[string]string{"Idempotency-Key": "c409-key-2"})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", w.Code)
+	}
+	var resp struct {
+		Data map[string]interface{} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got, _ := resp.Data["task_id"].(float64); int64(got) != blockingID {
+		t.Errorf("409 task_id = %v, want the blocking task %d — the user cannot cancel what is not named",
+			resp.Data["task_id"], blockingID)
+	}
+	if resp.Data["recovery_action"] == nil || resp.Data["cancel_endpoint"] == nil {
+		t.Errorf("409 must state how to escape a wedged finalize, got %#v", resp.Data)
+	}
+}
+
 // --- BLOCKING 2b: symmetric guard, sync save vs in-flight finalize --------
 
 // CreateAgentSummary hard-DELETEs every agent_message row of the session inside

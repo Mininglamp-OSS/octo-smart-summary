@@ -82,6 +82,17 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 		return
 	}
 
+	// R4 P2-3: bound len(req.Sources) with the SAME constant every other create
+	// path uses (bot_summary_create.go, service.MaxSummarySourceCount,
+	// worker/source_backfill.go). Each entry costs one IM-DB name lookup PLUS one
+	// row insert inside the creation transaction, so an uncapped list is an
+	// unbounded transaction an authenticated caller controls. A second,
+	// route-local limit would be a second convention; this is the existing one.
+	if len(req.Sources) > maxSourceCount {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: fmt.Sprintf("sources cannot exceed %d", maxSourceCount)})
+		return
+	}
+
 	title := strings.TrimSpace(req.Title)
 
 	// --- SUM-BE2 idempotency preflight (Idempotency-Key = finalize_request_id) ---
@@ -116,13 +127,22 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 	// and no lock in between, so two concurrent key-less requests (a double-click)
 	// both observe inflight == 0 and both commit a Pending task: two consolidation
 	// LLM runs and two deliverables for one session, violating §3.4
-	// "单会话单 Run … 不排队不并发". With the key required, a double-click sends the
-	// SAME key and the unique idempotency binding settles the race atomically
+	// "单会话单 Run … 不排队不并发".
+	//
+	// R4 P2-4 — NARROWING A CLAIM THE SERVER DOES NOT ENFORCE. Requiring the key
+	// does not close the double-click vector; it closes it only for a client that
+	// reuses ONE key across the retries of one user intent. A client that mints a
+	// fresh UUID per HTTP request — the common naive implementation — sends two
+	// DIFFERENT keys, both preflights miss, both COUNTs see zero, and both commit.
+	// What the requirement actually buys is that a correctly-keyed retry is
+	// settled atomically by the unique binding (insert + locked read-back)
 	// (insert + locked read-back), which is the vector that actually occurs.
 	//
 	// BE HONEST ABOUT THE RESIDUAL: two DIFFERENT keys for the same session still
-	// race past the COUNT and still produce two tasks. This closes the
-	// double-click vector, NOT the general one. The durable fix is a DB-level
+	// race past the COUNT and still produce two tasks, whether they came from a
+	// double-click or from anywhere else. "One active run per session" is
+	// therefore a contract this handler ASKS clients to honour, not one the
+	// server enforces. The durable fix is a DB-level
 	// constraint (a partial unique index over active finalize tasks per
 	// (creator_id, agent_session_id)), deferred out of v0 to avoid a schema
 	// change. Until then the "one active run per session" contract is enforced
@@ -195,7 +215,31 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 		return
 	}
 	if inflight > 0 {
-		c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "本次会话的定稿正在生成中,请稍候"})
+		// R4 P2-6: name the blocking task and the way out. Both this guard and
+		// the sync route's symmetric guard count Pending/Processing, so until the
+		// stuck scan or WorkerMaxRetry fires, a wedged finalize blocks BOTH save
+		// paths — and a 409 that says only "请稍候" leaves the user with no action.
+		// POST /summaries/:id/cancel clears it (task.go); surface that.
+		var blocking model.SummaryTask
+		blockingID := int64(0)
+		if err := h.db.WithContext(c.Request.Context()).
+			Select("id").
+			Where("creator_id = ? AND agent_session_id = ? AND trigger_type = ? AND status IN ? AND deleted_at IS NULL",
+				userID, req.SessionID, model.TriggerAgentFinalize,
+				[]int{model.StatusPending, model.StatusProcessing}).
+			Order("id DESC").First(&blocking).Error; err == nil {
+			blockingID = blocking.ID
+		}
+		c.JSON(http.StatusConflict, apiResponse{
+			Code:    40009,
+			Message: "本次会话的定稿正在生成中,请稍候",
+			Data: gin.H{
+				"task_id":         blockingID,
+				"reason":          "finalize_in_flight",
+				"recovery_action": "wait_or_cancel",
+				"cancel_endpoint": fmt.Sprintf("/api/v1/summaries/%d/cancel", blockingID),
+			},
+		})
 		return
 	}
 
@@ -343,9 +387,45 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 
 	// 202 Accepted: the worker poller claims the Pending task and runs
 	// executeAgentFinalize. The client polls task status for COMPLETED.
+	//
+	// Same envelope shape as the replay branch below — see
+	// writeFinalizeAcceptedResponse for why that matters.
+	writeFinalizeAcceptedResponse(c, task, false)
+}
+
+// writeFinalizeAcceptedResponse writes the 202 envelope for BOTH the fresh and
+// the replayed finalize.
+//
+// R4 blocking 3. The two branches used to disagree about the JSON TYPE of
+// data.status: fresh returned the string "GENERATING", replay returned
+// task.Status (an int). That divergence lands on exactly the case the mandatory
+// Idempotency-Key exists to serve — the client's first 202 was lost in transit
+// and it retries with the same key. A client written the obvious way against the
+// fresh envelope,
+//
+//	if (data.status === 'GENERATING') startPolling()
+//
+// takes no branch on the replay, never polls, and the summary silently never
+// appears even though the worker completed it.
+//
+// The int wins, for two reasons beyond "it is the smaller change":
+//   - it is the SAME value the sync route replays (agent_summary.go) and the
+//     same value every task-status endpoint returns, so a client has one
+//     status vocabulary across the API instead of a route-local string;
+//   - a string can only ever be honest on the fresh branch. The replay may
+//     legitimately arrive after the worker finished or failed, and there is no
+//     string that describes Completed, Failed and Pending at once — which is why
+//     the replay branch already had to break the convention.
+//
+// The two envelopes are also field-identical now (both carry task_id, task_no,
+// status, created_at, replayed), so a client never has to probe for a key.
+func writeFinalizeAcceptedResponse(c *gin.Context, task model.SummaryTask, replayed bool) {
 	c.JSON(http.StatusAccepted, apiResponse{Code: 0, Message: "ok", Data: gin.H{
-		"task_id": createdTaskID,
-		"status":  "GENERATING",
+		"task_id":    task.ID,
+		"task_no":    task.TaskNo,
+		"status":     task.Status,
+		"created_at": task.CreatedAt,
+		"replayed":   replayed,
 	}})
 }
 
@@ -360,12 +440,7 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 // route already returns the real status on replay; this aligns the two.
 // replayed:true likewise mirrors the sync envelope.
 func writeFinalizeReplayResponse(c *gin.Context, task model.SummaryTask) {
-	c.JSON(http.StatusAccepted, apiResponse{Code: 0, Message: "ok", Data: gin.H{
-		"task_id":  task.ID,
-		"task_no":  task.TaskNo,
-		"status":   task.Status,
-		"replayed": true,
-	}})
+	writeFinalizeAcceptedResponse(c, task, true)
 }
 
 // finalizeHashReq projects a finalize request onto the canonical save-request
