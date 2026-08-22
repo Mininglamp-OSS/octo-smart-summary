@@ -52,9 +52,9 @@ func TestMergeSummariesToolResolvesHandlesInsideBackend(t *testing.T) {
 	original := mergeSummariesLLM
 	defer func() { mergeSummariesLLM = original }()
 	var gotCombined string
-	mergeSummariesLLM = func(_ context.Context, combined, _ string) (string, error) {
+	mergeSummariesLLM = func(_ context.Context, combined, _ string) (string, bool, error) {
 		gotCombined = combined
-		return "# merged", nil
+		return "# merged", false, nil
 	}
 
 	_, handler := MergeSummariesTool()

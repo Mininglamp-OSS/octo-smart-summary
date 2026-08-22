@@ -200,34 +200,54 @@ func readErrorBody(body io.Reader) string {
 	return llmfallback.SafeTextForLog(string(b), 200)
 }
 
-const streamedTruncationNotice = "\n\n> 输出因长度限制被截断，请缩小范围或降低详细程度后重试。"
+// TruncationNotice is the single disclosure wording used whenever a degraded but
+// usable length-truncated result is handed to the user instead of being
+// discarded. Streaming and non-streaming paths share one convention.
+const TruncationNotice = "\n\n> 输出因长度限制被截断，请缩小范围或降低详细程度后重试。"
+
+type truncationPolicy int
+
+const (
+	truncateAllow truncationPolicy = iota
+	truncateReject
+	truncateDisclose
+)
 
 // Call makes a general chat completion request. A non-empty content response
 // remains usable when the provider reports finish_reason=length, preserving the
 // pre-existing behavior for refine and topic-narrowing callers.
 func (c *LLMClient) Call(ctx context.Context, messages []ChatMessage, temperature float64) (string, int, error) {
-	content, tokens, _, err := c.callWithModel(ctx, messages, temperature, false)
+	content, _, tokens, _, err := c.callWithPolicyAndModel(ctx, messages, temperature, truncateAllow)
 	return content, tokens, err
 }
 
 // CallStrict rejects any length-truncated response. Map/Reduce callers use this
 // path because a partial intermediate result can silently drop coverage.
 func (c *LLMClient) CallStrict(ctx context.Context, messages []ChatMessage, temperature float64) (string, int, error) {
-	content, tokens, _, err := c.callWithModel(ctx, messages, temperature, true)
+	content, _, tokens, _, err := c.callWithPolicyAndModel(ctx, messages, temperature, truncateReject)
 	return content, tokens, err
+}
+
+// CallDisclosingTruncation keeps a usable terminal result and marks it as
+// degraded; empty truncation still fails because there is nothing to deliver.
+func (c *LLMClient) CallDisclosingTruncation(ctx context.Context, messages []ChatMessage, temperature float64) (content string, truncated bool, tokens int, err error) {
+	content, truncated, tokens, _, err = c.callWithPolicyAndModel(ctx, messages, temperature, truncateDisclose)
+	return content, truncated, tokens, err
 }
 
 // CallWithModel makes a chat completion request and also returns the model
 // that produced the response. Callers that persist model attribution should
 // use this method instead of ModelVersion.
 func (c *LLMClient) CallWithModel(ctx context.Context, messages []ChatMessage, temperature float64) (string, int, string, error) {
-	return c.callWithModel(ctx, messages, temperature, false)
+	content, _, tokens, usedModel, err := c.callWithPolicyAndModel(ctx, messages, temperature, truncateAllow)
+	return content, tokens, usedModel, err
 }
 
-func (c *LLMClient) callWithModel(ctx context.Context, messages []ChatMessage, temperature float64, rejectTruncation bool) (string, int, string, error) {
+func (c *LLMClient) callWithPolicyAndModel(ctx context.Context, messages []ChatMessage, temperature float64, policy truncationPolicy) (string, bool, int, string, error) {
 	type result struct {
-		content string
-		tokens  int
+		content   string
+		truncated bool
+		tokens    int
 	}
 	// Keep retry ownership in the shared runner: exhaust transient failures on
 	// one model before switching to the next model.
@@ -295,13 +315,19 @@ func (c *LLMClient) callWithModel(ctx context.Context, messages []ChatMessage, t
 				reasoningLen, chatResp.Choices[0].FinishReason, chatResp.Usage.CompletionTokens)
 			return result{tokens: chatResp.Usage.TotalTokens}, llmfallback.Terminal, ErrReasoningBudgetExhausted
 		}
-		if chatResp.Choices[0].FinishReason == "length" && (rejectTruncation || content == "") {
+		if chatResp.Choices[0].FinishReason == "length" {
 			log.Printf("[llm] WARNING: response truncated with finish_reason=length, completion_tokens=%d", chatResp.Usage.CompletionTokens)
-			return result{tokens: chatResp.Usage.TotalTokens}, llmfallback.Terminal, ErrTokenLimitExhausted
+			if content == "" || policy == truncateReject {
+				return result{tokens: chatResp.Usage.TotalTokens}, llmfallback.Terminal, ErrTokenLimitExhausted
+			}
+			if policy == truncateDisclose {
+				content += TruncationNotice
+			}
+			return result{content: content, truncated: true, tokens: chatResp.Usage.TotalTokens}, llmfallback.Success, nil
 		}
 		return result{content: content, tokens: chatResp.Usage.TotalTokens}, llmfallback.Success, nil
 	})
-	return res.content, res.tokens, usedModel, err
+	return res.content, res.truncated, res.tokens, usedModel, err
 }
 
 type chatStreamResponse struct {
@@ -472,11 +498,11 @@ func (c *LLMClient) callStreamWithModel(ctx context.Context, messages []ChatMess
 		}
 		if finishReason == "length" && discloseTruncation {
 			if onDelta != nil {
-				if err := onDelta(streamedTruncationNotice); err != nil {
+				if err := onDelta(TruncationNotice); err != nil {
 					return result{content: content, tokens: totalTokens}, llmfallback.Terminal, err
 				}
 			}
-			content += streamedTruncationNotice
+			content += TruncationNotice
 		}
 		return result{content: content, tokens: totalTokens}, llmfallback.Success, nil
 	})
@@ -725,10 +751,10 @@ func (c *LLMClient) CallMapWithModel(ctx context.Context, formattedMessages stri
 	userPrompt := fmt.Sprintf("来源：%s\n时间范围：%s ~ %s\n消息数：%d 条\n\n聊天记录：\n%s",
 		sourceName, timeStart, timeEnd, msgCount, formattedMessages)
 
-	content, tokens, usedModel, err := c.callWithModel(ctx, []ChatMessage{
+	content, _, tokens, usedModel, err := c.callWithPolicyAndModel(ctx, []ChatMessage{
 		{Role: "system", Content: systemPrompt},
 		{Role: "user", Content: userPrompt},
-	}, 0.1, true)
+	}, 0.1, truncateReject)
 	if err == nil {
 		return content, tokens, usedModel, nil
 	}
@@ -764,10 +790,11 @@ func (c *LLMClient) CallReduceWithModel(ctx context.Context, chunkSummaries []st
 	userPrompt := fmt.Sprintf("信息来源：%s\n时间范围：%s ~ %s\n消息总量：%d 条\n\n以下是各分片的总结，请合并：\n\n%s",
 		sourceNames, startTime, endTime, totalMsgCount, summariesText)
 
-	return c.callWithModel(ctx, []ChatMessage{
+	content, _, tokens, usedModel, err := c.callWithPolicyAndModel(ctx, []ChatMessage{
 		{Role: "system", Content: system},
 		{Role: "user", Content: userPrompt},
-	}, 0.1, true)
+	}, 0.1, truncateReject)
+	return content, tokens, usedModel, err
 }
 
 // CallMapStream runs the Map phase for a user-visible single chunk and streams
@@ -877,7 +904,8 @@ func (c *LLMClient) CallReduceByPerson(ctx context.Context, participantSummaries
 
 // CallReduceByPersonWithModel is CallReduceByPerson with the actual producing model included.
 func (c *LLMClient) CallReduceByPersonWithModel(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string) (string, int, string, error) {
-	return c.callWithModel(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1, true)
+	content, _, tokens, usedModel, err := c.callWithPolicyAndModel(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1, truncateReject)
+	return content, tokens, usedModel, err
 }
 
 // CallReduceByPersonStream merges participant-level summaries and streams the

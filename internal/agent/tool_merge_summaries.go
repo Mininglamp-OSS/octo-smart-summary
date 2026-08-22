@@ -66,7 +66,7 @@ func MergeSummariesTool() (Tool, Handler) {
 		specGuidance := loadRunSpecGuidance(ctx)
 
 		// Use LLM to merge and structure
-		merged, err := mergeSummariesLLM(ctx, combined, specGuidance)
+		merged, truncated, err := mergeSummariesLLM(ctx, combined, specGuidance)
 		if err != nil {
 			return "", fmt.Errorf("merge summaries: %w", err)
 		}
@@ -78,10 +78,23 @@ func MergeSummariesTool() (Tool, Handler) {
 			"merged_summary": merged,
 			"chunk_count":    chunkCount,
 		}
+		// A length-truncated Reduce is degraded, not failed. The planner must be
+		// able to see the degradation structurally (not only as prose buried in
+		// merged_summary) so it repeats the disclosure in the final answer rather
+		// than presenting a partial merge as a complete one.
+		if truncated {
+			result["truncated"] = true
+			result["truncation_notice"] = strings.TrimSpace(service.TruncationNotice)
+		}
 		data, err := json.Marshal(result)
 		if err != nil {
 			return "", fmt.Errorf("marshal result: %w", err)
 		}
+		// Reached on the truncated-but-usable path too. Skipping it would leave
+		// NeedsReduce() true forever: the runner gate would reject every final
+		// answer and nudge an IDENTICAL merge_summaries retry (same handles, same
+		// combined text, no shrinking parameter), which truncates again until
+		// MaxSteps and ends the request with zero output.
 		store.MarkReduced(resolved.Generation)
 		return string(data), nil
 	}
@@ -97,7 +110,14 @@ var mergeSummariesLLM = mergeSummariesWithLLM
 // user's language / detail level / required sections / exclusions; the priority
 // note inside the guidance lets detail_level=detailed override the default
 // "每条不超过 50 字" compression. Empty (V2 off) → the exact legacy prompt.
-func mergeSummariesWithLLM(ctx context.Context, combined string, specGuidance string) (string, error) {
+//
+// Truncation policy: this is the TERMINAL deliverable of the agent Map/Reduce
+// pipeline, so it DISCLOSES rather than rejects (CallDisclosingTruncation).
+// Map (summarize_chunk) keeps CallStrict: a truncated chunk drops messages that
+// no later stage can recover, which is the SS-01 no-silent-loss invariant. Here
+// the input is already-summarized text and the output goes straight to the
+// user, so a hard failure trades a degraded answer for no answer at all.
+func mergeSummariesWithLLM(ctx context.Context, combined string, specGuidance string) (string, bool, error) {
 	_, _, _, cfg := GetSummaryDeps()
 	client := service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, 30, cfg.LLMFallbackModels)
 
@@ -124,6 +144,6 @@ func mergeSummariesWithLLM(ctx context.Context, combined string, specGuidance st
 		{Role: "user", Content: combined},
 	}
 
-	content, _, err := client.CallStrict(ctx, msgs, 0.1)
-	return content, err
+	content, truncated, _, err := client.CallDisclosingTruncation(ctx, msgs, 0.1)
+	return content, truncated, err
 }
