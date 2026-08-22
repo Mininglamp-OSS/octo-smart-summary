@@ -186,13 +186,21 @@ func (c *LLMClient) buildThinkingConfig(model string) (*ThinkingParam, map[strin
 
 // Call makes a chat completion request. Returns (content, tokenUsed, error).
 func (c *LLMClient) Call(ctx context.Context, messages []ChatMessage, temperature float64) (string, int, error) {
+	content, tokens, _, err := c.CallWithModel(ctx, messages, temperature)
+	return content, tokens, err
+}
+
+// CallWithModel makes a chat completion request and also returns the model
+// that produced the response. Callers that persist model attribution should
+// use this method instead of ModelVersion.
+func (c *LLMClient) CallWithModel(ctx context.Context, messages []ChatMessage, temperature float64) (string, int, string, error) {
 	type result struct {
 		content string
 		tokens  int
 	}
 	// MaxAttempts:1 — same-model retries are provided by the outer Map/Reduce
 	// loops that call Call; the runner only adds cross-model fallback here.
-	res, _, err := llmfallback.Run(ctx, llmfallback.Config{
+	res, usedModel, err := llmfallback.Run(ctx, llmfallback.Config{
 		Models:      c.models(),
 		MaxAttempts: 1,
 	}, func(ctx context.Context, model string) (result, llmfallback.Outcome, error) {
@@ -261,7 +269,7 @@ func (c *LLMClient) Call(ctx context.Context, messages []ChatMessage, temperatur
 		}
 		return result{content: content, tokens: chatResp.Usage.TotalTokens}, llmfallback.Success, nil
 	})
-	return res.content, res.tokens, err
+	return res.content, res.tokens, usedModel, err
 }
 
 type chatStreamResponse struct {
@@ -283,6 +291,13 @@ type chatStreamResponse struct {
 // each user-visible content delta. It returns the accumulated full content so
 // downstream citation building and DB persistence remain source-of-truth.
 func (c *LLMClient) CallStream(ctx context.Context, messages []ChatMessage, temperature float64, onDelta func(string) error) (string, int, error) {
+	content, tokens, _, err := c.CallStreamWithModel(ctx, messages, temperature, onDelta)
+	return content, tokens, err
+}
+
+// CallStreamWithModel is CallStream with the actual producing model included
+// for persistence and audit attribution.
+func (c *LLMClient) CallStreamWithModel(ctx context.Context, messages []ChatMessage, temperature float64, onDelta func(string) error) (string, int, string, error) {
 	type result struct {
 		content string
 		tokens  int
@@ -292,7 +307,7 @@ func (c *LLMClient) CallStream(ctx context.Context, messages []ChatMessage, temp
 	// would double-emit. Failures after HTTP 200 but before the first delivered
 	// delta may still try the next model. MaxAttempts:1 — outer Map/Reduce loops
 	// own same-model retries.
-	res, _, err := llmfallback.Run(ctx, llmfallback.Config{
+	res, usedModel, err := llmfallback.Run(ctx, llmfallback.Config{
 		Models:      c.models(),
 		MaxAttempts: 1,
 	}, func(ctx context.Context, model string) (result, llmfallback.Outcome, error) {
@@ -413,7 +428,7 @@ func (c *LLMClient) CallStream(ctx context.Context, messages []ChatMessage, temp
 		}
 		return result{content: content, tokens: totalTokens}, llmfallback.Success, nil
 	})
-	return res.content, res.tokens, err
+	return res.content, res.tokens, usedModel, err
 }
 
 // CallRaw is a simple single-turn call returning text only. Used for topic narrowing.
@@ -544,7 +559,9 @@ func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, t
 	return res.args, res.tokens, nil
 }
 
-// ModelVersion returns the configured model name.
+// ModelVersion returns the configured primary model name. Callers that persist
+// generated output should use the model returned by a *WithModel method so a
+// fallback-produced result is attributed correctly.
 func (c *LLMClient) ModelVersion() string {
 	return c.model
 }
@@ -632,8 +649,14 @@ func buildReduceSystemPrompt(topic string) string {
 
 // CallMap runs the Map phase for a message chunk.
 func (c *LLMClient) CallMap(ctx context.Context, formattedMessages string, sourceName string, chunkIndex int, msgCount int, timeStart, timeEnd string, topic string, userName string) (string, int, error) {
+	content, tokens, _, err := c.CallMapWithModel(ctx, formattedMessages, sourceName, chunkIndex, msgCount, timeStart, timeEnd, topic, userName)
+	return content, tokens, err
+}
+
+// CallMapWithModel is CallMap with the actual producing model included.
+func (c *LLMClient) CallMapWithModel(ctx context.Context, formattedMessages string, sourceName string, chunkIndex int, msgCount int, timeStart, timeEnd string, topic string, userName string) (string, int, string, error) {
 	if strings.TrimSpace(formattedMessages) == "" {
-		return "(该时段无文本消息)", 0, nil
+		return "(该时段无文本消息)", 0, c.model, nil
 	}
 
 	systemPrompt := buildMapSystemPrompt(userName, topic)
@@ -642,29 +665,35 @@ func (c *LLMClient) CallMap(ctx context.Context, formattedMessages string, sourc
 		sourceName, timeStart, timeEnd, msgCount, formattedMessages)
 
 	for attempt := 0; attempt < 3; attempt++ {
-		content, tokens, err := c.Call(ctx, []ChatMessage{
+		content, tokens, usedModel, err := c.CallWithModel(ctx, []ChatMessage{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userPrompt},
 		}, 0.1)
 		if err == nil {
-			return content, tokens, nil
+			return content, tokens, usedModel, nil
 		}
 		log.Printf("[llm] Map chunk %d attempt %d failed: %v", chunkIndex, attempt+1, err)
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "reasoning consumed") || strings.Contains(errMsg, "empty content due to token limit") {
-			return "", tokens, fmt.Errorf("reasoning budget exhausted on chunk %d", chunkIndex)
+			return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d", chunkIndex)
 		}
 		if attempt < 2 {
 			time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
 		}
 	}
-	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, nil
+	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, c.model, nil
 }
 
 // CallReduce runs the Reduce phase to merge chunk summaries.
 func (c *LLMClient) CallReduce(ctx context.Context, chunkSummaries []string, sourceNames string, startTime, endTime string, totalMsgCount int, topic string) (string, int, error) {
+	content, tokens, _, err := c.CallReduceWithModel(ctx, chunkSummaries, sourceNames, startTime, endTime, totalMsgCount, topic)
+	return content, tokens, err
+}
+
+// CallReduceWithModel is CallReduce with the actual producing model included.
+func (c *LLMClient) CallReduceWithModel(ctx context.Context, chunkSummaries []string, sourceNames string, startTime, endTime string, totalMsgCount int, topic string) (string, int, string, error) {
 	if len(chunkSummaries) == 1 {
-		return chunkSummaries[0], 0, nil
+		return chunkSummaries[0], 0, c.model, nil
 	}
 
 	var parts []string
@@ -677,7 +706,7 @@ func (c *LLMClient) CallReduce(ctx context.Context, chunkSummaries []string, sou
 	userPrompt := fmt.Sprintf("信息来源：%s\n时间范围：%s ~ %s\n消息总量：%d 条\n\n以下是各分片的总结，请合并：\n\n%s",
 		sourceNames, startTime, endTime, totalMsgCount, summariesText)
 
-	return c.Call(ctx, []ChatMessage{
+	return c.CallWithModel(ctx, []ChatMessage{
 		{Role: "system", Content: system},
 		{Role: "user", Content: userPrompt},
 	}, 0.1)
@@ -686,8 +715,14 @@ func (c *LLMClient) CallReduce(ctx context.Context, chunkSummaries []string, sou
 // CallMapStream runs the Map phase for a user-visible single chunk and streams
 // the generated summary deltas.
 func (c *LLMClient) CallMapStream(ctx context.Context, formattedMessages string, sourceName string, chunkIndex int, msgCount int, timeStart, timeEnd string, topic string, userName string, onDelta func(string) error) (string, int, error) {
+	content, tokens, _, err := c.CallMapStreamWithModel(ctx, formattedMessages, sourceName, chunkIndex, msgCount, timeStart, timeEnd, topic, userName, onDelta)
+	return content, tokens, err
+}
+
+// CallMapStreamWithModel is CallMapStream with the actual producing model included.
+func (c *LLMClient) CallMapStreamWithModel(ctx context.Context, formattedMessages string, sourceName string, chunkIndex int, msgCount int, timeStart, timeEnd string, topic string, userName string, onDelta func(string) error) (string, int, string, error) {
 	if strings.TrimSpace(formattedMessages) == "" {
-		return "(该时段无文本消息)", 0, nil
+		return "(该时段无文本消息)", 0, c.model, nil
 	}
 	systemPrompt := buildMapSystemPrompt(userName, topic)
 	userPrompt := fmt.Sprintf("来源：%s\n时间范围：%s ~ %s\n消息数：%d 条\n\n聊天记录：\n%s",
@@ -702,36 +737,42 @@ func (c *LLMClient) CallMapStream(ctx context.Context, formattedMessages string,
 		return onDelta(delta)
 	}
 	for attempt := 0; attempt < 3; attempt++ {
-		content, tokens, err := c.CallStream(ctx, []ChatMessage{
+		content, tokens, usedModel, err := c.CallStreamWithModel(ctx, []ChatMessage{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userPrompt},
 		}, 0.1, wrappedDelta)
 		if err == nil {
-			return content, tokens, nil
+			return content, tokens, usedModel, nil
 		}
 		log.Printf("[llm] Stream Map chunk %d attempt %d failed: %v", chunkIndex, attempt+1, err)
 		if emitted {
-			return content, tokens, err
+			return content, tokens, usedModel, err
 		}
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "reasoning consumed") || strings.Contains(errMsg, "empty content") {
-			return "", tokens, fmt.Errorf("reasoning budget exhausted on chunk %d", chunkIndex)
+			return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d", chunkIndex)
 		}
 		if attempt < 2 {
 			time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
 		}
 	}
-	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, nil
+	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, c.model, nil
 }
 
 // CallReduceStream merges chunk summaries and streams the final user-visible
 // reduced summary.
 func (c *LLMClient) CallReduceStream(ctx context.Context, chunkSummaries []string, sourceNames string, startTime, endTime string, totalMsgCount int, topic string, onDelta func(string) error) (string, int, error) {
+	content, tokens, _, err := c.CallReduceStreamWithModel(ctx, chunkSummaries, sourceNames, startTime, endTime, totalMsgCount, topic, onDelta)
+	return content, tokens, err
+}
+
+// CallReduceStreamWithModel is CallReduceStream with the actual producing model included.
+func (c *LLMClient) CallReduceStreamWithModel(ctx context.Context, chunkSummaries []string, sourceNames string, startTime, endTime string, totalMsgCount int, topic string, onDelta func(string) error) (string, int, string, error) {
 	if len(chunkSummaries) == 1 {
 		if onDelta != nil && chunkSummaries[0] != "" {
 			_ = onDelta(chunkSummaries[0])
 		}
-		return chunkSummaries[0], 0, nil
+		return chunkSummaries[0], 0, c.model, nil
 	}
 
 	var parts []string
@@ -743,7 +784,7 @@ func (c *LLMClient) CallReduceStream(ctx context.Context, chunkSummaries []strin
 	userPrompt := fmt.Sprintf("信息来源：%s\n时间范围：%s ~ %s\n消息总量：%d 条\n\n以下是各分片的总结，请合并：\n\n%s",
 		sourceNames, startTime, endTime, totalMsgCount, summariesText)
 
-	return c.CallStream(ctx, []ChatMessage{
+	return c.CallStreamWithModel(ctx, []ChatMessage{
 		{Role: "system", Content: system},
 		{Role: "user", Content: userPrompt},
 	}, 0.1, onDelta)
@@ -779,9 +820,19 @@ func (c *LLMClient) CallReduceByPerson(ctx context.Context, participantSummaries
 	return c.Call(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1)
 }
 
+// CallReduceByPersonWithModel is CallReduceByPerson with the actual producing model included.
+func (c *LLMClient) CallReduceByPersonWithModel(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string) (string, int, string, error) {
+	return c.CallWithModel(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1)
+}
+
 // CallReduceByPersonStream merges participant-level summaries and streams the
 // final team summary. Each participant is assigned a [Pn] tag that the LLM should
 // reference in the output.
 func (c *LLMClient) CallReduceByPersonStream(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string, onDelta func(string) error) (string, int, error) {
 	return c.CallStream(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1, onDelta)
+}
+
+// CallReduceByPersonStreamWithModel is CallReduceByPersonStream with the actual producing model included.
+func (c *LLMClient) CallReduceByPersonStreamWithModel(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string, onDelta func(string) error) (string, int, string, error) {
+	return c.CallStreamWithModel(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1, onDelta)
 }

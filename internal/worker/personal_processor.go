@@ -947,6 +947,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 
 	var finalContent string
 	var totalTokens int
+	modelVer := p.llm.ModelVersion()
 
 	if skipMapReduce {
 		// Skip Map-Reduce: call Map once with all messages (single chunk)
@@ -964,7 +965,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		mapStart := time.Now()
 		mapCallStart := time.Now()
 		var err error
-		finalContent, totalTokens, err = p.llm.CallMapStream(ctx,
+		finalContent, totalTokens, modelVer, err = p.llm.CallMapStreamWithModel(ctx,
 			joinStrings(formatted), sourceName, 0, len(userMessages),
 			startTime, endTime, generationTopic, userName, streamDelta,
 		)
@@ -984,6 +985,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		type chunkResult struct {
 			summary string
 			tokens  int
+			model   string
 			failed  bool
 			fatal   bool
 		}
@@ -1027,14 +1029,15 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 				callStart := time.Now()
 				var summary string
 				var tokens int
+				var usedModel string
 				var err error
 				if len(chunks) == 1 {
-					summary, tokens, err = p.llm.CallMapStream(ctx,
+					summary, tokens, usedModel, err = p.llm.CallMapStreamWithModel(ctx,
 						joinStrings(formatted), sourceName, idx, len(c),
 						startTime, endTime, generationTopic, userName, streamDelta,
 					)
 				} else {
-					summary, tokens, err = p.llm.CallMap(ctx,
+					summary, tokens, usedModel, err = p.llm.CallMapWithModel(ctx,
 						joinStrings(formatted), sourceName, idx, len(c),
 						startTime, endTime, generationTopic, userName,
 					)
@@ -1045,7 +1048,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 					isFatal := strings.Contains(err.Error(), "reasoning budget exhausted")
 					results[idx] = chunkResult{failed: true, fatal: isFatal}
 				} else {
-					results[idx] = chunkResult{summary: summary, tokens: tokens}
+					results[idx] = chunkResult{summary: summary, tokens: tokens, model: usedModel}
 				}
 			}(i, chunk)
 		}
@@ -1070,9 +1073,11 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		}
 
 		var chunkSummaries []string
+		var chunkModels []string
 		for _, r := range results {
 			if !r.failed && !strings.Contains(r.summary, service.MapFailedMarker) {
 				chunkSummaries = append(chunkSummaries, r.summary)
+				chunkModels = append(chunkModels, r.model)
 				totalTokens += r.tokens
 			}
 		}
@@ -1091,13 +1096,14 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		if len(chunkSummaries) == 1 {
 			// Single chunk fast path: skip Reduce, use Map result directly
 			finalContent = chunkSummaries[0]
+			modelVer = chunkModels[0]
 			reduceTokens = 0
 			log.Printf("[pipeline] single chunk — skipping Reduce")
 		} else {
 			// Multiple chunks: execute Reduce to merge
 			var err error
 			reduceCallStart := time.Now()
-			finalContent, reduceTokens, err = p.llm.CallReduceStream(ctx,
+			finalContent, reduceTokens, modelVer, err = p.llm.CallReduceStreamWithModel(ctx,
 				chunkSummaries, sourceName, startTime, endTime, targetMsgCount, generationTopic, streamDelta,
 			)
 			timing.RecordLLMSince(taskNo, "Reduce: 合并分块总结", reduceCallStart, reduceTokens)
@@ -1122,7 +1128,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	log.Printf("[personal-worker] Total executePersonalPipeline took %dms",
 		time.Since(totalStart).Milliseconds())
 
-	return finalContent, citations, targetMsgCount, totalTokens, p.llm.ModelVersion(), nil
+	return finalContent, citations, targetMsgCount, totalTokens, modelVer, nil
 }
 
 // SanitizeErrorForUser is the canonical whitelist that maps a raw internal

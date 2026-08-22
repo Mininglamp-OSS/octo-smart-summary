@@ -45,12 +45,15 @@ func TestCall_403EscalatesToFallback(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	content, tokens, err := c.Call(ctx, []ChatMessage{{Role: "user", Content: "hi"}}, 0.1)
+	content, tokens, usedModel, err := c.CallWithModel(ctx, []ChatMessage{{Role: "user", Content: "hi"}}, 0.1)
 	if err != nil {
 		t.Fatalf("403 on primary must escalate to fallback, got err: %v (seen=%v)", err, seen)
 	}
 	if !strings.Contains(content, fallback) || tokens != 7 {
 		t.Errorf("expected fallback content, got content=%q tokens=%d", content, tokens)
+	}
+	if usedModel != fallback {
+		t.Errorf("used model=%q want %q", usedModel, fallback)
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -168,12 +171,15 @@ func TestCallStream_MidStreamFailurePreservesPartialResult(t *testing.T) {
 
 	client := NewLLMClient(srv.URL, "k", "primary", 5, 4096, false, 5, []string{"backup"})
 	var streamed strings.Builder
-	content, tokens, err := client.CallStream(context.Background(), []ChatMessage{{Role: "user", Content: "hi"}}, 0.1, func(delta string) error {
+	content, tokens, usedModel, err := client.CallStreamWithModel(context.Background(), []ChatMessage{{Role: "user", Content: "hi"}}, 0.1, func(delta string) error {
 		streamed.WriteString(delta)
 		return nil
 	})
 	if err == nil || content != "Hello world" || streamed.String() != content || tokens != 42 {
 		t.Fatalf("expected preserved partial result, content=%q streamed=%q tokens=%d err=%v", content, streamed.String(), tokens, err)
+	}
+	if usedModel != "primary" {
+		t.Fatalf("partial result attributed to %q, want primary", usedModel)
 	}
 	if len(seen) != 1 || seen[0] != "primary" {
 		t.Fatalf("must not fallback after emitting content, seen=%v", seen)
@@ -199,12 +205,15 @@ func TestCallStream_PreEmissionFailureFallsBack(t *testing.T) {
 
 	client := NewLLMClient(srv.URL, "k", "primary", 5, 4096, false, 5, []string{"backup"})
 	var streamed strings.Builder
-	content, tokens, err := client.CallStream(context.Background(), []ChatMessage{{Role: "user", Content: "hi"}}, 0.1, func(delta string) error {
+	content, tokens, usedModel, err := client.CallStreamWithModel(context.Background(), []ChatMessage{{Role: "user", Content: "hi"}}, 0.1, func(delta string) error {
 		streamed.WriteString(delta)
 		return nil
 	})
 	if err != nil || content != "ok" || streamed.String() != "ok" || tokens != 5 {
 		t.Fatalf("expected fallback stream success, content=%q streamed=%q tokens=%d err=%v", content, streamed.String(), tokens, err)
+	}
+	if usedModel != "backup" {
+		t.Fatalf("fallback stream attributed to %q, want backup", usedModel)
 	}
 	if len(seen) != 2 || seen[0] != "primary" || seen[1] != "backup" {
 		t.Fatalf("expected pre-emission fallback, seen=%v", seen)
