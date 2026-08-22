@@ -31,9 +31,19 @@ var ErrReasoningBudgetExhausted = errors.New("LLM returned empty content: reason
 // ErrTokenLimitExhausted marks an empty response terminated by the token cap.
 var ErrTokenLimitExhausted = errors.New("LLM returned empty content due to token limit")
 
+type tokenLimitError struct {
+	message string
+}
+
+func (e *tokenLimitError) Error() string { return e.message }
+
+// Is preserves the token-limit identity introduced on main while allowing
+// callers to distinguish streaming from non-streaming truncation.
+func (e *tokenLimitError) Is(target error) bool { return target == ErrTokenLimitExhausted }
+
 var (
-	ErrOutputTruncated       = errors.New("LLM response truncated due to token limit")
-	ErrStreamOutputTruncated = errors.New("LLM streamed response truncated due to token limit")
+	ErrOutputTruncated       = &tokenLimitError{message: "LLM response truncated due to token limit"}
+	ErrStreamOutputTruncated = &tokenLimitError{message: "LLM streamed response truncated due to token limit"}
 )
 
 // LLMClient handles calls to a chat-completions-compatible LLM API.
