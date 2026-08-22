@@ -156,7 +156,8 @@ func (p *Processor) executeAgentFinalize(ctx context.Context, task model.Summary
 	// remapFinalizeCitations.
 	evidenceRows := loadSessionEvidenceRows(ctx, p.db, userID, sessionID, replies[len(replies)-1].CreatedAt)
 	pool := buildPoolFromEvidenceRows(evidenceRows)
-	replies, droppedMarkers := remapFinalizeCitations(replies, evidenceRows, pool)
+	handleOrder := loadEvidenceHandleOrder(ctx, p.db, userID, sessionID, task.AgentMessageID)
+	replies, droppedMarkers := remapFinalizeCitations(replies, evidenceRows, pool, handleOrder)
 	if droppedMarkers > 0 {
 		log.Printf("[finalize] task %d session %s: dropped %d unresolvable citation marker(s) during cross-turn remap",
 			task.ID, sessionID, droppedMarkers)
@@ -271,7 +272,7 @@ func (p *Processor) executeAgentFinalize(ctx context.Context, task model.Summary
 // it is not available in v0 because agent_message has no run_id column and
 // agent_citation_manifest is keyed by run_id, so a reply cannot be linked to its
 // own turn's manifest without a schema change.
-func remapFinalizeCitations(replies []model.AgentMessage, rows []model.AgentMessageEvidence, finalPool []pipeline.Message) ([]model.AgentMessage, int) {
+func remapFinalizeCitations(replies []model.AgentMessage, rows []model.AgentMessageEvidence, finalPool []pipeline.Message, handleOrder map[string]int64) ([]model.AgentMessage, int) {
 	if len(replies) == 0 {
 		return replies, 0
 	}
@@ -293,8 +294,8 @@ func remapFinalizeCitations(replies []model.AgentMessage, rows []model.AgentMess
 		// tool_summarize_chunk assigned. rows is already ordered
 		// (created_at ASC, handle ASC), and the filter keeps a prefix-by-time, so
 		// first-seen-wins de-dup resolves the same way a separate query would.
-		turnRows := filterEvidenceRowsCreatedBefore(rows, out[i].CreatedAt)
-		if false {
+		turnRows, ambiguous := filterEvidenceRowsForTurn(rows, out[i], handleOrder)
+		if ambiguous {
 			// R4 blocking 2, residual branch. We could not establish which side
 			// of this reply the tied evidence fell on, AND resolving it either way
 			// changes the numbering the fragment was written against. Every [n]
@@ -385,16 +386,158 @@ func messageIdentity(m pipeline.Message) string {
 	return fmt.Sprintf("%s:%d", m.ChannelID, m.MessageSeq)
 }
 
-// filterEvidenceRowsCreatedBefore keeps the rows that already existed when a
-// given reply was written, preserving input order.
-func filterEvidenceRowsCreatedBefore(rows []model.AgentMessageEvidence, bound time.Time) []model.AgentMessageEvidence {
-	if bound.IsZero() {
-		return rows
-	}
+// filterEvidenceRowsForTurn keeps the evidence rows that already existed when a
+// given reply was written, preserving input order, and reports whether that
+// question could not be answered.
+//
+// PRIMARY AXIS: agent_message.id, not created_at (R4 blocking 2).
+//
+// Both created_at columns are plain DATETIME — one-second resolution
+// (migrations/sql/20260707-01-add-agent-message.sql,
+// 20260717-01-add-agent-message-evidence.sql) — and AppendMessages stamps an
+// ENTIRE turn with one time.Now(). This PR already concedes the consequence:
+// executeAgentFinalize orders replies by id precisely because same-second ties
+// make created_at ordering non-deterministic. A filter that ties on the same
+// column has the same problem, one layer down and silently: turn 2's evidence,
+// persisted in the same second as turn 1's reply, passes an inclusive
+// created_at bound into turn 1's re-derived pool; if it sorts early it shifts
+// turn 1's numbering and turn 1's [1] resolves to a message that turn never saw.
+// The lookup SUCCEEDS, so nothing is dropped and nothing is logged.
+//
+// handleOrder supplies the monotonic key the timestamps cannot. Every
+// handle-producing tool returns "messages_handle" in its JSON result, the runner
+// persists that result as a role='tool' agent_message, and AppendMessages writes
+// one turn as a single ordered batch with the tool rows BEFORE that turn's final
+// assistant reply (internal/agent/runner.go: tool messages are appended to
+// newMsgs, then the answer). So `tool row id < reply id` is an exact,
+// tie-free answer to "did this handle exist when that reply was written" — the
+// same axis the freeze bound itself is expressed in.
+//
+// FALLBACK, and the exact scope of the degrade: a row whose handle has no tool
+// row (orphan evidence — the documented case where a chat step fails after
+// PersistEvidence but before AppendMessages, agent_summary_citations.go) has no
+// id to compare, so it falls back to created_at. Same-second rows are still
+// INCLUDED there, because a turn's own evidence is stamped in the same second as
+// its own reply: excluding it would drop the citations of every ordinary
+// single-turn session, which is a far larger quality loss than the defect.
+//
+// The tie is reported as ambiguous — and the fragment then degrades — only when
+// ALL THREE hold:
+//  1. the session HAS locatable tool rows (so a handle without one is anomalous,
+//     not merely unqueried);
+//  2. this particular row could not be placed on the id axis;
+//  3. including versus excluding it actually CHANGES the derived numbering.
+//
+// A tie that changes nothing is not a problem and is not reported. When the id
+// map is empty for the whole run (DB error, or a session with no tool rows at
+// all) the behaviour is exactly the pre-existing timestamp bound — degrading
+// every fragment on a failed helper query would trade a working deliverable for
+// an empty one.
+func filterEvidenceRowsForTurn(rows []model.AgentMessageEvidence, reply model.AgentMessage, handleOrder map[string]int64) ([]model.AgentMessageEvidence, bool) {
+	// haveIDs: this session HAS locatable tool rows, so a handle missing from the
+	// map is an anomaly (orphan evidence) rather than "we never looked".
+	haveIDs := len(handleOrder) > 0 && reply.ID > 0
+
 	out := make([]model.AgentMessageEvidence, 0, len(rows))
+	var suspicious []model.AgentMessageEvidence
 	for _, r := range rows {
-		if !r.CreatedAt.After(bound) {
+		if id, ok := handleOrder[r.Handle]; ok && reply.ID > 0 {
+			// Exact, monotonic, tie-free — the whole point of the id axis.
+			if id < reply.ID {
+				out = append(out, r)
+			}
+			continue
+		}
+		if reply.CreatedAt.IsZero() || r.CreatedAt.Before(reply.CreatedAt) {
 			out = append(out, r)
+			continue
+		}
+		if r.CreatedAt.After(reply.CreatedAt) {
+			continue
+		}
+		// Same second, no id. INCLUDE — a turn's own evidence is stamped in the
+		// same second as its own reply, so this is the ordinary case and
+		// excluding it would drop every citation of every single-turn session.
+		// It is only SUSPICIOUS when the session had ids to offer and this row
+		// had none.
+		out = append(out, r)
+		if haveIDs {
+			suspicious = append(suspicious, r)
+		}
+	}
+	if len(suspicious) == 0 {
+		return out, false
+	}
+	// Does the unresolved tie actually change the numbering? Compare against the
+	// pool that excludes the suspicious rows; an identical assignment means the
+	// ambiguity is harmless and the fragment keeps its markers.
+	skip := make(map[string]bool, len(suspicious))
+	for _, r := range suspicious {
+		skip[r.Handle] = true
+	}
+	without := make([]model.AgentMessageEvidence, 0, len(out))
+	for _, r := range out {
+		if !skip[r.Handle] {
+			without = append(without, r)
+		}
+	}
+	if sameNumbering(buildPoolFromEvidenceRows(out), buildPoolFromEvidenceRows(without)) {
+		return out, false
+	}
+	return out, true
+}
+
+// sameNumbering reports whether two pools assign the same identity to every
+// index.
+func sameNumbering(a, b []pipeline.Message) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if messageIdentity(a[i]) != messageIdentity(b[i]) || a[i].CitationIndex != b[i].CitationIndex {
+			return false
+		}
+	}
+	return true
+}
+
+// loadEvidenceHandleOrder maps each evidence handle to the agent_message id of
+// the role='tool' row that returned it, giving filterEvidenceRowsForTurn the
+// monotonic key agent_message_evidence itself does not carry (its PK is
+// (user_id, session_id, handle); there is no auto-increment column and adding
+// one is a schema change, out of scope for v0).
+//
+// Best-effort by design: a handle that cannot be located simply falls back to
+// the timestamp comparison, which is the pre-existing behaviour. A DB error
+// degrades every fragment to that fallback rather than failing the run.
+func loadEvidenceHandleOrder(ctx context.Context, db *gorm.DB, userID, sessionID string, maxID int64) map[string]int64 {
+	out := map[string]int64{}
+	if db == nil {
+		return out
+	}
+	q := db.WithContext(ctx).
+		Model(&model.AgentMessage{}).
+		Where("user_id = ? AND session_id = ? AND role = ?", userID, sessionID, "tool")
+	if maxID > 0 {
+		q = q.Where("id <= ?", maxID)
+	}
+	var rows []model.AgentMessage
+	if err := q.Order("id ASC").Find(&rows).Error; err != nil {
+		log.Printf("[finalize] session %s: could not load tool rows for handle ordering (%v); falling back to created_at bounds", sessionID, err)
+		return out
+	}
+	for _, r := range rows {
+		var payload struct {
+			MessagesHandle string `json:"messages_handle"`
+		}
+		if err := json.Unmarshal([]byte(r.Content), &payload); err != nil || payload.MessagesHandle == "" {
+			continue
+		}
+		// FIRST occurrence wins: a handle is minted once, and if a later row
+		// echoes it (search_messages consuming a handle it did not mint) the
+		// earlier id is the moment the evidence actually became available.
+		if _, seen := out[payload.MessagesHandle]; !seen {
+			out[payload.MessagesHandle] = r.ID
 		}
 	}
 	return out

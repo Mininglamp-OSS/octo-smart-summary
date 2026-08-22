@@ -214,7 +214,7 @@ func TestRemapFinalizeCitations_LaterEvidenceSortingEarlierDoesNotStealMarkers(t
 		{ID: 2, CreatedAt: turn3At, Content: "上周也讨论过 [1],今天确认 " + citeStr(alpha3Final)}, // turn 3 numbering
 	}
 
-	got, dropped := remapFinalizeCitations(replies, rows, finalPool)
+	got, dropped := remapFinalizeCitations(replies, rows, finalPool, nil)
 	if dropped != 0 {
 		t.Fatalf("dropped = %d, want 0 — every marker here is resolvable", dropped)
 	}
@@ -264,7 +264,7 @@ func TestRemapFinalizeCitations_OutOfRangeOrdinalIsTreatedAsProse(t *testing.T) 
 	replies := []model.AgentMessage{
 		{ID: 1, CreatedAt: at, Content: "有效 [1],越界 [9]"},
 	}
-	got, dropped := remapFinalizeCitations(replies, rows, finalPool)
+	got, dropped := remapFinalizeCitations(replies, rows, finalPool, nil)
 	if dropped != 0 {
 		t.Fatalf("dropped = %d, want 0 — an out-of-range ordinal is content, not a broken citation", dropped)
 	}
@@ -293,7 +293,7 @@ func TestRemapFinalizeCitations_MarkerAbsentFromFinalPoolIsDropped(t *testing.T)
 	})
 
 	replies := []model.AgentMessage{{ID: 1, CreatedAt: at, Content: "保留 [1],悬空 [2]"}}
-	got, dropped := remapFinalizeCitations(replies, turnRows, finalPool)
+	got, dropped := remapFinalizeCitations(replies, turnRows, finalPool, nil)
 	if dropped != 1 {
 		t.Fatalf("dropped = %d, want 1 (the marker whose message is not in the frozen pool)", dropped)
 	}
@@ -319,7 +319,7 @@ func TestRemapFinalizeCitations_SingleTurnIsIdentity(t *testing.T) {
 	}
 	finalPool := buildPoolFromEvidenceRows(rows)
 	replies := []model.AgentMessage{{ID: 1, CreatedAt: at, Content: "x [1] y [3]"}}
-	got, dropped := remapFinalizeCitations(replies, rows, finalPool)
+	got, dropped := remapFinalizeCitations(replies, rows, finalPool, nil)
 	if dropped != 0 {
 		t.Fatalf("dropped = %d, want 0", dropped)
 	}
