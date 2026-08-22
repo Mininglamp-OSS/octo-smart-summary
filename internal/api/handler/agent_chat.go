@@ -722,12 +722,22 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		return
 	}
 
+	// Enforce the per-claim citation cap on the planner's final body. The
+	// "a Map-only cap is re-exceeded by merging" argument that justifies the
+	// worker's final-body cap applies verbatim here: the planner merges chunk
+	// summaries in its own context. Runs BEFORE persistence so the stored
+	// history matches what the user is shown.
+	reply, newMsgs = agent.CapFinalAnswer(req.SessionID, reply, newMsgs)
+
 	// 成功回复后才落库；落库失败不阻断本次回复（宁可丢本回合历史，也不只落 user 造脏历史）。
 	// user_id 与 LoadHistory 保持一致，杜绝跨用户污染（SUM-158 blocker 1）。
-	trace.Report("ok")
 	if err := h.store.AppendMessages(ctx, req.SessionID, uid, newMsgs); err != nil {
 		log.Printf("[agent] append messages error: %v", err)
 	}
+	// Reported after persistence: trace.go documents "other" as covering
+	// persistence, which it could not do while this fired before
+	// AppendMessages.
+	trace.Report("ok")
 
 	respData := gin.H{
 		"reply":      reply,
@@ -1022,12 +1032,15 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		h.writeSSEErrorViaSinkWithDetail(sink, 50000, "agent chat failed", safeErrorDetail(err))
 		return
 	}
-	trace.Report("ok")
+	// Same final-body cap as Chat(); see the comment there.
+	reply, newMsgs = agent.CapFinalAnswer(req.SessionID, reply, newMsgs)
 
 	// Persist messages on success (same as Chat). owner-scoped by uid（SUM-158 blocker 1）。
 	if err := h.store.AppendMessages(ctx, req.SessionID, uid, newMsgs); err != nil {
 		log.Printf("[agent] append messages error: %v", err)
 	}
+	// After persistence — see Chat().
+	trace.Report("ok")
 
 	// Emit done event with final reply
 	h.writeSSEDoneViaSink(sink, reply, req.SessionID, v2RunID)
