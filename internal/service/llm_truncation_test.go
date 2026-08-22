@@ -2,8 +2,11 @@ package service
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -41,11 +44,126 @@ func TestCallDisclosingTruncationKeepsNonEmptyPartialAndFlagsIt(t *testing.T) {
 	if !truncated {
 		t.Fatal("truncated flag = false, want the degradation reported to the caller")
 	}
-	if !strings.Contains(content, "partial merged summary") || !strings.Contains(content, "输出因长度限制被截断") {
-		t.Fatalf("content = %q, want partial content plus the shared disclosure notice", content)
+	// The RAW body, with no notice concatenated. The disclosure belongs to the
+	// caller: while this client appended it, the caller's own emptiness check ran
+	// against text the client had already added to, so it could never fire.
+	if content != "partial merged summary" {
+		t.Fatalf("content = %q, want the raw model body with no client-appended notice", content)
 	}
-	if content != "partial merged summary"+TruncationNotice {
-		t.Fatalf("content = %q, want the streaming path's notice wording appended verbatim", content)
+}
+
+// P1-1. A whitespace-only truncated completion is not "" but is not a
+// deliverable either. Letting it take the disclose branch hands the caller a
+// body that is pure whitespace; once the caller appends TruncationNotice the
+// user's entire summary IS the notice, and on the agent path the completeness
+// gate is cleared by a Reduce that produced nothing.
+func TestCallDisclosingTruncationRejectsWhitespaceOnlyTruncation(t *testing.T) {
+	for _, body := range []string{" \n\t", "   ", "\n\n"} {
+		t.Run(strconv.Quote(body), func(t *testing.T) {
+			payload, err := json.Marshal(map[string]interface{}{
+				"choices": []map[string]interface{}{{
+					"message":       map[string]interface{}{"content": body},
+					"finish_reason": "length",
+				}},
+				"usage": map[string]interface{}{"total_tokens": 100, "completion_tokens": 4096},
+			})
+			if err != nil {
+				t.Fatalf("marshal stub: %v", err)
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write(payload)
+			}))
+			defer srv.Close()
+
+			client := NewLLMClient(srv.URL, "key", "test-model", 5, 4096, false, 5, nil)
+			content, truncated, _, err := client.CallDisclosingTruncation(
+				context.Background(), []ChatMessage{{Role: "user", Content: "go"}}, 0.1)
+			if err == nil || !errors.Is(err, ErrOutputTruncated) {
+				t.Fatalf("err = %v, want whitespace-only truncation to fail like empty truncation", err)
+			}
+			if content != "" || truncated {
+				t.Fatalf("content=%q truncated=%v, want nothing delivered", content, truncated)
+			}
+		})
+	}
+}
+
+// The streaming counterpart. This path feeds live worker code, so a
+// whitespace-only truncated stream would be PERSISTED as a summary whose entire
+// body is the disclosure notice.
+func TestCallStreamWithTruncationNoticeRejectsWhitespaceOnlyTruncation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\" \\n\\t\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	client := NewLLMClient(srv.URL, "key", "test-model", 5, 4096, false, 5, nil)
+	var delivered strings.Builder
+	content, _, err := client.callStreamWithTruncationNotice(
+		context.Background(),
+		[]ChatMessage{{Role: "user", Content: "go"}},
+		0.1,
+		func(delta string) error {
+			delivered.WriteString(delta)
+			return nil
+		},
+	)
+	if err == nil || !errors.Is(err, ErrStreamOutputTruncated) {
+		t.Fatalf("err = %v, want whitespace-only streamed truncation to fail", err)
+	}
+	if content != "" {
+		t.Fatalf("content = %q, want nothing returned for a whitespace-only stream", content)
+	}
+	if strings.Contains(delivered.String(), "输出因长度限制被截断") {
+		t.Fatalf("delivered = %q, want no bare disclosure streamed as if it were a summary", delivered.String())
+	}
+}
+
+// The terminal non-streaming Reduce entry points are user-facing deliverables.
+// They used to reject any truncation via CallStrict, which reproduces the
+// zero-output failure this PR fixed on the agent Reduce the moment either is
+// wired up.
+func TestNonStreamingReduceDisclosesTruncationInsteadOfFailing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"合并结果（正文在此被截断"},"finish_reason":"length"}],"usage":{"total_tokens":100,"completion_tokens":4096}}`))
+	}))
+	defer srv.Close()
+	client := NewLLMClient(srv.URL, "key", "test-model", 5, 4096, false, 5, nil)
+
+	content, _, err := client.CallReduce(context.Background(),
+		[]string{"分片一", "分片二"}, "群聊", "2026-08-01", "2026-08-02", 10, "")
+	if err != nil {
+		t.Fatalf("CallReduce must deliver a truncated terminal summary, not fail: %v", err)
+	}
+	if content != "合并结果（正文在此被截断"+TruncationNotice {
+		t.Fatalf("CallReduce content = %q, want the partial merge plus the disclosure", content)
+	}
+
+	content, _, err = client.CallReduceByPerson(context.Background(),
+		[]struct{ Name, Summary string }{{Name: "A", Summary: "a"}, {Name: "B", Summary: "b"}},
+		"2026-08-01", "2026-08-02", "")
+	if err != nil {
+		t.Fatalf("CallReduceByPerson must deliver a truncated terminal summary, not fail: %v", err)
+	}
+	if content != "合并结果（正文在此被截断"+TruncationNotice {
+		t.Fatalf("CallReduceByPerson content = %q, want the partial merge plus the disclosure", content)
+	}
+}
+
+// An EMPTY truncated terminal Reduce still has nothing to deliver, so the
+// disclosing switch above must not turn it into a bare notice.
+func TestNonStreamingReduceStillRejectsEmptyTruncation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":" \n\t"},"finish_reason":"length"}],"usage":{"total_tokens":100,"completion_tokens":4096}}`))
+	}))
+	defer srv.Close()
+	client := NewLLMClient(srv.URL, "key", "test-model", 5, 4096, false, 5, nil)
+
+	content, _, err := client.CallReduce(context.Background(),
+		[]string{"分片一", "分片二"}, "群聊", "2026-08-01", "2026-08-02", 10, "")
+	if err == nil || !errors.Is(err, ErrOutputTruncated) {
+		t.Fatalf("err = %v content = %q, want an empty truncated Reduce to still fail", err, content)
 	}
 }
 

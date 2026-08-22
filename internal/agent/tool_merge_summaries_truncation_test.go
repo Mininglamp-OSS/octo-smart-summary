@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 )
 
 // PR #208 round-4 B2/P1. A length-truncated agent Reduce used to hard-fail the
@@ -200,8 +202,52 @@ func TestRunnerDeliversTruncatedReduceWithDisclosure(t *testing.T) {
 // An EMPTY truncated Reduce has nothing to deliver and nothing to disclose
 // against, so it must still be an error rather than a bare notice presented as
 // a summary.
+//
+// The whitespace cases are PR #208 round-5 P1-1. " \n\t" is not "", so the
+// service client's `content == ""` guard let it take the disclose branch; the
+// client then appended TruncationNotice itself, which pre-satisfied this
+// handler's own `strings.TrimSpace(merged) == ""` check. The result was a
+// deliverable whose entire body was the truncation notice, with MarkReduced
+// called and NeedsReduce() false — the completeness gate cleared by a Reduce
+// that produced nothing.
 func TestMergeSummariesRejectsEmptyTruncatedReduce(t *testing.T) {
-	srv, _ := truncatedReduceServer(t, "")
+	for _, body := range []string{"", " \n\t", "   ", "\n"} {
+		t.Run(strconv.Quote(body), func(t *testing.T) {
+			srv, _ := truncatedReduceServer(t, body)
+			withReduceLLM(t, srv.URL)
+
+			ctx := withSummaryHandleStore(context.Background())
+			store, err := summaryHandleStoreFromContext(ctx)
+			if err != nil {
+				t.Fatalf("store: %v", err)
+			}
+			handle, err := store.Put("局部总结正文", 2)
+			if err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+
+			_, handler := MergeSummariesTool()
+			args, _ := json.Marshal(map[string]interface{}{"summary_handles": []string{handle}})
+			out, err := handler(ctx, args)
+			if err == nil || !strings.Contains(err.Error(), "truncated") {
+				t.Fatalf("out=%q err=%v, want empty truncation to fail loudly", out, err)
+			}
+			if strings.Contains(out, "输出因长度限制被截断") {
+				t.Fatalf("out=%q, want no bare disclosure returned as a deliverable", out)
+			}
+			if !store.NeedsReduce() {
+				t.Fatal("a failed Reduce must leave the completeness gate armed")
+			}
+		})
+	}
+}
+
+// The notice must appear exactly ONCE inside merged_summary. A planner that
+// concatenates merged_summary and truncation_notice would otherwise repeat the
+// same sentence, and if BOTH the client and the handler appended it the body
+// itself would already carry it twice.
+func TestMergeSummariesAppendsDisclosureExactlyOnce(t *testing.T) {
+	srv, _ := truncatedReduceServer(t, "合并结果：项目进展（正文在此被截断")
 	withReduceLLM(t, srv.URL)
 
 	ctx := withSummaryHandleStore(context.Background())
@@ -217,11 +263,25 @@ func TestMergeSummariesRejectsEmptyTruncatedReduce(t *testing.T) {
 	_, handler := MergeSummariesTool()
 	args, _ := json.Marshal(map[string]interface{}{"summary_handles": []string{handle}})
 	out, err := handler(ctx, args)
-	if err == nil || !strings.Contains(err.Error(), "truncated") {
-		t.Fatalf("out=%q err=%v, want empty truncation to fail loudly", out, err)
+	if err != nil {
+		t.Fatalf("a non-empty truncated Reduce must remain usable: %v", err)
 	}
-	if !store.NeedsReduce() {
-		t.Fatal("a failed Reduce must leave the completeness gate armed")
+	var result struct {
+		MergedSummary string `json:"merged_summary"`
+		Truncated     bool   `json:"truncated"`
+		Notice        string `json:"truncation_notice"`
+	}
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("unmarshal merge result: %v", err)
+	}
+	if !result.Truncated || result.Notice == "" {
+		t.Fatalf("merge result did not flag truncation structurally: %s", out)
+	}
+	if n := strings.Count(result.MergedSummary, "输出因长度限制被截断"); n != 1 {
+		t.Fatalf("disclosure appears %d times in merged_summary, want exactly 1: %q", n, result.MergedSummary)
+	}
+	if !strings.HasSuffix(result.MergedSummary, service.TruncationNotice) {
+		t.Fatalf("merged_summary = %q, want the shared notice appended verbatim at the end", result.MergedSummary)
 	}
 }
 

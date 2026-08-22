@@ -70,19 +70,30 @@ func MergeSummariesTool() (Tool, Handler) {
 		if err != nil {
 			return "", fmt.Errorf("merge summaries: %w", err)
 		}
+		// This check is load-bearing precisely BECAUSE the client no longer
+		// appends the disclosure: `merged` here is the raw model body. When the
+		// client concatenated TruncationNotice before returning, a whitespace-only
+		// truncated completion arrived as " \n\t" + notice, this guard could never
+		// fire, MarkReduced below cleared the completeness gate, and the user got
+		// a deliverable whose entire body was the notice.
 		if strings.TrimSpace(merged) == "" {
 			return "", fmt.Errorf("merge summaries: empty Reduce result")
 		}
 
+		// A length-truncated Reduce is degraded, not failed. The planner must be
+		// able to see the degradation structurally (not only as prose buried in
+		// merged_summary) so it repeats the disclosure in the final answer rather
+		// than presenting a partial merge as a complete one. The notice is
+		// appended here, after the emptiness check above has passed on the raw
+		// body, and only in merged_summary: `truncation_notice` stays the
+		// structural signal so a planner concatenating both fields does not emit
+		// the same sentence twice.
 		result := map[string]interface{}{
 			"merged_summary": merged,
 			"chunk_count":    chunkCount,
 		}
-		// A length-truncated Reduce is degraded, not failed. The planner must be
-		// able to see the degradation structurally (not only as prose buried in
-		// merged_summary) so it repeats the disclosure in the final answer rather
-		// than presenting a partial merge as a complete one.
 		if truncated {
+			result["merged_summary"] = merged + service.TruncationNotice
 			result["truncated"] = true
 			result["truncation_notice"] = strings.TrimSpace(service.TruncationNotice)
 		}
@@ -117,6 +128,10 @@ var mergeSummariesLLM = mergeSummariesWithLLM
 // no later stage can recover, which is the SS-01 no-silent-loss invariant. Here
 // the input is already-summarized text and the output goes straight to the
 // user, so a hard failure trades a degraded answer for no answer at all.
+//
+// The returned content is the RAW model body: CallDisclosingTruncation does not
+// append TruncationNotice, so the handler can still tell an empty truncated
+// Reduce from a usable one before it decides to disclose.
 func mergeSummariesWithLLM(ctx context.Context, combined string, specGuidance string) (string, bool, error) {
 	_, _, _, cfg := GetSummaryDeps()
 	client := service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, 30, cfg.LLMFallbackModels)

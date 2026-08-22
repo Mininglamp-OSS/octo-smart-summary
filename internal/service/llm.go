@@ -31,6 +31,11 @@ var ErrReasoningBudgetExhausted = errors.New("LLM returned empty content: reason
 // ErrTokenLimitExhausted marks an empty response terminated by the token cap.
 var ErrTokenLimitExhausted = errors.New("LLM returned empty content due to token limit")
 
+var (
+	ErrOutputTruncated       = errors.New("LLM response truncated due to token limit")
+	ErrStreamOutputTruncated = errors.New("LLM streamed response truncated due to token limit")
+)
+
 // LLMClient handles calls to a chat-completions-compatible LLM API.
 type LLMClient struct {
 	apiURL          string
@@ -309,7 +314,7 @@ func (c *LLMClient) callWithPolicyAndModel(ctx context.Context, messages []ChatM
 		}
 		content := chatResp.Choices[0].Message.Content
 		reasoningPresent := chatResp.Choices[0].Message.ReasoningContent != "" || chatResp.Choices[0].Message.Reasoning != ""
-		if content == "" && reasoningPresent {
+		if strings.TrimSpace(content) == "" && reasoningPresent {
 			reasoningLen := len(chatResp.Choices[0].Message.ReasoningContent) + len(chatResp.Choices[0].Message.Reasoning)
 			log.Printf("[llm] WARNING: content is empty but reasoning present (%d chars), finish_reason=%s, completion_tokens=%d. Reasoning consumed entire budget.",
 				reasoningLen, chatResp.Choices[0].FinishReason, chatResp.Usage.CompletionTokens)
@@ -317,11 +322,8 @@ func (c *LLMClient) callWithPolicyAndModel(ctx context.Context, messages []ChatM
 		}
 		if chatResp.Choices[0].FinishReason == "length" {
 			log.Printf("[llm] WARNING: response truncated with finish_reason=length, completion_tokens=%d", chatResp.Usage.CompletionTokens)
-			if content == "" || policy == truncateReject {
-				return result{tokens: chatResp.Usage.TotalTokens}, llmfallback.Terminal, ErrTokenLimitExhausted
-			}
-			if policy == truncateDisclose {
-				content += TruncationNotice
+			if strings.TrimSpace(content) == "" || policy == truncateReject {
+				return result{tokens: chatResp.Usage.TotalTokens}, llmfallback.Terminal, ErrOutputTruncated
 			}
 			return result{content: content, truncated: true, tokens: chatResp.Usage.TotalTokens}, llmfallback.Success, nil
 		}
@@ -487,12 +489,12 @@ func (c *LLMClient) callStreamWithModel(ctx context.Context, messages []ChatMess
 			return streamFailure(fmt.Errorf("LLM stream ended without terminal marker"))
 		}
 		content := sb.String()
-		if content == "" && reasoningLen > 0 {
+		if strings.TrimSpace(content) == "" && reasoningLen > 0 {
 			return result{tokens: totalTokens}, llmfallback.Terminal, ErrReasoningBudgetExhausted
 		}
-		if content == "" {
+		if strings.TrimSpace(content) == "" {
 			if finishReason == "length" {
-				return result{tokens: totalTokens}, llmfallback.Terminal, ErrTokenLimitExhausted
+				return result{tokens: totalTokens}, llmfallback.Terminal, ErrStreamOutputTruncated
 			}
 			return streamFailure(fmt.Errorf("LLM returned empty streamed content"))
 		}
@@ -759,7 +761,7 @@ func (c *LLMClient) CallMapWithModel(ctx context.Context, formattedMessages stri
 		return content, tokens, usedModel, nil
 	}
 	log.Printf("[llm] Map chunk %d failed: %s", chunkIndex, llmfallback.SafeErrorForLog(err, 200))
-	if errors.Is(err, ErrTokenLimitExhausted) {
+	if errors.Is(err, ErrOutputTruncated) {
 		return "", tokens, usedModel, fmt.Errorf("output truncated on chunk %d: %w", chunkIndex, err)
 	}
 	if errors.Is(err, ErrReasoningBudgetExhausted) {
@@ -790,11 +792,21 @@ func (c *LLMClient) CallReduceWithModel(ctx context.Context, chunkSummaries []st
 	userPrompt := fmt.Sprintf("信息来源：%s\n时间范围：%s ~ %s\n消息总量：%d 条\n\n以下是各分片的总结，请合并：\n\n%s",
 		sourceNames, startTime, endTime, totalMsgCount, summariesText)
 
-	content, _, tokens, usedModel, err := c.callWithPolicyAndModel(ctx, []ChatMessage{
+	return c.callDisclosingTerminalReduceWithModel(ctx, []ChatMessage{
 		{Role: "system", Content: system},
 		{Role: "user", Content: userPrompt},
-	}, 0.1, truncateReject)
-	return content, tokens, usedModel, err
+	})
+}
+
+func (c *LLMClient) callDisclosingTerminalReduceWithModel(ctx context.Context, msgs []ChatMessage) (string, int, string, error) {
+	content, truncated, tokens, usedModel, err := c.callWithPolicyAndModel(ctx, msgs, 0.1, truncateDisclose)
+	if err != nil {
+		return "", tokens, usedModel, err
+	}
+	if truncated {
+		content += TruncationNotice
+	}
+	return content, tokens, usedModel, nil
 }
 
 // CallMapStream runs the Map phase for a user-visible single chunk and streams
@@ -832,7 +844,7 @@ func (c *LLMClient) CallMapStreamWithModel(ctx context.Context, formattedMessage
 	if emitted {
 		return content, tokens, usedModel, err
 	}
-	if errors.Is(err, ErrTokenLimitExhausted) {
+	if errors.Is(err, ErrStreamOutputTruncated) {
 		return "", tokens, usedModel, fmt.Errorf("output truncated on chunk %d: %w", chunkIndex, err)
 	}
 	if errors.Is(err, ErrReasoningBudgetExhausted) {
@@ -899,13 +911,13 @@ func buildReduceByPersonMessages(participantSummaries []struct{ Name, Summary st
 // CallReduceByPerson merges participant-level summaries.
 // Each participant is assigned a [Pn] tag that the LLM should reference in the output.
 func (c *LLMClient) CallReduceByPerson(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string) (string, int, error) {
-	return c.CallStrict(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1)
+	content, tokens, _, err := c.callDisclosingTerminalReduceWithModel(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic))
+	return content, tokens, err
 }
 
 // CallReduceByPersonWithModel is CallReduceByPerson with the actual producing model included.
 func (c *LLMClient) CallReduceByPersonWithModel(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string) (string, int, string, error) {
-	content, _, tokens, usedModel, err := c.callWithPolicyAndModel(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1, truncateReject)
-	return content, tokens, usedModel, err
+	return c.callDisclosingTerminalReduceWithModel(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic))
 }
 
 // CallReduceByPersonStream merges participant-level summaries and streams the
