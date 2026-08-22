@@ -455,7 +455,7 @@ func formatChunkForLLM(chunk []map[string]interface{}) (formatted string, proces
 // (V2 off / no run / no spec) → the exact legacy prompt, byte-identical.
 func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{}, specGuidance string) (summary string, processed, oversized int, err error) {
 	_, _, _, cfg := GetSummaryDeps()
-	client := service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, 30)
+	client := service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, 30, cfg.LLMFallbackModels)
 
 	// Format messages for LLM with global citation_index (pure, testable).
 	formatted, processed, oversized := formatChunkForLLM(chunk)

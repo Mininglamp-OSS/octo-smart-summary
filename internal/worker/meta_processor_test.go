@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"gorm.io/gorm"
 )
@@ -143,8 +143,8 @@ func seedMetaParticipant(t *testing.T, db *gorm.DB, taskID int64, userID string,
 func TestMetaCompletionReady_FailedDoesNotDeadWait(t *testing.T) {
 	db := newReplaceTestDB(t)
 	taskID := seedProcessingTask(t, db)
-	seedMetaParticipant(t, db, taskID, "u2", model.PersonalStatusCompleted, true)  // submitted
-	seedMetaParticipant(t, db, taskID, "u3", model.PersonalStatusFailed, false)     // failed, never submits
+	seedMetaParticipant(t, db, taskID, "u2", model.PersonalStatusCompleted, true) // submitted
+	seedMetaParticipant(t, db, taskID, "u3", model.PersonalStatusFailed, false)   // failed, never submits
 
 	submitted, ready := metaCompletionReady(db, taskID)
 	if len(submitted) != 1 {
@@ -274,7 +274,7 @@ func TestProcessMetaSummary_NotReadyNoSubmittedStaysProcessing(t *testing.T) {
 // and never calls the network, so this keeps those tests offline/deterministic
 // while satisfying the non-nil llm dependency.
 func newOfflineLLM() *service.LLMClient {
-	return service.NewLLMClient("http://127.0.0.1:0", "", "test-model", 1, 0, false, 1)
+	return service.NewLLMClient("http://127.0.0.1:0", "", "test-model", 1, 0, false, 1, nil)
 }
 
 // seedSubmittedMember creates an Accepted participant + linked, submitted
@@ -317,14 +317,16 @@ func seedSubmittedMember(t *testing.T, db *gorm.DB, taskID int64, userID string)
 //
 // This exercises the full converge-in-one-worker path WITHOUT a live LLM by
 // keeping every iteration on the single-submission (no-merge) branch:
-//   pass 1: only A submitted -> snapshot {A}; an afterSnapshot hook then
-//           simulates RemoveMember(A) landing mid-merge: A's personal_result is
-//           deleted (A leaves the committed set) and B is added+submitted, so the
-//           committed contributor set ({B}) no longer equals the snapshot ({A}).
-//   write : saveLatestResultAndCompleteTask sees the mismatch -> aborts with
-//           errRosterChangedDuringMerge -> processMetaSummary `continue`s.
-//   pass 2: hook is now disarmed; submitted re-reads to {B} -> single-submission
-//           result for the UPDATED roster is written -> task Completed.
+//
+//	pass 1: only A submitted -> snapshot {A}; an afterSnapshot hook then
+//	        simulates RemoveMember(A) landing mid-merge: A's personal_result is
+//	        deleted (A leaves the committed set) and B is added+submitted, so the
+//	        committed contributor set ({B}) no longer equals the snapshot ({A}).
+//	write : saveLatestResultAndCompleteTask sees the mismatch -> aborts with
+//	        errRosterChangedDuringMerge -> processMetaSummary `continue`s.
+//	pass 2: hook is now disarmed; submitted re-reads to {B} -> single-submission
+//	        result for the UPDATED roster is written -> task Completed.
+//
 // Asserts the task converges (Completed, not stuck Processing), the result
 // reflects the new roster (B, not the departed A), and the loop does not spin.
 func TestProcessMetaSummary_RosterShrankMidMerge_RecomputesAndCompletes(t *testing.T) {

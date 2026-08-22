@@ -352,3 +352,54 @@ func TestTruncateForLog(t *testing.T) {
 		}
 	}
 }
+
+// TestChat_403EscalatesToFallback pins the #211 fix: an account-level denial
+// (HTTP 403, e.g. a Bedrock SCP explicit-deny of bedrock:InvokeModel) must
+// escalate to the fallback model — which the gateway can route to a different
+// provider — instead of being treated as terminal. Before #211 a 403 was
+// classified terminal (retry := status>=500 || status==429), so Chat returned
+// the failure without ever contacting the fallback. The primary must be tried
+// exactly once (no wasteful same-model retries on a denial).
+func TestChat_403EscalatesToFallback(t *testing.T) {
+	primary := "claude-sonnet-4-6"
+	fallback := "gpt-4.1"
+
+	var mu sync.Mutex
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		seen = append(seen, body.Model)
+		mu.Unlock()
+		if body.Model == primary {
+			http.Error(w, "AccessDeniedException: explicit deny in a service control policy", http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"choices":[{"message":{"content":"reply from %s","tool_calls":null}}],"usage":{"total_tokens":10}}`, body.Model)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "test-key", primary, 5, 512, []string{fallback})
+	c.http = &http.Client{Timeout: 2 * time.Second}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	turn, err := c.Chat(ctx, []Message{{Role: "user", Content: "hi"}}, nil)
+	if err != nil {
+		t.Fatalf("403 on primary must escalate to fallback %q, got err: %v (seen=%v)", fallback, err, seen)
+	}
+	if !strings.Contains(turn.Content, fallback) {
+		t.Errorf("expected reply from fallback %q, got %q", fallback, turn.Content)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	// primary once (403 is not retried on the same model), then fallback once.
+	if len(seen) != 2 || seen[0] != primary || seen[1] != fallback {
+		t.Fatalf("expected [primary, fallback], got %v", seen)
+	}
+}

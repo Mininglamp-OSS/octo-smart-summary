@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmfallback"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 )
 
@@ -25,6 +26,7 @@ type LLMClient struct {
 	apiURL          string
 	apiKey          string
 	model           string
+	fallbackModels  []string
 	timeout         time.Duration
 	toolCallTimeout time.Duration
 	maxTokens       int
@@ -33,17 +35,40 @@ type LLMClient struct {
 }
 
 // NewLLMClient creates a new LLM client.
-func NewLLMClient(apiURL, apiKey, model string, timeoutSec, maxTokens int, enableThinking bool, toolCallTimeoutSec int) *LLMClient {
+//
+// fallbackModels (typically sourced from LLM_FALLBACK_MODELS) are tried in
+// order when the primary model fails in a way a different model/provider may
+// survive — 429/5xx (after retries) and, critically, 401/403 account-level
+// denials such as a Bedrock SCP explicit-deny, which the gateway can route to
+// a different provider (issue #211). A nil/empty slice preserves single-model
+// behaviour. The primary model, empty entries and duplicates are dropped.
+func NewLLMClient(apiURL, apiKey, model string, timeoutSec, maxTokens int, enableThinking bool, toolCallTimeoutSec int, fallbackModels []string) *LLMClient {
+	fallbacks := make([]string, 0, len(fallbackModels))
+	seen := map[string]bool{model: true}
+	for _, m := range fallbackModels {
+		if m == "" || seen[m] {
+			continue
+		}
+		seen[m] = true
+		fallbacks = append(fallbacks, m)
+	}
 	return &LLMClient{
 		apiURL:          strings.TrimRight(apiURL, "/"),
 		apiKey:          apiKey,
 		model:           model,
+		fallbackModels:  fallbacks,
 		timeout:         time.Duration(timeoutSec) * time.Second,
 		toolCallTimeout: time.Duration(toolCallTimeoutSec) * time.Second,
 		maxTokens:       maxTokens,
 		enableThinking:  enableThinking,
 		client:          &http.Client{Timeout: time.Duration(timeoutSec) * time.Second},
 	}
+}
+
+// models returns the ordered model list (primary first, then fallbacks) used
+// by every fallback-aware call path.
+func (c *LLMClient) models() []string {
+	return append([]string{c.model}, c.fallbackModels...)
 }
 
 // ChatMessage represents a single message in a chat completion request.
@@ -161,75 +186,82 @@ func (c *LLMClient) buildThinkingConfig() (*ThinkingParam, map[string]interface{
 
 // Call makes a chat completion request. Returns (content, tokenUsed, error).
 func (c *LLMClient) Call(ctx context.Context, messages []ChatMessage, temperature float64) (string, int, error) {
-	if config.IsKimiModel(c.model) && temperature != kimiRequiredTemperature {
-		log.Printf("[llm] overriding temperature from %.2f to %.2f (model constraint)",
-			temperature, kimiRequiredTemperature)
-		temperature = kimiRequiredTemperature
-	} else if config.IsKimiModel(c.model) {
-		temperature = kimiRequiredTemperature
+	type result struct {
+		content string
+		tokens  int
 	}
-	log.Printf("[llm] calling model=%s temperature=%.2f max_tokens=%d", c.model, temperature, c.maxTokens)
-	reqBody := chatRequest{
-		Model:       c.model,
-		Messages:    messages,
-		Temperature: temperature,
-		MaxTokens:   c.maxTokens,
-	}
-	thinking, kwargs := c.buildThinkingConfig()
-	reqBody.Thinking = thinking
-	reqBody.ChatTemplateKwargs = kwargs
+	// MaxAttempts:1 — same-model retries are provided by the outer Map/Reduce
+	// loops that call Call; the runner only adds cross-model fallback here.
+	res, _, err := llmfallback.Run(ctx, llmfallback.Config{
+		Models:      c.models(),
+		MaxAttempts: 1,
+	}, func(ctx context.Context, model string) (result, llmfallback.Outcome, error) {
+		temp := temperature
+		if config.IsKimiModel(model) {
+			temp = kimiRequiredTemperature
+		}
+		log.Printf("[llm] calling model=%s temperature=%.2f max_tokens=%d", model, temp, c.maxTokens)
+		reqBody := chatRequest{
+			Model:       model,
+			Messages:    messages,
+			Temperature: temp,
+			MaxTokens:   c.maxTokens,
+		}
+		thinking, kwargs := c.buildThinkingConfig()
+		reqBody.Thinking = thinking
+		reqBody.ChatTemplateKwargs = kwargs
 
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", 0, err
-	}
+		body, err := json.Marshal(reqBody)
+		if err != nil {
+			return result{}, llmfallback.Terminal, err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL+"/chat/completions", bytes.NewReader(body))
+		if err != nil {
+			return result{}, llmfallback.Terminal, err
+		}
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+		req.Header.Set("Content-Type", "application/json")
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return "", 0, err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return "", 0, err
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", 0, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", 0, fmt.Errorf("LLM API error: status=%d body=%s", resp.StatusCode, string(respBody))
-	}
-
-	var chatResp chatResponse
-	if err := json.Unmarshal(respBody, &chatResp); err != nil {
-		return "", 0, fmt.Errorf("unmarshal LLM response: %w", err)
-	}
-	if len(chatResp.Choices) == 0 {
-		return "", 0, fmt.Errorf("LLM returned no choices")
-	}
-
-	content := chatResp.Choices[0].Message.Content
-	// Check both field names: "reasoning_content" (official Kimi) and "reasoning" (gateway proxy)
-	reasoningPresent := chatResp.Choices[0].Message.ReasoningContent != "" || chatResp.Choices[0].Message.Reasoning != ""
-	if content == "" && reasoningPresent {
-		reasoningLen := len(chatResp.Choices[0].Message.ReasoningContent) + len(chatResp.Choices[0].Message.Reasoning)
-		log.Printf("[llm] WARNING: content is empty but reasoning present (%d chars), "+
-			"finish_reason=%s, completion_tokens=%d. Reasoning consumed entire budget.",
-			reasoningLen, chatResp.Choices[0].FinishReason, chatResp.Usage.CompletionTokens)
-		return "", chatResp.Usage.TotalTokens, fmt.Errorf("LLM returned empty content: reasoning consumed entire max_tokens budget")
-	}
-	if content == "" && chatResp.Choices[0].FinishReason == "length" {
-		log.Printf("[llm] WARNING: content is empty and finish_reason=length, completion_tokens=%d",
-			chatResp.Usage.CompletionTokens)
-		return "", chatResp.Usage.TotalTokens, fmt.Errorf("LLM returned empty content due to token limit")
-	}
-
-	return content, chatResp.Usage.TotalTokens, nil
+		resp, err := c.client.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return result{}, llmfallback.Terminal, ctx.Err()
+			}
+			return result{}, llmfallback.RetrySameModel, err
+		}
+		defer resp.Body.Close()
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return result{}, llmfallback.RetrySameModel, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			return result{}, llmfallback.ClassifyStatus(resp.StatusCode),
+				fmt.Errorf("LLM API error: status=%d body=%s", resp.StatusCode, string(respBody))
+		}
+		var chatResp chatResponse
+		if err := json.Unmarshal(respBody, &chatResp); err != nil {
+			return result{}, llmfallback.Terminal, fmt.Errorf("unmarshal LLM response: %w", err)
+		}
+		if len(chatResp.Choices) == 0 {
+			return result{}, llmfallback.Terminal, fmt.Errorf("LLM returned no choices")
+		}
+		content := chatResp.Choices[0].Message.Content
+		reasoningPresent := chatResp.Choices[0].Message.ReasoningContent != "" || chatResp.Choices[0].Message.Reasoning != ""
+		if content == "" && reasoningPresent {
+			reasoningLen := len(chatResp.Choices[0].Message.ReasoningContent) + len(chatResp.Choices[0].Message.Reasoning)
+			log.Printf("[llm] WARNING: content is empty but reasoning present (%d chars), finish_reason=%s, completion_tokens=%d. Reasoning consumed entire budget.",
+				reasoningLen, chatResp.Choices[0].FinishReason, chatResp.Usage.CompletionTokens)
+			return result{tokens: chatResp.Usage.TotalTokens}, llmfallback.Terminal,
+				fmt.Errorf("LLM returned empty content: reasoning consumed entire max_tokens budget")
+		}
+		if content == "" && chatResp.Choices[0].FinishReason == "length" {
+			log.Printf("[llm] WARNING: content is empty and finish_reason=length, completion_tokens=%d", chatResp.Usage.CompletionTokens)
+			return result{tokens: chatResp.Usage.TotalTokens}, llmfallback.Terminal,
+				fmt.Errorf("LLM returned empty content due to token limit")
+		}
+		return result{content: content, tokens: chatResp.Usage.TotalTokens}, llmfallback.Success, nil
+	})
+	return res.content, res.tokens, err
 }
 
 type chatStreamResponse struct {
@@ -251,112 +283,129 @@ type chatStreamResponse struct {
 // each user-visible content delta. It returns the accumulated full content so
 // downstream citation building and DB persistence remain source-of-truth.
 func (c *LLMClient) CallStream(ctx context.Context, messages []ChatMessage, temperature float64, onDelta func(string) error) (string, int, error) {
-	if config.IsKimiModel(c.model) && temperature != kimiRequiredTemperature {
-		log.Printf("[llm] overriding stream temperature from %.2f to %.2f (model constraint)",
-			temperature, kimiRequiredTemperature)
-		temperature = kimiRequiredTemperature
-	} else if config.IsKimiModel(c.model) {
-		temperature = kimiRequiredTemperature
+	type result struct {
+		content string
+		tokens  int
 	}
-	log.Printf("[llm] streaming model=%s temperature=%.2f max_tokens=%d", c.model, temperature, c.maxTokens)
+	// Cross-model fallback is only safe BEFORE the stream starts emitting: once
+	// a 200 response begins delivering deltas (via onDelta) we are committed to
+	// that model — a fallback would double-emit. So only pre-stream failures
+	// (transport / non-200) are classified for fallback; everything after the
+	// 200 is Terminal. MaxAttempts:1 — outer Map/Reduce loops own same-model retries.
+	res, _, err := llmfallback.Run(ctx, llmfallback.Config{
+		Models:      c.models(),
+		MaxAttempts: 1,
+	}, func(ctx context.Context, model string) (result, llmfallback.Outcome, error) {
+		temp := temperature
+		if config.IsKimiModel(model) {
+			temp = kimiRequiredTemperature
+		}
+		log.Printf("[llm] streaming model=%s temperature=%.2f max_tokens=%d", model, temp, c.maxTokens)
 
-	reqBody := chatRequest{
-		Model:         c.model,
-		Messages:      messages,
-		Temperature:   temperature,
-		MaxTokens:     c.maxTokens,
-		Stream:        true,
-		StreamOptions: &streamOptions{IncludeUsage: true},
-	}
-	thinking, kwargs := c.buildThinkingConfig()
-	reqBody.Thinking = thinking
-	reqBody.ChatTemplateKwargs = kwargs
+		reqBody := chatRequest{
+			Model:         model,
+			Messages:      messages,
+			Temperature:   temp,
+			MaxTokens:     c.maxTokens,
+			Stream:        true,
+			StreamOptions: &streamOptions{IncludeUsage: true},
+		}
+		thinking, kwargs := c.buildThinkingConfig()
+		reqBody.Thinking = thinking
+		reqBody.ChatTemplateKwargs = kwargs
 
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", 0, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return "", 0, err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
+		body, err := json.Marshal(reqBody)
+		if err != nil {
+			return result{}, llmfallback.Terminal, err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL+"/chat/completions", bytes.NewReader(body))
+		if err != nil {
+			return result{}, llmfallback.Terminal, err
+		}
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "text/event-stream")
 
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return "", 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", 0, fmt.Errorf("LLM stream API error: status=%d body=%s", resp.StatusCode, string(respBody))
-	}
+		resp, err := c.client.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return result{}, llmfallback.Terminal, ctx.Err()
+			}
+			return result{}, llmfallback.RetrySameModel, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			respBody, _ := io.ReadAll(resp.Body)
+			return result{}, llmfallback.ClassifyStatus(resp.StatusCode),
+				fmt.Errorf("LLM stream API error: status=%d body=%s", resp.StatusCode, string(respBody))
+		}
 
-	var sb strings.Builder
-	var totalTokens int
-	var reasoningLen int
-	terminalSeen := false
-	finishReason := ""
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, ":") {
-			continue
-		}
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "[DONE]" {
-			terminalSeen = true
-			break
-		}
-		var chunk chatStreamResponse
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			return sb.String(), totalTokens, fmt.Errorf("unmarshal LLM stream chunk: %w", err)
-		}
-		if chunk.Usage.TotalTokens > 0 {
-			totalTokens = chunk.Usage.TotalTokens
-		}
-		if len(chunk.Choices) == 0 {
-			continue
-		}
-		if chunk.Choices[0].FinishReason != "" {
-			terminalSeen = true
-			finishReason = chunk.Choices[0].FinishReason
-		}
-		delta := chunk.Choices[0].Delta.Content
-		if delta == "" {
-			reasoningLen += len(chunk.Choices[0].Delta.ReasoningContent) + len(chunk.Choices[0].Delta.Reasoning)
-			continue
-		}
-		sb.WriteString(delta)
-		if onDelta != nil {
-			if err := onDelta(delta); err != nil {
-				return sb.String(), totalTokens, err
+		// Committed to this model from here on — all failures are Terminal.
+		var sb strings.Builder
+		var totalTokens int
+		var reasoningLen int
+		terminalSeen := false
+		finishReason := ""
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, ":") {
+				continue
+			}
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if data == "[DONE]" {
+				terminalSeen = true
+				break
+			}
+			var chunk chatStreamResponse
+			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				return result{content: sb.String(), tokens: totalTokens}, llmfallback.Terminal, fmt.Errorf("unmarshal LLM stream chunk: %w", err)
+			}
+			if chunk.Usage.TotalTokens > 0 {
+				totalTokens = chunk.Usage.TotalTokens
+			}
+			if len(chunk.Choices) == 0 {
+				continue
+			}
+			if chunk.Choices[0].FinishReason != "" {
+				terminalSeen = true
+				finishReason = chunk.Choices[0].FinishReason
+			}
+			delta := chunk.Choices[0].Delta.Content
+			if delta == "" {
+				reasoningLen += len(chunk.Choices[0].Delta.ReasoningContent) + len(chunk.Choices[0].Delta.Reasoning)
+				continue
+			}
+			sb.WriteString(delta)
+			if onDelta != nil {
+				if err := onDelta(delta); err != nil {
+					return result{content: sb.String(), tokens: totalTokens}, llmfallback.Terminal, err
+				}
 			}
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		return sb.String(), totalTokens, fmt.Errorf("read LLM stream: %w", err)
-	}
-	if !terminalSeen {
-		return sb.String(), totalTokens, fmt.Errorf("LLM stream ended without terminal marker")
-	}
-	content := sb.String()
-	if content == "" && reasoningLen > 0 {
-		return "", totalTokens, fmt.Errorf("LLM returned empty streamed content: reasoning consumed output budget")
-	}
-	if content == "" && finishReason == "length" {
-		return "", totalTokens, fmt.Errorf("LLM returned empty streamed content due to token limit")
-	}
-	if content == "" {
-		return "", totalTokens, fmt.Errorf("LLM returned empty streamed content")
-	}
-	return content, totalTokens, nil
+		if err := scanner.Err(); err != nil {
+			return result{content: sb.String(), tokens: totalTokens}, llmfallback.Terminal, fmt.Errorf("read LLM stream: %w", err)
+		}
+		if !terminalSeen {
+			return result{content: sb.String(), tokens: totalTokens}, llmfallback.Terminal, fmt.Errorf("LLM stream ended without terminal marker")
+		}
+		content := sb.String()
+		if content == "" && reasoningLen > 0 {
+			return result{tokens: totalTokens}, llmfallback.Terminal, fmt.Errorf("LLM returned empty streamed content: reasoning consumed output budget")
+		}
+		if content == "" && finishReason == "length" {
+			return result{tokens: totalTokens}, llmfallback.Terminal, fmt.Errorf("LLM returned empty streamed content due to token limit")
+		}
+		if content == "" {
+			return result{tokens: totalTokens}, llmfallback.Terminal, fmt.Errorf("LLM returned empty streamed content")
+		}
+		return result{content: content, tokens: totalTokens}, llmfallback.Success, nil
+	})
+	return res.content, res.tokens, err
 }
 
 // CallRaw is a simple single-turn call returning text only. Used for topic narrowing.
@@ -372,152 +421,119 @@ func (c *LLMClient) CallRaw(ctx context.Context, prompt string) (string, error) 
 // CallWithTools makes a chat completion request with function calling.
 // Returns the raw JSON string from tool_calls[0].function.arguments and token count.
 func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, tools []Tool, forceFn string, temperature float64) (string, int, error) {
-	if config.IsKimiModel(c.model) && temperature != kimiRequiredTemperature {
-		log.Printf("[llm] overriding temperature from %.2f to %.2f (model constraint)",
-			temperature, kimiRequiredTemperature)
-		temperature = kimiRequiredTemperature
-	} else if config.IsKimiModel(c.model) {
-		temperature = kimiRequiredTemperature
+	type result struct {
+		args   string
+		tokens int
 	}
-	log.Printf("[llm] CallWithTools: tool=%s temperature=%.2f model=%s", forceFn, temperature, c.model)
 	start := time.Now()
-
-	var toolChoice interface{}
-	if config.IsKimiModel(c.model) {
-		toolChoice = "auto"
-	} else {
-		toolChoice = ToolChoice{
-			Type:     "function",
-			Function: ToolChoiceFunction{Name: forceFn},
+	// MaxAttempts:3 preserves CallWithTools' original per-model retry budget;
+	// the runner adds cross-model fallback once those are exhausted (or on a
+	// 401/403 account denial, which escalates immediately — issue #211).
+	res, _, err := llmfallback.Run(ctx, llmfallback.Config{
+		Models:          c.models(),
+		PerModelTimeout: c.toolCallTimeout,
+		MaxAttempts:     3,
+	}, func(ctx context.Context, model string) (result, llmfallback.Outcome, error) {
+		temp := temperature
+		if config.IsKimiModel(model) {
+			temp = kimiRequiredTemperature
 		}
-	}
+		log.Printf("[llm] CallWithTools: tool=%s temperature=%.2f model=%s", forceFn, temp, model)
 
-	reqBody := chatRequestWithTools{
-		Model:       c.model,
-		Messages:    messages,
-		Temperature: temperature,
-		MaxTokens:   c.maxTokens,
-		Tools:       tools,
-		ToolChoice:  toolChoice,
-	}
-	thinking, kwargs := c.buildThinkingConfig()
-	reqBody.Thinking = thinking
-	reqBody.ChatTemplateKwargs = kwargs
-
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", 0, fmt.Errorf("marshal request: %w", err)
-	}
-
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		select {
-		case <-ctx.Done():
-			return "", 0, ctx.Err()
-		default:
+		var toolChoice interface{}
+		if config.IsKimiModel(model) {
+			toolChoice = "auto"
+		} else {
+			toolChoice = ToolChoice{Type: "function", Function: ToolChoiceFunction{Name: forceFn}}
 		}
-		if attempt > 0 {
-			time.Sleep(time.Duration(1<<uint(attempt-1)) * time.Second)
+		reqBody := chatRequestWithTools{
+			Model:       model,
+			Messages:    messages,
+			Temperature: temp,
+			MaxTokens:   c.maxTokens,
+			Tools:       tools,
+			ToolChoice:  toolChoice,
+		}
+		thinking, kwargs := c.buildThinkingConfig()
+		reqBody.Thinking = thinking
+		reqBody.ChatTemplateKwargs = kwargs
+
+		body, err := json.Marshal(reqBody)
+		if err != nil {
+			return result{}, llmfallback.Terminal, fmt.Errorf("marshal request: %w", err)
 		}
 
-		attemptCtx, attemptCancel := context.WithTimeout(ctx, c.toolCallTimeout)
+		attemptCtx, cancel := context.WithTimeout(ctx, c.toolCallTimeout)
+		defer cancel()
 		req, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, c.apiURL+"/chat/completions", bytes.NewReader(body))
 		if err != nil {
-			attemptCancel()
-			return "", 0, fmt.Errorf("create request: %w", err)
+			return result{}, llmfallback.Terminal, fmt.Errorf("create request: %w", err)
 		}
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 		req.Header.Set("Content-Type", "application/json")
 
 		resp, err := c.client.Do(req)
 		if err != nil {
-			lastErr = err
-			log.Printf("[llm] CallWithTools attempt %d network error: %v", attempt+1, err)
-			attemptCancel()
-			continue
-		}
-
-		respBody, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		attemptCancel()
-		if err != nil {
-			lastErr = fmt.Errorf("read response body: %w", err)
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Errorf("LLM API error: status=%d body=%s", resp.StatusCode, string(respBody))
-			log.Printf("[llm] CallWithTools attempt %d: %v", attempt+1, lastErr)
-			if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != 429 {
-				return "", 0, lastErr
+			if ctx.Err() != nil {
+				return result{}, llmfallback.Terminal, ctx.Err()
 			}
-			continue
+			return result{}, llmfallback.RetrySameModel, fmt.Errorf("network error: %w", err)
+		}
+		respBody, rerr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if rerr != nil {
+			return result{}, llmfallback.RetrySameModel, fmt.Errorf("read response body: %w", rerr)
+		}
+		if resp.StatusCode != http.StatusOK {
+			return result{}, llmfallback.ClassifyStatus(resp.StatusCode),
+				fmt.Errorf("LLM API error: status=%d body=%s", resp.StatusCode, string(respBody))
 		}
 
 		var chatResp chatResponseWithTools
 		if err := json.Unmarshal(respBody, &chatResp); err != nil {
-			lastErr = fmt.Errorf("unmarshal response: %w", err)
-			continue
+			return result{}, llmfallback.RetrySameModel, fmt.Errorf("unmarshal response: %w", err)
 		}
-
 		if len(chatResp.Choices) == 0 {
-			lastErr = fmt.Errorf("LLM returned no choices")
-			continue
+			return result{}, llmfallback.RetrySameModel, fmt.Errorf("LLM returned no choices")
 		}
 		if len(chatResp.Choices[0].Message.ToolCalls) == 0 {
 			reasoningPresent := chatResp.Choices[0].Message.ReasoningContent != "" || chatResp.Choices[0].Message.Reasoning != ""
 			if reasoningPresent {
-				reasoningLen := len(chatResp.Choices[0].Message.ReasoningContent) + len(chatResp.Choices[0].Message.Reasoning)
-				log.Printf("[llm] CallWithTools: no tool_calls but reasoning present (%d chars). Reasoning consumed entire budget.",
-					reasoningLen)
-				return "", chatResp.Usage.TotalTokens, fmt.Errorf("CallWithTools: reasoning consumed entire max_tokens budget, no tool_calls produced")
+				return result{tokens: chatResp.Usage.TotalTokens}, llmfallback.Terminal,
+					fmt.Errorf("CallWithTools: reasoning consumed entire max_tokens budget, no tool_calls produced")
 			}
-			lastErr = fmt.Errorf("LLM returned no tool_calls")
-			log.Printf("[llm] CallWithTools attempt %d: no tool_calls returned", attempt+1)
-			continue
+			return result{}, llmfallback.RetrySameModel, fmt.Errorf("LLM returned no tool_calls")
 		}
 
-		if config.IsKimiModel(c.model) {
-			matched := false
+		if config.IsKimiModel(model) {
 			for _, tc := range chatResp.Choices[0].Message.ToolCalls {
 				if tc.Function.Name == forceFn {
-					matched = true
-					args := tc.Function.Arguments
-					if args == "" {
-						lastErr = fmt.Errorf("LLM returned empty arguments")
-						break
+					if tc.Function.Arguments == "" {
+						return result{}, llmfallback.RetrySameModel, fmt.Errorf("LLM returned empty arguments")
 					}
-					log.Printf("[llm] CallWithTools: tool=%s took %dms tokens=%d", forceFn, time.Since(start).Milliseconds(), chatResp.Usage.TotalTokens)
-					return args, chatResp.Usage.TotalTokens, nil
+					return result{args: tc.Function.Arguments, tokens: chatResp.Usage.TotalTokens}, llmfallback.Success, nil
 				}
 			}
-			if !matched {
-				calledFn := chatResp.Choices[0].Message.ToolCalls[0].Function.Name
-				lastErr = fmt.Errorf("LLM called function %q instead of expected %q", calledFn, forceFn)
-				log.Printf("[llm] CallWithTools attempt %d: wrong function called: %s", attempt+1, calledFn)
-			}
-			continue
+			calledFn := chatResp.Choices[0].Message.ToolCalls[0].Function.Name
+			return result{}, llmfallback.RetrySameModel, fmt.Errorf("LLM called function %q instead of expected %q", calledFn, forceFn)
 		}
 
 		calledFn := chatResp.Choices[0].Message.ToolCalls[0].Function.Name
 		if calledFn != forceFn {
-			lastErr = fmt.Errorf("LLM called function %q instead of expected %q", calledFn, forceFn)
-			log.Printf("[llm] CallWithTools attempt %d: wrong function called: %s", attempt+1, calledFn)
-			continue
+			return result{}, llmfallback.RetrySameModel, fmt.Errorf("LLM called function %q instead of expected %q", calledFn, forceFn)
 		}
-
 		args := chatResp.Choices[0].Message.ToolCalls[0].Function.Arguments
 		if args == "" {
-			lastErr = fmt.Errorf("LLM returned empty arguments")
-			continue
+			return result{}, llmfallback.RetrySameModel, fmt.Errorf("LLM returned empty arguments")
 		}
-
-		log.Printf("[llm] CallWithTools: tool=%s took %dms tokens=%d", forceFn, time.Since(start).Milliseconds(), chatResp.Usage.TotalTokens)
-		return args, chatResp.Usage.TotalTokens, nil
+		return result{args: args, tokens: chatResp.Usage.TotalTokens}, llmfallback.Success, nil
+	})
+	if err != nil {
+		log.Printf("[llm] CallWithTools: tool=%s took %dms error=%v", forceFn, time.Since(start).Milliseconds(), err)
+		return "", 0, fmt.Errorf("CallWithTools failed: %w", err)
 	}
-	elapsed := time.Since(start).Milliseconds()
-	log.Printf("[llm] CallWithTools: tool=%s took %dms error=%v", forceFn, elapsed, lastErr)
-	return "", 0, fmt.Errorf("CallWithTools failed after 3 attempts: %w", lastErr)
+	log.Printf("[llm] CallWithTools: tool=%s took %dms tokens=%d", forceFn, time.Since(start).Milliseconds(), res.tokens)
+	return res.args, res.tokens, nil
 }
 
 // ModelVersion returns the configured model name.
