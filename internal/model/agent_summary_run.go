@@ -68,7 +68,20 @@ type AgentSummaryRun struct {
 	SucceededChannels string `gorm:"column:succeeded_channels;type:json" json:"succeeded_channels"`
 	FailedChannels    string `gorm:"column:failed_channels;type:json" json:"failed_channels"`
 	CoverageTruncated bool   `gorm:"column:coverage_truncated;not null;default:false" json:"coverage_truncated"`
-	DroppedMessages   int    `gorm:"column:dropped_messages;not null;default:0" json:"dropped_messages"`
+
+	// OutputTruncated records that a model completion on this run's ANSWER path
+	// hit finish_reason=length. Distinct from CoverageTruncated, which is about
+	// the fetched message pool: this one says the text we produced is unfinished,
+	// not that the input was clipped. The finish gate maps them to different gap
+	// kinds because the remediation differs (lower detail level vs narrower
+	// range).
+	//
+	// Persisted rather than passed in-process because the fact is produced deep
+	// inside a tool handler / the planner loop while the gate runs later, in the
+	// save path — and, critically, because a persisted fact cannot be edited away
+	// by the model that generated the text.
+	OutputTruncated bool `gorm:"column:output_truncated;not null;default:false" json:"output_truncated"`
+	DroppedMessages int  `gorm:"column:dropped_messages;not null;default:0" json:"dropped_messages"`
 
 	// FetchExpected records whether this turn was supposed to gather data at all.
 	// A confident rewrite (SS-08b) has the fetch tools physically removed, so it

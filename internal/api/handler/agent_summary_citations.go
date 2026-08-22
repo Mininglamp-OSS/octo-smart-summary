@@ -360,6 +360,7 @@ func (h *AgentSummaryHandler) finalizeRun(ctx context.Context, uid, sessionID, r
 		FailedChannels:           decodeFinishChannelIDs(run.FailedChannels),
 		DiscoveredChannels:       decodeFinishChannelIDs(run.DiscoveredChannels),
 		Truncated:                run.CoverageTruncated,
+		OutputTruncated:          run.OutputTruncated,
 		DroppedMessages:          run.DroppedMessages,
 	}
 
