@@ -29,6 +29,7 @@ All configuration is done via environment variables.
 | `WORKER_LISTEN_ADDR` | Listen address for worker server | No | `0.0.0.0` |
 | `WORKER_MAX_CONCURRENT_TASKS` | Max concurrent worker tasks | No | `20` |
 | `WORKER_MAP_CONCURRENCY` | Concurrency for map-phase LLM calls | No | `5` |
+| `AGENT_MAP_CONCURRENCY` | How many Map-phase chunk summaries ONE `summarize_chunk` tool call runs in parallel (agent path only). Clamped to `[1, 5]`; unset/0/negative resolve to the default. Deliberately separate from `WORKER_MAP_CONCURRENCY`: the agent runner already executes up to 4 tool calls from a single LLM turn concurrently (`agent.NewPool(4)`), so the two knobs MULTIPLY — at the default the ceiling of in-flight Map completions from one user request is 4×3=12. Set to `1` to take a dedicated serial path identical to the pre-concurrency loop (rollback without redeploying). | No | `3` |
 | `WORKER_POLL_INTERVAL_SECONDS` | Task polling interval in seconds | No | `2` |
 | `WORKER_TASK_LEASE_MINUTES` | Task lease duration in minutes | No | `20` |
 | `WORKER_MAX_RETRY` | Maximum retry attempts for failed tasks | No | `3` |

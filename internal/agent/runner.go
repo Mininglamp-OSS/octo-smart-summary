@@ -46,8 +46,9 @@ type Runner struct {
 	// gate FAILED). The target is passed because fetch_channel / summarize_chunk
 	// run once per channel/chunk through the worker pool: keying the fatal set on
 	// the tool name alone let one chunk's success clear a different chunk's fatal
-	// marker (verdict-by-scheduling). Nil-safe; must be goroutine-safe (runTools
-	// calls it from the worker pool).
+	// marker (verdict-by-scheduling). Nil-safe. runTools reports one completed
+	// step as a batch: errors first, then successes, so a successful sibling call
+	// for the same target deterministically wins over a same-step failure.
 	OnToolError func(toolName, target string, env ToolErrorEnvelope)
 
 	// OnToolSuccess is the counterpart, called when a tool call SUCCEEDS. It
@@ -63,7 +64,7 @@ type Runner struct {
 	// fact ("that tool worked on a later call") instead of guessed from text.
 	// A retry of the same target is a new tool_call with a new id but the SAME
 	// target, so the target (not the call id) is what makes recovery observable.
-	// Nil-safe; must be goroutine-safe.
+	// Nil-safe; emitted after the step's error callbacks.
 	OnToolSuccess func(toolName, target string)
 }
 
@@ -93,11 +94,17 @@ func (r *Runner) Run(ctx context.Context, system, userInput string) (string, err
 // 返回最终回复 + 本回合新产生的消息（user + assistant(含 tool_calls) + tool），供上层落库；
 // 新消息不含 system，也不含传入的 history。
 func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Message, userInput string) (string, []Message, error) {
+	// Keep Map output out of the planner transcript. Every run gets an isolated,
+	// request-scoped store shared by summarize_chunk and merge_summaries through
+	// the tool context. It deliberately shadows any store on the parent context so
+	// a reused context cannot leak handles or pending state across runner calls.
+	ctx = withSummaryHandleStore(ctx)
+
 	userMsg := Message{Role: "user", Content: userInput}
 
 	msgs := make([]Message, 0, len(history)+2)
 	msgs = append(msgs, Message{Role: "system", Content: system})
-	msgs = append(msgs, history...)
+	msgs = append(msgs, compactSummaryToolHistory(history)...)
 	msgs = append(msgs, userMsg)
 
 	// newMsgs 只累积本回合新增（user + 各 assistant + 各 tool），供落库；不含 system/history。
@@ -118,8 +125,8 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 
 		// stepCtx bounds ONLY the planning LLM call (r.client.Chat below).
 		// Tool execution must NOT share this budget: LLM-backed tools such
-		// as summarize_chunk and merge_summaries run their own sequential
-		// per-chunk LLM calls, each with its own LLMTimeout (default 180s,
+		// as summarize_chunk and merge_summaries run their own LLM calls
+		// (Map calls use bounded concurrency), each with its own LLMTimeout (default 180s,
 		// see config.go). Wrapping runTools in stepCtx (default 60s) — as
 		// briefly attempted in commit 4f614cc — clamps every large map-reduce
 		// summary to 60s and breaks the feature's primary path (byte-verified
@@ -137,6 +144,36 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 			return "", nil, err
 		}
 		totalTokens += turn.Tokens
+
+		// A final answer is not valid while this request still has Map outputs that
+		// have not passed through one successful Reduce covering every handle. The
+		// model can otherwise skip merge_summaries (or ignore its parse error) and
+		// confidently answer from partial Map text. Nudge it without persisting the
+		// rejected draft; at the final step fail closed.
+		if len(turn.ToolCalls) == 0 {
+			store, storeErr := summaryHandleStoreFromContext(ctx)
+			if storeErr == nil && (store.PendingMapFailures() > 0 || store.NeedsReduce()) {
+				pendingMaps := store.PendingMapFailures()
+				anonymousMaps := store.PendingAnonymousMapFailures()
+				log.Printf("[agent] step %d/%d: final answer attempted with pending summary work (map_failures=%d anonymous_map_failures=%d reduce_needed=%t)",
+					step+1, r.policy.MaxSteps, pendingMaps, anonymousMaps, store.NeedsReduce())
+				if step >= r.policy.MaxSteps-1 {
+					return "", nil, errors.New("successful Map retries and Reduce required before final answer")
+				}
+				instruction := "本次请求仍有未合并的 Map 结果。请先调用 merge_summaries，并在 summary_handles 中原样传入本次请求产生的全部 summary_handle；不要复制摘要正文，也不要直接输出最终答案。"
+				if pendingMaps > 0 {
+					instruction = "本次请求仍有失败的 summarize_chunk。请先使用原 messages_handle 重试每个失败的 Map 调用。不同 handle 不能证明覆盖同一批消息；若原 handle 已失效，本轮必须失败并由用户重新发起请求。全部 Map 成功后，再调用 merge_summaries 合并全部 summary_handle；不要直接输出最终答案。"
+					if anonymousMaps > 0 {
+						instruction = "本次请求仍有 summarize_chunk 参数无效或缺少 messages_handle。请修正参数，使用本次请求中正确的 messages_handle 逐一重试失败的 Map 调用；每个失败调用都需要一次后续成功。全部 Map 成功后，再调用 merge_summaries 合并全部 summary_handle；不要直接输出最终答案。"
+					}
+				}
+				msgs = append(msgs, Message{
+					Role:    "user",
+					Content: instruction,
+				})
+				continue
+			}
+		}
 
 		// SUM-158 blocker follow-up: 无工具调用 且 有 content = 模型给出最终答案，正常出口。
 		// 但如果 tool_calls 空 且 content 也空/空白，不能视为正常终止：
@@ -191,7 +228,7 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 		// 单跳内多工具并发执行；结果按原索引回填以保证顺序稳定、无数据竞争。
 		// Use the outer request ctx (300s ChatStream backstop) — NOT stepCtx.
 		// See the stepCtx setup comment above for why: LLM-backed tools like
-		// summarize_chunk run their own sequential LLM calls that legitimately
+		// summarize_chunk run their own bounded-concurrent LLM calls that legitimately
 		// exceed the 60s per-step planning budget.
 		results := r.runTools(ctx, turn.ToolCalls, step+1, r.policy.MaxSteps)
 		for i, tc := range turn.ToolCalls {
@@ -219,9 +256,18 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 		// 预算触顶：注入收尾指令，逼模型下一轮直接给答案。
 		// 这条纯运行时提示，不并入 newMsgs（不落库，避免污染历史）。
 		if totalTokens >= r.policy.MaxTokens {
+			instruction := "已达token预算，请基于现有信息直接给出最终答案，不要再调用工具。"
+			if store, storeErr := summaryHandleStoreFromContext(ctx); storeErr == nil && store.PendingMapFailures() > 0 {
+				instruction = "已达token预算，但仍有失败的 summarize_chunk。下一步只重试失败的 Map；全部成功后调用 merge_summaries，Reduce 成功后再直接输出最终答案。"
+			} else if storeErr == nil && store.NeedsReduce() {
+				// Never contradict the Reduce gate. A direct-answer instruction here
+				// makes the next planner turn skip merge_summaries, wasting one full
+				// LLM call before the gate can nudge it back.
+				instruction = "已达token预算，但本次请求仍有未合并的 Map 结果。下一步只调用 merge_summaries，传入全部 summary_handle；Reduce 成功后再直接输出最终答案。"
+			}
 			msgs = append(msgs, Message{
 				Role:    "user",
-				Content: "已达token预算，请基于现有信息直接给出最终答案，不要再调用工具。",
+				Content: instruction,
 			})
 		}
 	}
@@ -232,6 +278,7 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 // 结果写入预分配 slice 的固定索引，天然无写冲突；WaitGroup 收齐。
 func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps int) []string {
 	results := make([]string, len(calls))
+	hookOutcomes := make([]toolHookOutcome, len(calls))
 	var wg sync.WaitGroup
 	for i, tc := range calls {
 		wg.Add(1)
@@ -249,7 +296,21 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 				})
 			}
 
-			out, err := r.reg.Dispatch(ctx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+			toolCtx := withSummaryToolStep(ctx, step)
+			out, err := r.reg.Dispatch(toolCtx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+			if tc.Function.Name == "summarize_chunk" {
+				if store, storeErr := summaryHandleStoreFromContext(ctx); storeErr == nil {
+					target := toolCallTarget(tc.Function.Arguments)
+					if target == "" {
+						target = anonymousMapFailurePrefix + tc.ID
+					}
+					if err != nil {
+						store.MarkMapFailed(target, step)
+					} else {
+						store.MarkMapSucceeded(target, step)
+					}
+				}
+			}
 
 			toolElapsed := time.Since(toolStart).Milliseconds()
 
@@ -275,8 +336,10 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 				if SummaryV2Enabled() {
 					env := classifyToolError(tc.Function.Name, err)
 					results[i] = env.JSON()
-					if r.OnToolError != nil {
-						r.OnToolError(tc.Function.Name, toolCallTarget(tc.Function.Arguments), env)
+					hookOutcomes[i] = toolHookOutcome{
+						toolName: tc.Function.Name,
+						target:   toolCallTarget(tc.Function.Arguments),
+						err:      &env,
 					}
 				} else {
 					results[i] = "错误: " + err.Error()
@@ -288,13 +351,47 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 			// this tool+target was recoverable. Reported so the run's fatal marker can
 			// be cleared — see Runner.OnToolSuccess for why this is an observation
 			// rather than another error-string pattern.
-			if SummaryV2Enabled() && r.OnToolSuccess != nil {
-				r.OnToolSuccess(tc.Function.Name, toolCallTarget(tc.Function.Arguments))
+			if SummaryV2Enabled() {
+				hookOutcomes[i] = toolHookOutcome{
+					toolName: tc.Function.Name,
+					target:   toolCallTarget(tc.Function.Arguments),
+					success:  true,
+				}
 			}
 		})
 	}
 	wg.Wait()
+	r.reportToolHookOutcomes(hookOutcomes)
 	return results
+}
+
+type toolHookOutcome struct {
+	toolName string
+	target   string
+	err      *ToolErrorEnvelope
+	success  bool
+}
+
+// reportToolHookOutcomes makes the fatal-marker verdict independent of worker
+// completion order. All failures in one planner step are observed first, then
+// all successes. A same-step success for the same (tool, target) therefore
+// proves that the requested work completed despite a duplicate sibling call,
+// while failures for different targets remain latched.
+func (r *Runner) reportToolHookOutcomes(outcomes []toolHookOutcome) {
+	if r.OnToolError != nil {
+		for _, outcome := range outcomes {
+			if outcome.err != nil {
+				r.OnToolError(outcome.toolName, outcome.target, *outcome.err)
+			}
+		}
+	}
+	if r.OnToolSuccess != nil {
+		for _, outcome := range outcomes {
+			if outcome.success {
+				r.OnToolSuccess(outcome.toolName, outcome.target)
+			}
+		}
+	}
 }
 
 // extractToolCount extracts a cheap, safe integer count from a tool result.

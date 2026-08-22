@@ -259,7 +259,7 @@ func TestSummarizeChunkManifestMissesRecordedAsDropped(t *testing.T) {
 	t.Cleanup(func() { SetSummaryDeps(nil, nil, nil, config.Config{}) })
 
 	_, h := SummarizeChunkTool()
-	toolCtx := context.WithValue(ctx, ContextKeyUID, uid)
+	toolCtx := withSummaryHandleStore(context.WithValue(ctx, ContextKeyUID, uid))
 	toolCtx = context.WithValue(toolCtx, ContextKeySessionID, sessionID)
 	toolCtx = context.WithValue(toolCtx, ContextKeyRunID, run.RunID)
 	args, _ := json.Marshal(map[string]string{"messages_handle": handle})
