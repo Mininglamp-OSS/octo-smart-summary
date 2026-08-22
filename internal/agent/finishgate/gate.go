@@ -26,9 +26,19 @@ const (
 	GapChannel    = "channel"    // an expected channel was not fetched
 	GapCoverage   = "coverage"   // channel coverage was never measured
 	GapTruncation = "truncation" // the fetched pool was truncated
-	GapDropped    = "dropped"    // messages were dropped before the model
-	GapCitation   = "citation"   // citation integrity did not hold
-	GapToolError  = "tool_error" // a critical tool failed
+	// GapOutputTruncation reports that the MODEL'S OWN OUTPUT hit its token
+	// ceiling and stopped mid-sentence. Deliberately NOT folded into
+	// GapTruncation: the two describe opposite halves of the pipeline and need
+	// opposite remediation. GapTruncation means "we did not read everything"
+	// (retry with a narrower time range, or raise the per-channel cap);
+	// GapOutputTruncation means "we read everything but could not WRITE it all"
+	// (retry with a lower detail level or fewer output sections). Raising the
+	// fetch cap on an output-truncated run makes it strictly worse. They can
+	// also co-occur, and a single boolean would report only one of them.
+	GapOutputTruncation = "output_truncation"
+	GapDropped          = "dropped"    // messages were dropped before the model
+	GapCitation         = "citation"   // citation integrity did not hold
+	GapToolError        = "tool_error" // a critical tool failed
 )
 
 // Gap is a structured disclosure of one coverage/quality shortfall, surfaced to
@@ -76,6 +86,25 @@ type RunState struct {
 	Truncated         bool
 	DroppedMessages   int
 	FailedChannels    []string
+
+	// OutputTruncated reports that a model completion on the answer path was cut
+	// off by finish_reason=length, i.e. the deliverable itself is unfinished.
+	//
+	// Its own field rather than a second writer to Truncated: the two facts come
+	// from different halves of the pipeline and carry different advice (see
+	// GapOutputTruncation). Folding them together would have made the existing
+	// "fetched message pool was truncated" wording wrong for every
+	// output-truncated run — telling a user to narrow a time range that was never
+	// the problem. It sits outside the coverage group above for the same reason:
+	// it is a property of the GENERATION, not of the fetch.
+	//
+	// Fed from the run row (output_truncated), set by the producing paths through
+	// the SAME store-and-column channel every other run fact uses
+	// (RecordChannelFetch / AddDroppedMessages). That is what makes the guarantee
+	// hold: the disclosure is assembled from persisted evidence OUTSIDE the
+	// model's control, so a planner that rewrites or drops the inline prose
+	// notice cannot suppress it.
+	OutputTruncated bool
 
 	// DiscoveredChannels are the channels the run deliberately NARROWED to when no
 	// spec pinned a scope — the open-scope case, where ExpectedChannels is empty
@@ -208,6 +237,13 @@ func Evaluate(s RunState) (Verdict, []Gap) {
 	}
 	if s.Truncated {
 		gaps = append(gaps, Gap{Kind: GapTruncation, Detail: "fetched message pool was truncated"})
+	}
+	// Independent of the pool check above, and unconditional on CoverageMeasured:
+	// an output truncation is a property of the GENERATION, not of the fetch, so
+	// it must be disclosed even on turns that legitimately fetched nothing (a
+	// confident rewrite can still overrun its token ceiling).
+	if s.OutputTruncated {
+		gaps = append(gaps, Gap{Kind: GapOutputTruncation, Detail: "model output was truncated at its token limit; the summary is unfinished"})
 	}
 	if s.DroppedMessages > 0 {
 		gaps = append(gaps, Gap{Kind: GapDropped, Detail: "messages were dropped before summarization"})
