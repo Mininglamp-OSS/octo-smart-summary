@@ -350,3 +350,19 @@ func Numbers(text string) []int {
 	}
 	return out
 }
+
+// IsCitableAt reports whether the `[n]` occupying text[start:end] may be
+// treated as a citation marker. Exported wrapper over the guard CapRuns
+// applies internally.
+//
+// Exists so other pipeline stages enforce the SAME exemptions rather than
+// re-deriving them: worker.stripOrphanCitations previously ran with a bare
+// MarkerRe and no guard, which turned `[999](https://example.com/doc)` into
+// `(https://example.com/doc)` — exactly the damage this guard was added to
+// prevent, one stage later. One definition per mapping.
+func IsCitableAt(text string, start, end int) bool {
+	if start < 0 || end > len(text) || start >= end {
+		return false
+	}
+	return isCitable(text, []int{start, end})
+}

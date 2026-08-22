@@ -369,20 +369,41 @@ func isOnlyWhitespace(s string) bool {
 	return true
 }
 
+// stripOrphanCitations removes `[n]` markers that have no backing Citation
+// row.
+//
+// Skips non-citable `[n]` forms via citation.IsCitableAt, the same guard
+// CapRuns applies. Without it this function undid exactly the damage that
+// guard exists to prevent, one pipeline stage later:
+//
+//	in:  结论一[1][2]，详见 [999](https://example.com/doc)
+//	out: 结论一[1][2]，详见 (https://example.com/doc)     <- link destroyed
+//
+// A markdown link whose text happens to be a number is not a citation, has no
+// Citation row by construction, and so was deleted from every summary that
+// contained one. Pre-existing, not introduced by the cap — but a guard that
+// protects one of the two paths that need it is not a guard.
 func stripOrphanCitations(text string, citations []model.Citation) string {
 	validSet := make(map[int]bool)
 	for _, c := range citations {
 		validSet[c.Index] = true
 	}
-	result := citationRe.ReplaceAllStringFunc(text, func(match string) string {
-		sub := citationRe.FindStringSubmatch(match)
-		n, _ := strconv.Atoi(sub[1])
-		if validSet[n] {
-			return match
+	var b strings.Builder
+	b.Grow(len(text))
+	prev := 0
+	for _, m := range citationRe.FindAllStringSubmatchIndex(text, -1) {
+		if !citation.IsCitableAt(text, m[0], m[1]) {
+			continue
 		}
-		return ""
-	})
-	return strings.TrimSpace(multiSpaceRe.ReplaceAllString(result, " "))
+		n, err := strconv.Atoi(text[m[2]:m[3]])
+		if err != nil || validSet[n] {
+			continue
+		}
+		b.WriteString(text[prev:m[0]])
+		prev = m[1]
+	}
+	b.WriteString(text[prev:])
+	return strings.TrimSpace(multiSpaceRe.ReplaceAllString(b.String(), " "))
 }
 
 // finalizeCitations is the ONE definition of the worker's final citation

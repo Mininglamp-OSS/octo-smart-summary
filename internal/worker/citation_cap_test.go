@@ -3,6 +3,7 @@ package worker
 import (
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -335,4 +336,84 @@ func makeCapTestMessages(n int) []pipeline.Message {
 		})
 	}
 	return msgs
+}
+
+// P2-2. citation.isCitable exempts markdown links and reference definitions
+// from the cap, but stripOrphanCitations ran ~15 lines later with a bare
+// citationRe and no guard, doing exactly the damage the guard exists to
+// prevent. Pre-existing, not a cap regression — fixed because a guard that
+// protects one of the two paths that need it is not a guard.
+func TestStripOrphanCitationsPreservesMarkdownLinks(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		rows []model.Citation
+		want string
+	}{
+		{
+			name: "inline link with a numeric label",
+			in:   "结论一[1][2]，详见 [999](https://example.com/doc)",
+			rows: []model.Citation{{Index: 1}, {Index: 2}},
+			want: "结论一[1][2]，详见 [999](https://example.com/doc)",
+		},
+		{
+			name: "reference definition",
+			in:   "结论一[1]\n\n[999]: https://example.com/doc",
+			rows: []model.Citation{{Index: 1}},
+			want: "结论一[1]\n\n[999]: https://example.com/doc",
+		},
+		{
+			name: "genuine orphans are still stripped",
+			in:   "结论一[1][2][99]",
+			rows: []model.Citation{{Index: 1}, {Index: 2}},
+			want: "结论一[1][2]",
+		},
+		{
+			name: "orphan stripped, link preserved, in one body",
+			in:   "结论一[1][99]，详见 [42](https://example.com/x)",
+			rows: []model.Citation{{Index: 1}},
+			want: "结论一[1]，详见 [42](https://example.com/x)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := stripOrphanCitations(tc.in, tc.rows); got != tc.want {
+				t.Errorf("stripOrphanCitations:\n got: %q\nwant: %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// Mutation evidence for P2-2: the pre-fix implementation, reproduced inline,
+// must destroy the link.
+func TestMutationUnguardedStripDestroysMarkdownLinks(t *testing.T) {
+	const in = "结论一[1][2]，详见 [999](https://example.com/doc)"
+	rows := []model.Citation{{Index: 1}, {Index: 2}}
+
+	preFix := func(text string, citations []model.Citation) string {
+		valid := map[int]bool{}
+		for _, c := range citations {
+			valid[c.Index] = true
+		}
+		out := citationRe.ReplaceAllStringFunc(text, func(match string) string {
+			sub := citationRe.FindStringSubmatch(match)
+			n, _ := strconv.Atoi(sub[1])
+			if valid[n] {
+				return match
+			}
+			return ""
+		})
+		return strings.TrimSpace(multiSpaceRe.ReplaceAllString(out, " "))
+	}
+
+	old := preFix(in, rows)
+	if strings.Contains(old, "[999](") {
+		t.Fatal("MUTATION CHECK FAILED: the unguarded strip preserved the link, " +
+			"so this test does not pin the bug")
+	}
+	got := stripOrphanCitations(in, rows)
+	if !strings.Contains(got, "[999](https://example.com/doc)") {
+		t.Fatalf("guarded strip still damaged the link: %q", got)
+	}
+	t.Logf("MUTATION EVIDENCE: unguarded strip -> %q (link destroyed); guarded strip -> %q", old, got)
 }
