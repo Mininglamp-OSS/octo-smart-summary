@@ -615,6 +615,11 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, apiResponse{Code: 40100, Message: "missing auth context"})
 		return
 	}
+	// The runner itself (not only tool handlers) records planner-answer
+	// degradations against the owner-scoped summary run. Keep the authenticated
+	// identity on the request context passed to RunWithHistory; the per-tool UID
+	// wrapper below cannot supply values to the planner loop.
+	ctx = context.WithValue(ctx, agent.ContextKeyUID, uid)
 
 	// SS-03: persist the run/spec when V2 mode is enabled. Off → skipped entirely
 	// (byte-identical to pre-SS-03). Best-effort; never blocks the reply. The
@@ -915,6 +920,9 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		h.writeSSEErrorViaSink(sink, 40100, "missing auth context")
 		return
 	}
+	// ChatStream must carry the same runner-level identity as Chat. Tool-local
+	// UID injection does not reach planner-turn bookkeeping in RunWithHistory.
+	ctx = context.WithValue(ctx, agent.ContextKeyUID, uid)
 
 	// SS-03: persist run/spec when V2 mode is enabled (see Chat). Off → skipped.
 	// The returned run_id is injected into the tool context for the citation pass.

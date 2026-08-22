@@ -77,6 +77,44 @@ type noticeStrippingPlanner struct {
 	sawTruncatedMerge bool
 }
 
+// prematureTruncatedPlanner first tries to answer before its Map output has
+// been reduced. That truncated draft must be rejected without poisoning the
+// run; after a valid Reduce it returns a complete final answer.
+type prematureTruncatedPlanner struct {
+	calls int
+}
+
+func (c *prematureTruncatedPlanner) Chat(_ context.Context, msgs []Message, _ []Tool) (AssistantTurn, error) {
+	c.calls++
+	switch c.calls {
+	case 1:
+		return AssistantTurn{ToolCalls: []ToolCall{
+			mkToolCall("map-call", "summarize_chunk", `{}`),
+		}}, nil
+	case 2:
+		return AssistantTurn{Content: "premature truncated draft", Truncated: true}, nil
+	case 3:
+		var handles []string
+		for _, msg := range msgs {
+			if msg.Role != "tool" || msg.Name != "summarize_chunk" {
+				continue
+			}
+			var result struct {
+				SummaryHandle string `json:"summary_handle"`
+			}
+			if json.Unmarshal([]byte(msg.Content), &result) == nil && result.SummaryHandle != "" {
+				handles = append(handles, result.SummaryHandle)
+			}
+		}
+		args, _ := json.Marshal(map[string]interface{}{"summary_handles": handles})
+		return AssistantTurn{ToolCalls: []ToolCall{
+			mkToolCall("reduce-call", "merge_summaries", string(args)),
+		}}, nil
+	default:
+		return AssistantTurn{Content: "complete final answer"}, nil
+	}
+}
+
 func (c *noticeStrippingPlanner) Chat(_ context.Context, msgs []Message, _ []Tool) (AssistantTurn, error) {
 	var handles []string
 	merged := false
@@ -290,5 +328,83 @@ func TestNoOutputTruncationRecordedForCleanReduce(t *testing.T) {
 	})
 	if verdict != finishgate.Complete {
 		t.Fatalf("verdict = %s, want COMPLETE for a clean run (gaps=%v)", verdict, gaps)
+	}
+}
+
+// A content-only planner turn can be rejected by the pending Map/Reduce gate.
+// Its content is discarded, so its truncation must not survive as a one-way
+// latch after the planner performs the required Reduce and delivers a clean
+// final answer.
+func TestRejectedPrematureTruncatedAnswerDoesNotPoisonCleanFinal(t *testing.T) {
+	db := newTruncationRunDB(t)
+	if db == nil {
+		return
+	}
+	withReduceLLMAndDB(t, "", db)
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+
+	store := summaryrun.NewStore(db)
+	ctx := context.Background()
+	run, _, err := store.CreateOrGetRun(ctx, "u1", "sess-premature", "req-premature", model.ScopePolicyClosed)
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	ctx = context.WithValue(ctx, ContextKeyUID, "u1")
+	ctx = context.WithValue(ctx, ContextKeyRunID, run.RunID)
+
+	reg := NewRegistry()
+	reg.Register(Tool{Type: "function", Function: ToolFunction{Name: "summarize_chunk"}},
+		func(ctx context.Context, _ json.RawMessage) (string, error) {
+			handleStore, err := summaryHandleStoreFromContext(ctx)
+			if err != nil {
+				return "", err
+			}
+			handle, err := handleStore.PutAtStep("map body", 1, summaryToolStepFromContext(ctx))
+			if err != nil {
+				return "", err
+			}
+			return `{"summary_handle":"` + handle + `","chunk_count":1}`, nil
+		})
+	reg.Register(Tool{Type: "function", Function: ToolFunction{Name: "merge_summaries"}},
+		func(ctx context.Context, args json.RawMessage) (string, error) {
+			var req struct {
+				Handles []string `json:"summary_handles"`
+			}
+			if err := json.Unmarshal(args, &req); err != nil {
+				return "", err
+			}
+			handleStore, err := summaryHandleStoreFromContext(ctx)
+			if err != nil {
+				return "", err
+			}
+			resolved, err := handleStore.ResolveAllBefore(req.Handles, summaryToolStepFromContext(ctx))
+			if err != nil {
+				return "", err
+			}
+			handleStore.MarkReduced(resolved.Generation)
+			return `{"merged_summary":"complete merged summary","chunk_count":1}`, nil
+		})
+
+	client := &prematureTruncatedPlanner{}
+	runner := NewRunner(client, reg, NewPool(1), Policy{MaxSteps: 6, MaxTokens: 1 << 20, StepTimeout: time.Second})
+	out, newMsgs, err := runner.RunWithHistory(ctx, "system", nil, "summarize")
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if out != "complete final answer" {
+		t.Fatalf("out = %q, want clean final answer", out)
+	}
+	for _, msg := range newMsgs {
+		if msg.Content == "premature truncated draft" {
+			t.Fatalf("rejected truncated draft was persisted: %+v", newMsgs)
+		}
+	}
+
+	got, err := store.GetByID(ctx, "u1", run.RunID)
+	if err != nil {
+		t.Fatalf("reload run: %v", err)
+	}
+	if got.OutputTruncated {
+		t.Fatal("rejected truncated draft poisoned a later complete deliverable")
 	}
 }

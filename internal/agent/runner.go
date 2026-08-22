@@ -145,21 +145,6 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 		}
 		totalTokens += turn.Tokens
 
-		// A planner turn cut off at its token ceiling is the FINAL ANSWER being
-		// unfinished (llm.go only flags content-only turns; a truncated tool-call
-		// turn is rejected there). The client already appended the prose notice to
-		// turn.Content, but that notice is inside model-authored text: a later step
-		// can rewrite it, and history compaction can drop it. Latch the fact on the
-		// run row so the finish gate discloses it structurally regardless.
-		//
-		// Recorded here rather than in the client so the transport stays free of
-		// run/DB concerns, and recorded on EVERY truncated turn rather than only the
-		// terminating one because an intermediate truncated turn still feeds its
-		// partial text into the conversation the final answer is built from.
-		if turn.Truncated {
-			recordOutputTruncatedFromContext(ctx)
-		}
-
 		// A final answer is not valid while this request still has Map outputs that
 		// have not passed through one successful Reduce covering every handle. The
 		// model can otherwise skip merge_summaries (or ignore its parse error) and
@@ -217,6 +202,15 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 		}
 
 		if len(turn.ToolCalls) == 0 {
+			// A planner turn cut off at its token ceiling is recorded only once it
+			// has passed every acceptance gate and will actually be delivered. A
+			// premature answer rejected above is discarded rather than fed back into
+			// the conversation, so latching it would falsely mark a later complete
+			// Reduce/final answer as partial. The client has already appended the
+			// inline notice; this persisted fact is the model-proof disclosure channel.
+			if turn.Truncated {
+				recordOutputTruncatedFromContext(ctx)
+			}
 			stepElapsed := time.Since(stepStart).Milliseconds()
 			if r.OnEvent != nil {
 				r.OnEvent(Event{

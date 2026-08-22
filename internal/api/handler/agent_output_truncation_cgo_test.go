@@ -5,14 +5,77 @@ package handler
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/finishgate"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 )
+
+type handlerTruncatedPlanner struct{}
+
+func (*handlerTruncatedPlanner) Chat(context.Context, []agent.Message, []agent.Tool) (agent.AssistantTurn, error) {
+	return agent.AssistantTurn{Content: "truncated final answer", Truncated: true}, nil
+}
+
+// This pins the production wiring the lower-level agent tests cannot prove:
+// both HTTP handlers must put the authenticated uid and persisted run id on the
+// exact context handed to Runner.RunWithHistory.
+func TestAgentChatHandlersRecordPlannerOutputTruncation(t *testing.T) {
+	db := newFinalizeTestDB(t)
+	if db == nil {
+		return
+	}
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+	agent.SetSummaryDeps(db, nil, nil, config.Config{})
+	t.Cleanup(func() { agent.SetSummaryDeps(nil, nil, nil, config.Config{}) })
+
+	store := summaryrun.NewStore(db)
+	reg := agent.NewRegistry()
+	runner := agent.NewRunner(&handlerTruncatedPlanner{}, reg, agent.NewPool(1), agent.Policy{
+		MaxSteps: 1, MaxTokens: 1000, StepTimeout: time.Second,
+	})
+	handler := newAgentChatHandlerWithRunner(runner, "test-system", newFakeHistoryStore(), 10)
+	handler.runStore = store
+	router := setupAgentChatRouter(handler)
+
+	tests := []struct {
+		name      string
+		path      string
+		sessionID string
+		requestID string
+	}{
+		{name: "chat", path: "/api/v1/agent/chat", sessionID: "sess-handler-chat", requestID: "req-handler-chat"},
+		{name: "stream", path: "/api/v1/agent/chat/stream", sessionID: "sess-handler-stream", requestID: "req-handler-stream"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			body := strings.NewReader(`{"message":"summarize","session_id":"` + tc.sessionID + `","request_id":"` + tc.requestID + `","profile":"summary"}`)
+			req := httptest.NewRequest(http.MethodPost, tc.path, body)
+			req.Header.Set("Content-Type", "application/json")
+			router.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+			}
+
+			run, err := store.GetByRequest(context.Background(), testAgentChatUID, tc.sessionID, tc.requestID)
+			if err != nil {
+				t.Fatalf("get run: %v", err)
+			}
+			if !run.OutputTruncated {
+				t.Fatal("planner truncation was not recorded through the real handler context")
+			}
+		})
+	}
+}
 
 // THE LOAD-BEARING TEST: the truncation disclosure must not be defeatable by
 // the model.

@@ -40,7 +40,11 @@ import (
 // its bookkeeping write failed would trade a partial answer for no answer, which
 // the surrounding design explicitly refuses. A failed write is logged loudly.
 func recordOutputTruncated(ctx context.Context, uid, runID string) {
-	if !SummaryV2Enabled() || uid == "" || runID == "" {
+	if !SummaryV2Enabled() || runID == "" {
+		return
+	}
+	if uid == "" {
+		log.Printf("[truncation] skip output truncation record: missing uid for run=%s", runID)
 		return
 	}
 	summaryDB, _, _, _ := GetSummaryDeps()
