@@ -96,6 +96,13 @@ func MergeSummariesTool() (Tool, Handler) {
 			result["merged_summary"] = merged + service.TruncationNotice
 			result["truncated"] = true
 			result["truncation_notice"] = strings.TrimSpace(service.TruncationNotice)
+			// Also latch the fact on the run row. The three lines above disclose the
+			// truncation to the PLANNER; they cannot guarantee it reaches the USER,
+			// because the planner rewrites this tool result into its own final answer
+			// and may drop a notice that reads like meta-commentary. The run-row fact
+			// is read later by the finish gate, which assembles a structured gap the
+			// model has no way to edit. Both, not either.
+			recordOutputTruncatedFromContext(ctx)
 		}
 		data, err := json.Marshal(result)
 		if err != nil {

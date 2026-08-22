@@ -172,6 +172,10 @@ func (c *Client) attemptChat(ctx context.Context, model string, msgs []Message, 
 	}
 	choice := cr.Choices[0]
 	msg := choice.Message
+	// Set alongside the prose notice below, never instead of it: the notice tells
+	// the reader where the text stops, the flag lets the runner record a fact the
+	// model cannot edit away. See AssistantTurn.Truncated.
+	truncated := false
 	if choice.FinishReason == "length" {
 		if len(msg.ToolCalls) > 0 {
 			// Tool-call arguments can be syntactically present but cut off mid-JSON.
@@ -185,10 +189,12 @@ func (c *Client) attemptChat(ctx context.Context, model string, msgs []Message, 
 		// usable, so preserve it with an explicit disclosure instead of failing
 		// the whole request and discarding everything the model produced.
 		msg.Content += service.TruncationNotice
+		truncated = true
 	}
 	return AssistantTurn{
 		Content:   msg.Content,
 		ToolCalls: msg.ToolCalls,
 		Tokens:    cr.Usage.TotalTokens,
+		Truncated: truncated,
 	}, llmfallback.Success, nil
 }
