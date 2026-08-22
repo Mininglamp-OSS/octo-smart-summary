@@ -237,10 +237,19 @@ func TestRemapFinalizeCitations_LaterEvidenceSortingEarlierDoesNotStealMarkers(t
 
 func citeStr(n int) string { return "[" + strconv.Itoa(n) + "]" }
 
-// The load-bearing safety property: a marker that cannot be resolved is
-// DROPPED, never left pointing at whatever occupies its slot. Silent wrong
-// attribution is worse than a missing citation.
-func TestRemapFinalizeCitations_UnresolvableMarkersAreDropped(t *testing.T) {
+// R4 blocking 1 REVISED THIS CONTRACT, deliberately.
+//
+// Round 3 deleted an ordinal that was out of range in its own turn's pool. That
+// branch is what destroyed `GB/T 7714 [2020]` and `待办共 [3] 项`: an out-of-range
+// number is, by construction, a number the turn could NOT have been citing, so
+// treating it as a broken citation and deleting it is deleting prose. It is now
+// left byte-identical.
+//
+// The fail-closed half is unchanged and is asserted in the sibling test below:
+// a marker that DOES resolve to a real turn-pool message but whose message is
+// absent from the frozen merged pool is still dropped, because that one really
+// is a citation and a wrong citation is worse than a missing one.
+func TestRemapFinalizeCitations_OutOfRangeOrdinalIsTreatedAsProse(t *testing.T) {
 	at := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
 	rows := []model.AgentMessageEvidence{
 		evidenceRow(t, "msg_u1_1", at, []pipeline.Message{
@@ -250,16 +259,17 @@ func TestRemapFinalizeCitations_UnresolvableMarkersAreDropped(t *testing.T) {
 	}
 	finalPool := buildPoolFromEvidenceRows(rows)
 
-	// [9] is out of range in the reply's own turn pool (which holds 2 messages).
+	// [9] is out of range in the reply's own turn pool (which holds 2 messages),
+	// so it cannot be a citation this turn emitted — it is prose.
 	replies := []model.AgentMessage{
 		{ID: 1, CreatedAt: at, Content: "有效 [1],越界 [9]"},
 	}
 	got, dropped := remapFinalizeCitations(replies, rows, finalPool)
-	if dropped != 1 {
-		t.Fatalf("dropped = %d, want 1 (the out-of-range [9])", dropped)
+	if dropped != 0 {
+		t.Fatalf("dropped = %d, want 0 — an out-of-range ordinal is content, not a broken citation", dropped)
 	}
-	if strings.Contains(got[0].Content, "[9]") {
-		t.Fatalf("out-of-range marker survived: %q", got[0].Content)
+	if !strings.Contains(got[0].Content, "[9]") {
+		t.Fatalf("out-of-range token was deleted (this is the R4 blocking-1 defect): %q", got[0].Content)
 	}
 	if !strings.Contains(got[0].Content, "[1]") {
 		t.Fatalf("resolvable marker was lost: %q", got[0].Content)
