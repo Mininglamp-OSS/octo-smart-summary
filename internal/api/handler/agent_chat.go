@@ -372,9 +372,11 @@ func truncateRunes(s string, max int) string {
 // second fetch_channel, the model re-calls it and it works, the summary is
 // complete — and the user was shown finish_status=FAILED on a good deliverable.
 //
-// The hooks run concurrently from the tool worker pool, so state is mutex-guarded
-// and DB writes use a fresh context (the request context may already be canceled
-// by the very error being reported); SetStatus is a plain idempotent UPDATE.
+// The runner settles each tool step as a batch (errors before successes), so a
+// same-step success deterministically clears a duplicate sibling failure for the
+// same key. State remains mutex-guarded for direct/test callers, and DB writes use
+// a fresh context (the request context may already be canceled by the very error
+// being reported); SetStatus is a plain idempotent UPDATE.
 func (h *AgentChatHandler) attachToolErrorHook(runner *agent.Runner, userID, runID string) {
 	if runner == nil || userID == "" || runID == "" || h.runStore == nil {
 		return

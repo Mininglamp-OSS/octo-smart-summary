@@ -46,8 +46,9 @@ type Runner struct {
 	// gate FAILED). The target is passed because fetch_channel / summarize_chunk
 	// run once per channel/chunk through the worker pool: keying the fatal set on
 	// the tool name alone let one chunk's success clear a different chunk's fatal
-	// marker (verdict-by-scheduling). Nil-safe; must be goroutine-safe (runTools
-	// calls it from the worker pool).
+	// marker (verdict-by-scheduling). Nil-safe. runTools reports one completed
+	// step as a batch: errors first, then successes, so a successful sibling call
+	// for the same target deterministically wins over a same-step failure.
 	OnToolError func(toolName, target string, env ToolErrorEnvelope)
 
 	// OnToolSuccess is the counterpart, called when a tool call SUCCEEDS. It
@@ -63,7 +64,7 @@ type Runner struct {
 	// fact ("that tool worked on a later call") instead of guessed from text.
 	// A retry of the same target is a new tool_call with a new id but the SAME
 	// target, so the target (not the call id) is what makes recovery observable.
-	// Nil-safe; must be goroutine-safe.
+	// Nil-safe; emitted after the step's error callbacks.
 	OnToolSuccess func(toolName, target string)
 }
 
@@ -277,6 +278,7 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 // 结果写入预分配 slice 的固定索引，天然无写冲突；WaitGroup 收齐。
 func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps int) []string {
 	results := make([]string, len(calls))
+	hookOutcomes := make([]toolHookOutcome, len(calls))
 	var wg sync.WaitGroup
 	for i, tc := range calls {
 		wg.Add(1)
@@ -334,8 +336,10 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 				if SummaryV2Enabled() {
 					env := classifyToolError(tc.Function.Name, err)
 					results[i] = env.JSON()
-					if r.OnToolError != nil {
-						r.OnToolError(tc.Function.Name, toolCallTarget(tc.Function.Arguments), env)
+					hookOutcomes[i] = toolHookOutcome{
+						toolName: tc.Function.Name,
+						target:   toolCallTarget(tc.Function.Arguments),
+						err:      &env,
 					}
 				} else {
 					results[i] = "错误: " + err.Error()
@@ -347,13 +351,47 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 			// this tool+target was recoverable. Reported so the run's fatal marker can
 			// be cleared — see Runner.OnToolSuccess for why this is an observation
 			// rather than another error-string pattern.
-			if SummaryV2Enabled() && r.OnToolSuccess != nil {
-				r.OnToolSuccess(tc.Function.Name, toolCallTarget(tc.Function.Arguments))
+			if SummaryV2Enabled() {
+				hookOutcomes[i] = toolHookOutcome{
+					toolName: tc.Function.Name,
+					target:   toolCallTarget(tc.Function.Arguments),
+					success:  true,
+				}
 			}
 		})
 	}
 	wg.Wait()
+	r.reportToolHookOutcomes(hookOutcomes)
 	return results
+}
+
+type toolHookOutcome struct {
+	toolName string
+	target   string
+	err      *ToolErrorEnvelope
+	success  bool
+}
+
+// reportToolHookOutcomes makes the fatal-marker verdict independent of worker
+// completion order. All failures in one planner step are observed first, then
+// all successes. A same-step success for the same (tool, target) therefore
+// proves that the requested work completed despite a duplicate sibling call,
+// while failures for different targets remain latched.
+func (r *Runner) reportToolHookOutcomes(outcomes []toolHookOutcome) {
+	if r.OnToolError != nil {
+		for _, outcome := range outcomes {
+			if outcome.err != nil {
+				r.OnToolError(outcome.toolName, outcome.target, *outcome.err)
+			}
+		}
+	}
+	if r.OnToolSuccess != nil {
+		for _, outcome := range outcomes {
+			if outcome.success {
+				r.OnToolSuccess(outcome.toolName, outcome.target)
+			}
+		}
+	}
 }
 
 // extractToolCount extracts a cheap, safe integer count from a tool result.

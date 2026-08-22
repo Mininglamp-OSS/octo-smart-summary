@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestClassifyToolError(t *testing.T) {
@@ -291,6 +293,103 @@ func TestRunnerReportsToolSuccess(t *testing.T) {
 
 	if len(succeeded) != 1 || succeeded[0] != "fetch_channel" {
 		t.Fatalf("OnToolSuccess not fired for a successful call, got %v", succeeded)
+	}
+}
+
+// TestRunnerSameStepSuccessWinsRegardlessCompletionOrder pins PR #208 round-3
+// B1. Duplicate merge_summaries calls share one (tool, target) fatal-marker key.
+// A successful full Reduce in the same planner step must win over a failed
+// sibling regardless of which worker returns last; otherwise callback scheduling
+// can turn a saved deliverable into a false FAILED verdict.
+func TestRunnerSameStepSuccessWinsRegardlessCompletionOrder(t *testing.T) {
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+
+	for _, first := range []string{"success", "failure"} {
+		t.Run(first+" completes first", func(t *testing.T) {
+			started := make(chan string, 2)
+			finished := make(chan string, 2)
+			release := map[string]chan struct{}{
+				"success": make(chan struct{}),
+				"failure": make(chan struct{}),
+			}
+
+			reg := NewRegistry()
+			reg.Register(Tool{Type: "function", Function: ToolFunction{Name: "merge_summaries"}},
+				func(_ context.Context, args json.RawMessage) (string, error) {
+					var req struct {
+						Outcome string `json:"outcome"`
+					}
+					if err := json.Unmarshal(args, &req); err != nil {
+						return "", err
+					}
+					started <- req.Outcome
+					<-release[req.Outcome]
+					finished <- req.Outcome
+					if req.Outcome == "failure" {
+						return "", errors.New("reduce failed")
+					}
+					return `{"merged_summary":"complete"}`, nil
+				})
+
+			r := NewRunner(nil, reg, NewPool(2), Policy{})
+			var mu sync.Mutex
+			failed := false
+			errorsSeen := 0
+			successesSeen := 0
+			r.OnToolError = func(_, _ string, env ToolErrorEnvelope) {
+				mu.Lock()
+				defer mu.Unlock()
+				errorsSeen++
+				if env.Fatal {
+					failed = true
+				}
+			}
+			r.OnToolSuccess = func(_, _ string) {
+				mu.Lock()
+				defer mu.Unlock()
+				successesSeen++
+				failed = false
+			}
+
+			calls := []ToolCall{
+				mkToolCall("reduce-success", "merge_summaries", `{"outcome":"success"}`),
+				mkToolCall("reduce-failure", "merge_summaries", `{"outcome":"failure"}`),
+			}
+			done := make(chan struct{})
+			go func() {
+				r.runTools(context.Background(), calls, 1, 1)
+				close(done)
+			}()
+
+			<-started
+			<-started
+			close(release[first])
+			if got := <-finished; got != first {
+				t.Fatalf("first completed worker = %q, want %q", got, first)
+			}
+			// Give the first Dispatch return and its callback time to complete before
+			// releasing the sibling. This makes both historical callback orders
+			// deterministic while the production fix itself does not rely on timing.
+			time.Sleep(20 * time.Millisecond)
+			second := "success"
+			if first == "success" {
+				second = "failure"
+			}
+			close(release[second])
+			if got := <-finished; got != second {
+				t.Fatalf("second completed worker = %q, want %q", got, second)
+			}
+			<-done
+
+			mu.Lock()
+			defer mu.Unlock()
+			if errorsSeen != 1 || successesSeen != 1 {
+				t.Fatalf("callbacks = errors:%d successes:%d, want 1 each", errorsSeen, successesSeen)
+			}
+			if failed {
+				t.Fatal("same-step successful Reduce must clear its duplicate sibling failure")
+			}
+		})
 	}
 }
 
