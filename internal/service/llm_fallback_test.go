@@ -62,9 +62,8 @@ func TestCall_403EscalatesToFallback(t *testing.T) {
 	}
 }
 
-// TestCall_NoFallbackConfiguredSingleModel confirms the single-model contract
-// is unchanged when no fallback is configured: a 500 surfaces as an error and
-// no phantom fallback traffic occurs.
+// TestCall_NoFallbackConfiguredSingleModel confirms a single model exhausts
+// its retry budget without generating phantom fallback traffic.
 func TestCall_NoFallbackConfiguredSingleModel(t *testing.T) {
 	var count int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -78,8 +77,59 @@ func TestCall_NoFallbackConfiguredSingleModel(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from single-model 500")
 	}
-	if count != 1 {
-		t.Fatalf("expected exactly 1 request (MaxAttempts=1, no fallback), got %d", count)
+	if count != 3 {
+		t.Fatalf("expected exactly 3 same-model attempts and no fallback, got %d", count)
+	}
+}
+
+func TestCall_NonOKBelow400IsTerminal(t *testing.T) {
+	for _, status := range []int{http.StatusAccepted, http.StatusNoContent, http.StatusFound} {
+		t.Run(fmt.Sprintf("status_%d", status), func(t *testing.T) {
+			var count int
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				count++
+				w.WriteHeader(status)
+				if status != http.StatusNoContent {
+					_, _ = fmt.Fprint(w, `{}`)
+				}
+			}))
+			defer srv.Close()
+
+			client := NewLLMClient(srv.URL, "k", "primary", 5, 4096, false, 5, []string{"backup"})
+			content, tokens, usedModel, err := client.CallWithModel(context.Background(), []ChatMessage{{Role: "user", Content: "hi"}}, 0.1)
+			if err == nil || content != "" || tokens != 0 || usedModel != "primary" {
+				t.Fatalf("status %d got content=%q tokens=%d model=%q err=%v", status, content, tokens, usedModel, err)
+			}
+			if count != 1 {
+				t.Fatalf("status %d must be terminal without retry/fallback, requests=%d", status, count)
+			}
+		})
+	}
+}
+
+func TestCall_RetriesPrimaryBeforeFallback(t *testing.T) {
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		seen = append(seen, body.Model)
+		if body.Model == "primary" && len(seen) < 3 {
+			http.Error(w, "temporary", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"ok"}}],"usage":{"total_tokens":1}}`)
+	}))
+	defer srv.Close()
+
+	client := NewLLMClient(srv.URL, "k", "primary", 5, 4096, false, 5, []string{"backup"})
+	content, _, usedModel, err := client.CallWithModel(context.Background(), []ChatMessage{{Role: "user", Content: "hi"}}, 0.1)
+	if err != nil || content != "ok" || usedModel != "primary" {
+		t.Fatalf("got content=%q model=%q err=%v seen=%v", content, usedModel, err, seen)
+	}
+	if len(seen) != 3 || seen[0] != "primary" || seen[1] != "primary" || seen[2] != "primary" {
+		t.Fatalf("must retry primary before fallback, seen=%v", seen)
 	}
 }
 
@@ -217,5 +267,28 @@ func TestCallStream_PreEmissionFailureFallsBack(t *testing.T) {
 	}
 	if len(seen) != 2 || seen[0] != "primary" || seen[1] != "backup" {
 		t.Fatalf("expected pre-emission fallback, seen=%v", seen)
+	}
+}
+
+func TestCallStream_ReasoningOnlyIsTerminal(t *testing.T) {
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		seen = append(seen, body.Model)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"},\"finish_reason\":\"stop\"}],\"usage\":{\"total_tokens\":9}}\n\n")
+	}))
+	defer srv.Close()
+
+	client := NewLLMClient(srv.URL, "k", "primary", 5, 4096, false, 5, []string{"backup"})
+	content, tokens, usedModel, err := client.CallStreamWithModel(context.Background(), []ChatMessage{{Role: "user", Content: "hi"}}, 0.1, nil)
+	if err == nil || content != "" || tokens != 9 || usedModel != "primary" {
+		t.Fatalf("got content=%q tokens=%d model=%q err=%v", content, tokens, usedModel, err)
+	}
+	if len(seen) != 1 || seen[0] != "primary" {
+		t.Fatalf("deterministic reasoning-only response must not fallback, seen=%v", seen)
 	}
 }

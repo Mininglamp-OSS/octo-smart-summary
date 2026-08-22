@@ -85,8 +85,8 @@ type chatResponse struct {
 //     is replayed against each fallback in order (with a fresh 3-attempt
 //     budget). Terminal failures do not trigger fallback.
 //   - Deadline-aware escalation: before a same-model backoff, the shared
-//     runner reserves the backoff plus one full request timeout for the next
-//     fallback so it is not starved by the primary (issue #179 P1).
+//     runner reserves the backoff, pending retry and one full request timeout
+//     for the next fallback so it is not starved by the primary (#179 P1).
 //
 // A bounded, single-line log is emitted on every model switch to make silent
 // quality drift observable without dumping full upstream response bodies.
@@ -148,8 +148,12 @@ func (c *Client) attemptChat(ctx context.Context, model string, msgs []Message, 
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		return AssistantTurn{}, llmfallback.ClassifyStatus(resp.StatusCode), fmt.Errorf("http status %d: %s", resp.StatusCode, string(body))
+	if resp.StatusCode != http.StatusOK {
+		outcome := llmfallback.Terminal
+		if resp.StatusCode >= http.StatusBadRequest {
+			outcome = llmfallback.ClassifyStatus(resp.StatusCode)
+		}
+		return AssistantTurn{}, outcome, fmt.Errorf("http status %d: %s", resp.StatusCode, llmfallback.SafeTextForLog(string(body), 200))
 	}
 
 	var cr chatResponse

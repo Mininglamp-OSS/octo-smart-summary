@@ -119,7 +119,7 @@ func Run[T any](ctx context.Context, cfg Config, attempt Attempt[T]) (T, string,
 		}
 		if i > 0 {
 			log.Printf("[llmfallback] falling back from %q to %q: %s",
-				cfg.Models[i-1], model, safeErrorForLog(lastErr, 200))
+				cfg.Models[i-1], model, SafeErrorForLog(lastErr, 200))
 		}
 		hasNext := i < len(cfg.Models)-1
 
@@ -150,15 +150,16 @@ func runModel[T any](ctx context.Context, model string, maxAttempts int, hasNext
 	for a := 0; a < maxAttempts; a++ {
 		if a > 0 {
 			delay := cfg.backoff(a)
-			// Reserve both the backoff and one complete attempt for a fallback.
+			// Reserve the backoff, the pending same-model retry, and one complete
+			// attempt for a fallback.
 			// Checking before sleep prevents the backoff itself from consuming
-			// the budget that this branch exists to protect. If the context will
-			// expire during the backoff itself, let cancellation win instead of
-			// starting another doomed fallback request.
+			// the budget that this branch exists to protect. If the parent will
+			// expire during backoff, let cancellation win instead of contacting a
+			// fallback that cannot receive a meaningful attempt budget.
 			if hasNext && cfg.PerModelTimeout > 0 {
 				if dl, ok := ctx.Deadline(); ok {
 					remaining := time.Until(dl)
-					if remaining > delay && remaining < delay+cfg.PerModelTimeout {
+					if remaining > delay && remaining < delay+2*cfg.PerModelTimeout {
 						if lastErr == nil {
 							lastErr = fmt.Errorf("insufficient budget for another %s attempt on %q", cfg.PerModelTimeout, model)
 						}
@@ -175,6 +176,11 @@ func runModel[T any](ctx context.Context, model string, maxAttempts int, hasNext
 		val, outcome, err := attempt(ctx, model)
 		switch outcome {
 		case Success:
+			// Never let an inconsistent attempt result (Success plus error)
+			// become a silent empty success at the caller.
+			if err != nil {
+				return val, Terminal, err
+			}
 			return val, Success, nil
 		case Terminal:
 			return val, Terminal, err
@@ -187,14 +193,21 @@ func runModel[T any](ctx context.Context, model string, maxAttempts int, hasNext
 	return zero, TryNextModel, fmt.Errorf("model %q failed after %d attempt(s): %w", model, maxAttempts, lastErr)
 }
 
-func safeErrorForLog(err error, maxRunes int) string {
-	if err == nil {
-		return "unknown error"
-	}
-	s := strings.NewReplacer("\r", " ", "\n", " ", "\t", " ").Replace(err.Error())
+// SafeTextForLog flattens and bounds upstream-controlled text before it is
+// written to logs or embedded in an error that callers may log.
+func SafeTextForLog(s string, maxRunes int) string {
+	s = strings.NewReplacer("\r", " ", "\n", " ", "\t", " ").Replace(s)
 	runes := []rune(s)
 	if len(runes) <= maxRunes {
 		return s
 	}
 	return string(runes[:maxRunes]) + "...(truncated)"
+}
+
+// SafeErrorForLog is SafeTextForLog for errors.
+func SafeErrorForLog(err error, maxRunes int) string {
+	if err == nil {
+		return "unknown error"
+	}
+	return SafeTextForLog(err.Error(), maxRunes)
 }

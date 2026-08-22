@@ -45,6 +45,15 @@ func TestRun_TerminalPreservesPartialValue(t *testing.T) {
 	}
 }
 
+func TestRun_SuccessWithErrorIsTerminal(t *testing.T) {
+	val, used, err := Run(context.Background(), Config{Models: []string{"primary", "backup"}, MaxAttempts: 1}, func(_ context.Context, model string) (string, Outcome, error) {
+		return "partial", Success, errors.New("inconsistent success")
+	})
+	if err == nil || val != "partial" || used != "primary" {
+		t.Fatalf("got (%q,%q,%v), want defensive terminal failure on primary", val, used, err)
+	}
+}
+
 func TestRun_401IsTerminal(t *testing.T) {
 	var tried []string
 	_, _, err := Run(context.Background(), Config{Models: []string{"primary", "backup"}, MaxAttempts: 3, Backoff: noBackoff}, func(_ context.Context, model string) (string, Outcome, error) {
@@ -77,7 +86,10 @@ func TestRun_FallbackLogIsBoundedAndSingleLine(t *testing.T) {
 
 func TestRun_DeadlineCheckHappensBeforeBackoff(t *testing.T) {
 	var tried []string
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	// 250ms fits the 100ms backoff plus another primary attempt, but not the
+	// backoff plus both that retry and one complete fallback attempt. The old
+	// delay+T check retried primary here and starved the fallback.
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 	start := time.Now()
 	val, used, err := Run(ctx, Config{

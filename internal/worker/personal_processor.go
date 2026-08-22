@@ -1111,6 +1111,9 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 				return "", nil, 0, 0, "", fmt.Errorf("reduce: %w", err)
 			}
 		}
+		if strings.TrimSpace(finalContent) == "" {
+			return "", nil, 0, 0, "", fmt.Errorf("summary generation returned empty content")
+		}
 		totalTokens += reduceTokens
 		timing.Observe(taskNo, "llm_reduce_summary", reduceStart)
 		log.Printf("[personal-worker] Reduce phase took %dms", time.Since(reduceStart).Milliseconds())

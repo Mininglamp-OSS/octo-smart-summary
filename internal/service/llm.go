@@ -184,6 +184,17 @@ func (c *LLMClient) buildThinkingConfig(model string) (*ThinkingParam, map[strin
 	return nil, nil
 }
 
+// classifyNonOKStatus preserves the service client's historical contract:
+// only HTTP 200 is a successful chat completion. Retry/fallback classification
+// applies to HTTP errors; non-200 2xx/3xx responses are terminal protocol
+// errors instead of silent successes.
+func classifyNonOKStatus(code int) llmfallback.Outcome {
+	if code >= http.StatusBadRequest {
+		return llmfallback.ClassifyStatus(code)
+	}
+	return llmfallback.Terminal
+}
+
 // Call makes a chat completion request. Returns (content, tokenUsed, error).
 func (c *LLMClient) Call(ctx context.Context, messages []ChatMessage, temperature float64) (string, int, error) {
 	content, tokens, _, err := c.CallWithModel(ctx, messages, temperature)
@@ -198,11 +209,11 @@ func (c *LLMClient) CallWithModel(ctx context.Context, messages []ChatMessage, t
 		content string
 		tokens  int
 	}
-	// MaxAttempts:1 — same-model retries are provided by the outer Map/Reduce
-	// loops that call Call; the runner only adds cross-model fallback here.
+	// Keep retry ownership in the shared runner: exhaust transient failures on
+	// one model before switching to the next model.
 	res, usedModel, err := llmfallback.Run(ctx, llmfallback.Config{
 		Models:      c.models(),
-		MaxAttempts: 1,
+		MaxAttempts: 3,
 	}, func(ctx context.Context, model string) (result, llmfallback.Outcome, error) {
 		temp := temperature
 		if config.IsKimiModel(model) {
@@ -243,8 +254,8 @@ func (c *LLMClient) CallWithModel(ctx context.Context, messages []ChatMessage, t
 			return result{}, llmfallback.RetrySameModel, err
 		}
 		if resp.StatusCode != http.StatusOK {
-			return result{}, llmfallback.ClassifyStatus(resp.StatusCode),
-				fmt.Errorf("LLM API error: status=%d body=%s", resp.StatusCode, string(respBody))
+			return result{}, classifyNonOKStatus(resp.StatusCode),
+				fmt.Errorf("LLM API error: status=%d body=%s", resp.StatusCode, llmfallback.SafeTextForLog(string(respBody), 200))
 		}
 		var chatResp chatResponse
 		if err := json.Unmarshal(respBody, &chatResp); err != nil {
@@ -305,11 +316,11 @@ func (c *LLMClient) CallStreamWithModel(ctx context.Context, messages []ChatMess
 	// Cross-model fallback is only safe BEFORE the stream starts emitting: once
 	// onDelta receives content we are committed to that model, because switching
 	// would double-emit. Failures after HTTP 200 but before the first delivered
-	// delta may still try the next model. MaxAttempts:1 — outer Map/Reduce loops
-	// own same-model retries.
+	// delta may still try the next model. Transient failures exhaust the current
+	// model's retry budget before switching models.
 	res, usedModel, err := llmfallback.Run(ctx, llmfallback.Config{
 		Models:      c.models(),
-		MaxAttempts: 1,
+		MaxAttempts: 3,
 	}, func(ctx context.Context, model string) (result, llmfallback.Outcome, error) {
 		temp := temperature
 		if config.IsKimiModel(model) {
@@ -351,8 +362,8 @@ func (c *LLMClient) CallStreamWithModel(ctx context.Context, messages []ChatMess
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
 			respBody, _ := io.ReadAll(resp.Body)
-			return result{}, llmfallback.ClassifyStatus(resp.StatusCode),
-				fmt.Errorf("LLM stream API error: status=%d body=%s", resp.StatusCode, string(respBody))
+			return result{}, classifyNonOKStatus(resp.StatusCode),
+				fmt.Errorf("LLM stream API error: status=%d body=%s", resp.StatusCode, llmfallback.SafeTextForLog(string(respBody), 200))
 		}
 
 		var sb strings.Builder
@@ -418,10 +429,12 @@ func (c *LLMClient) CallStreamWithModel(ctx context.Context, messages []ChatMess
 		}
 		content := sb.String()
 		if content == "" && reasoningLen > 0 {
-			return streamFailure(fmt.Errorf("LLM returned empty streamed content: reasoning consumed output budget"))
+			return result{tokens: totalTokens}, llmfallback.Terminal,
+				fmt.Errorf("LLM returned empty streamed content: reasoning consumed output budget")
 		}
 		if content == "" && finishReason == "length" {
-			return streamFailure(fmt.Errorf("LLM returned empty streamed content due to token limit"))
+			return result{tokens: totalTokens}, llmfallback.Terminal,
+				fmt.Errorf("LLM returned empty streamed content due to token limit")
 		}
 		if content == "" {
 			return streamFailure(fmt.Errorf("LLM returned empty streamed content"))
@@ -435,7 +448,7 @@ func (c *LLMClient) CallStreamWithModel(ctx context.Context, messages []ChatMess
 func (c *LLMClient) CallRaw(ctx context.Context, prompt string) (string, error) {
 	content, _, err := c.Call(ctx, []ChatMessage{{Role: "user", Content: prompt}}, 0.3)
 	if err != nil {
-		log.Printf("[llm] CallRaw failed: %v", err)
+		log.Printf("[llm] CallRaw failed: %s", llmfallback.SafeErrorForLog(err, 200))
 		return "[]", nil
 	}
 	return content, nil
@@ -508,8 +521,8 @@ func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, t
 			return result{}, llmfallback.RetrySameModel, fmt.Errorf("read response body: %w", rerr)
 		}
 		if resp.StatusCode != http.StatusOK {
-			return result{}, llmfallback.ClassifyStatus(resp.StatusCode),
-				fmt.Errorf("LLM API error: status=%d body=%s", resp.StatusCode, string(respBody))
+			return result{}, classifyNonOKStatus(resp.StatusCode),
+				fmt.Errorf("LLM API error: status=%d body=%s", resp.StatusCode, llmfallback.SafeTextForLog(string(respBody), 200))
 		}
 
 		var chatResp chatResponseWithTools
@@ -552,7 +565,7 @@ func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, t
 		return result{args: args, tokens: chatResp.Usage.TotalTokens}, llmfallback.Success, nil
 	})
 	if err != nil {
-		log.Printf("[llm] CallWithTools: tool=%s took %dms error=%v", forceFn, time.Since(start).Milliseconds(), err)
+		log.Printf("[llm] CallWithTools: tool=%s took %dms error=%s", forceFn, time.Since(start).Milliseconds(), llmfallback.SafeErrorForLog(err, 200))
 		return "", 0, fmt.Errorf("CallWithTools failed: %w", err)
 	}
 	log.Printf("[llm] CallWithTools: tool=%s took %dms tokens=%d", forceFn, time.Since(start).Milliseconds(), res.tokens)
@@ -664,22 +677,17 @@ func (c *LLMClient) CallMapWithModel(ctx context.Context, formattedMessages stri
 	userPrompt := fmt.Sprintf("来源：%s\n时间范围：%s ~ %s\n消息数：%d 条\n\n聊天记录：\n%s",
 		sourceName, timeStart, timeEnd, msgCount, formattedMessages)
 
-	for attempt := 0; attempt < 3; attempt++ {
-		content, tokens, usedModel, err := c.CallWithModel(ctx, []ChatMessage{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: userPrompt},
-		}, 0.1)
-		if err == nil {
-			return content, tokens, usedModel, nil
-		}
-		log.Printf("[llm] Map chunk %d attempt %d failed: %v", chunkIndex, attempt+1, err)
-		errMsg := err.Error()
-		if strings.Contains(errMsg, "reasoning consumed") || strings.Contains(errMsg, "empty content due to token limit") {
-			return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d", chunkIndex)
-		}
-		if attempt < 2 {
-			time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
-		}
+	content, tokens, usedModel, err := c.CallWithModel(ctx, []ChatMessage{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: userPrompt},
+	}, 0.1)
+	if err == nil {
+		return content, tokens, usedModel, nil
+	}
+	log.Printf("[llm] Map chunk %d failed: %s", chunkIndex, llmfallback.SafeErrorForLog(err, 200))
+	errMsg := err.Error()
+	if strings.Contains(errMsg, "reasoning consumed") || strings.Contains(errMsg, "empty content due to token limit") {
+		return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d", chunkIndex)
 	}
 	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, c.model, nil
 }
@@ -736,25 +744,20 @@ func (c *LLMClient) CallMapStreamWithModel(ctx context.Context, formattedMessage
 		}
 		return onDelta(delta)
 	}
-	for attempt := 0; attempt < 3; attempt++ {
-		content, tokens, usedModel, err := c.CallStreamWithModel(ctx, []ChatMessage{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: userPrompt},
-		}, 0.1, wrappedDelta)
-		if err == nil {
-			return content, tokens, usedModel, nil
-		}
-		log.Printf("[llm] Stream Map chunk %d attempt %d failed: %v", chunkIndex, attempt+1, err)
-		if emitted {
-			return content, tokens, usedModel, err
-		}
-		errMsg := err.Error()
-		if strings.Contains(errMsg, "reasoning consumed") || strings.Contains(errMsg, "empty content") {
-			return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d", chunkIndex)
-		}
-		if attempt < 2 {
-			time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
-		}
+	content, tokens, usedModel, err := c.CallStreamWithModel(ctx, []ChatMessage{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: userPrompt},
+	}, 0.1, wrappedDelta)
+	if err == nil {
+		return content, tokens, usedModel, nil
+	}
+	log.Printf("[llm] Stream Map chunk %d failed: %s", chunkIndex, llmfallback.SafeErrorForLog(err, 200))
+	if emitted {
+		return content, tokens, usedModel, err
+	}
+	errMsg := err.Error()
+	if strings.Contains(errMsg, "reasoning consumed") || strings.Contains(errMsg, "empty content") {
+		return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d", chunkIndex)
 	}
 	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, c.model, nil
 }
