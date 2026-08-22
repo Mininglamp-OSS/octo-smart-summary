@@ -1,12 +1,16 @@
 package worker
 
 import (
+	"encoding/json"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
 
 func TestBuildFinalizeConsolidationPrompt(t *testing.T) {
@@ -128,6 +132,189 @@ func TestBudgetFinalizeReplies_NeverEmptiesThePrompt(t *testing.T) {
 	got, _ := p.budgetFinalizeReplies("", replies)
 	if len(got) != 1 {
 		t.Fatalf("kept %d fragments, want the single oversized one", len(got))
+	}
+}
+
+// --- cross-turn citation drift (BLOCKING 1) -------------------------------
+
+// evidenceRow builds one agent_message_evidence row holding the given messages,
+// stamped at the moment that turn's tool call persisted it.
+func evidenceRow(t *testing.T, handle string, at time.Time, msgs []pipeline.Message) model.AgentMessageEvidence {
+	t.Helper()
+	buf, err := json.Marshal(msgs)
+	if err != nil {
+		t.Fatalf("marshal evidence: %v", err)
+	}
+	return model.AgentMessageEvidence{
+		UserID: "u1", SessionID: "s1", Handle: handle,
+		Evidence:  string(buf),
+		CreatedAt: at,
+		UpdatedAt: at,
+	}
+}
+
+func poolMsg(channel string, seq int64, ts int64, content string) pipeline.Message {
+	return pipeline.Message{
+		MessageSeq: seq, ChannelID: channel, Timestamp: ts,
+		SenderUID: "sender-" + channel, SenderName: "Sender " + channel,
+		Content: content,
+	}
+}
+
+// THE regression the reviewers asked for by name.
+//
+// Turn 1 fetches #alpha (today) and cites [3] = alpha's 3rd message. Turn 3
+// then fetches #beta (LAST WEEK) — evidence persisted LATER whose messages sort
+// EARLIER. In the merged pool beta occupies 1..4 and alpha shifts to 5..7, so
+// turn 1's preserved [3] would resolve to a BETA message: in range, so
+// BuildCitations clamps nothing and logs nothing — confidently wrong
+// attribution. The remap must rewrite it to alpha's message 3 new index.
+func TestRemapFinalizeCitations_LaterEvidenceSortingEarlierDoesNotStealMarkers(t *testing.T) {
+	turn1At := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	turn3At := turn1At.Add(2 * time.Hour)
+
+	// alpha: today 10:00-ish (timestamps 1000..1002)
+	alpha := []pipeline.Message{
+		poolMsg("alpha", 1, 1000, "alpha-1"),
+		poolMsg("alpha", 2, 1001, "alpha-2"),
+		poolMsg("alpha", 3, 1002, "alpha-3 THE ONE"),
+	}
+	// beta: last week (timestamps 10..13) — sorts BEFORE all of alpha.
+	beta := []pipeline.Message{
+		poolMsg("beta", 1, 10, "beta-1"),
+		poolMsg("beta", 2, 11, "beta-2"),
+		poolMsg("beta", 3, 12, "beta-3"),
+		poolMsg("beta", 4, 13, "beta-4"),
+	}
+
+	rows := []model.AgentMessageEvidence{
+		evidenceRow(t, "msg_u1_1", turn1At, alpha),
+		evidenceRow(t, "msg_u1_2", turn3At, beta),
+	}
+	finalPool := buildPoolFromEvidenceRows(rows)
+
+	// Sanity: the merged pool really does put beta first, i.e. the drift
+	// precondition holds. Without this the test could pass vacuously.
+	if finalPool[0].ChannelID != "beta" {
+		t.Fatalf("precondition failed: merged pool starts with %s, want beta (later-fetched, earlier-timestamped)",
+			finalPool[0].ChannelID)
+	}
+	var alpha3Final int
+	for _, m := range finalPool {
+		if m.ChannelID == "alpha" && m.MessageSeq == 3 {
+			alpha3Final = m.CitationIndex
+		}
+	}
+	if alpha3Final == 3 {
+		t.Fatal("precondition failed: alpha#3 still has index 3 in the merged pool, so there is no drift to remap")
+	}
+
+	replies := []model.AgentMessage{
+		{ID: 1, CreatedAt: turn1At, Content: "确认了发布时间 [3]"},                             // turn 1 numbering
+		{ID: 2, CreatedAt: turn3At, Content: "上周也讨论过 [1],今天确认 " + citeStr(alpha3Final)}, // turn 3 numbering
+	}
+
+	got, dropped := remapFinalizeCitations(replies, rows, finalPool)
+	if dropped != 0 {
+		t.Fatalf("dropped = %d, want 0 — every marker here is resolvable", dropped)
+	}
+
+	// Turn 1's [3] must now name alpha#3 in the merged numbering, NOT beta#3.
+	want := citeStr(alpha3Final)
+	if !strings.Contains(got[0].Content, want) {
+		t.Fatalf("turn-1 fragment = %q, want it remapped to %s (alpha#3). Unremapped, [3] silently means %q",
+			got[0].Content, want, finalPool[2].Content)
+	}
+	if strings.Contains(got[0].Content, "[3]") && want != "[3]" {
+		t.Fatalf("turn-1 fragment still carries the stale [3]: %q", got[0].Content)
+	}
+	// Turn 3's markers were already in the final numbering; they must survive
+	// unchanged (its own pool IS the final pool).
+	if !strings.Contains(got[1].Content, "[1]") || !strings.Contains(got[1].Content, want) {
+		t.Fatalf("turn-3 fragment lost markers: %q", got[1].Content)
+	}
+}
+
+func citeStr(n int) string { return "[" + strconv.Itoa(n) + "]" }
+
+// The load-bearing safety property: a marker that cannot be resolved is
+// DROPPED, never left pointing at whatever occupies its slot. Silent wrong
+// attribution is worse than a missing citation.
+func TestRemapFinalizeCitations_UnresolvableMarkersAreDropped(t *testing.T) {
+	at := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	rows := []model.AgentMessageEvidence{
+		evidenceRow(t, "msg_u1_1", at, []pipeline.Message{
+			poolMsg("alpha", 1, 1000, "alpha-1"),
+			poolMsg("alpha", 2, 1001, "alpha-2"),
+		}),
+	}
+	finalPool := buildPoolFromEvidenceRows(rows)
+
+	// [9] is out of range in the reply's own turn pool (which holds 2 messages).
+	replies := []model.AgentMessage{
+		{ID: 1, CreatedAt: at, Content: "有效 [1],越界 [9]"},
+	}
+	got, dropped := remapFinalizeCitations(replies, rows, finalPool)
+	if dropped != 1 {
+		t.Fatalf("dropped = %d, want 1 (the out-of-range [9])", dropped)
+	}
+	if strings.Contains(got[0].Content, "[9]") {
+		t.Fatalf("out-of-range marker survived: %q", got[0].Content)
+	}
+	if !strings.Contains(got[0].Content, "[1]") {
+		t.Fatalf("resolvable marker was lost: %q", got[0].Content)
+	}
+}
+
+// The other unresolvable case: the marker resolves to a real message in its own
+// turn, but that message is absent from the frozen merged pool. It must be
+// dropped rather than silently re-pointed.
+func TestRemapFinalizeCitations_MarkerAbsentFromFinalPoolIsDropped(t *testing.T) {
+	at := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	turnRows := []model.AgentMessageEvidence{
+		evidenceRow(t, "msg_u1_1", at, []pipeline.Message{
+			poolMsg("alpha", 1, 1000, "alpha-1"),
+			poolMsg("gone", 7, 1001, "evicted from the frozen pool"),
+		}),
+	}
+	// The frozen merged pool lacks the "gone" channel entirely.
+	finalPool := buildPoolFromEvidenceRows([]model.AgentMessageEvidence{
+		evidenceRow(t, "msg_u1_1", at, []pipeline.Message{poolMsg("alpha", 1, 1000, "alpha-1")}),
+	})
+
+	replies := []model.AgentMessage{{ID: 1, CreatedAt: at, Content: "保留 [1],悬空 [2]"}}
+	got, dropped := remapFinalizeCitations(replies, turnRows, finalPool)
+	if dropped != 1 {
+		t.Fatalf("dropped = %d, want 1 (the marker whose message is not in the frozen pool)", dropped)
+	}
+	if strings.Contains(got[0].Content, "[2]") {
+		t.Fatalf("dangling marker survived: %q", got[0].Content)
+	}
+	if !strings.Contains(got[0].Content, "[1]") {
+		t.Fatalf("resolvable marker was lost: %q", got[0].Content)
+	}
+}
+
+// A single-turn session must be a no-op: its own pool IS the final pool, so
+// every marker maps to itself. This pins that the remap does not disturb the
+// common case.
+func TestRemapFinalizeCitations_SingleTurnIsIdentity(t *testing.T) {
+	at := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	rows := []model.AgentMessageEvidence{
+		evidenceRow(t, "msg_u1_1", at, []pipeline.Message{
+			poolMsg("alpha", 1, 1000, "a"),
+			poolMsg("alpha", 2, 1001, "b"),
+			poolMsg("alpha", 3, 1002, "c"),
+		}),
+	}
+	finalPool := buildPoolFromEvidenceRows(rows)
+	replies := []model.AgentMessage{{ID: 1, CreatedAt: at, Content: "x [1] y [3]"}}
+	got, dropped := remapFinalizeCitations(replies, rows, finalPool)
+	if dropped != 0 {
+		t.Fatalf("dropped = %d, want 0", dropped)
+	}
+	if got[0].Content != "x [1] y [3]" {
+		t.Fatalf("single-turn remap changed the fragment: %q", got[0].Content)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -84,7 +85,23 @@ func (p *Processor) executeAgentFinalize(ctx context.Context, task model.Summary
 	// is disclosed to the model so it does not claim coverage it does not have.
 	replies, droppedOld := p.budgetFinalizeReplies(task.Title, replies)
 
-	// 3. One lightweight consolidation pass over the already-usable fragments.
+	// 3. Rebuild the session's frozen evidence pool and REMAP every fragment's
+	// [n] markers into it before they are concatenated.
+	//
+	// The pool is bounded by the newest merged reply's timestamp so evidence
+	// written after the user clicked finalize cannot shift indices (the FORWARD
+	// drift vector). The remap below closes the CROSS-TURN vector, which is
+	// structural to merging and which the bound alone cannot touch — see
+	// remapFinalizeCitations.
+	evidenceRows := loadSessionEvidenceRows(ctx, p.db, userID, sessionID, replies[len(replies)-1].CreatedAt)
+	pool := buildPoolFromEvidenceRows(evidenceRows)
+	replies, droppedMarkers := remapFinalizeCitations(replies, evidenceRows, pool)
+	if droppedMarkers > 0 {
+		log.Printf("[finalize] task %d session %s: dropped %d unresolvable citation marker(s) during cross-turn remap",
+			task.ID, sessionID, droppedMarkers)
+	}
+
+	// 4. One lightweight consolidation pass over the already-usable fragments.
 	//
 	// Call, NOT CallRaw. CallRaw swallows every error and returns ("[]", nil) —
 	// a sane degraded value for its intended use (topic narrowing), and a silent
@@ -103,17 +120,9 @@ func (p *Processor) executeAgentFinalize(ctx context.Context, task model.Summary
 		return "", nil, 0, 0, modelVer, fmt.Errorf("consolidation produced empty content for session %s", sessionID)
 	}
 
-	// 4. Citations from the session's frozen evidence pool (same discovery
-	// source as the agent save path), so the [n] markers preserved through the
-	// merge resolve to real messages.
-	//
-	// The pool is bounded by the newest merged reply's timestamp: the body was
-	// frozen at save time, and the NUMBER SPACE has to be frozen with it. Indices
-	// are assigned positionally after a timestamp sort, so evidence written after
-	// the user clicked finalize would shift every later index and silently
-	// re-point the preserved [n] markers at other messages.
-	evidenceBound := replies[len(replies)-1].CreatedAt
-	pool := gatherSessionEvidencePool(ctx, p.db, userID, sessionID, evidenceBound)
+	// 5. Citations resolve against the same frozen pool the markers were remapped
+	// into in step 3, so every surviving [n] points at the message its sentence
+	// was actually about.
 	nameMap := make(map[string]string, len(pool))
 	for _, m := range pool {
 		if m.SenderUID != "" && m.SenderName != "" {
@@ -122,7 +131,132 @@ func (p *Processor) executeAgentFinalize(ctx context.Context, task model.Summary
 	}
 	citations := BuildCitations(content, pool, pool, nameMap)
 
-	return content, citations, len(replies), tokens, modelVer, nil
+	// msg_count is the number of SOURCE IM messages, everywhere else in the
+	// system (personal_processor.go, api/handler/task.go, api/handler/personal.go
+	// all surface it raw to clients as msg_count / total_msg_count). Reporting
+	// len(replies) here would publish "3" for a finalize over a 500-message
+	// session — the same field name meaning two different things depending on
+	// which route produced the row. The frozen evidence pool IS this route's
+	// source-message set, so it is the honest denominator.
+	return content, citations, len(pool), tokens, modelVer, nil
+}
+
+// remapFinalizeCitations rewrites each fragment's [n] markers from the numbering
+// THAT TURN saw into the numbering of the final merged pool.
+//
+// Why this is necessary: [n] markers are not assigned once per session. They are
+// assigned once per TURN, positionally, over the evidence pool as it existed at
+// that moment (internal/agent/tool_summarize_chunk.go: sort, then
+// CitationIndex = i+1). So the ordinal a marker means is a function of which
+// evidence rows existed during that turn.
+//
+// Turn 1 fetches #alpha (today 10:00-11:00) → 8 messages, indices 1-8, and the
+// reply cites [3] = alpha's 3rd message. Turn 3 fetches #beta (last week) → 12
+// messages with EARLIER timestamps, so turn 3's pool sorts beta into 1-12 and
+// alpha shifts to 13-20. Finalize merges both replies against ONE pool built at
+// the newest reply — turn 3's numbering — and turn 1's preserved [3] now names a
+// beta message. BuildCitations only clamps OUT-OF-RANGE indices; 3 is in range,
+// so nothing is dropped and nothing is logged. The deliverable ships confidently
+// wrong attribution, which this file's own comments (and every reviewer) call
+// worse than a missing citation.
+//
+// The remap resolves each marker through MESSAGE IDENTITY (channel_id:message_seq)
+// rather than through its ordinal: turn pool index → identity → final pool index.
+//
+// FAIL CLOSED. A marker that cannot be resolved is DROPPED, never left pointing
+// at whatever now occupies its slot. Two ways that happens:
+//   - the index is out of range in its own turn's pool (the fragment cited
+//     something the re-derived pool does not contain);
+//   - the identity it resolves to is absent from the final pool (evidence that
+//     existed at that turn is not in the frozen merged set).
+//
+// KNOWN WEAKNESS — this RE-DERIVES each turn's numbering instead of reading an
+// authoritative record of it. PersistEvidence upserts with
+// ON DUPLICATE KEY UPDATE evidence = VALUES(evidence) and deliberately does NOT
+// refresh created_at, so a row rewritten after the fact re-derives differently
+// than the turn actually saw. The window is narrow — it needs a handle counter
+// to be reused, and handles are msg_<uid>_<counter> with a PROCESS-LOCAL counter
+// (internal/agent/cache.go), so it takes a process restart during a live session
+// — but it is real. Reading the frozen per-run manifests
+// (internal/agent/citation_manifest.go) would remove the re-derivation entirely;
+// it is not available in v0 because agent_message has no run_id column and
+// agent_citation_manifest is keyed by run_id, so a reply cannot be linked to its
+// own turn's manifest without a schema change.
+func remapFinalizeCitations(replies []model.AgentMessage, rows []model.AgentMessageEvidence, finalPool []pipeline.Message) ([]model.AgentMessage, int) {
+	if len(replies) == 0 {
+		return replies, 0
+	}
+
+	// identity → index in the final merged pool.
+	finalIdx := make(map[string]int, len(finalPool))
+	for _, m := range finalPool {
+		finalIdx[messageIdentity(m)] = m.CitationIndex
+	}
+
+	out := make([]model.AgentMessage, len(replies))
+	copy(out, replies)
+
+	dropped := 0
+	for i := range out {
+		// Re-derive the pool THIS turn saw: the same rows, filtered to those that
+		// already existed when the reply was written, run through the identical
+		// de-dup / sort / index rules so the numbering is byte-identical to what
+		// tool_summarize_chunk assigned. rows is already ordered
+		// (created_at ASC, handle ASC), and the filter keeps a prefix-by-time, so
+		// first-seen-wins de-dup resolves the same way a separate query would.
+		turnPool := buildPoolFromEvidenceRows(filterEvidenceRowsCreatedBefore(rows, out[i].CreatedAt))
+		turnIdentity := make(map[int]string, len(turnPool))
+		for _, m := range turnPool {
+			turnIdentity[m.CitationIndex] = messageIdentity(m)
+		}
+
+		fragment := out[i].Content
+		out[i].Content = citationRe.ReplaceAllStringFunc(fragment, func(match string) string {
+			sub := citationRe.FindStringSubmatch(match)
+			n, err := strconv.Atoi(sub[1])
+			if err != nil {
+				return match
+			}
+			identity, ok := turnIdentity[n]
+			if !ok {
+				dropped++
+				log.Printf("[finalize] dropping citation %s in fragment %d (msg id=%d): index out of range in its own turn's pool (size=%d)",
+					match, i+1, out[i].ID, len(turnPool))
+				return ""
+			}
+			target, ok := finalIdx[identity]
+			if !ok {
+				dropped++
+				log.Printf("[finalize] dropping citation %s in fragment %d (msg id=%d): message %s is absent from the frozen merged pool",
+					match, i+1, out[i].ID, identity)
+				return ""
+			}
+			return fmt.Sprintf("[%d]", target)
+		})
+	}
+	return out, dropped
+}
+
+// messageIdentity is the stable, index-independent name of a source message.
+// It is the same key gatherSessionEvidencePool de-dups on, so the two cannot
+// disagree about what "the same message" means.
+func messageIdentity(m pipeline.Message) string {
+	return fmt.Sprintf("%s:%d", m.ChannelID, m.MessageSeq)
+}
+
+// filterEvidenceRowsCreatedBefore keeps the rows that already existed when a
+// given reply was written, preserving input order.
+func filterEvidenceRowsCreatedBefore(rows []model.AgentMessageEvidence, bound time.Time) []model.AgentMessageEvidence {
+	if bound.IsZero() {
+		return rows
+	}
+	out := make([]model.AgentMessageEvidence, 0, len(rows))
+	for _, r := range rows {
+		if !r.CreatedAt.After(bound) {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // buildFinalizeConsolidationPrompt assembles the single consolidation prompt.
@@ -174,6 +308,13 @@ func buildFinalizeConsolidationPrompt(title string, replies []model.AgentMessage
 // then resolve to different messages — confidently wrong attribution, which is
 // worse than dropping the citations outright.
 //
+// NOTE: this bound freezes the pool against evidence written AFTER the click. It
+// does NOT by itself make a merged multi-turn body's markers correct — each turn
+// numbered against its own smaller pool, so the merge needs an explicit remap
+// (remapFinalizeCitations) on top of this bound. Do not read the bound as "the
+// number space is frozen"; it is not, and saying so is what the previous round's
+// comment here got wrong.
+//
 // Best-effort: on any DB or decode error it returns what it has (citations
 // degrade, the body does not).
 //
@@ -182,7 +323,44 @@ func buildFinalizeConsolidationPrompt(title string, replies []model.AgentMessage
 // together); this one is the filter that matters here because the cache tier the
 // others consult is not available in the worker process, so the JSON snapshot is
 // the only source.
+//
+// Split into loadSessionEvidenceRows + buildPoolFromEvidenceRows because the
+// cross-turn remap needs to rebuild N per-turn pools from ONE query rather than
+// issuing N queries; this composition is the original single-shot form, kept for
+// callers that only want the final pool.
+//
+// P2-8 follow-up note: this split makes the still-pending extraction of ONE
+// shared pool builder CHEAPER, not harder. buildPoolFromEvidenceRows is now a
+// pure (rows -> indexed pool) function with no DB, context or session coupling,
+// which is exactly the shape the two canonical builders would have to converge
+// on; what remains to reconcile is only the query/source tier (they consult a
+// cache tier this process does not have) and the ev.Handle == "" vs
+// ev.Evidence == "" filter.
 func gatherSessionEvidencePool(ctx context.Context, db *gorm.DB, userID, sessionID string, createdBefore time.Time) []pipeline.Message {
+	return buildPoolFromEvidenceRows(loadSessionEvidenceRows(ctx, db, userID, sessionID, createdBefore))
+}
+
+// loadSessionEvidenceRows fetches the session's evidence rows up to createdBefore,
+// in the canonical (created_at ASC, handle ASC) order the de-dup depends on.
+//
+// On created_at vs updated_at (P2-4): the bound stays on created_at, and both
+// this query and remapFinalizeCitations' per-turn filter use the SAME field, so
+// they cannot disagree about which rows a turn saw. The reviewer is right that
+// created_at immutability is not enforced by the writer — PersistEvidence upserts
+// with ON DUPLICATE KEY UPDATE evidence = VALUES(evidence) and deliberately does
+// not refresh created_at — so a row rewritten after the freeze passes this
+// filter with new content. Switching to updated_at would express "unchanged
+// since the freeze" more literally, but it would be WRONG for the remap: a row
+// legitimately created during turn 1 and touched during turn 5 would drop out of
+// turn 1's re-derived pool entirely, shifting turn 1's numbering away from what
+// that turn actually saw and turning correct markers into dropped ones.
+// created_at is the field that answers "did this row exist when that turn ran", which
+// is the question the remap asks. The rewritten-content risk is real but narrow
+// (it needs a process-local handle counter to be reused, i.e. a restart during a
+// live session) and is the same residual documented on remapFinalizeCitations;
+// the durable fix for both is reading the frozen per-run manifests, which needs
+// a schema change (agent_message has no run_id).
+func loadSessionEvidenceRows(ctx context.Context, db *gorm.DB, userID, sessionID string, createdBefore time.Time) []model.AgentMessageEvidence {
 	q := db.WithContext(ctx).
 		Where("user_id = ? AND session_id = ?", userID, sessionID)
 	if !createdBefore.IsZero() {
@@ -192,6 +370,14 @@ func gatherSessionEvidencePool(ctx context.Context, db *gorm.DB, userID, session
 	if err := q.Order("created_at ASC, handle ASC").Find(&rows).Error; err != nil {
 		return nil
 	}
+	return rows
+}
+
+// buildPoolFromEvidenceRows decodes, de-dups, sorts and positionally indexes the
+// evidence rows into a citation pool. This is the numbering rule
+// tool_summarize_chunk.go applies per turn; reproducing it byte-for-byte is what
+// makes the per-turn re-derivation in remapFinalizeCitations meaningful.
+func buildPoolFromEvidenceRows(rows []model.AgentMessageEvidence) []pipeline.Message {
 
 	var pool []pipeline.Message
 	seen := make(map[string]bool)
@@ -204,7 +390,7 @@ func gatherSessionEvidencePool(ctx context.Context, db *gorm.DB, userID, session
 			continue
 		}
 		for _, m := range msgs {
-			key := fmt.Sprintf("%s:%d", m.ChannelID, m.MessageSeq)
+			key := messageIdentity(m)
 			if !seen[key] {
 				pool = append(pool, m)
 				seen[key] = true
