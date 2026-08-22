@@ -207,6 +207,48 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		}
 	}
 
+	// --- symmetric in-flight finalize guard (mirror of the one in
+	// FinalizeAgentSummary) ---
+	//
+	// A successful save DELETEs every agent_message row of this session below
+	// ("temporary workshop" lifecycle). A queued finalize task for the SAME
+	// session has already frozen its input as an id bound over exactly those
+	// rows. If the DELETE commits first, the worker's bounded query matches ZERO
+	// rows, every retry hits the same empty set, and the task dies Failed after
+	// WorkerMaxRetry — while the user holds a 202 and a task handle, with the
+	// cause invisible from the finalize endpoint. The finalize route already
+	// refuses a second finalize on an in-flight session; this is the other half of
+	// that guard, and without it the guard is one-sided.
+	//
+	// deleted_at IS NULL matches the finalize guard and the poller: a soft-deleted
+	// Pending task will never be claimed, so counting it would block saves on this
+	// session forever.
+	//
+	// Placed AFTER the idempotency preflight for the same reason the finalize
+	// route places its guard there: a same-key replay must replay, not be 409'd.
+	var inflightFinalize int64
+	if err := h.db.WithContext(c.Request.Context()).
+		Model(&model.SummaryTask{}).
+		Where("creator_id = ? AND agent_session_id = ? AND trigger_type = ? AND status IN ? AND deleted_at IS NULL",
+			userID, req.SessionID, model.TriggerAgentFinalize,
+			[]int{model.StatusPending, model.StatusProcessing}).
+		Count(&inflightFinalize).Error; err != nil {
+		log.Printf("[handler] CreateAgentSummary in-flight finalize check failed session=%s: %v", req.SessionID, err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "check in-flight finalize failed"})
+		return
+	}
+	if inflightFinalize > 0 {
+		c.JSON(http.StatusConflict, apiResponse{
+			Code:    40009,
+			Message: "本次会话的定稿正在生成中，请等定稿完成后再保存",
+			Data: gin.H{
+				"reason":          "finalize_in_flight",
+				"recovery_action": "wait_for_finalize",
+			},
+		})
+		return
+	}
+
 	if req.OriginChannelID == nil {
 		// Not provided → resolve from session tool traces
 		resolvedID, resolvedType, err := h.resolveOriginChannelFromSession(c.Request.Context(), req.SessionID, userID)

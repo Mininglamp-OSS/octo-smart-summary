@@ -312,8 +312,37 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 		return ensureStream().Delta(delta)
 	}
 
-	// Execute pipeline
-	content, citations, msgCount, totalTokens, modelVer, err := p.executePersonalPipeline(ctx, task, participant.UserID, reportStage, streamDelta)
+	// Execute pipeline. Session-Finalize v0 (TriggerAgentFinalize) swaps the
+	// slow fetch+Map-Reduce core for a single consolidation over the agent's
+	// already-produced replies; everything else on this path (status CAS,
+	// persist, failure handling) is shared.
+	var (
+		content     string
+		citations   []model.Citation
+		msgCount    int
+		totalTokens int
+		modelVer    string
+		err         error
+	)
+	if task.TriggerType == model.TriggerAgentFinalize {
+		// R4 P2-7 — STATED DECISION, not an omission. This branch deliberately
+		// passes neither reportStage nor streamDelta, so workflow_stage never
+		// advances for a finalize and finishStreamDone is a no-op on it.
+		//
+		// The reason it is acceptable in v0: finalize is ONE LLM call over
+		// already-written fragments, not a multi-stage fetch + Map-Reduce, so
+		// there are no intermediate stages to report — the honest progress signal
+		// is the task status itself (Pending -> Processing -> Completed/Failed),
+		// which the 202 envelope tells the client to poll. v0 clients poll task
+		// status; nothing subscribes to a finalize stream.
+		//
+		// If a future client wants incremental output here, the work is to switch
+		// this call to CallStream and thread streamDelta through — a behavioural
+		// change with its own review, not a gap to be quietly patched.
+		content, citations, msgCount, totalTokens, modelVer, err = p.executeAgentFinalize(ctx, task, participant.UserID)
+	} else {
+		content, citations, msgCount, totalTokens, modelVer, err = p.executePersonalPipeline(ctx, task, participant.UserID, reportStage, streamDelta)
+	}
 	if err != nil {
 		log.Printf("[personal-worker] pipeline error task=%d user=%s: %v", taskID, participant.UserID, err)
 		finishStreamError("summary generation failed")
@@ -1145,6 +1174,18 @@ func SanitizeErrorForUser(errMsg string) string {
 
 func sanitizeErrorForUser(errMsg string) string {
 	switch {
+	// Session-Finalize v0 (R4 P2-5): the one failure a retry provably cannot
+	// heal. The sync save route hard-DELETEs a session's agent_message rows, so
+	// a finalize queued just before it finds nothing to consolidate and will
+	// find nothing on every attempt. The generic default tells the user to
+	// "retry later", which is the one action that cannot work.
+	case strings.Contains(errMsg, "finalize: session has no usable assistant content"):
+		return "本次会话的内容已被保存或清空，无法定稿；请重新对话后再定稿"
+	// Session-Finalize v0 (R4 P2-10): a single fragment larger than the whole
+	// prompt budget. Surfaced as a distinct pre-flight error instead of an
+	// opaque gateway rejection.
+	case strings.Contains(errMsg, "finalize: prompt exceeds the model budget"):
+		return "本次会话内容过长，超出模型单次处理上限；请缩短后重试"
 	case strings.Contains(errMsg, "LLM API error"):
 		return "AI 服务暂时不可用，请稍后重试"
 	case strings.Contains(errMsg, "context deadline exceeded"):

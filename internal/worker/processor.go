@@ -45,6 +45,11 @@ type Processor struct {
 	// get dispatched) is observable without running the LLM personal pipeline.
 	// Production leaves it nil and the real pool/processPersonalSummary is used.
 	dispatchPersonalFn func(taskID, participantRefID int64)
+	// finalizeLLMFn, when non-nil, replaces p.llm for the Session-Finalize
+	// consolidation call. Test-only seam (same shape as executePipelineFn) so
+	// executeAgentFinalize — the production core — is reachable from tests
+	// without a live LLM gateway. Production leaves it nil.
+	finalizeLLMFn finalizeLLMClient
 	// notifier delivers the terminal-state (Completed/Failed) IM-bot notification
 	// after a task's status is durably committed. nil = disabled (OnTaskTerminal
 	// is a no-op), so it is safe to call unconditionally.
@@ -254,6 +259,29 @@ func (p *Processor) dispatchPersonal(taskID, participantRefID int64) {
 	})
 }
 
+// taskExecutor picks the task-level executor for a task.
+//
+// Session-Finalize v0 (TriggerAgentFinalize) consolidates the agent's already
+// produced replies; it has no channels to discover and no messages to fetch.
+// Running executePipeline for it would perform channel discovery, participant
+// intersection, a full intent-recognition tool call, and a message fetch over
+// a zero-width time range — paying exactly the latency and cost this feature
+// exists to avoid, and letting a finalize FAIL for reasons that have nothing
+// to do with finalizing (e.g. an imDB channel-discovery error).
+//
+// The test seam still wins when injected, so existing pipeline tests are
+// unaffected. Extracted from processTask so the ROUTING DECISION itself is
+// testable without driving a whole task through the poller.
+func (p *Processor) taskExecutor(task model.SummaryTask) func(model.SummaryTask) error {
+	if p.executePipelineFn != nil {
+		return p.executePipelineFn
+	}
+	if task.TriggerType == model.TriggerAgentFinalize {
+		return p.executeFinalizeTask
+	}
+	return p.executePipeline
+}
+
 func (p *Processor) processTask(task model.SummaryTask) {
 	log.Printf("[processor] processing task %d (%s)", task.ID, task.TaskNo)
 
@@ -265,11 +293,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 		Message:  "开始处理",
 	})
 
-	exec := p.executePipeline
-	if p.executePipelineFn != nil {
-		exec = p.executePipelineFn
-	}
-	err := exec(task)
+	err := p.taskExecutor(task)(task)
 	if err != nil {
 		log.Printf("[processor] task %d failed: %v", task.ID, err)
 		errMsg := err.Error()

@@ -165,6 +165,9 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	// reference-based chat flow — see CHAT-REFERENCE-BASED-DESIGN-v1.)
 	agentSummaryH := handler.NewAgentSummaryHandler(db, imDB, llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
 	v1.POST("/summaries/agent", agentSummaryH.CreateAgentSummary)
+	// POST /summaries/agent/finalize — Session-Finalize v0: async consolidation
+	// of the whole conversation into one deliverable (202 + worker-generated).
+	v1.POST("/summaries/agent/finalize", agentSummaryH.FinalizeAgentSummary)
 
 	return r
 }
