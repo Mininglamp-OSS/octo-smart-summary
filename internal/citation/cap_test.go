@@ -166,22 +166,20 @@ func TestCapRunsDisabledIsByteIdentical(t *testing.T) {
 // invisible to the cap, and the syntactic forms that are not citations must
 // survive byte-identically.
 
-// escapeCitationMarkers is a verbatim copy of the production helper at
-// internal/worker/personal_processor.go:23. Copied rather than imported
-// because internal/citation must not depend on internal/worker (the agent
-// path could not then use it). If the production version ever changes, this
-// test's premise changes with it — which is exactly what should fail loudly.
-func escapeCitationMarkers(content string) string {
-	return MarkerRe.ReplaceAllString(content, "($1)")
-}
-
+// The escape helper itself is NOT duplicated here. A copy of
+// worker.escapeCitationMarkers cannot fail when the original changes; it just
+// silently stops testing the real thing. internal/worker's
+// TestEscapeCitationMarkersDefeatsTheCap exercises the genuine production
+// helper against CapRuns. What this test owns is the narrower, package-local
+// property: text in the ESCAPED FORM is invisible to the cap.
 func TestEscapedBodyMarkersAreInvisibleToCap(t *testing.T) {
 	// A chat message whose BODY happens to contain bracketed numbers — the
-	// exact case escapeCitationMarkers exists for.
-	body := "看下 [12] 号需求和 [13][14][15][16][17] 这几条"
-	escaped := escapeCitationMarkers(body)
+	// exact case worker.escapeCitationMarkers exists for, written out in its
+	// post-escape form so this test asserts the cap's behaviour, not a
+	// re-implementation of the escape.
+	escaped := "看下 (12) 号需求和 (13)(14)(15)(16)(17) 这几条"
 	if strings.Contains(escaped, "[") {
-		t.Fatalf("escape left brackets: %q", escaped)
+		t.Fatalf("fixture is not in escaped form: %q", escaped)
 	}
 	// Rendered into a prompt line the way formatChunkForLLM does: the real
 	// citation index is the line's leading marker, the body's numbers are not.
@@ -326,5 +324,150 @@ func TestPromptRuleZH(t *testing.T) {
 	// The prompt must state the same number the enforcement uses.
 	if strings.Contains(PromptRuleZH(5), " 3 ") {
 		t.Error("PromptRuleZH(5) mentions 3 — prompt/enforcement drift")
+	}
+}
+
+// --- Marker identity: number, not spelling ------------------------------
+
+// The cap's per-run dedup must key on the PARSED number. `[1]` and `[01]` are
+// two spellings of one source — worker.extractCitationIndexes resolves both to
+// 1 via strconv.Atoi — so keying on the raw match text let one source consume
+// two budget slots and evict a genuinely different second source.
+func TestCapKeysOnParsedNumberNotSpelling(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		max  int
+		want string
+	}{
+		{
+			// The reviewer's case. Pre-fix output was "结论 [1][01]": the whole
+			// budget went to source 1 twice and [2] — a different message —
+			// was deleted.
+			name: "leading zero is the same source",
+			in:   "结论 [1][01][2]",
+			max:  2,
+			want: "结论 [1][2]",
+		},
+		{
+			name: "multiple zeros",
+			in:   "结论[7][007][0007][8]",
+			max:  2,
+			want: "结论[7][8]",
+		},
+		{
+			name: "dedup is still lossless when under the cap",
+			in:   "结论[3][03][3]",
+			max:  3,
+			want: "结论[3]",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, st := CapRuns(tc.in, tc.max)
+			if got != tc.want {
+				t.Errorf("CapRuns(%q, %d) = %q, want %q", tc.in, tc.max, got, tc.want)
+			}
+			// The distinct sources that survive must be exactly the first
+			// `max` distinct NUMBERS of the input.
+			if n := len(Numbers(got)); n > tc.max {
+				t.Errorf("%d distinct sources survived, cap is %d", n, tc.max)
+			}
+			_ = st
+		})
+	}
+}
+
+// Mutation evidence for the spelling bug: the pre-fix keying is reproduced
+// inline and must produce the wrong answer, proving the assertion above is
+// driven by the fix.
+func TestMutationSpellingKeyDropsADistinctSource(t *testing.T) {
+	const in = "结论 [1][01][2]"
+
+	// Pre-fix behaviour: key on the whole match text.
+	preFix := func(text string, max int) string {
+		runs, _, _ := findRuns(text)
+		var out []string
+		for _, r := range runs {
+			seen := map[string]bool{}
+			kept := 0
+			for _, m := range r {
+				k := text[m[0]:m[1]]
+				if seen[k] || kept >= max {
+					continue
+				}
+				seen[k] = true
+				kept++
+				out = append(out, k)
+			}
+		}
+		return strings.Join(out, "")
+	}
+
+	old := preFix(in, 2)
+	if !strings.Contains(old, "[01]") || strings.Contains(old, "[2]") {
+		t.Fatalf("MUTATION CHECK FAILED: pre-fix keying produced %q; it was supposed to "+
+			"keep the duplicate spelling and drop the distinct source", old)
+	}
+	got, _ := CapRuns(in, 2)
+	if strings.Contains(got, "[01]") || !strings.Contains(got, "[2]") {
+		t.Fatalf("fixed CapRuns = %q, want [1][2]", got)
+	}
+	t.Logf("MUTATION EVIDENCE: spelling-keyed dedup -> %q (source 2 destroyed); "+
+		"number-keyed dedup -> %q", old, got)
+}
+
+// Numbers() must apply the same isCitable guard CapRuns does, or a caller
+// counting "citations in this body" reports a number the cap deliberately
+// never touches.
+func TestNumbersAppliesTheCitableGuard(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want []int
+	}{
+		{"markdown inline link is not a citation", "结论[1] 详见 [9](http://x)", []int{1}},
+		{"reference definition is not a citation", "结论[2]\n\n[9]: http://x", []int{2}},
+		{"plain markers all count", "结论[1][2][3]", []int{1, 2, 3}},
+		{"leading zeros collapse to one number", "结论[1][01][001]", []int{1}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Numbers(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("Numbers(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("Numbers(%q) = %v, want %v", tc.in, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// --- Fenced code blocks -------------------------------------------------
+
+// CapRuns is fence-blind, and so is every other stage in the pipeline
+// (buildCitations, dedupCitations, stripOrphanCitations all share MarkerRe
+// with no fence tracking). This test PINS that as the intended behaviour
+// rather than leaving it undiscovered: a marker-shaped run inside a code
+// fence in model output IS truncated.
+//
+// Deliberately not "fixed". Fence-awareness in one stage and not the others
+// is strictly worse than fence-blindness everywhere: buildCitations would
+// still mint a Citation row for a marker inside a fence that the cap refused
+// to touch, and stripOrphanCitations would still delete one it did. One
+// definition per mapping. If fences ever need excluding it must land in
+// findRuns AND in the three worker stages in the same change.
+func TestCapRunsIsFenceBlindByDesign(t *testing.T) {
+	in := "说明：\n```\narr[1][2][3][4][5]\n```\n结论[1][2][3][4]"
+	got, _ := CapRuns(in, 3)
+	want := "说明：\n```\narr[1][2][3]\n```\n结论[1][2][3]"
+	if got != want {
+		t.Fatalf("fence handling changed:\n got: %q\nwant: %q\n\n"+
+			"If this was intentional, the same fence rule must also land in "+
+			"worker.buildCitations / dedupCitations / stripOrphanCitations, or a "+
+			"marker the cap spared will still be deleted (or cited) by them.", got, want)
 	}
 }

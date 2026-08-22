@@ -4,11 +4,29 @@
 //
 // Why a separate package: the marker regexp already existed in
 // internal/worker (citationRe), but the cap has to run on the AGENT Map path
-// (internal/agent), on the worker Map/final path (internal/worker) and on the
-// agent save path (internal/api/handler). internal/agent must not import
-// internal/worker, so the shared vocabulary moved down here where all three
-// can depend on it. There is still exactly ONE pattern in the process —
-// worker.citationRe is now an alias of MarkerRe.
+// (internal/agent) and on the worker final path (internal/worker).
+// internal/agent must not import internal/worker, so the shared vocabulary
+// moved down here where both can depend on it. There is still exactly ONE
+// pattern in the process — worker.citationRe is now an alias of MarkerRe.
+//
+// # Enforcement matrix (authoritative — keep in sync with CONFIGURATION.md)
+//
+// CapRuns runs on exactly three bodies, all of them MODEL OUTPUT:
+//
+//  1. agent Map tool output — internal/agent/tool_summarize_chunk.go, after
+//     the per-chunk LLM call returns.
+//  2. agent final answer — internal/agent/summary_answer.go, applied by the
+//     chat handler to the planner's user-facing body. Added because the
+//     "merging re-exceeds a Map-only cap" argument that justifies (3) applies
+//     verbatim here: the planner merges chunk summaries in its own context.
+//  3. worker final body — internal/worker/personal_processor.go, AFTER
+//     buildCitations/dedupCitations/stripOrphanCitations (see the call-site
+//     comment for why the order is what it is).
+//
+// Nothing caps rendered PROMPT INPUT, and nothing caps a stream delta; the
+// streaming path reconciles via a post-cap snapshot event instead. An earlier
+// version of this doc listed "the agent save path (internal/api/handler)" as
+// an enforcement site. That call did not exist; site (2) is the real one.
 package citation
 
 import (
@@ -146,11 +164,22 @@ func CapRuns(text string, max int) (string, Stats) {
 	var remove []span
 
 	for _, r := range runs {
-		seen := make(map[string]bool, len(r))
+		seen := make(map[int]bool, len(r))
 		kept := 0
 		capped := false
 		for i, m := range r {
-			num := text[m[0]:m[1]]
+			// Key on the PARSED number, not the marker's spelling. `[1]` and
+			// `[01]` are two spellings of one source: extractCitationIndexes
+			// resolves both to 1 via strconv.Atoi, so keying on the raw text
+			// would let one source eat two budget slots and evict a real
+			// second citation. m[2]:m[3] is submatch group 1 (the digits).
+			num, err := strconv.Atoi(text[m[2]:m[3]])
+			if err != nil {
+				// Unparseable digits cannot happen for \d{1,5}, but a marker
+				// we cannot key is one we must not delete.
+				kept++
+				continue
+			}
 			dup := seen[num]
 			seen[num] = true
 
@@ -207,7 +236,7 @@ func findRuns(text string) (runs [][][]int, citableCount, nonCitable int) {
 	if text == "" {
 		return nil, 0, 0
 	}
-	locs := MarkerRe.FindAllStringIndex(text, -1)
+	locs := MarkerRe.FindAllStringSubmatchIndex(text, -1)
 	if len(locs) == 0 {
 		return nil, 0, 0
 	}
@@ -267,12 +296,20 @@ func isRunGap(gap string) bool {
 // numbers that come from MESSAGE BODIES rather than from the citation
 // vocabulary:
 //
-//  1. Upstream, worker.escapeCitationMarkers rewrites `[12]` inside message
-//     content to `(12)` before that content is rendered into a prompt, so a
-//     body's literal marker never reaches the model as `[12]`. MarkerRe does
-//     not match `(12)`, so this function never sees it — and the cap runs on
-//     model OUTPUT only, never on rendered prompt input (see the call-site
-//     comments in tool_summarize_chunk.go / personal_processor.go).
+//  1. On the WORKER path only, worker.escapeCitationMarkers rewrites `[12]`
+//     inside message content to `(12)` before that content is rendered into a
+//     prompt, so a body's literal marker never reaches the model as `[12]`.
+//     MarkerRe does not match `(12)`, so this function never sees it.
+//
+//     This is NOT true on the agent path: agent.renderMessageLine
+//     (internal/agent/token_chunk.go) renders message content verbatim, so a
+//     literal `[12]` in a chat message does reach the agent's model. Nothing
+//     is corrupted — the cap runs on model OUTPUT, never on rendered prompt
+//     input — but a marker the model copies out of a body does consume a
+//     budget slot here and can therefore evict a real citation. Stated
+//     rather than fixed: escaping the agent path changes what the model reads
+//     and is a separate behavioural change.
+//
 //  2. Here, syntactic forms where `[n]` is not a citation are excluded:
 //     markdown inline links `[1](https://…)` and reference/footnote
 //     definitions `[1]: https://…`. Deleting the `[1]` out of `[1](url)`
@@ -289,14 +326,22 @@ func isCitable(text string, loc []int) bool {
 	return true
 }
 
-// Numbers returns the distinct marker numbers in text, in first-appearance
-// order. Helper for callers and tests that want marker coverage without
-// re-deriving the pattern.
+// Numbers returns the distinct CITABLE marker numbers in text, in
+// first-appearance order. Helper for callers and tests that want marker
+// coverage without re-deriving the pattern.
+//
+// Applies the same isCitable guard CapRuns does, so a caller counting
+// "markers in this body" and the cap that bounds them agree on what a marker
+// is. Without the guard, `[1](https://…)` would be reported as citation 1 —
+// a number the cap deliberately never touches.
 func Numbers(text string) []int {
 	var out []int
 	seen := make(map[int]bool)
-	for _, m := range MarkerRe.FindAllStringSubmatch(text, -1) {
-		n, err := strconv.Atoi(m[1])
+	for _, m := range MarkerRe.FindAllStringSubmatchIndex(text, -1) {
+		if !isCitable(text, m[:2]) {
+			continue
+		}
+		n, err := strconv.Atoi(text[m[2]:m[3]])
 		if err != nil || seen[n] {
 			continue
 		}
