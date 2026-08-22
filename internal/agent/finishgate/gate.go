@@ -229,3 +229,45 @@ func stringSet(values []string) map[string]bool {
 	}
 	return set
 }
+
+// MissingChannels returns the expected channel_ids that were never attempted:
+// the set difference expected − attempted, preserving expected's order and
+// de-duplicating.
+//
+// Exported so the SS-12 bounded-repair loop and Evaluate share ONE definition of
+// "which expected channels are a real coverage gap". Evaluate reaches the same
+// conclusion inline (see the ABSENCE half above, which additionally audits
+// recorded failures); the repair loop needs just the never-attempted subset to
+// decide what to re-fetch, and taking it from here is what keeps the two from
+// drifting apart.
+//
+// A channel that WAS attempted but returned empty is deliberately not missing:
+// the agent tried it and there was nothing to summarize (e.g. an all-system-
+// message group), which is a fact about the data, not a coverage failure. That
+// distinction is the whole reason this is a set diff and not a count compare.
+func MissingChannels(expected, attempted []string) []string {
+	if len(expected) == 0 {
+		return nil
+	}
+	tried := make(map[string]struct{}, len(attempted))
+	for _, c := range attempted {
+		if c != "" {
+			tried[c] = struct{}{}
+		}
+	}
+	var missing []string
+	seen := make(map[string]struct{}, len(expected))
+	for _, c := range expected {
+		if c == "" {
+			continue
+		}
+		if _, dup := seen[c]; dup {
+			continue
+		}
+		seen[c] = struct{}{}
+		if _, ok := tried[c]; !ok {
+			missing = append(missing, c)
+		}
+	}
+	return missing
+}

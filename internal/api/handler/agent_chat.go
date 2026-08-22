@@ -333,17 +333,15 @@ func buildSelectedChannelsPrompt(selected []selectedChannel) string {
 	return b.String()
 }
 
+// toolChannelType is the handler-local alias for agent.ToolChannelType, the ONE
+// definition of the chat-type string → fetch_channel integer mapping. It stays a
+// thin forwarder (rather than the mapping itself) because the SS-12-b coverage
+// gate lives in internal/agent and prints the same value in the same argument
+// slot: two copies is precisely how the gate ended up emitting the Spec's STRING
+// type into an INTEGER parameter, which fetch_channel rejects during argument
+// decoding — before recordFetch runs, so the channel stayed "never attempted".
 func toolChannelType(chatType string) int {
-	switch chatType {
-	case "direct":
-		return 1
-	case "group":
-		return 2
-	case "thread":
-		return 5
-	default:
-		return 0
-	}
+	return agent.ToolChannelType(chatType)
 }
 
 func truncateRunes(s string, max int) string {
@@ -705,6 +703,10 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 
 	history = agent.TruncateHistory(history, h.window)
 
+	// SS-12-b coverage enforcement is NOT here: it lives inside summarize_chunk,
+	// before the citation manifest freezes (internal/agent/coverage_gate.go). A
+	// post-answer repair round fetches after the freeze, so its messages are not
+	// citable and get dropped — see that file for the full argument.
 	reply, newMsgs, err := runner.RunWithHistory(ctx, system, history, req.Message)
 	if err != nil {
 		// 真实错误只记服务端日志，避免向调用方泄漏上游 LLM 地址/网络/内部细节。
@@ -1002,7 +1004,8 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 
 	history = agent.TruncateHistory(history, h.window)
 
-	// Run agent with history
+	// Run agent with history. Coverage enforcement happens inside the run
+	// (summarize_chunk's pre-freeze gate), not around it — see Chat().
 	reply, newMsgs, err := runner.RunWithHistory(ctx, system, history, req.Message)
 	if err != nil {
 		log.Printf("[agent] chat runner error: %v", err)

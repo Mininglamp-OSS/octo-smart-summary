@@ -232,6 +232,10 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 // 结果写入预分配 slice 的固定索引，天然无写冲突；WaitGroup 收齐。
 func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps int) []string {
 	results := make([]string, len(calls))
+	// Every tool call chosen by one planner turn shares the same immutable step
+	// metadata. The pre-freeze coverage gate uses this to make one decision for
+	// the whole fan-out, regardless of worker width or completion order.
+	toolCtx := withCoverageGateStep(ctx, step, ofSteps)
 	var wg sync.WaitGroup
 	for i, tc := range calls {
 		wg.Add(1)
@@ -249,7 +253,7 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 				})
 			}
 
-			out, err := r.reg.Dispatch(ctx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+			out, err := r.reg.Dispatch(toolCtx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
 
 			toolElapsed := time.Since(toolStart).Milliseconds()
 

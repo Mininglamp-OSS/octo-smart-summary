@@ -267,6 +267,22 @@ func SummarizeChunkTool() (Tool, Handler) {
 			return "", fmt.Errorf("missing session_id in context")
 		}
 
+		runID, _ := ctx.Value(ContextKeyRunID).(string)
+
+		// SS-12-b: the coverage gate runs BEFORE anything can freeze the citation
+		// manifest. If the run still owes an expected-channel fetch, the freeze must
+		// not happen yet — a channel fetched after it is not citable under it, so
+		// this is the last moment at which demanding the fetch is still free. The
+		// error is retryable + non-fatal (see classifyToolError's CoverageGateError
+		// arm) so the planner fetches and re-calls this same tool, and it is bounded
+		// so an unfetchable channel cannot loop: after the cap the gate stops firing
+		// and the freeze proceeds, leaving the finish gate to disclose the gap.
+		// Placed before the cache Retrieve so a stale handle cannot mask a real
+		// coverage failure with an unrelated INVALID_ARGUMENT.
+		if err := checkCoverageBeforeFreeze(ctx, uid, sessionID, runID); err != nil {
+			return "", err
+		}
+
 		messages := messageCache.Retrieve(req.MessagesHandle, uid)
 		if messages == nil {
 			return "", fmt.Errorf("invalid or expired messages_handle: %s", req.MessagesHandle)
@@ -289,7 +305,6 @@ func SummarizeChunkTool() (Tool, Handler) {
 		// SS-05 B1: when V2 mode is on and a run is in scope, override the just-
 		// computed indexes with the run's FROZEN manifest ordinals so the mid-run
 		// and save-time citation passes cannot drift. Off / no run → unchanged.
-		runID, _ := ctx.Value(ContextKeyRunID).(string)
 		v2 := SummaryV2Enabled() && runID != ""
 		if v2 {
 			globalPool = applyFrozenManifest(ctx, uid, sessionID, runID, globalPool)

@@ -124,6 +124,13 @@ type Config struct {
 	// Default 30. Values <=0 fall back to the default in handler.
 	SummaryCustomTemplateLimit int
 
+	// SummaryRepairMaxRounds bounds how many DISTINCT coverage states may block
+	// the citation freeze. Concurrent summarize_chunk calls from one planner step
+	// share a decision; an unchanged state on a later step is released as no
+	// progress. The gate also reserves enough steps for fetch, Map, Reduce, and a
+	// final answer. 0 disables the gate entirely.
+	SummaryRepairMaxRounds int
+
 	// Fetch concurrency for parallel channel message retrieval
 	FetchConcurrency int
 
@@ -226,6 +233,8 @@ func Load() *Config {
 		CandidateQueryLimit: envInt("SUMMARY_CHAT_CANDIDATE_LIMIT", -1),
 
 		SummaryCustomTemplateLimit: envInt("SUMMARY_CUSTOM_TEMPLATE_LIMIT", 30),
+
+		SummaryRepairMaxRounds: envInt("SUMMARY_REPAIR_MAX_ROUNDS", 2),
 
 		FetchConcurrency: envInt("FETCH_CONCURRENCY", 10),
 
