@@ -5,6 +5,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citation"
 )
 
 // Agent-summary V2 rollout modes + normalizer live here (not in internal/agent)
@@ -102,6 +104,24 @@ type Config struct {
 	// — the same function agent.SummaryV2Mode() uses, so the two read paths
 	// can never disagree on case/whitespace/unknown values.
 	AgentSummaryV2Mode string
+
+	// SummaryMaxCitationsPerClaim caps how many `[n]` citation markers a
+	// single claim (a maximal consecutive marker run) may carry in generated
+	// summary text. Read from SUMMARY_MAX_CITATIONS_PER_CLAIM.
+	//
+	// Default 3. Production measurement on one real run: 1227 markers / 794
+	// distinct in one body, longest unbroken marker run 1026 chars, step-5
+	// planner prompt 99336 chars, step-4 planning 160044ms (71% of total task
+	// time). Map output is Reduce/planner INPUT, so every surplus marker is
+	// paid again by every later hop.
+	//
+	// <=0 disables capping entirely (citation.Disabled) and restores the
+	// pre-cap behavior byte-identically — the same "non-positive means not in
+	// effect" convention as MapMaxTokens / SkipMapReduceThreshold /
+	// MaxMessagesPerChannel. The value is deliberately env-tunable rather
+	// than a constant: 3 is a judgement call to be retuned against production
+	// citation quality, and retuning must not need a rebuild.
+	SummaryMaxCitationsPerClaim int
 
 	// Message table count
 	MsgTableCount int
@@ -211,6 +231,8 @@ func Load() *Config {
 		ScheduleMaxWindowDays:      envInt("SCHEDULE_MAX_WINDOW_DAYS", 30),
 		WorkerCallbackURL:          envStr("WORKER_API_CALLBACK_URL", ""),
 		SummaryStreamInternalToken: envStr("SUMMARY_STREAM_INTERNAL_TOKEN", ""),
+
+		SummaryMaxCitationsPerClaim: envInt(MaxCitationsPerClaimEnvVar, defaultMaxCitationsPerClaim),
 
 		MsgTableCount: envInt("MSG_TABLE_COUNT", 5),
 
@@ -383,6 +405,52 @@ func (c *Config) ResolveMapMaxTokens() int {
 		}
 	}
 	return defaultMapMaxTokens
+}
+
+// defaultMaxCitationsPerClaim is the shipped per-claim citation cap. Three
+// markers is enough to show a claim is corroborated; the 4th onwards buys no
+// verifiability a reader will use and is re-paid by every downstream prompt.
+const defaultMaxCitationsPerClaim = 3
+
+// MaxCitationsPerClaimEnvVar names the knob in one place so the config field
+// and the env-only read path below cannot drift apart.
+const MaxCitationsPerClaimEnvVar = "SUMMARY_MAX_CITATIONS_PER_CLAIM"
+
+// NormalizeMaxCitationsPerClaim maps any non-positive value to
+// citation.Disabled (0) and passes positives through.
+//
+// SUMMARY_MAX_CITATIONS_PER_CLAIM has two read paths — the Config field (used
+// by the agent Map path and the worker pipeline, which both hold a Config)
+// and MaxCitationsPerClaim() (used by internal/service, which builds prompts
+// without one). Both go through this single function, for exactly the reason
+// NormalizeAgentSummaryV2Mode exists: two read paths that each re-implement
+// "what does -1 mean" is how a prompt promises one cap while the enforcement
+// applies another.
+func NormalizeMaxCitationsPerClaim(v int) int {
+	if v < 1 {
+		return citation.Disabled
+	}
+	return v
+}
+
+// ResolveMaxCitationsPerClaim returns the per-claim citation cap to enforce.
+//
+// Kept as a resolver rather than reading the field directly so callers in
+// three packages (agent Map, worker Map/final, service prompts) cannot
+// disagree about what a non-positive value means — the same reason
+// ResolveMapMaxTokens and ResolveSkipMapReduceThreshold exist.
+func (c *Config) ResolveMaxCitationsPerClaim() int {
+	return NormalizeMaxCitationsPerClaim(c.SummaryMaxCitationsPerClaim)
+}
+
+// MaxCitationsPerClaim reads the knob straight from the environment for
+// callers with no Config in hand (internal/service builds its Map/Reduce
+// system prompts from a package-level function and an LLMClient that
+// deliberately carries no Config). Same env var, same default, same
+// normalizer as the Config field — see NormalizeAgentSummaryV2Mode /
+// agent.SummaryV2Mode for the precedent this mirrors.
+func MaxCitationsPerClaim() int {
+	return NormalizeMaxCitationsPerClaim(envInt(MaxCitationsPerClaimEnvVar, defaultMaxCitationsPerClaim))
 }
 
 // modelThreshold is a model name pattern and its associated token threshold.
