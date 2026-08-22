@@ -248,3 +248,197 @@ func TestFinalizeHashReq_DiscriminatesFromSyncSaveRoute(t *testing.T) {
 		t.Fatal("finalize and sync save hashed identically — one key reused across routes would cross-replay")
 	}
 }
+
+// --- BLOCKING 2a: replay must survive the session cleanup ------------------
+
+// The sibling sync route DELETEs every agent_message row of the session as part
+// of a successful save — by design ("temporary workshop"). If the freeze/content
+// check ran before the idempotency preflight, a byte-identical retry arriving
+// after that DELETE would get 40004 "本次会话还没有可定稿的内容" instead of a 202
+// replay of the task it already owns — and since the 202 is the client's ONLY
+// handle on that task, it would lose it permanently.
+func TestFinalize_ReplayAfterSessionCleanup(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	h := NewAgentSummaryHandler(db, db, "", "", "", 0, 0)
+	r := setupFinalizeRouter(h)
+
+	seedAssistantMessage(t, db, "test-user", "sess-fin-cleanup", "内容")
+	body := map[string]interface{}{"session_id": "sess-fin-cleanup", "title": "同一份"}
+	hdr := map[string]string{"Idempotency-Key": "cleanup-key-1"}
+
+	first := doFinalize(t, r, body, hdr)
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("first status = %d, want 202 (body=%s)", first.Code, first.Body.String())
+	}
+
+	// The sync save (or a cleanup cron) empties the workshop.
+	if err := db.Where("user_id = ? AND session_id = ?", "test-user", "sess-fin-cleanup").
+		Delete(&model.AgentMessage{}).Error; err != nil {
+		t.Fatalf("simulate session cleanup: %v", err)
+	}
+
+	second := doFinalize(t, r, body, hdr)
+	if second.Code != http.StatusAccepted {
+		t.Fatalf("replay status = %d, want 202 — a same-key replay must not depend on session rows the first request's siblings destroy (body=%s)",
+			second.Code, second.Body.String())
+	}
+	if a, b := finalizeTaskID(t, first), finalizeTaskID(t, second); a != b {
+		t.Fatalf("replay returned task %d, want the original %d", b, a)
+	}
+}
+
+// A replay must report the task's REAL status, not a hardcoded "GENERATING".
+// A client that lost the first 202 has no idea how much time passed; telling it
+// GENERATING for a Completed task makes it poll for a transition that already
+// happened.
+func TestFinalize_ReplayReportsRealTaskStatus(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	h := NewAgentSummaryHandler(db, db, "", "", "", 0, 0)
+	r := setupFinalizeRouter(h)
+
+	seedAssistantMessage(t, db, "test-user", "sess-fin-status", "内容")
+	body := map[string]interface{}{"session_id": "sess-fin-status"}
+	hdr := map[string]string{"Idempotency-Key": "status-key-1"}
+
+	first := doFinalize(t, r, body, hdr)
+	taskID := finalizeTaskID(t, first)
+	if err := db.Model(&model.SummaryTask{}).Where("id = ?", taskID).
+		Update("status", model.StatusCompleted).Error; err != nil {
+		t.Fatalf("complete the task: %v", err)
+	}
+
+	second := doFinalize(t, r, body, hdr)
+	var resp struct {
+		Data struct {
+			Status   interface{} `json:"status"`
+			Replayed bool        `json:"replayed"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got, ok := resp.Data.Status.(float64); !ok || int(got) != model.StatusCompleted {
+		t.Fatalf("replay status = %v, want the real task status %d — not a hardcoded GENERATING",
+			resp.Data.Status, model.StatusCompleted)
+	}
+	if !resp.Data.Replayed {
+		t.Fatal("replay must be marked replayed:true, like the sync route")
+	}
+}
+
+// --- BLOCKING 2b: symmetric guard, sync save vs in-flight finalize --------
+
+// CreateAgentSummary hard-DELETEs every agent_message row of the session inside
+// its transaction. A queued finalize task has already frozen its input as an id
+// bound over exactly those rows, so if the DELETE lands first the worker loads
+// ZERO replies, every retry hits the same empty set, and the task dies Failed
+// after WorkerMaxRetry — while the user holds a 202 and a task handle, with the
+// cause invisible from the finalize endpoint. The finalize route refuses a
+// second finalize on an in-flight session; this is the other half of that guard.
+func TestCreateAgentSummary_RefusedWhileFinalizeInFlight(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	h := NewAgentSummaryHandler(db, db, "", "", "", 0, 0)
+	finalizeR := setupFinalizeRouter(h)
+	saveR := setupAgentSummaryRouter(h)
+
+	sessionID := "sess-sym-1"
+	seedAssistantMessage(t, db, "test-user", sessionID, "会话产出")
+
+	if w := doFinalize(t, finalizeR, map[string]interface{}{"session_id": sessionID},
+		map[string]string{"Idempotency-Key": "sym-key-1"}); w.Code != http.StatusAccepted {
+		t.Fatalf("finalize status = %d, want 202 (body=%s)", w.Code, w.Body.String())
+	}
+
+	w := doAgentSave(t, saveR, map[string]interface{}{
+		"session_id":          sessionID,
+		"origin_channel_id":   "CH-1",
+		"origin_channel_type": 1,
+		"title":               "同步保存",
+	}, nil)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("sync save status = %d, want 409 while a finalize is in flight (body=%s)", w.Code, w.Body.String())
+	}
+
+	// The load-bearing consequence: the finalize's frozen input still exists.
+	var remaining int64
+	db.Model(&model.AgentMessage{}).Where("user_id = ? AND session_id = ?", "test-user", sessionID).Count(&remaining)
+	if remaining == 0 {
+		t.Fatal("the refused save still destroyed the in-flight finalize's frozen input")
+	}
+}
+
+// The other direction, already enforced: a finalize is refused while another
+// finalize for the session is in flight. Pinned here so the pair cannot drift
+// apart.
+func TestFinalize_RefusedWhileAnotherFinalizeInFlight(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	h := NewAgentSummaryHandler(db, db, "", "", "", 0, 0)
+	r := setupFinalizeRouter(h)
+
+	sessionID := "sess-sym-2"
+	seedAssistantMessage(t, db, "test-user", sessionID, "会话产出")
+	body := map[string]interface{}{"session_id": sessionID}
+
+	if w := doFinalize(t, r, body, map[string]string{"Idempotency-Key": "sym2-a"}); w.Code != http.StatusAccepted {
+		t.Fatalf("first finalize status = %d, want 202", w.Code)
+	}
+	if w := doFinalize(t, r, body, map[string]string{"Idempotency-Key": "sym2-b"}); w.Code != http.StatusConflict {
+		t.Fatalf("second finalize status = %d, want 409", w.Code)
+	}
+}
+
+// A TERMINAL finalize task must not block saves forever — otherwise a single
+// Failed finalize would permanently lock the session out of the sync route.
+func TestCreateAgentSummary_TerminalFinalizeDoesNotBlockSave(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	h := NewAgentSummaryHandler(db, db, "", "", "", 0, 0)
+	finalizeR := setupFinalizeRouter(h)
+	saveR := setupAgentSummaryRouter(h)
+
+	sessionID := "sess-sym-3"
+	seedAssistantMessage(t, db, "test-user", sessionID, "会话产出")
+	first := doFinalize(t, finalizeR, map[string]interface{}{"session_id": sessionID},
+		map[string]string{"Idempotency-Key": "sym3-a"})
+	if err := db.Model(&model.SummaryTask{}).Where("id = ?", finalizeTaskID(t, first)).
+		Update("status", model.StatusFailed).Error; err != nil {
+		t.Fatalf("fail the task: %v", err)
+	}
+
+	w := doAgentSave(t, saveR, map[string]interface{}{
+		"session_id":          sessionID,
+		"origin_channel_id":   "CH-1",
+		"origin_channel_type": 1,
+	}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("sync save status = %d, want 200 — a terminal finalize is not in flight (body=%s)", w.Code, w.Body.String())
+	}
+}
+
+// A soft-deleted Pending finalize is invisible to the poller, so counting it as
+// in-flight would block the session's saves forever. Mirrors the identical
+// condition on the finalize route's own guard.
+func TestCreateAgentSummary_SoftDeletedFinalizeDoesNotBlockSave(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	h := NewAgentSummaryHandler(db, db, "", "", "", 0, 0)
+	finalizeR := setupFinalizeRouter(h)
+	saveR := setupAgentSummaryRouter(h)
+
+	sessionID := "sess-sym-4"
+	seedAssistantMessage(t, db, "test-user", sessionID, "会话产出")
+	first := doFinalize(t, finalizeR, map[string]interface{}{"session_id": sessionID},
+		map[string]string{"Idempotency-Key": "sym4-a"})
+	now := timezone.Now()
+	if err := db.Model(&model.SummaryTask{}).Where("id = ?", finalizeTaskID(t, first)).
+		Update("deleted_at", &now).Error; err != nil {
+		t.Fatalf("soft delete: %v", err)
+	}
+
+	w := doAgentSave(t, saveR, map[string]interface{}{
+		"session_id":          sessionID,
+		"origin_channel_id":   "CH-1",
+		"origin_channel_type": 1,
+	}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("sync save status = %d, want 200 — a soft-deleted finalize is not in flight (body=%s)", w.Code, w.Body.String())
+	}
+}

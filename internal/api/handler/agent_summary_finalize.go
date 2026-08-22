@@ -45,9 +45,20 @@ type finalizeAgentSummaryReq struct {
 	// it does NOT let the user pick a message. v0 folds it into the request hash
 	// so a retry with a different revision 409s; a full revision CAS is a
 	// forward-compatible follow-up.
-	ExpectedSessionRevision int         `json:"expected_session_revision,omitempty"`
-	Sources                 []sourceReq `json:"sources,omitempty"`
-	ReferencedTaskIDs       []int64     `json:"referenced_task_ids,omitempty"`
+	ExpectedSessionRevision int `json:"expected_session_revision,omitempty"`
+	// Sources and ReferencedTaskIDs are AUDIT-ONLY on this route. They are
+	// validated, deduped and persisted (summary_source rows / the task's
+	// referenced_task_ids column), but NO finalize code path reads them back:
+	// executeFinalizeTask / executeAgentFinalize consume only the session's own
+	// assistant replies and evidence. Unlike the sync route — which gates
+	// ReferencedTaskIDs[0] through space + deleted_at + status + canAccessTaskDB
+	// before consuming it — nothing here validates ownership, because nothing
+	// consumes it. That is not an IDOR today, but it does mean the stored list is
+	// caller-controlled and UNTRUSTED: any future consumer MUST validate it at
+	// read time (or this route must start validating at write time) rather than
+	// assuming these columns were vetted.
+	Sources           []sourceReq `json:"sources,omitempty"`
+	ReferencedTaskIDs []int64     `json:"referenced_task_ids,omitempty"`
 }
 
 // FinalizeAgentSummary handles POST /api/v1/summaries/agent/finalize.
@@ -69,6 +80,60 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 	if len(req.ReferencedTaskIDs) > maxReferencedTaskIDs {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: fmt.Sprintf("too many referenced task IDs: %d distinct (max %d)", len(req.ReferencedTaskIDs), maxReferencedTaskIDs)})
 		return
+	}
+
+	title := strings.TrimSpace(req.Title)
+
+	// --- SUM-BE2 idempotency preflight (Idempotency-Key = finalize_request_id) ---
+	//
+	// This runs BEFORE the freeze/content check, BEFORE the in-flight guard and
+	// BEFORE origin resolution. All three orderings are load-bearing:
+	//
+	//   - before the freeze/content check, because that check reads MUTABLE
+	//     session state that another request is allowed to destroy. The sibling
+	//     sync route (CreateAgentSummary) DELETEs every agent_message row for the
+	//     session as part of a successful save, by design. Once that has happened,
+	//     a byte-identical retry with the same key would get
+	//     40004 "本次会话还没有可定稿的内容" instead of a 202 replay of the task it
+	//     already owns — and since the 202 is the ONLY handle the client has on
+	//     that task, it would lose it permanently. The sync route puts its
+	//     preflight before every mutable-session read for exactly this reason.
+	//   - before the in-flight guard, because the single most likely reason a
+	//     client retries with the same key is that it never received the first
+	//     202. At that moment the first task is Pending/Processing, so a guard
+	//     placed first would 409 exactly the replay this preflight exists to
+	//     serve, making the whole idempotency path dead code in its own window.
+	//   - before origin resolution, because canonicalAgentSaveRequestHash's
+	//     contract is that the hash is computed from REQUEST-OWNED fields only.
+	//     resolveOriginChannelFromSession reads mutable session state and can
+	//     fail transiently, so folding its result in would let a byte-identical
+	//     retry hash differently and 409 a request the client never changed.
+	//
+	idempotencyKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
+	var requestHash string
+	if idempotencyKey != "" {
+		if !validAgentSaveIdempotencyKey(idempotencyKey) {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "valid Idempotency-Key header is required"})
+			return
+		}
+		requestHash = canonicalAgentSaveRequestHash(userID, finalizeHashReq(req, title))
+		existing, mismatched, ok, stale, ferr := findAgentSaveIdempotentTaskWithHash(
+			c.Request.Context(), h.db, spaceID, userID, idempotencyKey, requestHash)
+		if ferr != nil {
+			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "idempotency lookup failed"})
+			return
+		}
+		if ok {
+			if stale || mismatched {
+				// Reuse the sync path's 40009 envelope so the client gets the
+				// same reason/recovery_action contract on both save routes.
+				writeAgentSaveIdempotencyResponse(c, existing, mismatched, stale)
+				return
+			}
+			// Same-body replay: return the already-created task.
+			writeFinalizeReplayResponse(c, existing)
+			return
+		}
 	}
 
 	// The session must have usable assistant content to consolidate, AND we
@@ -96,53 +161,6 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 		return
 	}
 	frozenMessageID := frozen.MaxID
-
-	title := strings.TrimSpace(req.Title)
-
-	// --- SUM-BE2 idempotency preflight (Idempotency-Key = finalize_request_id) ---
-	//
-	// This runs BEFORE the in-flight guard below and BEFORE origin resolution, and
-	// both orderings are load-bearing:
-	//
-	//   - before the in-flight guard, because the single most likely reason a
-	//     client retries with the same key is that it never received the first
-	//     202. At that moment the first task is Pending/Processing, so a guard
-	//     placed first would 409 exactly the replay this preflight exists to
-	//     serve, making the whole idempotency path dead code in its own window.
-	//   - before origin resolution, because canonicalAgentSaveRequestHash's
-	//     contract is that the hash is computed from REQUEST-OWNED fields only.
-	//     resolveOriginChannelFromSession reads mutable session state and can
-	//     fail transiently, so folding its result in would let a byte-identical
-	//     retry hash differently and 409 a request the client never changed.
-	idempotencyKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
-	var requestHash string
-	if idempotencyKey != "" {
-		if !validAgentSaveIdempotencyKey(idempotencyKey) {
-			c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "valid Idempotency-Key header is required"})
-			return
-		}
-		requestHash = canonicalAgentSaveRequestHash(userID, finalizeHashReq(req, title))
-		existing, mismatched, ok, stale, ferr := findAgentSaveIdempotentTaskWithHash(
-			c.Request.Context(), h.db, spaceID, userID, idempotencyKey, requestHash)
-		if ferr != nil {
-			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "idempotency lookup failed"})
-			return
-		}
-		if ok {
-			if stale || mismatched {
-				// Reuse the sync path's 40009 envelope so the client gets the
-				// same reason/recovery_action contract on both save routes.
-				writeAgentSaveIdempotencyResponse(c, existing, mismatched, stale)
-				return
-			}
-			// Same-body replay: return the already-created task.
-			c.JSON(http.StatusAccepted, apiResponse{Code: 0, Message: "ok", Data: gin.H{
-				"task_id": existing.ID,
-				"status":  "GENERATING",
-			}})
-			return
-		}
-	}
 
 	// One active Finalize Run per session (docs §3.4): reject if a finalize task
 	// for this session is not yet terminal (Pending before the poller claims it,
@@ -303,10 +321,7 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 					writeAgentSaveIdempotencyResponse(c, existing, mismatched, stale)
 					return
 				}
-				c.JSON(http.StatusAccepted, apiResponse{Code: 0, Message: "ok", Data: gin.H{
-					"task_id": existing.ID,
-					"status":  "GENERATING",
-				}})
+				writeFinalizeReplayResponse(c, existing)
 				return
 			}
 		}
@@ -319,6 +334,25 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 	c.JSON(http.StatusAccepted, apiResponse{Code: 0, Message: "ok", Data: gin.H{
 		"task_id": createdTaskID,
 		"status":  "GENERATING",
+	}})
+}
+
+// writeFinalizeReplayResponse answers a same-key, same-body replay with the
+// task the client already owns.
+//
+// status is read from the TASK, not hardcoded to "GENERATING". The replay can
+// legitimately arrive after the worker has finished (or failed) the run — a
+// client that lost the first 202 has no idea how much time passed — and telling
+// it "GENERATING" for a Completed task makes a polling client wait for a
+// transition that already happened, or wait forever on a Failed one. The sync
+// route already returns the real status on replay; this aligns the two.
+// replayed:true likewise mirrors the sync envelope.
+func writeFinalizeReplayResponse(c *gin.Context, task model.SummaryTask) {
+	c.JSON(http.StatusAccepted, apiResponse{Code: 0, Message: "ok", Data: gin.H{
+		"task_id":  task.ID,
+		"task_no":  task.TaskNo,
+		"status":   task.Status,
+		"replayed": true,
 	}})
 }
 
