@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -127,5 +128,65 @@ func TestBudgetFinalizeReplies_NeverEmptiesThePrompt(t *testing.T) {
 	got, _ := p.budgetFinalizeReplies("", replies)
 	if len(got) != 1 {
 		t.Fatalf("kept %d fragments, want the single oversized one", len(got))
+	}
+}
+
+// --- P2-7: the TriggerAgentFinalize routing branch ------------------------
+
+// A finalize task must NOT run executePipeline. executePipeline exists to
+// discover channels and fetch raw messages; a finalize task has neither, and
+// running it would pay the exact discovery + intent-LLM + zero-width-fetch cost
+// this feature exists to avoid — and could fail the finalize for reasons that
+// have nothing to do with finalizing.
+func TestTaskExecutor_FinalizeTaskDoesNotUsePipeline(t *testing.T) {
+	p := &Processor{}
+
+	finalize := p.taskExecutor(model.SummaryTask{TriggerType: model.TriggerAgentFinalize})
+	if reflect.ValueOf(finalize).Pointer() != reflect.ValueOf(p.executeFinalizeTask).Pointer() {
+		t.Fatal("a TriggerAgentFinalize task must route to executeFinalizeTask")
+	}
+	if reflect.ValueOf(finalize).Pointer() == reflect.ValueOf(p.executePipeline).Pointer() {
+		t.Fatal("a TriggerAgentFinalize task must NOT route to executePipeline")
+	}
+
+	// Every other trigger keeps the legacy pipeline.
+	for _, tt := range []int{model.TriggerManual, model.TriggerScheduled, model.TriggerAgent} {
+		got := p.taskExecutor(model.SummaryTask{TriggerType: tt})
+		if reflect.ValueOf(got).Pointer() != reflect.ValueOf(p.executePipeline).Pointer() {
+			t.Fatalf("trigger_type %d must still route to executePipeline", tt)
+		}
+	}
+}
+
+// The test seam still wins when injected, so the existing pipeline tests keep
+// driving processTask deterministically.
+func TestTaskExecutor_InjectedSeamWinsOverFinalizeRouting(t *testing.T) {
+	called := false
+	p := &Processor{executePipelineFn: func(model.SummaryTask) error { called = true; return nil }}
+	if err := p.taskExecutor(model.SummaryTask{TriggerType: model.TriggerAgentFinalize})(model.SummaryTask{}); err != nil {
+		t.Fatalf("seam returned error: %v", err)
+	}
+	if !called {
+		t.Fatal("injected executePipelineFn must win over the finalize routing branch")
+	}
+}
+
+// P2-2: executeFinalizeTask must NOT bootstrap the creator participant. The
+// handler already created it in the same tx as the task, so the call was a
+// guaranteed unique-key conflict on every run — and bootstrapCreatorParticipant
+// decides insert-vs-conflict via RowsAffected == 0, which under
+// clientFoundRows=true leaves participant.ID == 0 and writes an orphan
+// personal_result with participant_ref_id = 0. processTask bootstraps
+// defensively one line later anyway.
+//
+// A nil db proves it: if executeFinalizeTask touched the DB at all this would
+// panic instead of returning nil.
+func TestExecuteFinalizeTask_DoesNotTouchTheDatabase(t *testing.T) {
+	p := &Processor{} // db is nil on purpose
+	if err := p.executeFinalizeTask(model.SummaryTask{ID: 1, AgentSessionID: "s1"}); err != nil {
+		t.Fatalf("executeFinalizeTask must be a pure validation step, got: %v", err)
+	}
+	if err := p.executeFinalizeTask(model.SummaryTask{ID: 2}); err == nil {
+		t.Fatal("a finalize task with no agent_session_id must be rejected")
 	}
 }

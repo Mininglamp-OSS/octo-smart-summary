@@ -59,7 +59,14 @@ func (p *Processor) executeAgentFinalize(ctx context.Context, task model.Summary
 	}
 	q = q.Where("id <= ?", task.AgentMessageID)
 	var replies []model.AgentMessage
-	if err := q.Order("created_at ASC").Find(&replies).Error; err != nil {
+	// Order by id, NOT created_at. agent_message.created_at is DATETIME (1-second
+	// precision) and AppendMessages stamps every message of a turn with the same
+	// `now`, so two turns that complete inside the same second tie and MySQL may
+	// return them in either order. Fragment order decides the merged body, so a
+	// tie would make the output non-reproducible across worker retries — which is
+	// exactly what the freeze exists to prevent. id is monotonic, and it is
+	// already the axis the freeze bound above is expressed in.
+	if err := q.Order("id ASC").Find(&replies).Error; err != nil {
 		return "", nil, 0, 0, modelVer, fmt.Errorf("load session assistant replies: %w", err)
 	}
 	if len(replies) == 0 {
@@ -232,19 +239,24 @@ func gatherSessionEvidencePool(ctx context.Context, db *gorm.DB, userID, session
 // and it could fail the finalize for reasons unrelated to finalizing.
 //
 // So this does only the one thing executePipeline does that finalize also needs:
-// make sure the creator participant + a Pending personal_result exist, then hand
-// off. processTask's own dispatch logic takes it from there and
-// processPersonalSummaryWithOptions routes to executeAgentFinalize.
+// nothing. The handler creates the creator participant + a Pending
+// personal_result in the SAME transaction as the task, and processTask
+// bootstraps them defensively one line after this returns when
+// participantCount == 0. Calling bootstrapCreatorParticipant here as well was a
+// GUARANTEED unique-key conflict on uk_summary_participant_task_user on every
+// finalize run — and bootstrapCreatorParticipant decides insert-vs-conflict via
+// result.RowsAffected == 0, the exact DSN-sensitive pattern this PR replaced in
+// the handler: under clientFoundRows=true the conflict reports one affected row,
+// the reload is skipped, participant.ID stays 0, and the personal_result insert
+// writes an orphan with participant_ref_id = 0. Not calling it sidesteps the DSN
+// question entirely and loses no coverage.
+//
+// So this validates the task shape and hands off; processTask's own dispatch
+// logic takes it from there and processPersonalSummaryWithOptions routes to
+// executeAgentFinalize.
 func (p *Processor) executeFinalizeTask(task model.SummaryTask) error {
 	if task.AgentSessionID == "" {
 		return fmt.Errorf("agent-finalize task %d has no agent_session_id", task.ID)
-	}
-	// The handler creates participant + personal_result in the same tx as the
-	// task, so this is normally a no-op; it is kept for the same defensive reason
-	// processTask bootstraps them, since a task with no participant row can never
-	// be dispatched and would sit in Processing forever.
-	if _, err := p.bootstrapCreatorParticipant(task); err != nil {
-		return fmt.Errorf("bootstrap creator artifacts for finalize task %d: %w", task.ID, err)
 	}
 	return nil
 }
@@ -278,7 +290,11 @@ func (p *Processor) budgetFinalizeReplies(title string, replies []model.AgentMes
 	})
 	budget -= tok.Count(title)
 
-	// Walk newest→oldest, keeping while the budget holds.
+	// Walk newest→oldest, keeping while the budget holds. keepFrom is assigned on
+	// the FIRST iteration unconditionally (the break guard requires
+	// keepFrom < len(replies), which is false at i == len-1), and the caller
+	// guarantees replies is non-empty, so no "nothing was kept" branch is
+	// reachable afterwards.
 	keepFrom := len(replies)
 	for i := len(replies) - 1; i >= 0; i-- {
 		cost := tok.Count(replies[i].Content)
@@ -290,11 +306,6 @@ func (p *Processor) budgetFinalizeReplies(title string, replies []model.AgentMes
 		if budget <= 0 {
 			break
 		}
-	}
-	// Always keep at least the newest reply: an empty prompt is strictly worse
-	// than an over-budget one, and the LLM error path handles the overflow.
-	if keepFrom >= len(replies) {
-		keepFrom = len(replies) - 1
 	}
 	if keepFrom <= 0 {
 		return replies, 0
