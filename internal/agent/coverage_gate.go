@@ -91,28 +91,33 @@ func (e *CoverageGateError) Error() string { return e.Instruction }
 // it belongs to is gone but never while that run is still executing.
 const coverageGateTTL = 30 * time.Minute
 
-// maxBlocksPerCoverageRound is how many blocked summarize_chunk calls may share
-// ONE coverage round.
-//
-// A round is keyed on what the run had attempted at the time, so a single
-// planner step that fans out N parallel summarize_chunk calls sees one identical
-// coverage state and must produce ONE round, not N — otherwise a 3-way fan-out
-// would exhaust the default 2-round budget in a single step and the gate would
-// effectively never fire.
-//
-// The value is chosen against the runner's step budget, not by taste. A planner
-// that re-calls summarize_chunk SERIALLY without ever fetching burns one step
-// per block, so the serial worst case is maxRounds × this constant: 2 × 4 = 8,
-// inside the summary profile's MaxSteps of 15. It has to be, because exceeding
-// MaxSteps makes RunWithHistory return "max steps exceeded" — an error, i.e. NO
-// summary. Trading an incomplete summary for no summary is the one thing this
-// feature must never do, so the bound protects the step budget first.
-//
-// A fan-out WIDER than this cap lets the surplus calls through unblocked, and
-// one of them freezes. That degrades to exactly the cap-reached behaviour
-// (freeze proceeds, finish gate discloses the gap) — weaker enforcement, never a
-// broken run.
-const maxBlocksPerCoverageRound = 4
+// coverageRepairReservedSteps is the minimum planner budget left AFTER a gate
+// block: fetch the missing channel, retry Map, run Reduce, and emit the final
+// answer. Blocking with less headroom can turn an incomplete-but-disclosed
+// summary into `max steps exceeded`, which is strictly worse than allowing the
+// freeze and letting the finish gate report the gap.
+const coverageRepairReservedSteps = 4
+
+type coverageStepContext struct {
+	step     int
+	maxSteps int
+}
+
+type contextKeyCoverageStep struct{}
+
+func withCoverageGateStep(ctx context.Context, step, maxSteps int) context.Context {
+	return context.WithValue(ctx, contextKeyCoverageStep{}, coverageStepContext{step: step, maxSteps: maxSteps})
+}
+
+func coverageGateStep(ctx context.Context) coverageStepContext {
+	if v, ok := ctx.Value(contextKeyCoverageStep{}).(coverageStepContext); ok && v.step > 0 && v.maxSteps > 0 {
+		return v
+	}
+	// Direct tool-handler tests and non-runner callers do not carry step data.
+	// Give them the normal summary profile budget; production Runner paths always
+	// inject the real values above.
+	return coverageStepContext{step: 1, maxSteps: profiles["summary"].Policy.MaxSteps}
+}
 
 type coverageGateState struct {
 	// signature identifies the coverage round: the run's attempted+missing sets.
@@ -121,9 +126,13 @@ type coverageGateState struct {
 	// rounds counts DISTINCT signatures blocked so far — the value bounded by
 	// SUMMARY_REPAIR_MAX_ROUNDS.
 	rounds int
-	// blocks counts calls blocked at the current signature (the fan-out width).
-	blocks    int
-	updatedAt time.Time
+	// decisionStep is the 1-indexed planner step for which block/reason was
+	// decided. Every concurrent call from that step reuses the same decision.
+	decisionStep int
+	block        bool
+	reason       string
+	satisfied    bool
+	updatedAt    time.Time
 }
 
 var (
@@ -132,48 +141,98 @@ var (
 	coverageGateClock = time.Now // indirected for tests
 )
 
-// admitCoverageBlock decides whether this call may be blocked, and books the
-// decision. Returns (block, round).
-//
-// Termination is structural, not hopeful: a NEW signature costs a round and
-// rounds are capped at maxRounds; a REPEATED signature costs a slot and slots
-// are capped at maxBlocksPerCoverageRound. Once either cap is hit the gate stops
-// blocking forever and the freeze proceeds — the run still delivers a summary
-// with the gap honestly disclosed by the finish gate. Never "no summary".
-func admitCoverageBlock(runID, signature string, maxRounds int) (bool, int) {
-	if runID == "" || maxRounds <= 0 {
-		return false, 0
-	}
-	now := coverageGateClock()
-
-	coverageGateMu.Lock()
-	defer coverageGateMu.Unlock()
+func sweepCoverageGateLocked(now time.Time) {
 	for id, st := range coverageGateRuns {
 		if now.Sub(st.updatedAt) > coverageGateTTL {
 			delete(coverageGateRuns, id)
 		}
 	}
+}
+
+// admitCoverageBlock makes one decision per planner step. All summarize_chunk
+// calls fanned out by that step reuse it, so no concurrency width can bypass the
+// gate. A later step with an unchanged signature means the planner made no fetch
+// progress; it is allowed through immediately instead of burning another step.
+// A changed signature may consume another configured round, provided enough
+// steps remain for fetch + Map + Reduce + final answer.
+func admitCoverageBlock(runID, signature string, step, maxSteps, maxRounds int) (bool, int, string) {
+	if runID == "" || maxRounds <= 0 {
+		return false, 0, "disabled"
+	}
+	now := coverageGateClock()
+
+	coverageGateMu.Lock()
+	defer coverageGateMu.Unlock()
+	sweepCoverageGateLocked(now)
 
 	st, ok := coverageGateRuns[runID]
-	if !ok || st.signature != signature {
-		prevRounds := 0
-		if ok {
-			prevRounds = st.rounds
-		}
-		if prevRounds >= maxRounds {
-			return false, prevRounds
-		}
-		coverageGateRuns[runID] = &coverageGateState{
-			signature: signature, rounds: prevRounds + 1, blocks: 1, updatedAt: now,
-		}
-		return true, prevRounds + 1
+	if ok && st.satisfied {
+		st.updatedAt = now
+		return false, st.rounds, "coverage_satisfied"
 	}
-	if st.blocks >= maxBlocksPerCoverageRound {
-		return false, st.rounds
+	if ok && st.decisionStep == step {
+		st.updatedAt = now
+		return st.block, st.rounds, st.reason
 	}
-	st.blocks++
+
+	prevRounds := 0
+	if ok {
+		prevRounds = st.rounds
+		if st.signature == signature {
+			st.decisionStep = step
+			st.block = false
+			st.reason = "no_coverage_progress"
+			st.updatedAt = now
+			return false, st.rounds, st.reason
+		}
+	}
+
+	reason := "blocked"
+	block := true
+	if prevRounds >= maxRounds {
+		block = false
+		reason = "round_budget_exhausted"
+	} else if maxSteps-step < coverageRepairReservedSteps {
+		block = false
+		reason = "step_budget_reserved"
+	}
+	if block {
+		prevRounds++
+	}
+	coverageGateRuns[runID] = &coverageGateState{
+		signature: signature, rounds: prevRounds, decisionStep: step,
+		block: block, reason: reason, updatedAt: now,
+	}
+	return block, prevRounds, reason
+}
+
+func coverageGateSatisfied(runID string) bool {
+	coverageGateMu.Lock()
+	defer coverageGateMu.Unlock()
+	now := coverageGateClock()
+	sweepCoverageGateLocked(now)
+	st := coverageGateRuns[runID]
+	if st == nil || !st.satisfied {
+		return false
+	}
 	st.updatedAt = now
-	return true, st.rounds
+	return true
+}
+
+func markCoverageGateSatisfied(runID string) {
+	coverageGateMu.Lock()
+	defer coverageGateMu.Unlock()
+	now := coverageGateClock()
+	sweepCoverageGateLocked(now)
+	st := coverageGateRuns[runID]
+	if st == nil {
+		st = &coverageGateState{}
+		coverageGateRuns[runID] = st
+	}
+	st.satisfied = true
+	st.block = false
+	st.reason = "coverage_satisfied"
+	st.updatedAt = now
 }
 
 // forgetCoverageGateRun drops a run's gate bookkeeping. Test-only hygiene; the
@@ -195,6 +254,9 @@ func checkCoverageBeforeFreeze(ctx context.Context, uid, sessionID, runID string
 	if !SummaryV2Enabled() || uid == "" || runID == "" {
 		return nil
 	}
+	if coverageGateSatisfied(runID) {
+		return nil
+	}
 	db, _, _, cfg := GetSummaryDeps()
 	if db == nil {
 		return nil
@@ -207,12 +269,17 @@ func checkCoverageBeforeFreeze(ctx context.Context, uid, sessionID, runID string
 
 	runStore := summaryrun.NewStore(db)
 	run, err := runStore.GetByID(ctx, uid, runID)
-	if err != nil || run == nil {
+	if err != nil {
+		log.Printf("[coverage_gate] run=%s session=%s: load run failed: %v", runID, sessionID, err)
+		return nil
+	}
+	if run == nil {
 		return nil
 	}
 	// Open scope has no authoritative expected list — nothing can be proven
 	// missing, so there is nothing to demand.
 	if run.ScopePolicy != model.ScopePolicyClosed {
+		markCoverageGateSatisfied(runID)
 		return nil
 	}
 	// FetchExpected=false means this turn was never owed a fetch: SS-08b strips
@@ -223,11 +290,16 @@ func checkCoverageBeforeFreeze(ctx context.Context, uid, sessionID, runID string
 	// same mistake, and worse — it would demand it from a model whose fetch tools
 	// were physically removed, which cannot succeed.
 	if !run.FetchExpected {
+		markCoverageGateSatisfied(runID)
 		return nil
 	}
 
 	spec, found, err := runStore.GetLatestSpec(ctx, uid, runID)
-	if err != nil || !found || len(spec.Channels) == 0 {
+	if err != nil {
+		log.Printf("[coverage_gate] run=%s session=%s: load latest spec failed: %v", runID, sessionID, err)
+		return nil
+	}
+	if !found || len(spec.Channels) == 0 {
 		return nil
 	}
 	expected := make([]string, 0, len(spec.Channels))
@@ -239,6 +311,7 @@ func checkCoverageBeforeFreeze(ctx context.Context, uid, sessionID, runID string
 	attempted := decodeAttemptedChannels(run.AttemptedChannels, runID)
 	missingIDs := finishgate.MissingChannels(expected, attempted)
 	if len(missingIDs) == 0 {
+		markCoverageGateSatisfied(runID)
 		return nil
 	}
 
@@ -246,20 +319,24 @@ func checkCoverageBeforeFreeze(ctx context.Context, uid, sessionID, runID string
 	// replay reusing the original run's manifest): the moment this gate protects
 	// has passed. Blocking now could only cost turns to fetch messages that the
 	// manifest can no longer make citable.
-	if _, _, frozen, ferr := artifact.NewStore(db).GetFrozenManifestByRun(ctx, uid, runID); ferr == nil && frozen {
+	if _, _, frozen, ferr := artifact.NewStore(db).GetFrozenManifestByRun(ctx, uid, runID); ferr != nil {
+		log.Printf("[coverage_gate] run=%s session=%s: read frozen manifest failed: %v", runID, sessionID, ferr)
+	} else if frozen {
+		markCoverageGateSatisfied(runID)
 		return nil
 	}
 
-	block, round := admitCoverageBlock(runID, coverageSignature(attempted, missingIDs), maxRounds)
+	stepInfo := coverageGateStep(ctx)
+	block, round, reason := admitCoverageBlock(runID, coverageSignature(attempted, missingIDs), stepInfo.step, stepInfo.maxSteps, maxRounds)
 	if !block {
-		log.Printf("[coverage_gate] run=%s session=%s: %d expected channel(s) still unfetched after %d round(s); allowing the freeze so the run still delivers a summary (gap will be disclosed)",
-			runID, sessionID, len(missingIDs), maxRounds)
+		log.Printf("[coverage_gate] run=%s session=%s step=%d/%d: %d expected channel(s) still unfetched after %d blocked round(s); allowing freeze reason=%s (finish gate will disclose the gap)",
+			runID, sessionID, stepInfo.step, stepInfo.maxSteps, len(missingIDs), round, reason)
 		return nil
 	}
 
 	missing := channelsForIDs(spec.Channels, missingIDs)
-	log.Printf("[coverage_gate] run=%s session=%s round=%d/%d: blocking the citation freeze, %d expected channel(s) never fetched",
-		runID, sessionID, round, maxRounds, len(missingIDs))
+	log.Printf("[coverage_gate] run=%s session=%s step=%d/%d round=%d/%d: blocking the citation freeze, %d expected channel(s) never fetched",
+		runID, sessionID, stepInfo.step, stepInfo.maxSteps, round, maxRounds, len(missingIDs))
 	return &CoverageGateError{
 		Missing:     missing,
 		Instruction: buildCoverageGateInstruction(missing, spec.TimeRange),
@@ -339,7 +416,7 @@ func buildCoverageGateInstruction(missing []summaryspec.Channel, tr summaryspec.
 		} else {
 			// Never print channel_type=0: fetch_channel rejects it, and an
 			// instruction the tool refuses is worse than no instruction.
-			fmt.Fprintf(&b, "  - channel_id=%q channel_type=<用系统提示里该频道的 tool_channel_type> (%s)\n", c.ChannelID, name)
+			fmt.Fprintf(&b, "  - channel_id=%q (%s; channel_type 请使用系统提示中该频道对应的整数)\n", c.ChannelID, name)
 		}
 	}
 	b.WriteString("\n请对上面每个频道调用 fetch_channel(channel_type 必须是上面给出的整数,1=私聊 2=群 5=子区)")

@@ -9,6 +9,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -148,30 +149,20 @@ func TestToolChannelType(t *testing.T) {
 }
 
 // Termination, the property that makes this safe to put in front of the freeze.
-// A planner that cannot fetch the channel re-calls summarize_chunk unchanged;
-// the signature does not move, so the fan-out budget drains and the gate stops
-// blocking. The freeze then proceeds and the run still produces a summary.
+// A later planner step with the same signature proves no fetch progress was
+// made, so the gate must stop blocking immediately.
 func TestAdmitCoverageBlock_TerminatesWhenPlannerMakesNoProgress(t *testing.T) {
 	runID := "run-no-progress"
 	forgetCoverageGateRun(runID)
 	t.Cleanup(func() { forgetCoverageGateRun(runID) })
 
-	blocked := 0
-	for i := 0; i < 100; i++ {
-		block, _ := admitCoverageBlock(runID, "same-signature", 2)
-		if !block {
-			break
-		}
-		blocked++
+	block, round, reason := admitCoverageBlock(runID, "same-signature", 1, 20, 2)
+	if !block || round != 1 || reason != "blocked" {
+		t.Fatalf("first step: block=%v round=%d reason=%q, want true/1/blocked", block, round, reason)
 	}
-	if blocked == 0 {
-		t.Fatal("never blocked once — the gate would never fire at all")
-	}
-	if blocked > maxBlocksPerCoverageRound {
-		t.Fatalf("blocked %d times at one signature, want at most %d", blocked, maxBlocksPerCoverageRound)
-	}
-	if block, _ := admitCoverageBlock(runID, "same-signature", 2); block {
-		t.Fatal("still blocking after the budget drained — the freeze must be allowed to proceed")
+	block, round, reason = admitCoverageBlock(runID, "same-signature", 2, 20, 2)
+	if block || round != 1 || reason != "no_coverage_progress" {
+		t.Fatalf("next step without progress: block=%v round=%d reason=%q, want false/1/no_coverage_progress", block, round, reason)
 	}
 }
 
@@ -184,32 +175,65 @@ func TestAdmitCoverageBlock_FanOutInOneStepCostsOneRound(t *testing.T) {
 	forgetCoverageGateRun(runID)
 	t.Cleanup(func() { forgetCoverageGateRun(runID) })
 
-	for i := 0; i < 3; i++ {
-		block, round := admitCoverageBlock(runID, "sig-A", 2)
-		if !block {
-			t.Fatalf("parallel call %d was not blocked", i)
-		}
-		if round != 1 {
-			t.Fatalf("parallel call %d reported round %d, want 1 — a fan-out is one round", i, round)
+	const width = 12 // regression: the old hard cap let call 5 freeze the manifest
+	type decision struct {
+		block bool
+		round int
+	}
+	start := make(chan struct{})
+	decisions := make(chan decision, width)
+	for i := 0; i < width; i++ {
+		go func() {
+			<-start
+			block, round, _ := admitCoverageBlock(runID, "sig-A", 3, 20, 2)
+			decisions <- decision{block: block, round: round}
+		}()
+	}
+	close(start)
+	for i := 0; i < width; i++ {
+		got := <-decisions
+		if !got.block || got.round != 1 {
+			t.Fatalf("parallel call %d: block=%v round=%d, want true/1", i, got.block, got.round)
 		}
 	}
+	// Same signature on a LATER planner step is no progress and must be allowed.
+	if block, _, reason := admitCoverageBlock(runID, "sig-A", 4, 20, 2); block || reason != "no_coverage_progress" {
+		t.Fatalf("later no-progress step: block=%v reason=%q, want false/no_coverage_progress", block, reason)
+	}
 	// The planner fetched something: new coverage state, new round.
-	block, round := admitCoverageBlock(runID, "sig-B", 2)
+	block, round, _ := admitCoverageBlock(runID, "sig-B", 5, 20, 2)
 	if !block || round != 2 {
 		t.Fatalf("after progress: block=%v round=%d, want true/2", block, round)
 	}
 	// Budget exhausted: a third distinct state must NOT block.
-	if block, _ := admitCoverageBlock(runID, "sig-C", 2); block {
+	if block, _, reason := admitCoverageBlock(runID, "sig-C", 6, 20, 2); block || reason != "round_budget_exhausted" {
 		t.Fatal("blocked a 3rd round with maxRounds=2 — the cap is not enforced")
+	}
+}
+
+func TestAdmitCoverageBlock_ReservesStepsForRecoveryAndFinalAnswer(t *testing.T) {
+	runID := "run-step-budget"
+	forgetCoverageGateRun(runID)
+	t.Cleanup(func() { forgetCoverageGateRun(runID) })
+
+	if block, _, reason := admitCoverageBlock(runID, "sig", 17, 20, 2); block || reason != "step_budget_reserved" {
+		t.Fatalf("block=%v reason=%q, want false/step_budget_reserved with only 3 steps left", block, reason)
+	}
+
+	boundaryRunID := "run-step-budget-boundary"
+	forgetCoverageGateRun(boundaryRunID)
+	t.Cleanup(func() { forgetCoverageGateRun(boundaryRunID) })
+	if block, _, reason := admitCoverageBlock(boundaryRunID, "sig", 16, 20, 2); !block || reason != "blocked" {
+		t.Fatalf("block=%v reason=%q, want true/blocked with exactly 4 steps left", block, reason)
 	}
 }
 
 // maxRounds<=0 is the documented kill switch and must never block.
 func TestAdmitCoverageBlock_ZeroRoundsDisables(t *testing.T) {
-	if block, _ := admitCoverageBlock("run-x", "sig", 0); block {
+	if block, _, _ := admitCoverageBlock("run-x", "sig", 1, 20, 0); block {
 		t.Fatal("maxRounds=0 must disable the gate entirely")
 	}
-	if block, _ := admitCoverageBlock("", "sig", 2); block {
+	if block, _, _ := admitCoverageBlock("", "sig", 1, 20, 2); block {
 		t.Fatal("an empty run id must never block")
 	}
 }
@@ -277,12 +301,12 @@ func TestCoverageGateStateExpires(t *testing.T) {
 
 	base := time.Now()
 	coverageGateClock = func() time.Time { return base }
-	if block, _ := admitCoverageBlock(runID, "sig", 1); !block {
+	if block, _, _ := admitCoverageBlock(runID, "sig", 1, 20, 1); !block {
 		t.Fatal("first call must block")
 	}
 	coverageGateClock = func() time.Time { return base.Add(coverageGateTTL + time.Minute) }
 	// Sweep happens on the next admit; a fresh unrelated run triggers it.
-	admitCoverageBlock("run-other", "sig", 1)
+	admitCoverageBlock("run-other", "sig", 1, 20, 1)
 	t.Cleanup(func() { forgetCoverageGateRun("run-other") })
 
 	coverageGateMu.Lock()
@@ -293,16 +317,35 @@ func TestCoverageGateStateExpires(t *testing.T) {
 	}
 }
 
-// The bound is not decorative: exceeding the runner's MaxSteps makes
-// RunWithHistory return "max steps exceeded", i.e. NO summary at all — strictly
-// worse than the incomplete-but-disclosed summary the gate is protecting. The
-// serial worst case (maxRounds × fan-out width) must therefore fit inside the
-// summary profile's step budget with room for the run's real work.
-func TestCoverageGateWorstCaseFitsStepBudget(t *testing.T) {
-	const defaultMaxRounds = 2 // SUMMARY_REPAIR_MAX_ROUNDS default
-	const summaryProfileMaxSteps = 15
-	if worst := defaultMaxRounds * maxBlocksPerCoverageRound; worst >= summaryProfileMaxSteps {
-		t.Fatalf("worst-case blocked calls = %d, which can exhaust the summary profile's MaxSteps (%d) and end the run with no summary at all", worst, summaryProfileMaxSteps)
+func TestCoverageGateReserveFitsSummaryProfiles(t *testing.T) {
+	for _, name := range []string{"summary", "summary_refine"} {
+		maxSteps := profiles[name].Policy.MaxSteps
+		if coverageRepairReservedSteps >= maxSteps {
+			t.Fatalf("reserve=%d must leave usable planner steps in profile %q (MaxSteps=%d)", coverageRepairReservedSteps, name, maxSteps)
+		}
+	}
+}
+
+func TestRunToolsInjectsOneStepAcrossFanOut(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(Tool{Type: "function", Function: ToolFunction{Name: "observe_step"}},
+		func(ctx context.Context, _ json.RawMessage) (string, error) {
+			got := coverageGateStep(ctx)
+			if got.step != 7 || got.maxSteps != 20 {
+				return "", fmt.Errorf("step context = %+v, want 7/20", got)
+			}
+			return "ok", nil
+		})
+
+	r := NewRunner(nil, reg, NewPool(16), Policy{})
+	calls := make([]ToolCall, 12)
+	for i := range calls {
+		calls[i] = mkToolCall(fmt.Sprintf("call-%d", i), "observe_step", `{}`)
+	}
+	for i, got := range r.runTools(context.Background(), calls, 7, 20) {
+		if got != "ok" {
+			t.Fatalf("call %d result=%q, want ok", i, got)
+		}
 	}
 }
 

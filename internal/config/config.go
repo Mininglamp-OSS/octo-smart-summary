@@ -124,13 +124,11 @@ type Config struct {
 	// Default 30. Values <=0 fall back to the default in handler.
 	SummaryCustomTemplateLimit int
 
-	// SummaryRepairMaxRounds bounds the SS-12 coverage gate: how many times
-	// summarize_chunk may refuse to freeze the citation manifest while an
-	// expected channel has never been fetched. Each block costs the planner a
-	// fetch+retry step, so this is a latency and step-budget ceiling as well as a
-	// termination guarantee for a channel that simply cannot be fetched. After
-	// the cap the freeze proceeds and the run still delivers a summary with the
-	// gap disclosed by the finish gate. 0 disables the gate entirely.
+	// SummaryRepairMaxRounds bounds how many DISTINCT coverage states may block
+	// the citation freeze. Concurrent summarize_chunk calls from one planner step
+	// share a decision; an unchanged state on a later step is released as no
+	// progress. The gate also reserves enough steps for fetch, Map, Reduce, and a
+	// final answer. 0 disables the gate entirely.
 	SummaryRepairMaxRounds int
 
 	// Fetch concurrency for parallel channel message retrieval

@@ -142,6 +142,10 @@ func (f *coverageGateFixture) toolCtx() context.Context {
 	return context.WithValue(ctx, ContextKeyRunID, f.runID)
 }
 
+func (f *coverageGateFixture) toolCtxAtStep(step int) context.Context {
+	return withCoverageGateStep(f.toolCtx(), step, profiles["summary"].Policy.MaxSteps)
+}
+
 func (f *coverageGateFixture) frozen(t *testing.T) bool {
 	t.Helper()
 	_, _, found, err := artifact.NewStore(f.db).GetFrozenManifestByRun(context.Background(), f.uid, f.runID)
@@ -250,7 +254,7 @@ func TestCoverageGate_RepairedChannelIsCitable(t *testing.T) {
 
 	// Round 1: blocked.
 	argsA, _ := json.Marshal(map[string]string{"messages_handle": handleA})
-	if _, err := h(f.toolCtx(), argsA); err == nil {
+	if _, err := h(f.toolCtxAtStep(1), argsA); err == nil {
 		t.Fatal("round 1 must be blocked")
 	}
 
@@ -264,7 +268,7 @@ func TestCoverageGate_RepairedChannelIsCitable(t *testing.T) {
 	// Round 2: coverage is complete, so the gate stands aside and the freeze
 	// happens over a pool that INCLUDES ch-B.
 	argsB, _ := json.Marshal(map[string]string{"messages_handle": handleB})
-	out, err := h(f.toolCtx(), argsB)
+	out, err := h(f.toolCtxAtStep(2), argsB)
 	if err != nil {
 		t.Fatalf("round 2 summarize_chunk: %v", err)
 	}
@@ -346,7 +350,7 @@ func TestCoverageGate_AfterCapFreezeProceedsAndRunStillSummarizes(t *testing.T) 
 	calls := 0
 	for i := 0; i < 40; i++ {
 		calls++
-		lastOut, lastErr = h(f.toolCtx(), args)
+		lastOut, lastErr = h(f.toolCtxAtStep(i+1), args)
 		if lastErr == nil {
 			break
 		}
@@ -358,8 +362,8 @@ func TestCoverageGate_AfterCapFreezeProceedsAndRunStillSummarizes(t *testing.T) 
 	if lastErr != nil {
 		t.Fatalf("gate never gave up after %d calls — an unfetchable channel would loop forever and the user would get NO summary; last err: %v", calls, lastErr)
 	}
-	if calls > 2*maxBlocksPerCoverageRound+1 {
-		t.Fatalf("gate blocked %d times before giving up; the bound (maxRounds × fan-out) is not being enforced", calls-1)
+	if calls != 2 {
+		t.Fatalf("calls=%d, want 2: one blocked step followed by immediate no-progress release", calls)
 	}
 
 	var result struct {
