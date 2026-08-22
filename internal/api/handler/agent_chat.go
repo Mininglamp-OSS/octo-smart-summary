@@ -1124,6 +1124,14 @@ func safeErrorDetail(err error) string {
 	case strings.Contains(err.Error(), "LLM returned empty response with no tool_calls"):
 		// runner.go final-step empty content guard (SUM-158 blocker follow-up).
 		return "LLM returned empty response with no tool_calls at final step"
+	case strings.Contains(err.Error(), "successful Map retries and Reduce required before final answer"):
+		// runner.go final-step completeness gate: the model never landed a
+		// successful merge_summaries over every Map handle (or left a Map retry
+		// outstanding). Generic "internal error" is actively misleading here —
+		// nothing broke server-side, the run failed to converge on a complete
+		// summary — and the wording is a constant errors.New with no interpolated
+		// data, so it is safe to pass through.
+		return "successful Map retries and Reduce required before final answer"
 	case strings.Contains(err.Error(), "unknown agent profile"):
 		// profile.go GetProfile lookup miss.
 		return "unknown agent profile"

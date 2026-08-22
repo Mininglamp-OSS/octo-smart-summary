@@ -11,9 +11,8 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmfallback"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 )
-
-const truncatedAnswerNotice = "\n\n> 输出因长度限制被截断，请缩小范围或降低详细程度后重试。"
 
 // Client 是 agent 自带的 LLM 客户端，独立于 service/llm.go，只依赖标准库。
 type Client struct {
@@ -185,7 +184,7 @@ func (c *Client) attemptChat(ctx context.Context, model string, msgs []Message, 
 		// A content-only turn is the user-facing answer. It is degraded but still
 		// usable, so preserve it with an explicit disclosure instead of failing
 		// the whole request and discarding everything the model produced.
-		msg.Content += truncatedAnswerNotice
+		msg.Content += service.TruncationNotice
 	}
 	return AssistantTurn{
 		Content:   msg.Content,
