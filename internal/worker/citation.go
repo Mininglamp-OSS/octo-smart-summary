@@ -2,16 +2,24 @@ package worker
 
 import (
 	"fmt"
+	"log"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citation"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
 
-var citationRe = regexp.MustCompile(`\[(\d{1,5})\]`)
+// citationRe is the single process-wide citation-marker pattern, now owned by
+// internal/citation so the agent Map path (which must not import
+// internal/worker) enforces the cap against the very same definition
+// buildCitations / dedupCitations / stripOrphanCitations match on. Aliased
+// rather than re-declared: two copies of this regexp is exactly how a marker
+// one stage deletes becomes a marker another stage still counts.
+var citationRe = citation.MarkerRe
 var multiSpaceRe = regexp.MustCompile(`[ \t]{2,}`)
 var emptyLineRe = regexp.MustCompile(`(?m)^[ \t]*$\n`)
 
@@ -30,12 +38,12 @@ func extractCitationIndexes(text string) []int {
 	return indexes
 }
 
-
 // BuildCitations is the exported wrapper of buildCitations.
 // Exposed so out-of-package callers can reuse the citation logic.
 func BuildCitations(text string, messages []pipeline.Message, allMessages []pipeline.Message, nameMap map[string]string) []model.Citation {
 	return buildCitations(text, messages, allMessages, nameMap)
 }
+
 // buildCitations builds a citation list from the summary text and original messages.
 // Only messages actually referenced in the text are included.
 
@@ -361,18 +369,131 @@ func isOnlyWhitespace(s string) bool {
 	return true
 }
 
+// stripOrphanCitations removes `[n]` markers that have no backing Citation
+// row.
+//
+// Skips non-citable `[n]` forms via citation.IsCitableAt, the same guard
+// CapRuns applies. Without it this function undid exactly the damage that
+// guard exists to prevent, one pipeline stage later:
+//
+//	in:  结论一[1][2]，详见 [999](https://example.com/doc)
+//	out: 结论一[1][2]，详见 (https://example.com/doc)     <- link destroyed
+//
+// A markdown link whose text happens to be a number is not a citation, has no
+// Citation row by construction, and so was deleted from every summary that
+// contained one. Pre-existing, not introduced by the cap — but a guard that
+// protects one of the two paths that need it is not a guard.
 func stripOrphanCitations(text string, citations []model.Citation) string {
 	validSet := make(map[int]bool)
 	for _, c := range citations {
 		validSet[c.Index] = true
 	}
-	result := citationRe.ReplaceAllStringFunc(text, func(match string) string {
-		sub := citationRe.FindStringSubmatch(match)
-		n, _ := strconv.Atoi(sub[1])
-		if validSet[n] {
-			return match
+	var b strings.Builder
+	b.Grow(len(text))
+	prev := 0
+	for _, m := range citationRe.FindAllStringSubmatchIndex(text, -1) {
+		if !citation.IsCitableAt(text, m[0], m[1]) {
+			continue
 		}
-		return ""
-	})
-	return strings.TrimSpace(multiSpaceRe.ReplaceAllString(result, " "))
+		n, err := strconv.Atoi(text[m[2]:m[3]])
+		if err != nil || validSet[n] {
+			continue
+		}
+		b.WriteString(text[prev:m[0]])
+		prev = m[1]
+	}
+	b.WriteString(text[prev:])
+	return strings.TrimSpace(multiSpaceRe.ReplaceAllString(b.String(), " "))
+}
+
+// finalizeCitations is the ONE definition of the worker's final citation
+// pipeline: derive rows, dedup, strip orphans, then cap. It exists as a
+// function so a test cannot exercise a different order than production does —
+// the previous test stopped at buildCitations, and that one-call gap between
+// the test's order and production's order hid a default-on regression for a
+// whole review round.
+//
+// maxCites <= 0 disables the cap (citation.Disabled), in which case this is
+// byte-for-byte the pre-cap pipeline.
+//
+// # Why the cap runs LAST
+//
+// dedupCitations ends with a whole-document dedup: for each [n] it keeps only
+// the FIRST occurrence anywhere in the body and deletes every later repeat.
+// citation.CapRuns keeps the HEAD of each run. Head-keeping is the worst
+// possible survivor policy against a first-occurrence global dedup — the
+// markers the cap preserves are precisely the ones an earlier claim has
+// already consumed, and the tail markers it deletes are the ones that would
+// have survived the dedup.
+//
+// Two claims citing the same source is not a corner case. It is what a real
+// summary looks like: one decisive message supports several conclusions.
+// Capping BEFORE the dedup therefore stripped claims down to zero citations:
+//
+//	in:          结论一：范围已确认[1][2][3]
+//	             结论二：负责人已定[1][2][3][10][11][12]
+//	cap off:     结论二：负责人已定[10][11][12]     <- cited
+//	cap=3 first: 结论二：负责人已定                 <- ZERO citations
+//
+// The cap destroyed a citation that exists without the cap. That violates
+// citation.CapRuns' own stated invariant ("an uncited claim is worse than an
+// over-cited one" — true inside CapRuns, false two calls later), and the Map
+// prompt's "没有引用的结论不允许输出".
+//
+// # Why capping last does not leave orphan Citation rows
+//
+// That concern is real and is what put the cap first to begin with. It is
+// handled by RE-DERIVING: buildCitations is a pure function of (text,
+// messages, allMessages, nameMap) — it reads no state and mutates nothing —
+// so running it again over the capped body returns exactly the rows whose
+// markers are still present.
+//
+// The subtle part is dedupCitations' remap, which rewrites marker NUMBERS
+// when two citations share (sender, content). Re-deriving after it is still
+// correct because the remap has already been applied to the body: the
+// remapped-away numbers are gone from the text, so buildCitations never sees
+// them and cannot resurrect a row for one. TestCapLastSurvivesCitationRemap
+// pins this by asserting the re-derived rows equal dedupCitations' rows minus
+// exactly what the cap removed.
+//
+// And the cap only ever DELETES markers, never adds or renumbers, so it
+// cannot introduce a marker with no backing row either.
+//
+// # What this does NOT bound
+//
+// It does not bound what a STREAMING client sees first. Deltas are emitted
+// straight from the model (CallMapStream / CallReduceStream); every stage in
+// this function runs after the last delta. The live view is reconciled by
+// publishing the final body as a streaming snapshot before Done — see
+// finishStreamDone in personal_processor.go.
+func finalizeCitations(
+	text string,
+	userMessages []pipeline.Message,
+	allMessages []pipeline.Message,
+	nameMap map[string]string,
+	maxCites int,
+) (string, []model.Citation) {
+	citations := buildCitations(text, userMessages, allMessages, nameMap)
+	text, citations = dedupCitations(text, citations)
+	text = stripOrphanCitations(text, citations)
+
+	if maxCites <= 0 {
+		return text, citations
+	}
+
+	capped, st := citation.CapRuns(text, maxCites)
+	if !st.Changed() {
+		// Nothing removed: the body and rows are already consistent, and
+		// skipping the re-derive keeps the no-op path allocation-free and
+		// provably identical to the disabled path.
+		return text, citations
+	}
+	log.Printf("[personal-worker] citation cap max=%d runs=%d capped_runs=%d markers=%d->%d dedup=%d cap=%d longest_run=%d->%d marks (%d->%d chars) bytes=%d->%d",
+		maxCites, st.Runs, st.CappedRuns, st.MarkersBefore, st.MarkersAfter,
+		st.RemovedByDedup, st.RemovedByCap,
+		st.LongestRunBefore, st.LongestRunAfter,
+		st.LongestRunCharsBefore, st.LongestRunCharsAfter,
+		st.BytesBefore, st.BytesAfter)
+
+	return capped, buildCitations(capped, userMessages, allMessages, nameMap)
 }

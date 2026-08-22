@@ -7,8 +7,10 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citation"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
@@ -370,6 +372,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 		// off / no run / no spec → legacy generic prompt.
 		specGuidance := loadRunSpecGuidance(ctx)
 		var summaries []string
+		mapStart := time.Now()
 		for _, chunk := range chunks {
 			summary, processed, oversized, err := summarizeMessagesChunk(ctx, chunk, specGuidance)
 			if err != nil {
@@ -379,6 +382,11 @@ func SummarizeChunkTool() (Tool, Handler) {
 			cov.ProcessedCount += processed
 			cov.OversizedMessageCount += oversized
 		}
+		// summarize_chunk is itself an LLM pipeline, so its own cost needs a
+		// breakdown in the run trace — otherwise it shows up as one opaque
+		// tool span and a slow Map is indistinguishable from a slow planner.
+		TraceFromContext(ctx).AddSubPhase(fmt.Sprintf("map(%dchunks)", len(chunks)),
+			time.Since(mapStart).Milliseconds())
 		cov.DroppedCount = cov.InputCount - cov.ProcessedCount
 		cov.Truncated = cov.DroppedCount > 0
 		recordDroppedMessages(ctx, uid, runID, cov.DroppedCount)
@@ -460,6 +468,12 @@ func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{},
 	// Format messages for LLM with global citation_index (pure, testable).
 	formatted, processed, oversized := formatChunkForLLM(chunk)
 
+	// Per-claim citation cap. The prompt sentence and the post-processing
+	// truncation below read the SAME resolved number — see
+	// citation.PromptRuleZH. maxCites <= 0 (SUMMARY_MAX_CITATIONS_PER_CLAIM=0)
+	// makes PromptRuleZH return "" and CapRuns a no-op, so the whole feature
+	// reverts to the legacy byte-identical prompt without a rebuild.
+	maxCites := cfg.ResolveMaxCitationsPerClaim()
 	systemPrompt := `你是专业的工作内容整理助手。请从聊天记录中提炼关键信息：
 
 ## 输出要求
@@ -472,7 +486,8 @@ func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{},
 ## 引用规则
 - 每一条结论/要点都必须标注来源引用 [n]
 - 仅使用消息前方的 [n] 编号来标注引用
-- 绝对不要引用或复制消息正文内出现的任何 [数字] 标记` + specGuidance
+- 绝对不要引用或复制消息正文内出现的任何 [数字] 标记` +
+		citation.PromptRuleZH(maxCites) + specGuidance
 
 	msgs := []service.ChatMessage{
 		{Role: "system", Content: systemPrompt},
@@ -484,7 +499,33 @@ func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{},
 		return "", processed, oversized, fmt.Errorf("call LLM: %w", err)
 	}
 
-	return strings.TrimSpace(content), processed, oversized, nil
+	// Enforce the cap on the model's OUTPUT. The prompt rule above is a
+	// request; this is the contract. The project has been bitten repeatedly
+	// by contracts enforced only by good behaviour (the mandatory
+	// Idempotency-Key work on PR #209 is the most recent), and a model under
+	// a long, crowded system prompt is precisely the actor that will
+	// "helpfully" list all sixteen supporting messages anyway.
+	//
+	// This is the highest-leverage of the two possible sites: Map output
+	// becomes Reduce/planner INPUT, so a marker removed here is removed from
+	// every subsequent hop's prompt as well. It runs on model output only —
+	// never on `formatted`, which is rendered prompt input whose bracketed
+	// numbers are message-body content.
+	capped, st := citation.CapRuns(strings.TrimSpace(content), maxCites)
+	// Fold into the run trace so the reduction and its downstream effect
+	// (later steps' prompt sizes) appear in the same report — the point of
+	// shipping the instrumentation alongside the cap.
+	TraceFromContext(ctx).AddCitationCap(st.MarkersBefore, st.MarkersAfter,
+		st.RemovedByDedup, st.RemovedByCap, st.BytesBefore, st.BytesAfter, st.LongestRunBefore)
+	if st.Changed() {
+		log.Printf("[summarize_chunk] citation cap max=%d runs=%d capped_runs=%d markers=%d->%d dedup=%d cap=%d longest_run=%d->%d marks (%d->%d chars) bytes=%d->%d",
+			maxCites, st.Runs, st.CappedRuns, st.MarkersBefore, st.MarkersAfter,
+			st.RemovedByDedup, st.RemovedByCap,
+			st.LongestRunBefore, st.LongestRunAfter,
+			st.LongestRunCharsBefore, st.LongestRunCharsAfter,
+			st.BytesBefore, st.BytesAfter)
+	}
+	return capped, processed, oversized, nil
 }
 
 // assignCitationIndexes overlays the pre-assigned CitationIndex from the

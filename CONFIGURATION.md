@@ -28,17 +28,19 @@ All configuration is done via environment variables.
 | `WORKER_INTERNAL_PORT` | Port for the worker internal server | No | `8082` |
 | `WORKER_LISTEN_ADDR` | Listen address for worker server | No | `0.0.0.0` |
 | `WORKER_MAX_CONCURRENT_TASKS` | Max concurrent worker tasks | No | `20` |
-| `WORKER_MAP_CONCURRENCY` | Concurrency for map-phase LLM calls | No | `5` |
+| `WORKER_MAP_CONCURRENCY` | Concurrency for map-phase LLM calls | No | `3` |
 | `WORKER_POLL_INTERVAL_SECONDS` | Task polling interval in seconds | No | `2` |
 | `WORKER_TASK_LEASE_MINUTES` | Task lease duration in minutes | No | `20` |
 | `WORKER_MAX_RETRY` | Maximum retry attempts for failed tasks | No | `3` |
 | `WORKER_API_CALLBACK_URL` | Callback URL from worker to API | Yes (Worker) | — |
 | `WORKER_TRIGGER_URL` | URL for API to trigger worker | Yes (API) | — |
-| `MSG_TABLE_COUNT` | Number of message sharding tables | No | `5` |
+| `MSG_TABLE_COUNT` | Number of message sharding tables | No | `3` |
 | `CONTEXT_WINDOW` | Context window for personal summary filtering | No | `2` |
 | `MAX_MESSAGES_PER_PARTICIPANT` | Max messages per participant in map phase | No | `5000` |
 | `MAX_MESSAGES_PER_CHANNEL` | Max messages per channel (-1 = no limit) | No | `-1` |
 | `MAP_MAX_TOKENS` | Override map-phase token budget (0 = auto) | No | `0` |
+| `SUMMARY_MAX_CITATIONS_PER_CLAIM` | Maximum number of `[n]` citation markers a single claim may carry. A "claim" is a maximal consecutive marker run (`[3][7][12]`, spaces/tabs tolerated); a newline starts a new claim. Duplicate markers inside one claim are removed first (lossless, keyed on the parsed number so `[1]` and `[01]` are one source) and only then is the cap applied; a capped claim always keeps at least one marker. Enforced by post-processing MODEL OUTPUT at exactly three sites, all stated in `internal/citation/cap.go`: the agent Map tool output, the agent planner's final answer, and the worker's final body (where it runs AFTER dedup/orphan-strip and the citation rows are then re-derived). Prompt input is never capped, and stream deltas are not capped — the worker reconciles the live view by publishing the final body as a stream snapshot before `done`. The same resolved number is rendered into the Map prompts and the agent planner prompt, so the model is asked for exactly what is enforced. `0` or negative disables capping entirely and restores the previous behavior byte-for-byte, prompt included (pinned by `TestDisabledCapRestoresTheLegacyMapPrompt` and `TestPlannerPromptDropsTheCapRuleWhenDisabled`). | No | `3` |
+| `AGENT_TRACE` | Emit a per-request agent latency trace (`[agent-trace]` log lines): total wall clock split into planning / tools / unaccounted, per-step planner latency and prompt size, slowest tool spans, and the citation cap's effect. Roughly a few dozen lines per request, so it is off by default and intended for diagnosing a specific slow request. Logs sizes, counts, durations, step numbers and tool names only — never message content, prompt text, tool arguments, or user/channel names. | No | `false` |
 | `CHARS_PER_TOKEN_CJK` | Characters per token for CJK text | No | `1` |
 | `CHARS_PER_TOKEN_ASCII` | Characters per token for ASCII text | No | `4` |
 | `SUMMARY_CHAT_CANDIDATE_LIMIT` | Candidate query limit (-1 = no limit) | No | `-1` |

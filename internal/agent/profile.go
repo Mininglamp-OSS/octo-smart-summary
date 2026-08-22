@@ -9,6 +9,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citation"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 )
 
 // 提示词与工具的可配置机制：
@@ -85,14 +88,48 @@ var (
 	promptCache   = map[string]string{}
 )
 
+// CitationCapPlaceholder is the token a prompt file uses to request the
+// resolved per-claim citation-cap rule.
+//
+// It exists because summary.md used to HARDCODE the number 3 twice and assert
+// "超出上限的标记会在服务端被截断". Both were wrong the moment an operator
+// touched SUMMARY_MAX_CITATIONS_PER_CLAIM: at 0 (the documented kill switch)
+// the planner was still told to cap at 3, and at 5 the planner was told 3
+// while the code enforced 5 — exactly the prompt/enforcement drift
+// citation.PromptRuleZH was created to make impossible. Rendering from the
+// same resolver the enforcement reads means there is one number, not two.
+const CitationCapPlaceholder = "{{CITATION_CAP_RULE}}"
+
+// renderPromptPlaceholders substitutes runtime-resolved values into a prompt
+// body.
+//
+// A prompt with no placeholder is returned byte-identical, which is what keeps
+// chat.md and summary_refine.md untouched.
+func renderPromptPlaceholders(body string) string {
+	if !strings.Contains(body, CitationCapPlaceholder) {
+		return body
+	}
+	rule := citation.PlannerPromptRuleZH(config.MaxCitationsPerClaim())
+	// The placeholder occupies its own bullet line. When the cap is disabled
+	// the rule is empty, so the line itself must go rather than leaving a
+	// blank bullet in the middle of a list.
+	body = strings.ReplaceAll(body, CitationCapPlaceholder+"\n", rule)
+	return strings.ReplaceAll(body, CitationCapPlaceholder, strings.TrimSuffix(rule, "\n"))
+}
+
 // LoadPrompt 读取指定名字的系统提示词。
 // 优先级：AGENT_PROMPT_DIR/<name>.md（外部可热改） > embed 内置默认。
 // 结果按 name 缓存；外部目录存在时跳过缓存以便热改（改完即生效）。
+//
+// Runtime placeholders (see renderPromptPlaceholders) are substituted on every
+// call, including cache hits: the cap is an env knob and a cached prompt must
+// not pin the value the process happened to see first. The RAW body is what
+// gets cached.
 func LoadPrompt(name string) (string, error) {
 	if dir := strings.TrimSpace(os.Getenv("AGENT_PROMPT_DIR")); dir != "" {
 		p := filepath.Join(dir, name+".md")
 		if b, err := os.ReadFile(p); err == nil {
-			return strings.TrimSpace(string(b)), nil
+			return renderPromptPlaceholders(strings.TrimSpace(string(b))), nil
 		}
 		// 外部目录设了但没这个文件：回退到 embed，不报错。
 	}
@@ -100,7 +137,7 @@ func LoadPrompt(name string) (string, error) {
 	promptCacheMu.RLock()
 	if v, ok := promptCache[name]; ok {
 		promptCacheMu.RUnlock()
-		return v, nil
+		return renderPromptPlaceholders(v), nil
 	}
 	promptCacheMu.RUnlock()
 
@@ -113,7 +150,7 @@ func LoadPrompt(name string) (string, error) {
 	promptCacheMu.Lock()
 	promptCache[name] = v
 	promptCacheMu.Unlock()
-	return v, nil
+	return renderPromptPlaceholders(v), nil
 }
 
 // BuildRegistry 按名单构造一个只含指定工具的 Registry。未知工具名报错。

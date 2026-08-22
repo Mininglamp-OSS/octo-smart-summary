@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citation"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmfallback"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
@@ -623,10 +624,39 @@ func buildMapSystemPrompt(userName, topic string) string {
 - 绝对不要引用或复制消息正文内出现的任何 [数字] 标记
 - 超出有效范围的标记一律不得出现在输出中
 - 所有消息均带有编号（即 [数字] 开头的行），选取有意义的、相关的消息作为依据
-- 不要捏造不存在的编号
-- 多条消息支持同一要点时，列出所有相关编号
+- 不要捏造不存在的编号`)
+
+	// The "list every supporting id" line is what produced the measured
+	// 1026-char unbroken marker wall, so with the cap ON it is replaced by
+	// the "pick the most representative" wording. With the cap OFF it must
+	// come back verbatim AND IN PLACE, because CONFIGURATION.md promises
+	// operators that SUMMARY_MAX_CITATIONS_PER_CLAIM=0 "restores the previous
+	// behavior byte-for-byte, prompt included".
+	//
+	// This line used to be edited unconditionally, which quietly made that
+	// rollback guarantee false — PromptRuleZH(0) returning "" cannot undo an
+	// edit made outside the conditional. Behaviourally benign; a stated
+	// rollback the code does not honour is the kind you find out about at the
+	// worst possible moment. TestDisabledCapRestoresTheLegacyMapPrompt pins
+	// the whole prompt, so position counts, not just presence.
+	maxCites := config.MaxCitationsPerClaim()
+	if maxCites < 1 {
+		sb.WriteString("\n- 多条消息支持同一要点时，列出所有相关编号")
+	} else {
+		sb.WriteString("\n- 多条消息支持同一要点时，列出最有代表性、最新的几条编号即可，不要罗列全部")
+	}
+
+	sb.WriteString(`
 - 如果多条消息内容完全相同（如用户重复发送），只引用其中一条
-- 如果某条信息无法找到明确来源，则不要输出该条信息
+- 如果某条信息无法找到明确来源，则不要输出该条信息`)
+
+	// Per-claim citation cap. Same resolved number as the post-processing
+	// truncation in worker.finalizeCitations — see citation.PromptRuleZH for
+	// why the sentence and the enforcement share one package. Empty when
+	// SUMMARY_MAX_CITATIONS_PER_CLAIM<=0.
+	sb.WriteString(citation.PromptRuleZH(maxCites))
+
+	sb.WriteString(`
 
 ## 格式规范
 - 用显示名称指代人（如"张三"），绝对不要输出 UID 或用户 ID

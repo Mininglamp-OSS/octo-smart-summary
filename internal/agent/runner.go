@@ -131,8 +131,21 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 		// ever needed, wrap it inside the tool handler itself — do NOT
 		// re-widen stepCtx here.
 		stepCtx, cancel := context.WithTimeout(ctx, r.policy.StepTimeout)
+		// Measure the planner turn and the size of what it was handed. The
+		// message list grows by every tool result, so a late hop can spend
+		// more wall clock re-reading accumulated output than the tools took
+		// to produce it; without both numbers that cost is invisible. The
+		// measurement itself is skipped when tracing is off.
+		trace := TraceFromContext(ctx)
+		var promptChars, promptMsgs int
+		if trace.Active() {
+			promptChars, promptMsgs = measurePrompt(msgs)
+		}
+		planStart := time.Now()
 		turn, err := r.client.Chat(stepCtx, msgs, r.reg.Schemas())
+		planMs := time.Since(planStart).Milliseconds()
 		cancel()
+		trace.AddStep(step+1, planMs, promptChars, promptMsgs, turnTokens(turn, err))
 		if err != nil {
 			return "", nil, err
 		}
@@ -193,7 +206,15 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 		// See the stepCtx setup comment above for why: LLM-backed tools like
 		// summarize_chunk run their own sequential LLM calls that legitimately
 		// exceed the 60s per-step planning budget.
+		toolsStart := time.Now()
 		results := r.runTools(ctx, turn.ToolCalls, step+1, r.policy.MaxSteps)
+		if trace.Active() {
+			toolNames := make([]string, 0, len(turn.ToolCalls))
+			for _, tc := range turn.ToolCalls {
+				toolNames = append(toolNames, tc.Function.Name)
+			}
+			trace.CloseStep(step+1, time.Since(toolsStart).Milliseconds(), toolNames)
+		}
 		for i, tc := range turn.ToolCalls {
 			toolMsg := Message{
 				Role:       "tool",
@@ -252,6 +273,9 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 			out, err := r.reg.Dispatch(ctx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
 
 			toolElapsed := time.Since(toolStart).Milliseconds()
+			// Tools in a hop run concurrently, so the hop's wall clock is set
+			// by the slowest one; record each so the straggler can be named.
+			TraceFromContext(ctx).AddTool(tc.Function.Name, toolElapsed)
 
 			// Extract a cheap, safe integer count from the tool result (0 = none).
 			count := extractToolCount(tc.Function.Name, out, i, len(calls))
@@ -341,4 +365,14 @@ func extractToolCount(toolName, result string, idx, total int) int {
 	}
 
 	return 0
+}
+
+// turnTokens reports a turn's completion tokens, tolerating the error path
+// (a failed turn has no usable token count, but its latency still matters and
+// the step is still recorded).
+func turnTokens(turn AssistantTurn, err error) int {
+	if err != nil {
+		return 0
+	}
+	return turn.Tokens
 }
