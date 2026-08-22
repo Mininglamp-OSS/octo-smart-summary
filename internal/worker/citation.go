@@ -7,11 +7,18 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citation"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
 
-var citationRe = regexp.MustCompile(`\[(\d{1,5})\]`)
+// citationRe is the single process-wide citation-marker pattern, now owned by
+// internal/citation so the agent Map path (which must not import
+// internal/worker) enforces the cap against the very same definition
+// buildCitations / dedupCitations / stripOrphanCitations match on. Aliased
+// rather than re-declared: two copies of this regexp is exactly how a marker
+// one stage deletes becomes a marker another stage still counts.
+var citationRe = citation.MarkerRe
 var multiSpaceRe = regexp.MustCompile(`[ \t]{2,}`)
 var emptyLineRe = regexp.MustCompile(`(?m)^[ \t]*$\n`)
 
@@ -30,12 +37,12 @@ func extractCitationIndexes(text string) []int {
 	return indexes
 }
 
-
 // BuildCitations is the exported wrapper of buildCitations.
 // Exposed so out-of-package callers can reuse the citation logic.
 func BuildCitations(text string, messages []pipeline.Message, allMessages []pipeline.Message, nameMap map[string]string) []model.Citation {
 	return buildCitations(text, messages, allMessages, nameMap)
 }
+
 // buildCitations builds a citation list from the summary text and original messages.
 // Only messages actually referenced in the text are included.
 
