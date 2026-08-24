@@ -17,6 +17,7 @@ package llmfallback
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -95,6 +96,14 @@ type Config struct {
 	// Backoff returns the sleep before retry attempt n (n >= 1). Nil defaults
 	// to exponential 1s, 2s, 4s… Tests pass a zero-backoff to run fast.
 	Backoff func(attempt int) time.Duration
+	// Path labels which call site drove this Run, for metrics/logs. Optional;
+	// defaults to PathUnknown.
+	Path Path
+	// Observer receives attempt/switch/result events. Optional; nil installs a
+	// no-op. Not free: a nil observer still costs the timing calls Run makes
+	// around each attempt (measured ~14ns -> ~200ns per Run, zero allocations),
+	// which is noise against a network round trip but is not "nothing".
+	Observer Observer
 }
 
 func (c Config) backoff(attempt int) time.Duration {
@@ -114,8 +123,18 @@ func Run[T any](ctx context.Context, cfg Config, attempt Attempt[T]) (T, string,
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
+	obs, path := cfg.observer(), cfg.pathFor(ctx)
+	start := time.Now()
+	switches := 0
+
+	// Report the misconfiguration too. This used to return before any observer
+	// call, so a deployment with an empty model list failed every request while
+	// llm_calls_total stayed flat — the one case where a silent counter is
+	// least affordable.
 	if len(cfg.Models) == 0 {
-		return zero, "", fmt.Errorf("llmfallback: no models configured")
+		err := fmt.Errorf("llmfallback: no models configured")
+		obs.ObserveResult(ResultEvent{Path: path, Duration: time.Since(start), Err: err})
+		return zero, "", err
 	}
 
 	var lastErr error
@@ -123,38 +142,122 @@ func Run[T any](ctx context.Context, cfg Config, attempt Attempt[T]) (T, string,
 		// Respect caller cancellation before opening the next model's budget.
 		if err := ctx.Err(); err != nil {
 			if lastErr != nil {
-				return zero, "", fmt.Errorf("%w (last: %v)", err, lastErr)
+				err = fmt.Errorf("%w (last: %v)", err, lastErr)
 			}
+			obs.ObserveResult(ResultEvent{
+				Path: path, Switches: switches, Cancelled: true,
+				Duration: time.Since(start), Err: err,
+			})
 			return zero, "", err
 		}
 		if i > 0 {
 			log.Printf("[llmfallback] falling back from %q to %q: %s",
 				cfg.Models[i-1], model, SafeErrorForLog(lastErr, 200))
+			switches++
+			obs.ObserveSwitch(SwitchEvent{
+				Path:     path,
+				From:     cfg.Models[i-1],
+				To:       model,
+				FromPos:  PositionOf(i - 1),
+				Reason:   reasonFor(lastErr),
+				Attempts: attemptsSpent(lastErr, maxAttempts),
+				Err:      lastErr,
+			})
 		}
 		hasNext := i < len(cfg.Models)-1
 
-		val, outcome, err := runModel(ctx, model, maxAttempts, hasNext, cfg, attempt)
+		val, outcome, err := runModel(ctx, model, maxAttempts, hasNext, cfg, attempt, obs, path, PositionOf(i))
 		switch outcome {
 		case Success:
+			obs.ObserveResult(ResultEvent{
+				Path: path, Model: model, Position: PositionOf(i),
+				Switches: switches, OK: true, Duration: time.Since(start),
+			})
 			return val, model, nil
 		case Terminal:
+			obs.ObserveResult(ResultEvent{
+				Path: path, Model: model, Position: PositionOf(i),
+				Switches: switches, Duration: time.Since(start), Err: err,
+			})
 			return val, model, err
 		}
 		// runModel exhausted retries or hit TryNextModel → advance.
 		lastErr = err
 	}
 
-	if len(cfg.Models) == 1 {
-		return zero, "", lastErr
+	if len(cfg.Models) > 1 {
+		lastErr = fmt.Errorf("all %d model(s) failed: %w", len(cfg.Models), lastErr)
 	}
-	return zero, "", fmt.Errorf("all %d model(s) failed: %w", len(cfg.Models), lastErr)
+	obs.ObserveResult(ResultEvent{Path: path, Switches: switches, Duration: time.Since(start), Err: lastErr})
+	return zero, "", lastErr
+}
+
+// budgetStarvedErr marks the error returned when the deadline guard abandons a
+// model's remaining retries. It is a distinct type so ObserveSwitch can report
+// ReasonBudgetStarved — a configuration problem — separately from a genuine
+// upstream failure, without parsing error strings.
+type budgetStarvedErr struct {
+	model   string
+	budget  time.Duration
+	spent   int
+	wrapped error
+}
+
+func (e *budgetStarvedErr) Error() string {
+	if e.wrapped != nil {
+		return fmt.Sprintf("insufficient budget for another %s attempt on %q after %d attempt(s): %v",
+			e.budget, e.model, e.spent, e.wrapped)
+	}
+	return fmt.Sprintf("insufficient budget for another %s attempt on %q after %d attempt(s)",
+		e.budget, e.model, e.spent)
+}
+
+func (e *budgetStarvedErr) Unwrap() error { return e.wrapped }
+
+// reasonFor classifies why a model was abandoned, for the switch metric.
+func reasonFor(err error) SwitchReason {
+	var starved *budgetStarvedErr
+	switch {
+	case err == nil:
+		return ReasonRetriesExhausted
+	case errors.As(err, &starved):
+		return ReasonBudgetStarved
+	// Deliberately NOT special-cased here: an error wrapping
+	// context.DeadlineExceeded. Every production call site gives each attempt
+	// its own request timeout (agent/llm.go attemptChat, service/llm.go
+	// CallWithTools), so a merely slow upstream trips the INNER deadline while
+	// the parent Run context is still healthy. Classifying on the sentinel
+	// reported those as "cancelled" and emptied retries_exhausted during
+	// exactly the incident this metric exists for. Genuine caller cancellation
+	// never reaches this function: Run returns at the top of the model loop
+	// before any switch is observed.
+	case isDenied(err):
+		return ReasonDenied
+	default:
+		return ReasonRetriesExhausted
+	}
+}
+
+// attemptsSpent reports how many attempts were actually spent on the abandoned
+// model, so the switch metric distinguishes "gave up after 1" (the starvation
+// signature) from "gave up after the full budget".
+func attemptsSpent(err error, maxAttempts int) int {
+	var starved *budgetStarvedErr
+	if errors.As(err, &starved) {
+		return starved.spent
+	}
+	var denied *deniedErr
+	if errors.As(err, &denied) {
+		return denied.spent
+	}
+	return maxAttempts
 }
 
 // runModel runs the per-model retry loop. Returns Success (with value),
 // Terminal (stop everything), or TryNextModel (advance to the next model,
 // either because retries were exhausted on RetrySameModel or because the
 // attempt classified TryNextModel).
-func runModel[T any](ctx context.Context, model string, maxAttempts int, hasNext bool, cfg Config, attempt Attempt[T]) (T, Outcome, error) {
+func runModel[T any](ctx context.Context, model string, maxAttempts int, hasNext bool, cfg Config, attempt Attempt[T], obs Observer, path Path, position string) (T, Outcome, error) {
 	var zero T
 	var lastErr error
 	for a := 0; a < maxAttempts; a++ {
@@ -170,10 +273,9 @@ func runModel[T any](ctx context.Context, model string, maxAttempts int, hasNext
 				if dl, ok := ctx.Deadline(); ok {
 					remaining := time.Until(dl)
 					if remaining > delay && remaining < delay+2*cfg.PerModelTimeout {
-						if lastErr == nil {
-							lastErr = fmt.Errorf("insufficient budget for another %s attempt on %q", cfg.PerModelTimeout, model)
+						return zero, TryNextModel, &budgetStarvedErr{
+							model: model, budget: cfg.PerModelTimeout, spent: a, wrapped: lastErr,
 						}
-						return zero, TryNextModel, lastErr
 					}
 				}
 			}
@@ -183,7 +285,13 @@ func runModel[T any](ctx context.Context, model string, maxAttempts int, hasNext
 			case <-time.After(delay):
 			}
 		}
+		attemptStart := time.Now()
 		val, outcome, err := attempt(ctx, model)
+		obs.ObserveAttempt(AttemptEvent{
+			Path: path, Model: model, Position: position,
+			Attempt: a + 1, MaxAttempts: maxAttempts,
+			Outcome: outcome, Duration: time.Since(attemptStart), Err: err,
+		})
 		switch outcome {
 		case Success:
 			// Never let an inconsistent attempt result (Success plus error)
@@ -195,12 +303,32 @@ func runModel[T any](ctx context.Context, model string, maxAttempts int, hasNext
 		case Terminal:
 			return val, Terminal, err
 		case TryNextModel:
-			return zero, TryNextModel, err
+			return zero, TryNextModel, &deniedErr{model: model, spent: a + 1, wrapped: err}
 		case RetrySameModel:
 			lastErr = err
 		}
 	}
 	return zero, TryNextModel, fmt.Errorf("model %q failed after %d attempt(s): %w", model, maxAttempts, lastErr)
+}
+
+// deniedErr marks an attempt-classified TryNextModel (today: HTTP 403 account
+// denial) so the switch metric can separate "this credential is refused" from
+// "upstream is overloaded". The two need different responders.
+type deniedErr struct {
+	model   string
+	spent   int
+	wrapped error
+}
+
+func (e *deniedErr) Error() string {
+	return fmt.Sprintf("model %q refused the credential after %d attempt(s): %v", e.model, e.spent, e.wrapped)
+}
+
+func (e *deniedErr) Unwrap() error { return e.wrapped }
+
+func isDenied(err error) bool {
+	var d *deniedErr
+	return errors.As(err, &d)
 }
 
 // SafeTextForLog flattens and bounds upstream-controlled text before it is

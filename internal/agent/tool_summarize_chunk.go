@@ -12,6 +12,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmfallback"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
@@ -484,7 +485,8 @@ func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{},
 		{Role: "user", Content: formatted},
 	}
 
-	content, _, err := client.CallStrict(ctx, msgs, 0.3)
+	content, _, err := client.CallStrict(
+		llmfallback.WithPath(ctx, llmfallback.PathAgentTool), msgs, 0.3)
 	if err != nil {
 		return "", processed, oversized, fmt.Errorf("call LLM: %w", err)
 	}

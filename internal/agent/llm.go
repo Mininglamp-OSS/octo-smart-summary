@@ -99,6 +99,7 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, tools []Tool) (Assist
 		Models:          models,
 		PerModelTimeout: c.timeout,
 		MaxAttempts:     3,
+		Path:            llmfallback.PathAgentChat,
 	}, func(ctx context.Context, model string) (AssistantTurn, llmfallback.Outcome, error) {
 		return c.attemptChat(ctx, model, msgs, tools)
 	})

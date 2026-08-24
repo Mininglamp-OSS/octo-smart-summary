@@ -546,6 +546,7 @@ func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, t
 		Models:          c.models(),
 		PerModelTimeout: c.toolCallTimeout,
 		MaxAttempts:     3,
+		Path:            llmfallback.PathToolCall,
 	}, func(ctx context.Context, model string) (result, llmfallback.Outcome, error) {
 		temp := temperature
 		if config.IsKimiModel(model) {
@@ -754,6 +755,7 @@ func (c *LLMClient) CallMap(ctx context.Context, formattedMessages string, sourc
 
 // CallMapWithModel is CallMap with the actual producing model included.
 func (c *LLMClient) CallMapWithModel(ctx context.Context, formattedMessages string, sourceName string, chunkIndex int, msgCount int, timeStart, timeEnd string, topic string, userName string) (string, int, string, error) {
+	ctx = llmfallback.WithPath(ctx, llmfallback.PathWorkerMap)
 	if strings.TrimSpace(formattedMessages) == "" {
 		return "(该时段无文本消息)", 0, c.model, nil
 	}
@@ -788,6 +790,7 @@ func (c *LLMClient) CallReduce(ctx context.Context, chunkSummaries []string, sou
 
 // CallReduceWithModel is CallReduce with the actual producing model included.
 func (c *LLMClient) CallReduceWithModel(ctx context.Context, chunkSummaries []string, sourceNames string, startTime, endTime string, totalMsgCount int, topic string) (string, int, string, error) {
+	ctx = llmfallback.WithPath(ctx, llmfallback.PathWorkerReduce)
 	if len(chunkSummaries) == 1 {
 		return chunkSummaries[0], 0, c.model, nil
 	}
@@ -828,6 +831,7 @@ func (c *LLMClient) CallMapStream(ctx context.Context, formattedMessages string,
 
 // CallMapStreamWithModel is CallMapStream with the actual producing model included.
 func (c *LLMClient) CallMapStreamWithModel(ctx context.Context, formattedMessages string, sourceName string, chunkIndex int, msgCount int, timeStart, timeEnd string, topic string, userName string, onDelta func(string) error) (string, int, string, error) {
+	ctx = llmfallback.WithPath(ctx, llmfallback.PathWorkerMap)
 	if strings.TrimSpace(formattedMessages) == "" {
 		return "(该时段无文本消息)", 0, c.model, nil
 	}
@@ -872,6 +876,7 @@ func (c *LLMClient) CallReduceStream(ctx context.Context, chunkSummaries []strin
 
 // CallReduceStreamWithModel is CallReduceStream with the actual producing model included.
 func (c *LLMClient) CallReduceStreamWithModel(ctx context.Context, chunkSummaries []string, sourceNames string, startTime, endTime string, totalMsgCount int, topic string, onDelta func(string) error) (string, int, string, error) {
+	ctx = llmfallback.WithPath(ctx, llmfallback.PathWorkerReduce)
 	if len(chunkSummaries) == 1 {
 		if onDelta != nil && chunkSummaries[0] != "" {
 			_ = onDelta(chunkSummaries[0])
@@ -939,5 +944,6 @@ func (c *LLMClient) CallReduceByPersonStream(ctx context.Context, participantSum
 
 // CallReduceByPersonStreamWithModel is CallReduceByPersonStream with the actual producing model included.
 func (c *LLMClient) CallReduceByPersonStreamWithModel(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string, onDelta func(string) error) (string, int, string, error) {
+	ctx = llmfallback.WithPath(ctx, llmfallback.PathWorkerReduce)
 	return c.callStreamWithModel(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1, onDelta, true)
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,6 +17,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/auth"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/db"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmobs"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/streaming"
@@ -23,6 +25,11 @@ import (
 
 func main() {
 	cfg := config.Load()
+
+	// Instrument every llmfallback.Run in this process (agent chat, agent
+	// tools, worker Map/Reduce, API refine). Must run before any LLM client
+	// is constructed so no call path starts unmonitored.
+	llmobs.Install(slog.Default().With(slog.String("component", "api")))
 
 	// Apply config to pipeline package-level variables
 	if cfg.MaxSafetyLimit > 0 {

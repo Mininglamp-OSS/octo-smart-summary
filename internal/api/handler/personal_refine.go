@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmfallback"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
@@ -105,7 +106,8 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 		return
 	}
 
-	llmCtx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
+	llmCtx, cancel := context.WithTimeout(
+		llmfallback.WithPath(c.Request.Context(), llmfallback.PathAPIRefine), 90*time.Second)
 	defer cancel()
 	newContent, tokens, usedModel, err := h.llm.CallWithModel(llmCtx, []service.ChatMessage{
 		{Role: "system", Content: buildRefineSystemPrompt()},
@@ -330,7 +332,8 @@ func (h *PersonalHandler) RefinePersonalSummaryStream(c *gin.Context) {
 		w.Flush()
 	}
 
-	llmCtx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
+	llmCtx, cancel := context.WithTimeout(
+		llmfallback.WithPath(c.Request.Context(), llmfallback.PathAPIRefine), 90*time.Second)
 	defer cancel()
 	newContent, tokens, usedModel, err := h.llm.CallStreamWithModel(llmCtx, []service.ChatMessage{
 		{Role: "system", Content: buildRefineSystemPrompt()},

@@ -5,6 +5,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/handler"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/ws"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmobs"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/streaming"
@@ -178,6 +179,15 @@ func SetupInternal(hub *ws.Hub, streamHub ...*streaming.Hub) (*gin.Engine, *hand
 	intH := handler.NewInternalHandler(hub)
 	r.GET("/internal/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
+	// Prometheus scrape target. Deliberately on the INTERNAL router only: it
+	// exposes model identifiers and failure volumes, which are operational
+	// details that should not be reachable from the public listener.
+	r.GET("/internal/metrics", func(c *gin.Context) {
+		c.Header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		if m := llmobs.Default(); m != nil {
+			m.WritePrometheus(c.Writer)
+		}
 	})
 	r.POST("/internal/task-event", intH.TaskEvent)
 	r.POST("/internal/worker-trigger", intH.WorkerTrigger)

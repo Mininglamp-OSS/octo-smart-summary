@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmfallback"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 )
 
@@ -159,6 +160,10 @@ func mergeSummariesWithLLM(ctx context.Context, combined string, specGuidance st
 		{Role: "user", Content: combined},
 	}
 
-	content, truncated, _, err := client.CallDisclosingTruncation(ctx, msgs, 0.1)
+	// Tag the path so this tool's LLM traffic is attributable in metrics
+	// instead of landing in path="unknown" (the generic service client cannot
+	// know which caller drove it).
+	content, truncated, _, err := client.CallDisclosingTruncation(
+		llmfallback.WithPath(ctx, llmfallback.PathAgentTool), msgs, 0.1)
 	return content, truncated, err
 }
