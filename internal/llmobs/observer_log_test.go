@@ -122,7 +122,7 @@ func TestObserverLog_SuccessAndTerminalAreQuiet(t *testing.T) {
 func TestObserverLog_CancellationIsNotAnOutage(t *testing.T) {
 	o, buf := captureLogs(t)
 	o.ObserveResult(llmfallback.ResultEvent{
-		Path: llmfallback.PathAPIRefine, Cancelled: true,
+		Path: llmfallback.PathAPIRefine, End: llmfallback.RunEndCancelled,
 		Duration: 10 * time.Millisecond, Err: context.Canceled,
 	})
 	recs := records(t, buf)
@@ -154,4 +154,26 @@ func TestObserverLog_NilLoggerIsSafe(t *testing.T) {
 	o.ObserveAttempt(llmfallback.AttemptEvent{Attempt: 1, MaxAttempts: 3, Outcome: llmfallback.RetrySameModel})
 	o.ObserveSwitch(llmfallback.SwitchEvent{Reason: llmfallback.ReasonDenied})
 	o.ObserveResult(llmfallback.ResultEvent{})
+}
+
+// TestObserverLog_TimeoutIsAlertableButNotAnOutage pins the third state apart
+// from the other two. Our own deadline expiring is not a caller walking away
+// (Info would bury a real incident) and not a proven provider outage (Error
+// would page someone about a model that was never shown to be bad).
+func TestObserverLog_TimeoutIsAlertableButNotAnOutage(t *testing.T) {
+	o, buf := captureLogs(t)
+	o.ObserveResult(llmfallback.ResultEvent{
+		Path: llmfallback.PathAgentChat, End: llmfallback.RunEndTimedOut,
+		Duration: 240 * time.Second, Err: context.DeadlineExceeded,
+	})
+	recs := records(t, buf)
+	if len(recs) != 1 {
+		t.Fatalf("want 1 record, got %d", len(recs))
+	}
+	if got := recs[0]["level"]; got != "WARN" {
+		t.Errorf("level = %v, want WARN (Info buries it, Error reads as a provider outage)", got)
+	}
+	if got := recs[0]["event"]; got != "llm.call.timeout" {
+		t.Errorf("event = %v, want llm.call.timeout", got)
+	}
 }

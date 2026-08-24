@@ -145,7 +145,7 @@ func Run[T any](ctx context.Context, cfg Config, attempt Attempt[T]) (T, string,
 				err = fmt.Errorf("%w (last: %v)", err, lastErr)
 			}
 			obs.ObserveResult(ResultEvent{
-				Path: path, Switches: switches, Cancelled: true,
+				Path: path, Switches: switches, End: endOf(ctx),
 				Duration: time.Since(start), Err: err,
 			})
 			return zero, "", err
@@ -175,8 +175,13 @@ func Run[T any](ctx context.Context, cfg Config, attempt Attempt[T]) (T, string,
 			})
 			return val, model, nil
 		case Terminal:
+			// endOf matters here too: both real clients turn a caller-cancelled
+			// in-flight request into exactly this exit (they check the PARENT
+			// ctx, so Terminal here means "the caller's context is dead"), and
+			// without it a closed tab was counted result="failed" WITH a
+			// position — invisible against genuine 400s on the same series.
 			obs.ObserveResult(ResultEvent{
-				Path: path, Model: model, Position: PositionOf(i),
+				Path: path, Model: model, Position: PositionOf(i), End: endOf(ctx),
 				Switches: switches, Duration: time.Since(start), Err: err,
 			})
 			return val, model, err
@@ -188,8 +193,37 @@ func Run[T any](ctx context.Context, cfg Config, attempt Attempt[T]) (T, string,
 	if len(cfg.Models) > 1 {
 		lastErr = fmt.Errorf("all %d model(s) failed: %w", len(cfg.Models), lastErr)
 	}
-	obs.ObserveResult(ResultEvent{Path: path, Switches: switches, Duration: time.Since(start), Err: lastErr})
+	// The loop-end exit is reached on cancellation too: runModel returns
+	// TryNextModel with ctx.Err() when the caller goes away during a backoff
+	// sleep, and with no next model the loop simply ends here. In the default
+	// single-model deployment that made a closed tab emit the ERROR
+	// "exhausted every configured model" — the exact record this is meant to
+	// keep for real outages.
+	obs.ObserveResult(ResultEvent{
+		Path: path, Switches: switches, End: endOf(ctx),
+		Duration: time.Since(start), Err: lastErr,
+	})
 	return zero, "", lastErr
+}
+
+// endOf classifies how the caller's context ended a run, if it did.
+//
+// It keys on the sentinel rather than on ctx.Err() != nil because those are two
+// different incidents: context.Canceled means the caller walked away and nobody
+// should be paged, while context.DeadlineExceeded means OUR budget expired —
+// usually because upstream was slow — which is exactly what an operator needs
+// to see. This is the same distinction reasonFor makes for SwitchReason; it was
+// missing one layer up, so a run that timed out was filed under a label whose
+// documentation says "do not alert on it".
+func endOf(ctx context.Context) RunEnd {
+	switch {
+	case errors.Is(ctx.Err(), context.Canceled):
+		return RunEndCancelled
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return RunEndTimedOut
+	default:
+		return RunEndNone
+	}
 }
 
 // budgetStarvedErr marks the error returned when the deadline guard abandons a

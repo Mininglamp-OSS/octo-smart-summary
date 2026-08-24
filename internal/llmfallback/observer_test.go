@@ -289,6 +289,23 @@ func TestRun_PreservesSanitizerMatchableText(t *testing.T) {
 		}
 	})
 
+	t.Run("upstream text survives the denied wrapper", func(t *testing.T) {
+		// deniedErr prefixes the caller-visible text; nothing pinned that the
+		// wrapped upstream body still shows through, so sanitizeErrorForUser's
+		// "LLM API error" branch was unguarded for every 403.
+		_, _, err := Run(context.Background(), Config{Models: []string{"a"}, MaxAttempts: 3, Backoff: noBackoff},
+			func(_ context.Context, m string) (string, Outcome, error) {
+				return "", ClassifyStatus(http.StatusForbidden),
+					fmt.Errorf("LLM API error: status=403 body=AccessDenied on %s", m)
+			})
+		if err == nil {
+			t.Fatal("expected an error from a denied model")
+		}
+		if !strings.Contains(err.Error(), "LLM API error") {
+			t.Errorf("upstream text lost through the denied wrapper: %q", err)
+		}
+	})
+
 	t.Run("deadline text survives the budget-starved guard", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
 		defer cancel()
@@ -366,27 +383,85 @@ func TestReasonFor_RealProductionErrorShapes(t *testing.T) {
 	}
 }
 
-// TestRun_CancellationIsFlaggedNotReportedAsExhaustion pins the second half of
-// the same problem: a caller walking away must not look like a total outage.
-func TestRun_CancellationIsFlaggedNotReportedAsExhaustion(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+// TestRun_ContextEndIsClassifiedAtEveryExit pins the second half of the same
+// problem: a caller walking away must not look like a total outage, and our own
+// deadline expiring must not look like a caller walking away.
+//
+// The earlier version of this test cancelled BEFORE calling Run, so the attempt
+// function never ran and only the top-of-loop exit was ever exercised — the one
+// exit production almost never takes. Each case below drives a real exit:
+// both clients turn a mid-flight cancel into Terminal (they check the parent
+// ctx), and a cancel during a backoff sleep falls out of the model loop.
+func TestRun_ContextEndIsClassifiedAtEveryExit(t *testing.T) {
+	t.Run("cancelled mid-attempt reaches the Terminal exit", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		r := &recorder{}
+		Run(ctx, Config{Models: []string{"a", "b"}, MaxAttempts: 3, Backoff: noBackoff, Observer: r},
+			func(actx context.Context, _ string) (string, Outcome, error) {
+				cancel() // the client closed the tab while the request was open
+				if actx.Err() != nil {
+					// Exactly what agent attemptChat and service Call do.
+					return "", Terminal, actx.Err()
+				}
+				return "", RetrySameModel, nil
+			})
+		assertEnd(t, r, RunEndCancelled)
+	})
 
-	r := &recorder{}
-	Run(ctx, Config{Models: []string{"a", "b"}, MaxAttempts: 2, Backoff: noBackoff, Observer: r},
-		func(_ context.Context, _ string) (string, Outcome, error) {
-			return "ok", Success, nil
+	t.Run("cancelled during backoff reaches the loop-end exit", func(t *testing.T) {
+		// A single model is the default deployment (LLM_FALLBACK_MODELS empty),
+		// and it is the shape that used to emit the "exhausted every configured
+		// model" ERROR for a plain disconnect.
+		ctx, cancel := context.WithCancel(context.Background())
+		r := &recorder{}
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			cancel()
+		}()
+		Run(ctx, Config{
+			Models: []string{"only"}, MaxAttempts: 3, Observer: r,
+			Backoff: func(int) time.Duration { return 50 * time.Millisecond },
+		}, func(context.Context, string) (string, Outcome, error) {
+			return "", RetrySameModel, errors.New("upstream 503")
 		})
+		assertEnd(t, r, RunEndCancelled)
+	})
 
+	t.Run("our own deadline expiring is a timeout, not a cancellation", func(t *testing.T) {
+		// Upstream is slow and our budget runs out. Filing this under
+		// "cancelled" would mark a real incident "do not alert on it".
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		r := &recorder{}
+		Run(ctx, Config{Models: []string{"a", "b"}, MaxAttempts: 1, Backoff: noBackoff, Observer: r},
+			func(context.Context, string) (string, Outcome, error) {
+				time.Sleep(50 * time.Millisecond)
+				return "", ClassifyStatus(http.StatusServiceUnavailable), errors.New("503 slow")
+			})
+		assertEnd(t, r, RunEndTimedOut)
+	})
+
+	t.Run("an ordinary upstream failure is neither", func(t *testing.T) {
+		r := &recorder{}
+		Run(context.Background(), Config{Models: []string{"a"}, MaxAttempts: 1, Backoff: noBackoff, Observer: r},
+			func(context.Context, string) (string, Outcome, error) {
+				return "", ClassifyStatus(http.StatusBadRequest), errors.New("400 bad request")
+			})
+		assertEnd(t, r, RunEndNone)
+	})
+}
+
+func assertEnd(t *testing.T, r *recorder, want RunEnd) {
+	t.Helper()
 	if len(r.results) != 1 {
-		t.Fatalf("expected exactly 1 result event, got %d", len(r.results))
+		t.Fatalf("expected exactly 1 result event, got %d: %+v", len(r.results), r.results)
 	}
 	got := r.results[0]
-	if !got.Cancelled {
-		t.Error("caller cancellation was not flagged; it is indistinguishable from total exhaustion")
+	if got.End != want {
+		t.Errorf("End = %q, want %q (err: %v)", got.End, want, got.Err)
 	}
 	if got.OK {
-		t.Error("a cancelled run must not report OK")
+		t.Error("a failed run must not report OK")
 	}
 }
 

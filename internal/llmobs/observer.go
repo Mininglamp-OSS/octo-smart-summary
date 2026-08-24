@@ -89,9 +89,22 @@ func (o *Observer) ObserveResult(e llmfallback.ResultEvent) {
 		// with "exhausted every configured model" put user-closed SSE streams
 		// into the same record operators page on; switches=0 with one attempt
 		// was the only tell.
-		if e.Cancelled {
+		switch e.End {
+		case llmfallback.RunEndCancelled:
 			o.log.Info("llm call ended by caller cancellation",
 				slog.String("event", "llm.call.cancelled"),
+				slog.String("path", string(e.Path)),
+				slog.Int("switches", e.Switches),
+				slog.Int64("duration_ms", e.Duration.Milliseconds()),
+				slog.String("error", llmfallback.SafeErrorForLog(e.Err, 200)),
+			)
+			return
+		case llmfallback.RunEndTimedOut:
+			// Warn, not Info: nobody walked away — we ran out of our own budget,
+			// which is what an operator needs to see. Not Error either: no model
+			// was proven bad, so it must not read as a provider outage.
+			o.log.Warn("llm call ran out of its time budget",
+				slog.String("event", "llm.call.timeout"),
 				slog.String("path", string(e.Path)),
 				slog.Int("switches", e.Switches),
 				slog.Int64("duration_ms", e.Duration.Milliseconds()),

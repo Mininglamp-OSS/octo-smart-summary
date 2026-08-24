@@ -528,17 +528,36 @@ func TestInstall_ExhaustionAndCancellationAreDistinct(t *testing.T) {
 			return "", llmfallback.ClassifyStatus(http.StatusServiceUnavailable), errors.New("503")
 		})
 
-	// 2. The caller goes away — an SSE client closing the tab.
+	// 2. The caller goes away mid-request — an SSE client closing the tab.
+	// Cancelled from INSIDE the attempt, because that is the exit production
+	// takes: both clients check the parent ctx and return Terminal. Cancelling
+	// before Run only ever exercised the top-of-loop guard.
 	cancelled, cancel := context.WithCancel(context.Background())
-	cancel()
 	llmfallback.Run(
 		llmfallback.WithPath(cancelled, llmfallback.PathAPIRefine),
 		llmfallback.Config{
 			Models: []string{"a-live", "b-live"}, MaxAttempts: 1,
 			Backoff: func(int) time.Duration { return 0 },
 		},
-		func(_ context.Context, _ string) (string, llmfallback.Outcome, error) {
-			return "ok", llmfallback.Success, nil
+		func(actx context.Context, _ string) (string, llmfallback.Outcome, error) {
+			cancel()
+			return "", llmfallback.Terminal, actx.Err()
+		})
+
+	// 3. Our own budget expires while upstream is slow. This must NOT share a
+	// series with either the outage or the disconnect: nobody walked away, and
+	// no model was proven bad — it is its own alertable condition.
+	timedOut, cancelTimeout := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelTimeout()
+	llmfallback.Run(
+		llmfallback.WithPath(timedOut, llmfallback.PathAgentChat),
+		llmfallback.Config{
+			Models: []string{"slow-a", "slow-b"}, MaxAttempts: 1,
+			Backoff: func(int) time.Duration { return 0 },
+		},
+		func(context.Context, string) (string, llmfallback.Outcome, error) {
+			time.Sleep(40 * time.Millisecond)
+			return "", llmfallback.ClassifyStatus(http.StatusServiceUnavailable), errors.New("503 slow")
 		})
 
 	var buf bytes.Buffer
@@ -548,11 +567,19 @@ func TestInstall_ExhaustionAndCancellationAreDistinct(t *testing.T) {
 	if got := mustSample(t, out, `llm_calls_total{path="worker_reduce",position="none",result="failed"}`); got != 1 {
 		t.Errorf("exhausted call = %v, want 1 — Run must emit a result event when every model fails", got)
 	}
-	if got := mustSample(t, out, `llm_calls_total{path="api_refine",position="none",result="cancelled"}`); got != 1 {
+	// The cancelled run reached the Terminal exit, so it carries the position of
+	// the model that was in flight — what matters is the result label.
+	if got := mustSample(t, out, `llm_calls_total{path="api_refine",position="primary",result="cancelled"}`); got != 1 {
 		t.Errorf("cancelled call = %v, want 1", got)
 	}
-	if v, ok := sampleValue(t, out, `llm_calls_total{path="api_refine",position="none",result="failed"}`); ok {
+	if v, ok := sampleValue(t, out, `llm_calls_total{path="api_refine",position="primary",result="failed"}`); ok {
 		t.Errorf("caller cancellation was counted as an upstream failure (%v); it must not land on the series operators alert on", v)
+	}
+	if got := mustSample(t, out, `llm_calls_total{path="agent_chat",position="none",result="timeout"}`); got != 1 {
+		t.Errorf("timed-out call = %v, want 1", got)
+	}
+	if v, ok := sampleValue(t, out, `llm_calls_total{path="agent_chat",position="none",result="cancelled"}`); ok {
+		t.Errorf("our own deadline expiring was labelled cancelled (%v) — that label documents itself as 'do not alert on it', which would bury a real incident", v)
 	}
 }
 
@@ -579,5 +606,36 @@ func TestInstall_TerminalFailureIsNotCountedOK(t *testing.T) {
 	}
 	if v, ok := sampleValue(t, out, `llm_calls_total{path="agent_chat",position="primary",result="ok"}`); ok {
 		t.Errorf("a terminal failure was counted as ok (%v)", v)
+	}
+}
+
+// TestWritePrometheus_CarriageReturnIsFlattenedNotEscaped pins the one escape
+// that must NOT be produced. The Prometheus text format defines only \\, \" and
+// \n inside a label value; \r is an invalid escape sequence and the reference
+// parser aborts the ENTIRE scrape on it — so "hardening" a bare CR into \r
+// trades one ugly character for the loss of every metric in the response.
+// Nothing covered this, which is how it shipped.
+func TestWritePrometheus_CarriageReturnIsFlattenedNotEscaped(t *testing.T) {
+	m := NewMetrics(fixedNow)
+	m.ObserveAttempt(llmfallback.AttemptEvent{
+		Path:     llmfallback.PathAgentChat,
+		Model:    "we\rird-model",
+		Position: llmfallback.PositionPrimary, Attempt: 1, MaxAttempts: 3,
+		Outcome: llmfallback.Success,
+	})
+
+	var buf bytes.Buffer
+	m.WritePrometheus(&buf)
+	out := buf.String()
+
+	if strings.Contains(out, `\r`) {
+		t.Errorf("emitted the invalid escape sequence \\r; the reference parser aborts the whole scrape on it:\n%s", out)
+	}
+	if strings.ContainsRune(out, '\r') {
+		t.Errorf("emitted a bare CR inside a label value:\n%q", out)
+	}
+	// And the series is still there, flattened rather than dropped.
+	if !strings.Contains(out, `model="we ird-model"`) {
+		t.Errorf("CR should flatten to a space, keeping the series intact:\n%s", out)
 	}
 }

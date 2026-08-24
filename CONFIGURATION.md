@@ -27,16 +27,6 @@ All configuration is done via environment variables.
 | `API_INTERNAL_PORT` | Port for the API internal server. **Must not be published outside the cluster/container network** — see the warning below. | No | `8081` |
 | `WORKER_INTERNAL_PORT` | Port for the worker internal server. **Must not be published outside the cluster/container network** — see the warning below. | No | `8082` |
 | `WORKER_LISTEN_ADDR` | Listen address for worker server. The default binds all interfaces; narrow it to `127.0.0.1` for a single-host deployment. | No | `0.0.0.0` |
-
-> **The internal listeners are unauthenticated.** Both `API_INTERNAL_PORT` and
-> `WORKER_INTERNAL_PORT` serve `/internal/*` with no credential check. That
-> surface includes the *mutating* `/internal/worker-trigger` and
-> `/internal/task-event`, and the read-only `/internal/metrics` scrape endpoint
-> (model identifiers and per-path failure volumes). A separate HTTP engine is
-> not an access-control boundary: restrict these ports to the cluster/container
-> network with a network policy, security group, or by binding
-> `WORKER_LISTEN_ADDR` to a private interface. Do not expose them through an
-> ingress or `docker run -p`.
 | `WORKER_MAX_CONCURRENT_TASKS` | Max concurrent worker tasks | No | `20` |
 | `WORKER_MAP_CONCURRENCY` | Concurrency for map-phase LLM calls | No | `5` |
 | `AGENT_MAP_CONCURRENCY` | How many Map-phase chunk summaries ONE `summarize_chunk` tool call runs in parallel (agent path only). Clamped to `[1, 5]`; unset/0/negative resolve to the default. Deliberately separate from `WORKER_MAP_CONCURRENCY`: the agent runner already executes up to 4 tool calls from a single LLM turn concurrently (`agent.NewPool(4)`), so the two knobs MULTIPLY — at the default the ceiling of in-flight Map completions from one user request is 4×3=12. Set to `1` to take a dedicated serial path identical to the pre-concurrency loop (rollback without redeploying). | No | `3` |
@@ -82,5 +72,21 @@ The following model identifiers are tested and supported:
 | `qwen3.6-flash` | Alibaba Cloud | Fast inference |
 | `deepseek-v4-flash` | DeepSeek | Fast inference |
 | `deepseek-v4-pro` | DeepSeek | Higher capability |
+
+> **The internal listeners are unauthenticated.** Both `API_INTERNAL_PORT` and
+> `WORKER_INTERNAL_PORT` serve `/internal/*` with no credential check. That
+> surface includes the *mutating* `/internal/worker-trigger` and
+> `/internal/task-event`, and the read-only `/internal/metrics` scrape endpoint
+> (model identifiers and per-path failure volumes). A separate HTTP engine is
+> not an access-control boundary.
+>
+> Restrict both ports at the network layer — a Kubernetes NetworkPolicy, a
+> security group, or simply not publishing them. Do not expose them through an
+> ingress or `docker run -p`.
+>
+> Note the asymmetry: the worker can additionally be narrowed with
+> `WORKER_LISTEN_ADDR=127.0.0.1`, but **the API internal listener has no
+> bind-address knob** — it binds all interfaces unconditionally. For the API
+> port, the network-layer control is the only one available.
 
 The system automatically adjusts token budgets and tokenization ratios based on the selected model.

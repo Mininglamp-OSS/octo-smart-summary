@@ -55,7 +55,12 @@ func labels(pairs ...string) labelSet {
 // separator so it cannot forge a line, but leaving a bare CR in a value makes
 // log/terminal output overwrite itself, and SafeTextForLog already strips it
 // elsewhere in this codebase.
-var labelEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`, "\r", `\r`)
+// CR is replaced with a space, NOT escaped as \r. The Prometheus text format
+// defines only \\, \" and \n inside a label value; \r is an invalid escape and
+// the reference parser aborts the ENTIRE scrape on it, not just that line. So
+// "hardening" a bare CR into \r traded one ugly character for the loss of every
+// metric in the response. Flattening matches what SafeTextForLog already does.
+var labelEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`, "\r", " ")
 
 // escapeLabelValue applies the Prometheus text-format escaping rules.
 func escapeLabelValue(v string) string {
@@ -159,9 +164,9 @@ func NewMetrics(nowFn func() time.Time) *Metrics {
 		attempts: newCounterVec("llm_attempts_total",
 			"Upstream LLM attempts by call path, model, list position and classified outcome."),
 		switches: newCounterVec("llm_model_switch_total",
-			"Cross-model fallback switches. reason=denied is a credential/billing problem, retries_exhausted is upstream overload, budget_starved is a deadline misconfiguration."),
+			"Cross-model fallback switches. reason=denied means the provider refused this request for this model (HTTP 403 — credentials, entitlement, a WAF rule or a regional restriction); retries_exhausted means the per-model retry budget ran out, usually upstream overload, though a deterministic contract failure (undecodable response, no choices) also lands here; budget_starved means the deadline guard abandoned the remaining retries, which is a configuration fault."),
 		calls: newCounterVec("llm_calls_total",
-			"Completed LLM calls by call path, the position of the model that served them, and the outcome: ok, failed (no model could serve it), or cancelled (the caller went away — not an upstream fault, do not alert on it)."),
+			"Completed LLM calls by call path, the position of the model that served them, and the outcome: ok; failed (no model could serve it); cancelled (the caller went away — not an upstream fault, do not alert on it); timeout (our own deadline expired before any model answered — nobody walked away, so this one IS alertable)."),
 		callSecs: newCounterVec("llm_call_duration_seconds_total",
 			"Cumulative wall-clock seconds spent in llmfallback.Run, by call path. Labelled by path only, so a mean needs sum by(path)(llm_call_duration_seconds_total) / sum by(path)(llm_calls_total) — dividing the raw series returns an empty vector."),
 		lastOK: newGaugeVec("llm_primary_last_success_timestamp_seconds",
@@ -200,8 +205,10 @@ func (m *Metrics) ObserveResult(e llmfallback.ResultEvent) {
 	switch {
 	case e.OK:
 		result = "ok"
-	case e.Cancelled:
+	case e.End == llmfallback.RunEndCancelled:
 		result = "cancelled"
+	case e.End == llmfallback.RunEndTimedOut:
+		result = "timeout"
 	}
 	position := e.Position
 	if position == "" {

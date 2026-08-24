@@ -93,15 +93,34 @@ type ResultEvent struct {
 	Switches int
 	// OK is true when a model returned a usable result.
 	OK bool
-	// Cancelled is true when the caller's context ended the run rather than an
-	// upstream failure — an SSE client closing the tab, a shutdown, a parent
-	// timeout. Without this, an ordinary disconnect is indistinguishable from
-	// "every configured model failed": both arrive with OK=false and an empty
-	// Model, which is the series a real provider outage lands on.
-	Cancelled bool
-	Duration  time.Duration
-	Err       error
+	// End records whether the caller's context ended the run, and how. Without
+	// it an ordinary disconnect is indistinguishable from "every configured
+	// model failed": both arrive with OK=false and an empty Model, which is the
+	// series a real provider outage lands on.
+	End      RunEnd
+	Duration time.Duration
+	Err      error
 }
+
+// RunEnd says how the caller's context ended a run, when it did. Cancellation
+// and deadline expiry are separate values because they page different people: a
+// client closing a tab is not actionable, while exhausting our own time budget
+// is a real incident that must stay alertable. A single boolean forced those
+// two into one bucket, and whichever label it carried was wrong for the other.
+type RunEnd string
+
+const (
+	// RunEndNone: the run finished on its own terms — success, a terminal
+	// upstream error, or every model failing. The caller was still waiting.
+	RunEndNone RunEnd = ""
+	// RunEndCancelled: the caller went away (SSE disconnect, shutdown). Not an
+	// upstream fault.
+	RunEndCancelled RunEnd = "cancelled"
+	// RunEndTimedOut: our own deadline expired (AGENT_STEP_TIMEOUT, the refine
+	// budget). Nobody walked away — we ran out of time, usually because
+	// upstream was slow. Alertable.
+	RunEndTimedOut RunEnd = "timeout"
+)
 
 // Observer receives Run's lifecycle events. Implementations MUST be safe for
 // concurrent use (the worker runs Map chunks in parallel) and MUST NOT block —

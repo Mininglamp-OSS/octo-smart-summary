@@ -75,7 +75,15 @@ func concretePath(pattern string) string {
 // serve the installed metric set with the content type a Prometheus scraper
 // expects.
 func TestMetricsRendersExposition(t *testing.T) {
+	// Install writes process-wide state. Without this cleanup it leaked into
+	// every later test in the package — the same hazard ResetDefaultForTest was
+	// added to close, and the reason TestMetricsBeforeInstallDoesNotPanic has to
+	// defend itself explicitly.
 	llmobs.Install(nil)
+	t.Cleanup(func() {
+		llmfallback.SetDefaultObserver(nil)
+		llmobs.ResetDefaultForTest()
+	})
 
 	internal, _ := SetupInternal(nil)
 	w := httptest.NewRecorder()
