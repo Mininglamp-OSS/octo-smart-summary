@@ -1,0 +1,18 @@
+# Rule index for this repo's .octospec/rules/
+# Each entry mirrors the frontmatter of its rule file so tooling can resolve
+# injection without parsing every file.
+#
+# Resolution semantics:
+#   - id must be globally unique (including inherited global rules).
+#   - a repo-tier rule with the same id overrides the global one.
+#   - inject_when = paths glob OR touches tag (union); a rule is injected once.
+#   - when the injection budget is exceeded, keep load_bearing first, then by
+#     priority (desc); truncated low-priority rules inject only their summary line.
+
+rules: []
+  # - id: error-handling
+  #   priority: 80
+  #   load_bearing: true
+  #   inject_when:
+  #     paths: ["modules/**/api*.go"]
+  #     touches: ["error-response"]
