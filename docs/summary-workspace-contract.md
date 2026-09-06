@@ -62,10 +62,20 @@ characters before any retrieval starts. Incidental, questioned, negated,
 complained-about, or historical mentions do not replace the current range.
 
 Each preview message is bound to the exact Agent run that generated it. Saving
-the preview resolves citations from that run's evidence session, including
-replacement/extension turns that rotate the internal session identity. The
-workspace session identity is used only as a compatibility fallback for legacy
-messages without a persisted run binding.
+the preview first resolves citations from that run's evidence session. An
+evidence-free `agent_revision` may inherit citations only through its explicit
+`parent_message_id` preview chain; replacement/extension runs with their own
+evidence remain authoritative. If the workspace scope references an existing
+summary, the save path may instead borrow that referenced artifact's citations,
+or remove its now-unresolvable markers when citation details are unavailable.
+The workspace session identity is used only as a compatibility fallback for
+legacy messages without a persisted run binding.
+
+If a `[1]`-anchored citation sequence cannot be resolved from the generating
+run, its preview ancestors, or a referenced artifact, save returns HTTP 409 with
+`code: 40902`, `reason: "workspace_citation_unresolved"`, and
+`recovery_action: "regenerate_preview"`. Reloading the unchanged session is not
+expected to repair this condition.
 
 A pending team proposal also stores its resolved `time_range`. Confirmation
 uses that stored value, so the displayed range and the dispatched workflow

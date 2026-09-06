@@ -697,8 +697,9 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		// explicit parent preview chain; legacy saves preserve best-effort fallback.
 		var cits []model.Citation
 		var cerr error
+		workspaceCitationFallback := false
 		if workspaceSave {
-			cits, cerr = h.buildWorkspacePreviewCitations(
+			cits, workspaceCitationFallback, cerr = h.buildWorkspacePreviewCitations(
 				c.Request.Context(), tx, userID, req.SessionID, content, workspaceCandidate, runBinding,
 			)
 		} else {
@@ -724,10 +725,11 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		// Without this, refined content shows "[n]" markers pointing at an
 		// empty citations array → frontend renders broken/dangling refs.
 		if len(cits) == 0 && len(req.ReferencedTaskIDs) > 0 {
-			borrowedCits, unresolvedMarkers := h.borrowCitationsFromReference(
-				c.Request.Context(), req.ReferencedTaskIDs[0], spaceID, userID)
+			borrowedCits, unresolvedMarkers := h.borrowCitationsFromReferenceWithDB(
+				c.Request.Context(), tx, req.ReferencedTaskIDs[0], spaceID, userID)
 			if len(borrowedCits) > 0 {
 				cits = borrowedCits
+				workspaceCitationFallback = false
 				log.Printf("[handler] CreateAgentSummary borrowed %d citations from referenced task_id=%d session=%s",
 					len(cits), req.ReferencedTaskIDs[0], req.SessionID)
 			} else if len(unresolvedMarkers) > 0 {
@@ -740,9 +742,16 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 				// artifact. Unrelated bracketed integers remain user content.
 				content = stripUnresolvedCitationMarkers(content, unresolvedMarkers)
 				creatorPR.Content = content
+				workspaceCitationFallback = contentHasCitationSequence(content)
 				log.Printf("[handler] CreateAgentSummary stripped dangling citation markers (borrow returned empty) session=%s ref_task_id=%d",
 					req.SessionID, req.ReferencedTaskIDs[0])
 			}
+		}
+		if workspaceSave && len(cits) > 0 && contentHasCitationMarker(content) && !citationsValid(content, cits, true) {
+			return fmt.Errorf("%w: fallback citations do not resolve preview markers", errWorkspacePreviewCitationUnresolved)
+		}
+		if workspaceSave && workspaceCitationFallback && contentHasCitationSequence(content) {
+			return fmt.Errorf("%w: no evidence or referenced artifact resolves preview markers", errWorkspacePreviewCitationUnresolved)
 		}
 		creatorPR.SetCitations(cits)
 		savedCitations = cits
@@ -833,6 +842,11 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			return
 		}
 		writeAgentSaveIdempotencyResponse(c, existing, mismatched, stale)
+		return
+	}
+	if errors.Is(err, errWorkspacePreviewCitationUnresolved) {
+		log.Printf("[handler] CreateAgentSummary rejected unresolved workspace citations space=%s user=%s session=%s: %v", spaceID, userID, req.SessionID, err)
+		writeWorkspacePreviewCitationConflict(c)
 		return
 	}
 	if errors.Is(err, errWorkspacePreviewSaveStale) {

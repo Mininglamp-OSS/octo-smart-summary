@@ -62,6 +62,11 @@ var errAgentMessageRunMismatch = errors.New("agent message does not match summar
 // otherwise a message id could be used to probe another workspace.
 var errWorkspacePreviewSaveStale = errors.New("workspace preview is stale")
 
+// errWorkspacePreviewCitationUnresolved is distinct from stale preview state:
+// reloading the same message cannot repair its citation lineage. The client
+// should regenerate the preview instead of retrying the identical save.
+var errWorkspacePreviewCitationUnresolved = errors.New("workspace preview citations are unresolved")
+
 type workspacePreviewSaveCandidate struct {
 	Session model.AgentSummarySession
 	Message model.AgentMessage
@@ -298,6 +303,17 @@ func writeWorkspacePreviewSaveConflict(c *gin.Context) {
 	})
 }
 
+func writeWorkspacePreviewCitationConflict(c *gin.Context) {
+	c.JSON(409, apiResponse{
+		Code:    40902,
+		Message: "当前预览中的引用无法解析，请重新生成预览后再保存",
+		Data: map[string]interface{}{
+			"reason":          "workspace_citation_unresolved",
+			"recovery_action": "regenerate_preview",
+		},
+	})
+}
+
 // Reuse the bot handler's Idempotency-Key regex + length cap so the two
 // user-facing endpoints share one canonical validation rule. Declared here as
 // package-local aliases to keep this file self-contained on read; they point
@@ -492,7 +508,7 @@ func (h *AgentSummaryHandler) buildWorkspacePreviewCitations(
 	userID, sessionID, content string,
 	candidate workspacePreviewSaveCandidate,
 	binding agentMessageRunBinding,
-) ([]model.Citation, error) {
+) ([]model.Citation, bool, error) {
 	evidenceSessionID := binding.EvidenceSessionID
 	if evidenceSessionID == "" {
 		evidenceSessionID = persistedOrDerivedWorkspaceAgentSessionID(
@@ -504,33 +520,39 @@ func (h *AgentSummaryHandler) buildWorkspacePreviewCitations(
 	}
 	citations, err := h.buildCitationsForSessionWithDB(ctx, db, evidenceSessionID, content, userID, binding.RequestID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	if !contentHasCitationSequence(content) {
-		return citations, nil
+	if !contentHasCitationMarker(content) {
+		return citations, false, nil
 	}
 	if len(citations) > 0 {
 		if citationsValid(content, citations, true) {
-			return citations, nil
+			return citations, false, nil
 		}
-		return nil, fmt.Errorf("%w: preview citation evidence does not resolve", errWorkspacePreviewSaveStale)
+		return nil, false, fmt.Errorf("%w: current preview evidence does not resolve", errWorkspacePreviewCitationUnresolved)
 	}
 	currentHasEvidence, err := workspaceEvidenceSessionHasRows(ctx, db, userID, evidenceSessionID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	if currentHasEvidence || candidate.Message.ResultType != agent.SummaryResultAgentRevision {
-		return nil, fmt.Errorf("%w: preview citation evidence does not resolve", errWorkspacePreviewSaveStale)
+	if currentHasEvidence {
+		if contentHasCitationSequence(content) {
+			return nil, false, fmt.Errorf("%w: current preview evidence does not resolve", errWorkspacePreviewCitationUnresolved)
+		}
+		return nil, false, nil
+	}
+	if candidate.Message.ResultType != agent.SummaryResultAgentRevision {
+		return nil, true, nil
 	}
 
 	ancestors, err := workspaceRevisionAncestorBindings(ctx, db, userID, sessionID, candidate.Message)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	for _, ancestor := range ancestors {
 		hasEvidence, err := workspaceEvidenceSessionHasRows(ctx, db, userID, ancestor.EvidenceSessionID)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if !hasEvidence {
 			continue
@@ -539,14 +561,17 @@ func (h *AgentSummaryHandler) buildWorkspacePreviewCitations(
 			ctx, db, ancestor.EvidenceSessionID, content, userID, ancestor.RequestID,
 		)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if len(citations) > 0 && citationsValid(content, citations, true) {
-			return citations, nil
+			return citations, false, nil
 		}
-		return nil, fmt.Errorf("%w: parent preview citation evidence does not resolve", errWorkspacePreviewSaveStale)
+		if contentHasCitationSequence(content) {
+			return nil, false, fmt.Errorf("%w: parent preview evidence does not resolve", errWorkspacePreviewCitationUnresolved)
+		}
+		return nil, false, nil
 	}
-	return nil, fmt.Errorf("%w: preview citation evidence is unavailable", errWorkspacePreviewSaveStale)
+	return nil, true, nil
 }
 
 // canonicalAgentSaveRequestHash returns a deterministic sha256 fingerprint of

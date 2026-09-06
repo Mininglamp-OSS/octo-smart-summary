@@ -232,6 +232,15 @@ func overrideWithRunManifest(ctx context.Context, db *gorm.DB, uid, sessionID, r
 
 var citationMarkerRE = regexp.MustCompile(`\[(\d+)\]`)
 
+// contentHasCitationMarker is intentionally broader than
+// contentHasCitationSequence. Workspace revision inheritance must still run
+// when an edit removes the sentence containing [1] but keeps [2]/[3]. The
+// narrower [1] predicate remains the strict anti-prose guard used when an
+// unresolved marker sequence would reject a save.
+func contentHasCitationMarker(content string) bool {
+	return citationMarkerRE.MatchString(content)
+}
+
 // citationsValid reports whether every [n] marker in content resolves to a built
 // citation index. No markers → vacuously valid (nothing to break).
 //

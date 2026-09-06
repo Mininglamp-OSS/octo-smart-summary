@@ -85,15 +85,16 @@ func TestCreateAgentSummary_WorkspaceNoFetchRevisionInheritsParentCitations(t *t
 	}
 	fixture := seedWorkspaceSaveFixture(t, db, "workspace-save-no-fetch-revision")
 	parent := fixture.Message
-	parentSessionID := bindWorkspacePreviewRun(t, db, fixture, &parent, "grounded", agent.SummaryResultAgentPreview, 0, 3, "Alice confirmed [1]")
-	seedEvidenceRow(t, db, fixture.Session.UserID, parentSessionID, "grounded-evidence", []pipeline.Message{{
-		ChannelID: "channel-workspace", ChannelType: 2, MessageSeq: 1, SenderUID: "alice", SenderName: "Alice",
-		Content: "confirmed", Timestamp: time.Now().Unix(),
-	}})
+	parentSessionID := bindWorkspacePreviewRun(t, db, fixture, &parent, "grounded", agent.SummaryResultAgentPreview, 0, 3, "A [1] B [2] C [3]")
+	seedEvidenceRow(t, db, fixture.Session.UserID, parentSessionID, "grounded-evidence", []pipeline.Message{
+		{ChannelID: "channel-workspace", ChannelType: 2, MessageSeq: 1, SenderUID: "alice", SenderName: "Alice", Content: "A", Timestamp: time.Now().Unix()},
+		{ChannelID: "channel-workspace", ChannelType: 2, MessageSeq: 2, SenderUID: "bob", SenderName: "Bob", Content: "B", Timestamp: time.Now().Unix() + 1},
+		{ChannelID: "channel-workspace", ChannelType: 2, MessageSeq: 3, SenderUID: "carol", SenderName: "Carol", Content: "C", Timestamp: time.Now().Unix() + 2},
+	})
 	revisionOne := model.AgentMessage{}
-	bindWorkspacePreviewRun(t, db, fixture, &revisionOne, "revision-1", agent.SummaryResultAgentRevision, parent.ID, 4, "Alice confirmed [1]")
+	bindWorkspacePreviewRun(t, db, fixture, &revisionOne, "revision-1", agent.SummaryResultAgentRevision, parent.ID, 4, "A [1] B [2] C [3]")
 	revisionTwo := model.AgentMessage{}
-	bindWorkspacePreviewRun(t, db, fixture, &revisionTwo, "revision-2", agent.SummaryResultAgentRevision, revisionOne.ID, 5, "Alice confirmed [1]")
+	bindWorkspacePreviewRun(t, db, fixture, &revisionTwo, "revision-2", agent.SummaryResultAgentRevision, revisionOne.ID, 5, "B [2] C [3]")
 	if err := db.Model(&model.AgentSummarySession{}).Where("id = ?", fixture.Session.ID).Updates(map[string]interface{}{
 		"latest_preview_message_id": revisionTwo.ID, "artifact_version": 5,
 	}).Error; err != nil {
@@ -113,8 +114,134 @@ func TestCreateAgentSummary_WorkspaceNoFetchRevisionInheritsParentCitations(t *t
 		t.Fatalf("load saved result: %v", err)
 	}
 	citations := saved.GetCitations()
-	if len(citations) != 1 || citations[0].ChannelID != "channel-workspace" {
-		t.Fatalf("saved citations = %+v, want parent preview evidence", citations)
+	if len(citations) != 2 || citations[0].Index != 2 || citations[1].Index != 3 {
+		t.Fatalf("saved citations = %+v, want inherited parent indexes 2 and 3", citations)
+	}
+}
+
+func TestCreateAgentSummary_WorkspaceReferencedPreviewAndRevisionBorrowCitations(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		revision bool
+	}{
+		{name: "preview"},
+		{name: "revision", revision: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+			db := setupAgentSummaryTestDB(t)
+			if err := db.AutoMigrate(&model.AgentSummarySession{}, &model.AgentSummaryRun{}, &model.AgentSummaryTurn{}, &model.AgentSummarySpec{}, &model.AgentEvidenceArtifact{}, &model.AgentCitationManifest{}); err != nil {
+				t.Fatalf("migrate workspace tables: %v", err)
+			}
+			fixture := seedWorkspaceSaveFixture(t, db, "workspace-reference-"+test.name)
+			refTask := createCompletedTask(t, db, fixture.Session.SpaceID, fixture.Session.UserID, model.OriginChannelGroup)
+			refTask.SummaryMode = 1
+			refTask.OriginChannelID = "reference-channel"
+			if err := db.Save(&refTask).Error; err != nil {
+				t.Fatalf("update referenced task: %v", err)
+			}
+			refResult := addTeamResult(t, db, refTask.ID, "Referenced evidence [1]")
+			refResult.SetCitations([]model.Citation{{
+				Index: 1, ChannelID: "reference-channel", ChannelType: 2, MessageSeq: 9, Content: "referenced evidence",
+			}})
+			if err := db.Save(&refResult).Error; err != nil {
+				t.Fatalf("save referenced citations: %v", err)
+			}
+			scope := summaryWorkspaceContext{
+				SelectedChannels: []summaryWorkspaceChannel{}, Participants: []summaryWorkspaceParticipant{},
+				ReferencedTaskIDs: []int64{refTask.ID},
+			}
+			scopeJSON, scopeHash, err := marshalSummaryWorkspaceContext(scope)
+			if err != nil {
+				t.Fatalf("marshal referenced scope: %v", err)
+			}
+			if err := db.Model(&model.AgentSummarySession{}).Where("id = ?", fixture.Session.ID).Updates(map[string]interface{}{
+				"scope_json": string(scopeJSON), "scope_hash": scopeHash,
+			}).Error; err != nil {
+				t.Fatalf("persist referenced scope: %v", err)
+			}
+
+			selected := fixture.Message
+			bindWorkspacePreviewRun(t, db, fixture, &selected, "reference-preview", agent.SummaryResultAgentPreview, 0, 3, "Refined reference [1]")
+			artifactVersion := 3
+			requestID := "reference-preview"
+			if test.revision {
+				revision := model.AgentMessage{}
+				bindWorkspacePreviewRun(t, db, fixture, &revision, "reference-revision", agent.SummaryResultAgentRevision, selected.ID, 4, "Shorter reference [1]")
+				selected = revision
+				artifactVersion = 4
+				requestID = "reference-revision"
+			}
+			if err := db.Model(&model.AgentSummarySession{}).Where("id = ?", fixture.Session.ID).Updates(map[string]interface{}{
+				"latest_preview_message_id": selected.ID, "artifact_version": artifactVersion,
+			}).Error; err != nil {
+				t.Fatalf("select referenced preview: %v", err)
+			}
+			fixture.Body["agent_message_id"] = selected.ID
+			fixture.Body["expected_artifact_version"] = artifactVersion
+			fixture.Body["request_id"] = requestID
+
+			h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+			w := doAgentSave(t, setupAgentSummaryRouter(h), fixture.Body, map[string]string{"Idempotency-Key": "reference-" + test.name})
+			if w.Code != http.StatusOK {
+				t.Fatalf("save status=%d: %s", w.Code, w.Body.String())
+			}
+			var saved model.PersonalResult
+			if err := db.Where("task_id <> ?", refTask.ID).First(&saved).Error; err != nil {
+				t.Fatalf("load saved workspace result: %v", err)
+			}
+			citations := saved.GetCitations()
+			if len(citations) != 1 || citations[0].ChannelID != "reference-channel" {
+				t.Fatalf("saved citations = %+v, want referenced artifact citation", citations)
+			}
+		})
+	}
+}
+
+func TestCreateAgentSummary_WorkspaceReferencedPreviewStripsRedactedMarkers(t *testing.T) {
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+	db := setupAgentSummaryTestDB(t)
+	if err := db.AutoMigrate(&model.AgentSummarySession{}, &model.AgentSummaryRun{}, &model.AgentSummaryTurn{}, &model.AgentSummarySpec{}, &model.AgentEvidenceArtifact{}, &model.AgentCitationManifest{}); err != nil {
+		t.Fatalf("migrate workspace tables: %v", err)
+	}
+	fixture := seedWorkspaceSaveFixture(t, db, "workspace-reference-redacted")
+	refTask := createCompletedTask(t, db, fixture.Session.SpaceID, fixture.Session.UserID, model.OriginChannelGroup)
+	refTask.OriginChannelID = "reference-channel"
+	if err := db.Save(&refTask).Error; err != nil {
+		t.Fatalf("update referenced task: %v", err)
+	}
+	refResult := addTeamResult(t, db, refTask.ID, "Private evidence [1]")
+	refResult.SetCitations([]model.Citation{{Index: 1, ChannelID: "reference-channel", Content: "private"}})
+	if err := db.Save(&refResult).Error; err != nil {
+		t.Fatalf("save redacted citations: %v", err)
+	}
+	scopeJSON, scopeHash, err := marshalSummaryWorkspaceContext(summaryWorkspaceContext{
+		SelectedChannels: []summaryWorkspaceChannel{}, Participants: []summaryWorkspaceParticipant{},
+		ReferencedTaskIDs: []int64{refTask.ID},
+	})
+	if err != nil {
+		t.Fatalf("marshal referenced scope: %v", err)
+	}
+	if err := db.Model(&model.AgentSummarySession{}).Where("id = ?", fixture.Session.ID).Updates(map[string]interface{}{
+		"scope_json": string(scopeJSON), "scope_hash": scopeHash,
+	}).Error; err != nil {
+		t.Fatalf("persist referenced scope: %v", err)
+	}
+	selected := fixture.Message
+	bindWorkspacePreviewRun(t, db, fixture, &selected, "reference-redacted", agent.SummaryResultAgentPreview, 0, 3, "Refined private evidence [1]")
+	fixture.Body["request_id"] = "reference-redacted"
+
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	w := doAgentSave(t, setupAgentSummaryRouter(h), fixture.Body, map[string]string{"Idempotency-Key": "reference-redacted"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("save status=%d: %s", w.Code, w.Body.String())
+	}
+	var saved model.PersonalResult
+	if err := db.Where("task_id <> ?", refTask.ID).First(&saved).Error; err != nil {
+		t.Fatalf("load saved workspace result: %v", err)
+	}
+	if saved.Content != "Refined private evidence" || len(saved.GetCitations()) != 0 {
+		t.Fatalf("saved result content=%q citations=%+v", saved.Content, saved.GetCitations())
 	}
 }
 
@@ -183,6 +310,19 @@ func TestCreateAgentSummary_WorkspaceRevisionRejectsUnresolvableCitationSequence
 	w := doAgentSave(t, setupAgentSummaryRouter(h), fixture.Body, map[string]string{"Idempotency-Key": "missing-evidence"})
 	if w.Code != http.StatusConflict {
 		t.Fatalf("save status=%d, want conflict: %s", w.Code, w.Body.String())
+	}
+	var response struct {
+		Code int `json:"code"`
+		Data struct {
+			Reason         string `json:"reason"`
+			RecoveryAction string `json:"recovery_action"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode conflict: %v", err)
+	}
+	if response.Code != 40902 || response.Data.Reason != "workspace_citation_unresolved" || response.Data.RecoveryAction != "regenerate_preview" {
+		t.Fatalf("citation conflict = %+v", response)
 	}
 	var count int64
 	if err := db.Model(&model.SummaryTask{}).Count(&count).Error; err != nil || count != 0 {

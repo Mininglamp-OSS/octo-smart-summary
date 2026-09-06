@@ -504,7 +504,17 @@ func (h *AgentSummaryHandler) borrowCitationsFromReference(
 	spaceID string,
 	userID string,
 ) ([]model.Citation, citationMarkerSet) {
-	art, err := resolveReferencedArtifact(ctx, h.db, refTaskID, spaceID, userID)
+	return h.borrowCitationsFromReferenceWithDB(ctx, h.db, refTaskID, spaceID, userID)
+}
+
+func (h *AgentSummaryHandler) borrowCitationsFromReferenceWithDB(
+	ctx context.Context,
+	db *gorm.DB,
+	refTaskID int64,
+	spaceID string,
+	userID string,
+) ([]model.Citation, citationMarkerSet) {
+	art, err := resolveReferencedArtifact(ctx, db, refTaskID, spaceID, userID)
 	if err != nil || art == nil {
 		return []model.Citation{}, nil
 	}
