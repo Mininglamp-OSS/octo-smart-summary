@@ -69,7 +69,7 @@ func TestDiscoverableChannelScopeRequiresDeclarationBeforeRead(t *testing.T) {
 	}
 }
 
-func TestDiscoverableChannelScopeUnionsMultipleDiscoveryResults(t *testing.T) {
+func TestDiscoverableChannelScopeCanDeclareAcrossMultipleDiscoveryResults(t *testing.T) {
 	ctx := context.WithValue(context.Background(), ContextKeyUID, "user-1")
 	ctx = WithDiscoverableChannelScope(ctx)
 	AuthorizeDiscoveredChannels(ctx, []pipeline.ChannelInfo{{ChannelID: "group-1", ChannelType: model.ChannelTypeGroup}})

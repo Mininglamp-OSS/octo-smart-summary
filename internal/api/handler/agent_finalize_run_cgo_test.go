@@ -13,6 +13,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/finishgate"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryspec"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 )
 
@@ -167,8 +168,8 @@ func TestFinalizeRunOpenScopeUnderFetchIsDisclosed(t *testing.T) {
 		Update("spec_id", "spec-1").Error; err != nil {
 		t.Fatalf("set spec_id: %v", err)
 	}
-	if err := store.RecordDiscoveredChannels(ctx, "u1", run.RunID, []string{"ch-1", "ch-2", "ch-3"}); err != nil {
-		t.Fatalf("record discovered: %v", err)
+	if err := store.SetDeclaredChannels(ctx, "u1", run.RunID, []string{"ch-1", "ch-2", "ch-3"}); err != nil {
+		t.Fatalf("set declared channels: %v", err)
 	}
 	if err := store.RecordChannelFetch(ctx, "u1", run.RunID, "ch-1", true, false); err != nil {
 		t.Fatalf("record fetch: %v", err)
@@ -187,6 +188,43 @@ func TestFinalizeRunOpenScopeUnderFetchIsDisclosed(t *testing.T) {
 	}
 	if !named["ch-2"] || !named["ch-3"] {
 		t.Fatalf("the disclosure must name the missed channels, got %v", gaps)
+	}
+}
+
+func TestFinalizeRunDeclaredReplacementSupersedesPickerSpec(t *testing.T) {
+	db := newFinalizeTestDB(t)
+	if db == nil {
+		return
+	}
+	store := summaryrun.NewStore(db)
+	ctx := context.Background()
+	run, _, err := store.CreateOrGetRun(ctx, "u1", "sess-replace", "req-replace", model.ScopePolicyClosed)
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	objective := "总结新聊天"
+	spec, sources, err := summaryspec.Validate(summaryspec.Draft{
+		Objective: &objective,
+		Channels:  []summaryspec.Channel{{ChannelID: "picker-A", Name: "旧选择", Type: "group"}},
+		TimeRange: &summaryspec.TimeRange{Start: 1755000000, End: 1755086400},
+	}, summaryspec.Options{ProvidedSource: summaryspec.SourceUser, ChannelSource: summaryspec.SourceUI})
+	if err != nil {
+		t.Fatalf("validate spec: %v", err)
+	}
+	if _, err := store.SaveSpec(ctx, run, run.Version, spec, sources, objective); err != nil {
+		t.Fatalf("save picker spec: %v", err)
+	}
+	if err := store.SetDeclaredChannels(ctx, "u1", run.RunID, []string{"declared-B"}); err != nil {
+		t.Fatalf("set declared replacement: %v", err)
+	}
+	if err := store.RecordChannelFetch(ctx, "u1", run.RunID, "declared-B", true, false); err != nil {
+		t.Fatalf("record replacement fetch: %v", err)
+	}
+
+	h := &AgentSummaryHandler{db: db}
+	verdict, gaps := h.finalizeRun(ctx, "u1", "sess-replace", "req-replace", "总结正文", nil)
+	if verdict != finishgate.Complete {
+		t.Fatalf("verdict = %s, want COMPLETE for declared-B; stale picker-A gaps=%v", verdict, gaps)
 	}
 }
 

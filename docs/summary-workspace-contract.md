@@ -15,6 +15,18 @@ returns `enabled: true` and `contract_version: "2"`.
 - Reusing the same `request_id` is idempotent and does not dispatch a second
   workflow.
 
+## Input origin and routing
+
+- `action: "chat"` with `input_origin: "user"` is conversational. Except for
+  explanation-only turns, it always runs through the Agent and returns an
+  `agent_preview` or `agent_revision`; it does not directly start a personal
+  Workflow or create a team proposal.
+- `input_origin: "template"` and `input_origin: "system_intent"` are trusted UI
+  inputs. When the remaining route requirements are satisfied, they may enter
+  the deterministic personal or team Workflow paths directly.
+- `action: "start_team_workflow"` remains the explicit trusted team execution
+  entry point and is not changed by the conversational routing rule above.
+
 ## Effective scope
 
 The session's `scope_json` and `scope_hash` are the authoritative effective
@@ -36,8 +48,10 @@ message retrieval, `scope_json`, and `preview.effective_scope`. Ordinary edits,
 questions, negations, and historical references do not call the scope tool and
 therefore keep the picker scope. On a cold start, a preview without a successful
 source declaration becomes a clarification instead of an ungrounded preview or
-a retryable server error. A source-changing turn cannot directly dispatch a
-Workflow; the trusted start action may run after the resolved scope is returned.
+a retryable server error. Because every user-authored non-explanation chat turn
+is conversational, it cannot directly dispatch a Workflow. A trusted
+template/system intent or the explicit team start action may do so after the
+resolved scope is returned.
 
 `time_range.source` records whether the current range came from the picker,
 the server default, or a conversational instruction. Explicit conversational

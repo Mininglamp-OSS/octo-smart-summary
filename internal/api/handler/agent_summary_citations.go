@@ -446,8 +446,12 @@ func (h *AgentSummaryHandler) finalizeRunForDeliverable(ctx context.Context, uid
 		state.HasUsableEvidence = true
 	}
 
-	// Expected channels from the run's Spec, when persisted.
-	if spec, ok, serr := runStore.GetLatestSpec(ctx, uid, run.RunID); serr == nil && ok {
+	// A set_summary_scope declaration is the final coverage authority and
+	// supersedes the picker-time Spec. The legacy column name is retained for DB
+	// compatibility, but its value is replacement-written by the scope tool.
+	if declared := decodeFinishChannelIDs(run.DiscoveredChannels); len(declared) > 0 {
+		state.ExpectedChannels = declared
+	} else if spec, ok, serr := runStore.GetLatestSpec(ctx, uid, run.RunID); serr == nil && ok {
 		state.ExpectedChannels = make([]string, 0, len(spec.Channels))
 		for _, ch := range spec.Channels {
 			if ch.ChannelID != "" {

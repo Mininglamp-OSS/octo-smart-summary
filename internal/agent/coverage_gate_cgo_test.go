@@ -232,6 +232,28 @@ func TestCoverageGate_BlocksFreezeAndNamesMissingChannel(t *testing.T) {
 	}
 }
 
+func TestCoverageGate_DeclaredReplacementSupersedesPickerSpec(t *testing.T) {
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+	f := newCoverageGateFixture(t, true, []summaryspec.Channel{{ChannelID: "picker-A", Name: "旧选择", Type: "group"}})
+	if f == nil {
+		return
+	}
+	llm := newEchoLLM(t)
+	SetSummaryDeps(f.db, nil, nil, llm.cfg())
+	t.Cleanup(func() { SetSummaryDeps(nil, nil, nil, config.Config{}) })
+	if err := f.runStore.SetDeclaredChannels(context.Background(), f.uid, f.runID, []string{"declared-B"}); err != nil {
+		t.Fatalf("set declared replacement: %v", err)
+	}
+	handle := f.seedFetched(t, "declared-B", []pipeline.Message{{
+		ChannelID: "declared-B", MessageSeq: 1, Timestamp: 1000, Content: "replacement evidence",
+	}})
+	_, summarize := SummarizeChunkTool()
+	args, _ := json.Marshal(map[string]string{"messages_handle": handle})
+	if _, err := summarize(f.toolCtxAtStep(1), args); err != nil {
+		t.Fatalf("replacement scope still demanded picker-A: %v", err)
+	}
+}
+
 // THE regression the reviewers asked for by name: "repair must still summarize
 // and cite the repaired channel's messages".
 //

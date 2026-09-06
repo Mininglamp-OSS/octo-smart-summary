@@ -276,12 +276,6 @@ func checkCoverageBeforeFreeze(ctx context.Context, uid, sessionID, runID string
 	if run == nil {
 		return nil
 	}
-	// Open scope has no authoritative expected list — nothing can be proven
-	// missing, so there is nothing to demand.
-	if run.ScopePolicy != model.ScopePolicyClosed {
-		markCoverageGateSatisfied(runID)
-		return nil
-	}
 	// FetchExpected=false means this turn was never owed a fetch: SS-08b strips
 	// the fetch tools from a confident rewrite, and refineFetchExpected persists
 	// 0 for a refine turn that will not gather data. The finish gate deliberately
@@ -299,13 +293,23 @@ func checkCoverageBeforeFreeze(ctx context.Context, uid, sessionID, runID string
 		log.Printf("[coverage_gate] run=%s session=%s: load latest spec failed: %v", runID, sessionID, err)
 		return nil
 	}
-	if !found || len(spec.Channels) == 0 {
-		return nil
-	}
-	expected := make([]string, 0, len(spec.Channels))
-	for _, c := range spec.Channels {
-		if c.ChannelID != "" {
-			expected = append(expected, c.ChannelID)
+	declared := decodeAttemptedChannels(run.DiscoveredChannels, runID)
+	expected := declared
+	if len(expected) == 0 {
+		// Without a declaration, only a closed picker scope has an authoritative
+		// expected set. Open-scope discovery candidates are not sufficient.
+		if run.ScopePolicy != model.ScopePolicyClosed {
+			markCoverageGateSatisfied(runID)
+			return nil
+		}
+		if !found || len(spec.Channels) == 0 {
+			return nil
+		}
+		expected = make([]string, 0, len(spec.Channels))
+		for _, c := range spec.Channels {
+			if c.ChannelID != "" {
+				expected = append(expected, c.ChannelID)
+			}
 		}
 	}
 	attempted := decodeAttemptedChannels(run.AttemptedChannels, runID)

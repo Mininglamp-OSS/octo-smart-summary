@@ -347,7 +347,7 @@ func TestRecordChannelFetchAndDroppedMessages(t *testing.T) {
 	}
 }
 
-func TestRecordDiscoveredChannels(t *testing.T) {
+func TestSetDeclaredChannelsReplacesPriorDeclaration(t *testing.T) {
 	db := newStoreTestDB(t)
 	if db == nil {
 		return
@@ -356,29 +356,27 @@ func TestRecordDiscoveredChannels(t *testing.T) {
 	ctx := context.Background()
 	run, _, _ := s.CreateOrGetRun(ctx, "u1", "sess1", "req-disc", model.ScopePolicyOpen)
 
-	// Discovery arrives across several tool calls, each seeing only its own slice,
-	// so the write must union rather than replace.
-	if err := s.RecordDiscoveredChannels(ctx, "u1", run.RunID, []string{"ch-1", "ch-2"}); err != nil {
-		t.Fatalf("RecordDiscoveredChannels: %v", err)
+	if err := s.SetDeclaredChannels(ctx, "u1", run.RunID, []string{"ch-1", "ch-2"}); err != nil {
+		t.Fatalf("SetDeclaredChannels: %v", err)
 	}
-	if err := s.RecordDiscoveredChannels(ctx, "u1", run.RunID, []string{"ch-2", "ch-3", ""}); err != nil {
-		t.Fatalf("RecordDiscoveredChannels second call: %v", err)
+	if err := s.SetDeclaredChannels(ctx, "u1", run.RunID, []string{"ch-2", "ch-3", ""}); err != nil {
+		t.Fatalf("SetDeclaredChannels second call: %v", err)
 	}
 
 	got, err := s.GetByID(ctx, "u1", run.RunID)
 	if err != nil {
 		t.Fatalf("GetByID: %v", err)
 	}
-	if got.DiscoveredChannels != `["ch-1","ch-2","ch-3"]` {
-		t.Fatalf("discovered_channels = %s, want a deduped union with the empty id dropped", got.DiscoveredChannels)
+	if got.DiscoveredChannels != `["ch-2","ch-3"]` {
+		t.Fatalf("discovered_channels = %s, want the latest deduped declaration", got.DiscoveredChannels)
 	}
 
 	// Owner-scoped like every other run write: another user's call is a no-op.
-	if err := s.RecordDiscoveredChannels(ctx, "u2", run.RunID, []string{"ch-9"}); err == nil {
-		t.Error("cross-user RecordDiscoveredChannels should not find the row")
+	if err := s.SetDeclaredChannels(ctx, "u2", run.RunID, []string{"ch-9"}); err == nil {
+		t.Error("cross-user SetDeclaredChannels should not find the row")
 	}
 	got, _ = s.GetByID(ctx, "u1", run.RunID)
-	if got.DiscoveredChannels != `["ch-1","ch-2","ch-3"]` {
+	if got.DiscoveredChannels != `["ch-2","ch-3"]` {
 		t.Fatalf("cross-user call mutated the row: %s", got.DiscoveredChannels)
 	}
 }

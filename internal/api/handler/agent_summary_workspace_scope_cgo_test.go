@@ -122,7 +122,7 @@ func runWorkspaceScopeTurn(
 	snapshot, err := handler.completeWorkspaceAgentTurn(
 		context.Background(), &summaryWorkspaceResponder{}, key, begin.Turn.ID, begin.Turn.Attempt,
 		agentChatRequest{SessionID: key.SessionID, RequestID: requestID, ScopeVersion: 1, Message: "总结项目进展"},
-		contextValue, begin.Snapshot, service.SummaryRouteAgentPreview, true, summaryWorkspaceSourceUnchanged, false,
+		contextValue, begin.Snapshot, service.SummaryRouteAgentPreview, true, false,
 	)
 	if err != nil {
 		t.Fatalf("complete workspace Agent turn: %v", err)
@@ -143,6 +143,30 @@ func TestWorkspaceColdStartWithoutScopeDeclarationReturnsClarification(t *testin
 	}
 	if snapshot.Session.State != workspaceResultClarification || snapshot.CurrentPreview != nil {
 		t.Fatalf("cold start state=%q preview=%#v, want clarification without preview", snapshot.Session.State, snapshot.CurrentPreview)
+	}
+	if len(snapshot.Messages) == 0 {
+		t.Fatal("cold start clarification message is missing")
+	}
+	last := snapshot.Messages[len(snapshot.Messages)-1]
+	if last.ResultType != agent.SummaryResultClarification || last.Content != "请先告诉我需要总结哪个聊天或哪些参与者。" {
+		t.Fatalf("persisted clarification = type %q content %q", last.ResultType, last.Content)
+	}
+}
+
+func TestWorkspaceColdStartWithParticipantsOnlyAsksForChat(t *testing.T) {
+	var captured []agent.ChannelScope
+	runner := workspaceScopeTestRunner(t, nil, nil, "", &captured,
+		`{"result_type":"agent_preview","reply":"已生成","execution_target":"agent_preview","preview":{"content":"预览","version":1}}`,
+	)
+	contextValue := emptySummaryWorkspaceContext()
+	contextValue.Participants = []summaryWorkspaceParticipant{{UserID: "member", UserName: "成员 A"}}
+	snapshot := runWorkspaceScopeTurn(t, runner, contextValue, "participants-only")
+	if len(snapshot.Messages) == 0 {
+		t.Fatal("participants-only clarification message is missing")
+	}
+	last := snapshot.Messages[len(snapshot.Messages)-1]
+	if last.Content != "请先告诉我需要总结哪个聊天。" {
+		t.Fatalf("participants-only clarification = %q", last.Content)
 	}
 }
 

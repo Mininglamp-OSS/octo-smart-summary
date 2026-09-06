@@ -44,6 +44,17 @@ var toolFactories = map[string]ToolFactory{
 	"merge_summaries":          MergeSummariesTool,
 }
 
+var toolPhases = map[string]ToolPhase{
+	"get_current_time":         ToolPhaseScopePreparation,
+	"extract_time_range":       ToolPhaseScopePreparation,
+	"list_channels":            ToolPhaseScopePreparation,
+	"narrow_channels_by_topic": ToolPhaseScopePreparation,
+	"find_shared_channels":     ToolPhaseScopePreparation,
+	"set_summary_scope":        ToolPhaseScopeCommit,
+	"fetch_channel":            ToolPhaseFetch,
+	"summarize_chunk":          ToolPhaseSummarize,
+}
+
 var terminalToolFactories = map[string]TerminalToolFactory{
 	"emit_summary_response": EmitSummaryResponseTool,
 }
@@ -148,7 +159,7 @@ func BuildRegistry(toolNames []string) (*Registry, error) {
 	for _, name := range toolNames {
 		if factory, ok := toolFactories[name]; ok {
 			schema, handler := factory()
-			reg.Register(schema, handler)
+			reg.RegisterWithPhase(schema, handler, GetToolPhase(name))
 			continue
 		}
 		if factory, ok := terminalToolFactories[name]; ok {
@@ -183,6 +194,12 @@ func GetProfile(name string) (Profile, error) {
 func GetToolFactory(name string) (ToolFactory, bool) {
 	f, ok := toolFactories[name]
 	return f, ok
+}
+
+// GetToolPhase returns the execution phase registered for a tool factory.
+// Unclassified tools remain freely concurrent.
+func GetToolPhase(name string) ToolPhase {
+	return toolPhases[name]
 }
 
 // GetTerminalToolFactory returns a terminal tool factory by name. Per-request

@@ -512,18 +512,19 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 	hasSummarize := false
 	for i, tc := range calls {
 		all = append(all, i)
-		if tc.Function.Name == "fetch_channel" {
+		phase := r.reg.Phase(tc.Function.Name)
+		if phase == ToolPhaseFetch {
 			fetches = append(fetches, i)
 		} else {
 			rest = append(rest, i)
 		}
-		if tc.Function.Name == "summarize_chunk" {
+		if phase == ToolPhaseSummarize {
 			hasSummarize = true
 		}
-		switch tc.Function.Name {
-		case "list_channels", "narrow_channels_by_topic", "find_shared_channels":
+		switch phase {
+		case ToolPhaseScopePreparation:
 			discoveries = append(discoveries, i)
-		case "set_summary_scope":
+		case ToolPhaseScopeCommit:
 			scopeSetters = append(scopeSetters, i)
 		default:
 			afterScope = append(afterScope, i)
@@ -548,13 +549,13 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 		remainingRest := make([]int, 0, len(afterScope))
 		remainingHasSummarize := false
 		for _, index := range afterScope {
-			name := calls[index].Function.Name
-			if name == "fetch_channel" {
+			phase := r.reg.Phase(calls[index].Function.Name)
+			if phase == ToolPhaseFetch {
 				remainingFetches = append(remainingFetches, index)
 			} else {
 				remainingRest = append(remainingRest, index)
 			}
-			if name == "summarize_chunk" {
+			if phase == ToolPhaseSummarize {
 				remainingHasSummarize = true
 			}
 		}

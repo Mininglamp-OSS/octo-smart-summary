@@ -363,6 +363,8 @@ type agentMessageRunBinding struct {
 	EvidenceSessionID string
 }
 
+const maxWorkspaceCitationParentDepth = 128
+
 // resolveAgentMessageRunBinding makes the server-persisted message→run binding
 // authoritative before any deliverable rows are written. Besides deriving the
 // request id, it returns the internal session identity that the generating run
@@ -410,6 +412,141 @@ func resolveAgentMessageRunBinding(ctx context.Context, db *gorm.DB, userID, ses
 func resolveAgentMessageRequestID(ctx context.Context, db *gorm.DB, userID, sessionID, requestID string, msg model.AgentMessage) (string, error) {
 	binding, err := resolveAgentMessageRunBinding(ctx, db, userID, sessionID, requestID, msg)
 	return binding.RequestID, err
+}
+
+// workspaceRevisionAncestorBindings returns the persisted run bindings for the
+// selected revision's parent chain, nearest first. The chain is owner-, space-,
+// session-, and scope-bound so a no-fetch wording revision can reuse only the
+// evidence that its visible parent preview was grounded in.
+func workspaceRevisionAncestorBindings(
+	ctx context.Context,
+	db *gorm.DB,
+	userID, sessionID string,
+	message model.AgentMessage,
+) ([]agentMessageRunBinding, error) {
+	if message.ResultType != agent.SummaryResultAgentRevision || message.ParentMessageID <= 0 {
+		return nil, nil
+	}
+	bindings := make([]agentMessageRunBinding, 0, 4)
+	seenMessages := map[int64]struct{}{message.ID: {}}
+	seenBindings := make(map[string]struct{})
+	parentID := message.ParentMessageID
+	for depth := 0; parentID > 0 && depth < maxWorkspaceCitationParentDepth; depth++ {
+		if _, exists := seenMessages[parentID]; exists {
+			return nil, fmt.Errorf("%w: preview parent cycle", errWorkspacePreviewSaveStale)
+		}
+		seenMessages[parentID] = struct{}{}
+		var parent model.AgentMessage
+		if err := db.WithContext(ctx).Where(
+			"id = ? AND space_id = ? AND user_id = ? AND session_id = ? AND scope_version = ? AND role = ? AND tool_calls IS NULL",
+			parentID, message.SpaceID, userID, sessionID, message.ScopeVersion, "assistant",
+		).Take(&parent).Error; err != nil {
+			return nil, fmt.Errorf("%w: preview parent not found", errWorkspacePreviewSaveStale)
+		}
+		if parent.ResultType != agent.SummaryResultAgentPreview && parent.ResultType != agent.SummaryResultAgentRevision {
+			return nil, fmt.Errorf("%w: preview parent is not saveable", errWorkspacePreviewSaveStale)
+		}
+		binding, err := resolveAgentMessageRunBinding(ctx, db, userID, sessionID, "", parent)
+		if err != nil {
+			if errors.Is(err, errAgentMessageRunMismatch) {
+				return nil, fmt.Errorf("%w: preview parent run binding changed", errWorkspacePreviewSaveStale)
+			}
+			return nil, err
+		}
+		if binding.EvidenceSessionID != "" {
+			key := binding.EvidenceSessionID + "\x00" + binding.RequestID
+			if _, exists := seenBindings[key]; !exists {
+				seenBindings[key] = struct{}{}
+				bindings = append(bindings, binding)
+			}
+		}
+		parentID = parent.ParentMessageID
+	}
+	if parentID > 0 {
+		return nil, fmt.Errorf("%w: preview parent chain is too deep", errWorkspacePreviewSaveStale)
+	}
+	return bindings, nil
+}
+
+func workspaceEvidenceSessionHasRows(ctx context.Context, db *gorm.DB, userID, sessionID string) (bool, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return false, nil
+	}
+	var count int64
+	if err := db.WithContext(ctx).Model(&model.AgentMessageEvidence{}).
+		Where("user_id = ? AND session_id = ?", userID, sessionID).
+		Limit(1).Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// buildWorkspacePreviewCitations keeps per-turn evidence isolation while
+// preserving citations for a wording-only revision. The selected run remains
+// authoritative when it fetched anything. Only an evidence-empty revision may
+// walk its explicit parent preview lineage, and the first grounded ancestor
+// must resolve the current [n] sequence or the save is rejected.
+func (h *AgentSummaryHandler) buildWorkspacePreviewCitations(
+	ctx context.Context,
+	db *gorm.DB,
+	userID, sessionID, content string,
+	candidate workspacePreviewSaveCandidate,
+	binding agentMessageRunBinding,
+) ([]model.Citation, error) {
+	evidenceSessionID := binding.EvidenceSessionID
+	if evidenceSessionID == "" {
+		evidenceSessionID = persistedOrDerivedWorkspaceAgentSessionID(
+			candidate.Session.AgentSessionID,
+			candidate.Session.SpaceID,
+			sessionID,
+			candidate.Session.ScopeVersion,
+		)
+	}
+	citations, err := h.buildCitationsForSessionWithDB(ctx, db, evidenceSessionID, content, userID, binding.RequestID)
+	if err != nil {
+		return nil, err
+	}
+	if !contentHasCitationSequence(content) {
+		return citations, nil
+	}
+	if len(citations) > 0 {
+		if citationsValid(content, citations, true) {
+			return citations, nil
+		}
+		return nil, fmt.Errorf("%w: preview citation evidence does not resolve", errWorkspacePreviewSaveStale)
+	}
+	currentHasEvidence, err := workspaceEvidenceSessionHasRows(ctx, db, userID, evidenceSessionID)
+	if err != nil {
+		return nil, err
+	}
+	if currentHasEvidence || candidate.Message.ResultType != agent.SummaryResultAgentRevision {
+		return nil, fmt.Errorf("%w: preview citation evidence does not resolve", errWorkspacePreviewSaveStale)
+	}
+
+	ancestors, err := workspaceRevisionAncestorBindings(ctx, db, userID, sessionID, candidate.Message)
+	if err != nil {
+		return nil, err
+	}
+	for _, ancestor := range ancestors {
+		hasEvidence, err := workspaceEvidenceSessionHasRows(ctx, db, userID, ancestor.EvidenceSessionID)
+		if err != nil {
+			return nil, err
+		}
+		if !hasEvidence {
+			continue
+		}
+		citations, err := h.buildCitationsForSessionWithDB(
+			ctx, db, ancestor.EvidenceSessionID, content, userID, ancestor.RequestID,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if len(citations) > 0 && citationsValid(content, citations, true) {
+			return citations, nil
+		}
+		return nil, fmt.Errorf("%w: parent preview citation evidence does not resolve", errWorkspacePreviewSaveStale)
+	}
+	return nil, fmt.Errorf("%w: preview citation evidence is unavailable", errWorkspacePreviewSaveStale)
 }
 
 // canonicalAgentSaveRequestHash returns a deterministic sha256 fingerprint of

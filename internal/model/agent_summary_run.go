@@ -96,10 +96,9 @@ type AgentSummaryRun struct {
 	// 20260820-01 still applies — it is there for rows that predate the column.
 	FetchExpected bool `gorm:"column:fetch_expected;not null" json:"fetch_expected"`
 
-	// DiscoveredChannels are the in-scope channels the run learned about (via
-	// list_channels et al.) but that no UI selection pinned. For an open-scope run
-	// ExpectedChannels is empty, so this is the only signal that distinguishes
-	// "fetched everything in scope" from "fetched 2 of the 12 it found".
+	// DiscoveredChannels is the legacy column name for the final channel set
+	// declared by set_summary_scope. A declaration supersedes the picker-time Spec
+	// for coverage, including replace/extend turns and idempotent retries.
 	DiscoveredChannels string `gorm:"column:discovered_channels;type:json" json:"discovered_channels"`
 
 	// Version is the optimistic-lock counter for serialized run updates.

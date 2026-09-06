@@ -244,7 +244,7 @@ func (h *AgentChatHandler) buildRegistryWithUID(uid, sessionID string, toolNames
 				ctx = context.WithValue(ctx, agent.ContextKeySessionID, sessionID)
 				return origHandler(ctx, args)
 			}
-			reg.Register(schema, wrappedHandler)
+			reg.RegisterWithPhase(schema, wrappedHandler, agent.GetToolPhase(name))
 			continue
 		}
 		if factory, ok := agent.GetTerminalToolFactory(name); ok {

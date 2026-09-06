@@ -610,6 +610,17 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			workspaceCandidate = lockedCandidate
 			draftMsg = lockedCandidate.Message
 			content = lockedCandidate.Content
+			lockedBinding, bindingErr := resolveAgentMessageRunBinding(
+				c.Request.Context(), tx, userID, req.SessionID, req.RequestID, draftMsg,
+			)
+			if bindingErr != nil {
+				if errors.Is(bindingErr, errAgentMessageRunMismatch) {
+					return fmt.Errorf("%w: preview run binding changed", errWorkspacePreviewSaveStale)
+				}
+				return bindingErr
+			}
+			runBinding = lockedBinding
+			resolvedRequestID = lockedBinding.RequestID
 			lockedRange, rangeErr := workspaceAgentSaveTimeRange(lockedCandidate.Scope, now)
 			if rangeErr != nil {
 				return fmt.Errorf("%w: invalid workspace time range", errWorkspacePreviewSaveStale)
@@ -681,21 +692,23 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			CreatedAt:        now,
 			UpdatedAt:        now,
 		}
-		// Build citations from session tool traces (fallback to empty array on error)
-		evidenceSessionID := req.SessionID
+		// Build citations from the selected preview's persisted run lineage.
+		// Workspace revisions that did not fetch may inherit only from their
+		// explicit parent preview chain; legacy saves preserve best-effort fallback.
+		var cits []model.Citation
+		var cerr error
 		if workspaceSave {
-			if runBinding.EvidenceSessionID != "" {
-				evidenceSessionID = runBinding.EvidenceSessionID
-			} else {
-				evidenceSessionID = persistedOrDerivedWorkspaceAgentSessionID(
-					workspaceCandidate.Session.AgentSessionID,
-					spaceID,
-					req.SessionID,
-					workspaceCandidate.Session.ScopeVersion,
-				)
-			}
+			cits, cerr = h.buildWorkspacePreviewCitations(
+				c.Request.Context(), tx, userID, req.SessionID, content, workspaceCandidate, runBinding,
+			)
+		} else {
+			cits, cerr = h.buildCitationsForSessionWithDB(
+				c.Request.Context(), tx, req.SessionID, content, userID, resolvedRequestID,
+			)
 		}
-		cits, cerr := h.buildCitationsForSessionWithDB(c.Request.Context(), tx, evidenceSessionID, content, userID, resolvedRequestID)
+		if cerr != nil && workspaceSave {
+			return cerr
+		}
 		if cerr != nil {
 			log.Printf("[handler] buildCitationsForSession failed session=%s: %v (fallback to empty)", req.SessionID, cerr)
 			cits = nil

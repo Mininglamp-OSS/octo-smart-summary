@@ -76,6 +76,19 @@ func TestSetSummaryScopeRejectsUndiscoveredChannel(t *testing.T) {
 	}
 }
 
+func TestSetSummaryScopeRejectsEmptySourceMode(t *testing.T) {
+	_, handler := SetSummaryScopeTool()
+	ctx := context.WithValue(context.Background(), ContextKeyUID, "actor")
+	ctx = WithDiscoverableChannelScopeForUser(ctx, "actor", []ChannelScope{{ChannelID: "group-a", ChannelType: 2}})
+	_, err := handler(ctx, json.RawMessage(`{"source_mode":"","time_range":{"start":"2026-09-01T00:00:00Z","end":"2026-09-02T00:00:00Z"}}`))
+	if err == nil || !strings.Contains(err.Error(), "invalid workspace source mode") {
+		t.Fatalf("empty source_mode error = %v", err)
+	}
+	if _, declared := DeclaredWorkspaceScopeChange(ctx); declared {
+		t.Fatal("invalid empty source_mode froze scope declaration")
+	}
+}
+
 func TestSetSummaryScopeRejectsChangesAfterMessageFetch(t *testing.T) {
 	_, handler := SetSummaryScopeTool()
 	ctx := context.WithValue(context.Background(), ContextKeyUID, "actor")

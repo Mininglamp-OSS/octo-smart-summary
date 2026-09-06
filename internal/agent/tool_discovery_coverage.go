@@ -5,10 +5,9 @@ import (
 	"log"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
-	"gorm.io/gorm"
 )
 
-// recordDiscoveredChannels records the final model-declared channel scope on
+// recordDeclaredChannels records the final model-declared channel scope on
 // the run row, so the finish gate can detect an open-scope under-fetch.
 //
 // Why this exists: for an open-scope run (no UI channel picker) the Spec pins no
@@ -22,16 +21,20 @@ import (
 // this is observability for the verdict, never a reason to fail a tool call. The
 // write uses WithoutCancel for the same reason fetch_channel's does — the losses
 // worth recording are often the ones that come with a canceled context.
-func recordDiscoveredChannels(ctx context.Context, summaryDB *gorm.DB, uid string, channelIDs []string) {
-	if !SummaryV2Enabled() || summaryDB == nil || uid == "" || len(channelIDs) == 0 {
+func recordDeclaredChannels(ctx context.Context, uid string, channelIDs []string) {
+	if !SummaryV2Enabled() || uid == "" {
+		return
+	}
+	summaryDB, _, _, _ := GetSummaryDeps()
+	if summaryDB == nil {
 		return
 	}
 	runID, _ := ctx.Value(ContextKeyRunID).(string)
 	if runID == "" {
 		return
 	}
-	if err := summaryrun.NewStore(summaryDB).RecordDiscoveredChannels(context.WithoutCancel(ctx), uid, runID, channelIDs); err != nil {
-		log.Printf("[agent] record discovered channels failed run=%s count=%d: %v", runID, len(channelIDs), err)
+	if err := summaryrun.NewStore(summaryDB).SetDeclaredChannels(context.WithoutCancel(ctx), uid, runID, channelIDs); err != nil {
+		log.Printf("[agent] record declared channels failed run=%s count=%d: %v", runID, len(channelIDs), err)
 	}
 }
 

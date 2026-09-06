@@ -13,12 +13,27 @@ type Handler func(ctx context.Context, args json.RawMessage) (string, error)
 type entry struct {
 	schema Tool
 	fn     Handler
+	phase  ToolPhase
 }
 
 type terminalEntry struct {
 	schema Tool
 	fn     TerminalHandler
 }
+
+// ToolPhase describes the causal phase an ordinary tool belongs to when one
+// planner step contains a workspace scope declaration. Keeping this metadata
+// on registry entries prevents runner ordering from drifting when tools are
+// renamed or new discovery tools are added.
+type ToolPhase uint8
+
+const (
+	ToolPhaseDefault ToolPhase = iota
+	ToolPhaseScopePreparation
+	ToolPhaseScopeCommit
+	ToolPhaseFetch
+	ToolPhaseSummarize
+)
 
 // Registry 线程安全地保存工具 schema + handler，支持注册/取 schema/分发。
 type Registry struct {
@@ -35,10 +50,14 @@ func NewRegistry() *Registry {
 }
 
 func (r *Registry) Register(schema Tool, fn Handler) {
+	r.RegisterWithPhase(schema, fn, GetToolPhase(schema.Function.Name))
+}
+
+func (r *Registry) RegisterWithPhase(schema Tool, fn Handler, phase ToolPhase) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.terminals, schema.Function.Name)
-	r.tools[schema.Function.Name] = entry{schema: schema, fn: fn}
+	r.tools[schema.Function.Name] = entry{schema: schema, fn: fn, phase: phase}
 }
 
 // RegisterTerminal registers a tool whose successful dispatch terminates the
@@ -83,6 +102,15 @@ func (r *Registry) IsTerminal(name string) bool {
 	defer r.mu.RUnlock()
 	_, ok := r.terminals[name]
 	return ok
+}
+
+func (r *Registry) Phase(name string) ToolPhase {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if tool, ok := r.tools[name]; ok {
+		return tool.phase
+	}
+	return ToolPhaseDefault
 }
 
 // Dispatch 按名分发。未知工具/handler panic 都转成错误返回，绝不中断回环。

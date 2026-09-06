@@ -81,7 +81,11 @@ func SetSummaryScopeTool() (Tool, Handler) {
 		if err := decoder.Decode(&parsed); err != nil {
 			return "", fmt.Errorf("invalid args: %w", err)
 		}
-		change := WorkspaceScopeChange{SourceMode: strings.TrimSpace(parsed.SourceMode)}
+		sourceMode := strings.TrimSpace(parsed.SourceMode)
+		if sourceMode != WorkspaceSourceKeep && sourceMode != WorkspaceSourceReplace && sourceMode != WorkspaceSourceExtend {
+			return "", fmt.Errorf("invalid workspace source mode %q", sourceMode)
+		}
+		change := WorkspaceScopeChange{SourceMode: sourceMode}
 		if len(parsed.Channels) > MaxWorkspaceSelectedChannels {
 			return "", fmt.Errorf("workspace scope cannot exceed %d channels", MaxWorkspaceSelectedChannels)
 		}
@@ -116,11 +120,8 @@ func SetSummaryScopeTool() (Tool, Handler) {
 		if !ok {
 			return "", errors.New("workspace scope declaration was not retained")
 		}
-		if SummaryV2Enabled() {
-			summaryDB, _, _, _ := GetSummaryDeps()
-			uid, _ := ctx.Value(ContextKeyUID).(string)
-			recordDiscoveredChannels(ctx, summaryDB, uid, channelScopeIDsOf(declared.Channels))
-		}
+		uid, _ := ctx.Value(ContextKeyUID).(string)
+		recordDeclaredChannels(ctx, uid, channelScopeIDsOf(declared.Channels))
 		return "已记录并约束本轮总结范围。", nil
 	}
 	return schema, handler

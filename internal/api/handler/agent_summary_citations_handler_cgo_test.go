@@ -7,13 +7,188 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/finishgate"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
+	"gorm.io/gorm"
 )
+
+func bindWorkspacePreviewRun(
+	t *testing.T,
+	db *gorm.DB,
+	fixture workspaceSaveFixture,
+	message *model.AgentMessage,
+	requestID string,
+	resultType string,
+	parentMessageID int64,
+	artifactVersion int,
+	content string,
+) string {
+	t.Helper()
+	runSessionID := summaryWorkspaceReplacementAgentSessionID(
+		fixture.Session.SpaceID, fixture.Session.SessionID, fixture.Session.ScopeVersion, requestID,
+	)
+	run, _, err := summaryrun.NewStore(db).CreateOrGetRun(
+		context.Background(), fixture.Session.UserID, runSessionID, requestID, model.ScopePolicyOpen,
+	)
+	if err != nil {
+		t.Fatalf("create run %s: %v", requestID, err)
+	}
+	turn := model.AgentSummaryTurn{
+		SpaceID: fixture.Session.SpaceID, UserID: fixture.Session.UserID, SessionID: fixture.Session.SessionID,
+		RequestID: requestID, RequestHash: "hash-" + requestID, ScopeVersion: fixture.Session.ScopeVersion,
+		Status: "completed", Attempt: 1, RunID: run.RunID,
+	}
+	if err := db.Create(&turn).Error; err != nil {
+		t.Fatalf("create turn %s: %v", requestID, err)
+	}
+	payloadJSON, err := json.Marshal(agent.SummaryResponsePayload{
+		ResultType: resultType, Reply: "预览已更新。", ExecutionTarget: "agent_preview",
+		Preview: &agent.SummaryResponsePreview{
+			Content: content, Version: artifactVersion, ParentMessageID: parentMessageID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal preview %s: %v", requestID, err)
+	}
+	payload := string(payloadJSON)
+	if message.ID == 0 {
+		*message = model.AgentMessage{
+			SpaceID: fixture.Session.SpaceID, UserID: fixture.Session.UserID, SessionID: fixture.Session.SessionID,
+			Role: "assistant", Content: "预览已更新。", ResultType: resultType, ResponsePayload: &payload,
+			ScopeVersion: fixture.Session.ScopeVersion, ArtifactVersion: artifactVersion,
+			SnapshotVersion: workspaceSnapshotVersion, ParentMessageID: parentMessageID,
+			RunID: run.RunID, TurnID: turn.ID,
+		}
+		if err := db.Create(message).Error; err != nil {
+			t.Fatalf("create preview %s: %v", requestID, err)
+		}
+	} else if err := db.Model(&model.AgentMessage{}).Where("id = ?", message.ID).Updates(map[string]interface{}{
+		"content": "预览已更新。", "result_type": resultType, "response_payload_json": payload,
+		"artifact_version": artifactVersion, "parent_message_id": parentMessageID,
+		"run_id": run.RunID, "turn_id": turn.ID,
+	}).Error; err != nil {
+		t.Fatalf("update preview %s: %v", requestID, err)
+	}
+	return runSessionID
+}
+
+func TestCreateAgentSummary_WorkspaceNoFetchRevisionInheritsParentCitations(t *testing.T) {
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+	db := setupAgentSummaryTestDB(t)
+	if err := db.AutoMigrate(&model.AgentSummaryRun{}, &model.AgentSummaryTurn{}, &model.AgentSummarySpec{}, &model.AgentEvidenceArtifact{}, &model.AgentCitationManifest{}); err != nil {
+		t.Fatalf("migrate run binding tables: %v", err)
+	}
+	fixture := seedWorkspaceSaveFixture(t, db, "workspace-save-no-fetch-revision")
+	parent := fixture.Message
+	parentSessionID := bindWorkspacePreviewRun(t, db, fixture, &parent, "grounded", agent.SummaryResultAgentPreview, 0, 3, "Alice confirmed [1]")
+	seedEvidenceRow(t, db, fixture.Session.UserID, parentSessionID, "grounded-evidence", []pipeline.Message{{
+		ChannelID: "channel-workspace", ChannelType: 2, MessageSeq: 1, SenderUID: "alice", SenderName: "Alice",
+		Content: "confirmed", Timestamp: time.Now().Unix(),
+	}})
+	revisionOne := model.AgentMessage{}
+	bindWorkspacePreviewRun(t, db, fixture, &revisionOne, "revision-1", agent.SummaryResultAgentRevision, parent.ID, 4, "Alice confirmed [1]")
+	revisionTwo := model.AgentMessage{}
+	bindWorkspacePreviewRun(t, db, fixture, &revisionTwo, "revision-2", agent.SummaryResultAgentRevision, revisionOne.ID, 5, "Alice confirmed [1]")
+	if err := db.Model(&model.AgentSummarySession{}).Where("id = ?", fixture.Session.ID).Updates(map[string]interface{}{
+		"latest_preview_message_id": revisionTwo.ID, "artifact_version": 5,
+	}).Error; err != nil {
+		t.Fatalf("select latest revision: %v", err)
+	}
+	fixture.Body["agent_message_id"] = revisionTwo.ID
+	fixture.Body["expected_artifact_version"] = 5
+	fixture.Body["request_id"] = "revision-2"
+
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	w := doAgentSave(t, setupAgentSummaryRouter(h), fixture.Body, map[string]string{"Idempotency-Key": "no-fetch-revision"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("save status=%d: %s", w.Code, w.Body.String())
+	}
+	var saved model.PersonalResult
+	if err := db.First(&saved).Error; err != nil {
+		t.Fatalf("load saved result: %v", err)
+	}
+	citations := saved.GetCitations()
+	if len(citations) != 1 || citations[0].ChannelID != "channel-workspace" {
+		t.Fatalf("saved citations = %+v, want parent preview evidence", citations)
+	}
+}
+
+func TestCreateAgentSummary_WorkspaceRevisionPrefersCurrentRunEvidence(t *testing.T) {
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+	db := setupAgentSummaryTestDB(t)
+	if err := db.AutoMigrate(&model.AgentSummaryRun{}, &model.AgentSummaryTurn{}, &model.AgentSummarySpec{}, &model.AgentEvidenceArtifact{}, &model.AgentCitationManifest{}); err != nil {
+		t.Fatalf("migrate run binding tables: %v", err)
+	}
+	fixture := seedWorkspaceSaveFixture(t, db, "workspace-save-current-evidence")
+	parent := fixture.Message
+	parentSessionID := bindWorkspacePreviewRun(t, db, fixture, &parent, "old-grounding", agent.SummaryResultAgentPreview, 0, 3, "Old [1]")
+	seedEvidenceRow(t, db, fixture.Session.UserID, parentSessionID, "old-evidence", []pipeline.Message{{
+		ChannelID: "old-channel", ChannelType: 2, MessageSeq: 1, SenderUID: "old", SenderName: "Old", Content: "old", Timestamp: 1,
+	}})
+	revision := model.AgentMessage{}
+	currentSessionID := bindWorkspacePreviewRun(t, db, fixture, &revision, "new-grounding", agent.SummaryResultAgentRevision, parent.ID, 4, "New [1]")
+	seedEvidenceRow(t, db, fixture.Session.UserID, currentSessionID, "new-evidence", []pipeline.Message{{
+		ChannelID: "new-channel", ChannelType: 2, MessageSeq: 2, SenderUID: "new", SenderName: "New", Content: "new", Timestamp: 2,
+	}})
+	if err := db.Model(&model.AgentSummarySession{}).Where("id = ?", fixture.Session.ID).Updates(map[string]interface{}{
+		"latest_preview_message_id": revision.ID, "artifact_version": 4,
+	}).Error; err != nil {
+		t.Fatalf("select latest revision: %v", err)
+	}
+	fixture.Body["agent_message_id"] = revision.ID
+	fixture.Body["expected_artifact_version"] = 4
+	fixture.Body["request_id"] = "new-grounding"
+
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	w := doAgentSave(t, setupAgentSummaryRouter(h), fixture.Body, map[string]string{"Idempotency-Key": "current-evidence"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("save status=%d: %s", w.Code, w.Body.String())
+	}
+	var saved model.PersonalResult
+	if err := db.First(&saved).Error; err != nil {
+		t.Fatalf("load saved result: %v", err)
+	}
+	citations := saved.GetCitations()
+	if len(citations) != 1 || citations[0].ChannelID != "new-channel" {
+		t.Fatalf("saved citations = %+v, want current run evidence", citations)
+	}
+}
+
+func TestCreateAgentSummary_WorkspaceRevisionRejectsUnresolvableCitationSequence(t *testing.T) {
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+	db := setupAgentSummaryTestDB(t)
+	if err := db.AutoMigrate(&model.AgentSummaryRun{}, &model.AgentSummaryTurn{}, &model.AgentSummarySpec{}, &model.AgentEvidenceArtifact{}, &model.AgentCitationManifest{}); err != nil {
+		t.Fatalf("migrate run binding tables: %v", err)
+	}
+	fixture := seedWorkspaceSaveFixture(t, db, "workspace-save-missing-evidence")
+	parent := fixture.Message
+	bindWorkspacePreviewRun(t, db, fixture, &parent, "empty-parent", agent.SummaryResultAgentPreview, 0, 3, "Missing [1]")
+	revision := model.AgentMessage{}
+	bindWorkspacePreviewRun(t, db, fixture, &revision, "empty-revision", agent.SummaryResultAgentRevision, parent.ID, 4, "Missing [1]")
+	if err := db.Model(&model.AgentSummarySession{}).Where("id = ?", fixture.Session.ID).Updates(map[string]interface{}{
+		"latest_preview_message_id": revision.ID, "artifact_version": 4,
+	}).Error; err != nil {
+		t.Fatalf("select latest revision: %v", err)
+	}
+	fixture.Body["agent_message_id"] = revision.ID
+	fixture.Body["expected_artifact_version"] = 4
+	fixture.Body["request_id"] = "empty-revision"
+
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	w := doAgentSave(t, setupAgentSummaryRouter(h), fixture.Body, map[string]string{"Idempotency-Key": "missing-evidence"})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("save status=%d, want conflict: %s", w.Code, w.Body.String())
+	}
+	var count int64
+	if err := db.Model(&model.SummaryTask{}).Count(&count).Error; err != nil || count != 0 {
+		t.Fatalf("failed save persisted %d task(s), err=%v", count, err)
+	}
+}
 
 func TestCreateAgentSummary_WorkspaceSaveUsesGeneratingRunEvidenceIdentity(t *testing.T) {
 	t.Setenv("AGENT_SUMMARY_V2_MODE", "off")
