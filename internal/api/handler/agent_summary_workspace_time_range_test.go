@@ -3,7 +3,6 @@ package handler
 import (
 	"encoding/json"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 
@@ -117,8 +116,19 @@ func TestMaterializeWorkspaceAgentContextMaterializesTeamDefaultRange(t *testing
 	if err != nil {
 		t.Fatalf("materialize context: %v", err)
 	}
-	if got.TimeRange == nil || !strings.HasSuffix(got.TimeRange.Label, "（默认）") {
+	if got.TimeRange == nil || got.TimeRange.Label != "最近一个月（默认）" {
 		t.Fatalf("time range=%#v, want materialized team default", got.TimeRange)
+	}
+	start, err := time.Parse(time.RFC3339, got.TimeRange.Start)
+	if err != nil {
+		t.Fatalf("parse default start: %v", err)
+	}
+	end, err := time.Parse(time.RFC3339, got.TimeRange.End)
+	if err != nil {
+		t.Fatalf("parse default end: %v", err)
+	}
+	if got := end.Sub(start); got != 30*24*time.Hour {
+		t.Fatalf("default range=%s, want 30 days", got)
 	}
 }
 

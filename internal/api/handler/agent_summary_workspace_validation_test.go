@@ -92,7 +92,7 @@ func TestSummaryWorkspaceRecentChannelDoesNotExpandPastEffectiveRange(t *testing
 	}
 }
 
-func TestMaterializeTemplateOnlyContextPinsRecentChannelAndSevenDays(t *testing.T) {
+func TestMaterializeTemplateOnlyContextPinsRecentChannelAndOneMonth(t *testing.T) {
 	imDB := newSummaryWorkspaceIMValidationDB(t)
 	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
 	if err := imDB.Exec(`INSERT INTO message (message_seq, from_uid, channel_id, channel_type, timestamp, payload, is_deleted) VALUES (1, 'actor', 'group-a', 2, ?, X'01', 0)`, now.Add(-time.Hour).Unix()).Error; err != nil {
@@ -113,12 +113,12 @@ func TestMaterializeTemplateOnlyContextPinsRecentChannelAndSevenDays(t *testing.
 		t.Fatalf("materialized source = %#v inferred=%t", got.SelectedChannels, inferred)
 	}
 	start, end, err := parseSummaryWorkspaceTimeRange(got.TimeRange)
-	if err != nil || end.Sub(start) != 7*24*time.Hour {
+	if err != nil || end.Sub(start) != time.Duration(service.AgentSummaryDefaultTimeRangeDays)*24*time.Hour {
 		t.Fatalf("materialized range = %#v duration=%s err=%v", got.TimeRange, end.Sub(start), err)
 	}
 }
 
-func TestMaterializeOpenScopeAgentContextPinsSevenDays(t *testing.T) {
+func TestMaterializeOpenScopeAgentContextPinsOneMonth(t *testing.T) {
 	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
 	coordinator := &summaryWorkspaceCoordinator{now: func() time.Time { return now }}
 
@@ -133,7 +133,7 @@ func TestMaterializeOpenScopeAgentContextPinsSevenDays(t *testing.T) {
 		t.Fatalf("open-scope context unexpectedly inferred a channel: %#v inferred=%t", got.SelectedChannels, inferred)
 	}
 	start, end, err := parseSummaryWorkspaceTimeRange(got.TimeRange)
-	if err != nil || end.Sub(start) != 7*24*time.Hour {
+	if err != nil || end.Sub(start) != time.Duration(service.AgentSummaryDefaultTimeRangeDays)*24*time.Hour {
 		t.Fatalf("materialized range = %#v duration=%s err=%v", got.TimeRange, end.Sub(start), err)
 	}
 }

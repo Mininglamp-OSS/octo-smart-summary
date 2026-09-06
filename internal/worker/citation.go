@@ -12,8 +12,31 @@ import (
 )
 
 var citationRe = regexp.MustCompile(`\[(\d{1,5})\]`)
+var alternateCitationRe = regexp.MustCompile(`(?:【[[:space:]]*([0-9０-９]{1,5})[[:space:]]*】|［[[:space:]]*([0-9０-９]{1,5})[[:space:]]*］)`)
 var multiSpaceRe = regexp.MustCompile(`[ \t]{2,}`)
 var emptyLineRe = regexp.MustCompile(`(?m)^[ \t]*$\n`)
+
+// normalizeCitationMarkers canonicalizes citation-shaped brackets emitted by
+// Chinese-language models. Only numeric markers are touched; ordinary bracketed
+// prose remains unchanged.
+func normalizeCitationMarkers(text string) string {
+	return alternateCitationRe.ReplaceAllStringFunc(text, func(match string) string {
+		parts := alternateCitationRe.FindStringSubmatch(match)
+		digits := parts[1]
+		if digits == "" {
+			digits = parts[2]
+		}
+
+		var normalized strings.Builder
+		for _, r := range digits {
+			if r >= '０' && r <= '９' {
+				r = '0' + (r - '０')
+			}
+			normalized.WriteRune(r)
+		}
+		return "[" + normalized.String() + "]"
+	})
+}
 
 // extractCitationIndexes extracts all [n] citation indexes from text.
 func extractCitationIndexes(text string) []int {
@@ -30,12 +53,12 @@ func extractCitationIndexes(text string) []int {
 	return indexes
 }
 
-
 // BuildCitations is the exported wrapper of buildCitations.
 // Exposed so out-of-package callers can reuse the citation logic.
 func BuildCitations(text string, messages []pipeline.Message, allMessages []pipeline.Message, nameMap map[string]string) []model.Citation {
 	return buildCitations(text, messages, allMessages, nameMap)
 }
+
 // buildCitations builds a citation list from the summary text and original messages.
 // Only messages actually referenced in the text are included.
 
@@ -102,6 +125,21 @@ func buildCitations(text string, messages []pipeline.Message, allMessages []pipe
 		return []model.Citation{}
 	}
 	return citations
+}
+
+// finalizeCitations normalizes model output before resolving references, then
+// applies the existing dedup/orphan cleanup. A citation-shaped response that
+// resolves to no evidence is rejected instead of being persisted as inert text.
+func finalizeCitations(text string, messages []pipeline.Message, allMessages []pipeline.Message, nameMap map[string]string) (string, []model.Citation, error) {
+	normalized := normalizeCitationMarkers(text)
+	hasMarkers := citationRe.MatchString(normalized)
+	citations := buildCitations(normalized, messages, allMessages, nameMap)
+	normalized, citations = dedupCitations(normalized, citations)
+	normalized = stripOrphanCitations(normalized, citations)
+	if len(messages) > 0 && hasMarkers && len(citations) == 0 {
+		return "", nil, fmt.Errorf("citation markers present but no valid citations resolved")
+	}
+	return normalized, citations, nil
 }
 
 func truncateRunes(s string, maxRunes int) string {

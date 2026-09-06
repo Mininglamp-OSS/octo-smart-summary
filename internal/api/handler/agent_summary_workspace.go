@@ -471,7 +471,7 @@ func (h *AgentChatHandler) completeWorkspaceProposal(ctx context.Context, key Wo
 		timeRange := *contextValue.TimeRange
 		proposal.TimeRange = &timeRange
 	} else {
-		proposal.TimeRangeLabel = "最近 7 天"
+		proposal.TimeRangeLabel = "最近一个月"
 	}
 	proposalJSON, err := json.Marshal(proposal)
 	if err != nil {
@@ -1376,7 +1376,7 @@ func summaryWorkspaceExecutionRequirement(contextValue summaryWorkspaceContext, 
 func summaryWorkspaceAssumptions(context summaryWorkspaceContext) []string {
 	assumptions := make([]string, 0, 3)
 	if context.TimeRange == nil {
-		assumptions = append(assumptions, "时间范围使用最近 7 天")
+		assumptions = append(assumptions, "时间范围使用最近一个月")
 	} else if label := strings.TrimSuffix(strings.TrimSpace(context.TimeRange.Label), "（默认）"); label != "" {
 		assumptions = append(assumptions, "时间范围使用"+label)
 	}
@@ -1453,7 +1453,7 @@ func materializeSummaryWorkspaceDefaultTimeRange(contextValue summaryWorkspaceCo
 	contextValue.TimeRange = &summaryWorkspaceTimeRange{
 		Start:  start.Format(time.RFC3339),
 		End:    end.Format(time.RFC3339),
-		Label:  "最近 7 天（默认）",
+		Label:  "最近一个月（默认）",
 		Source: summaryWorkspaceTimeRangeSourceDefault,
 	}
 	return contextValue

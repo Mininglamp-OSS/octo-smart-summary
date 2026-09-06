@@ -28,10 +28,9 @@ const (
 	// semantically different workflow requests.
 	WorkflowIdempotencyMismatchCode = 40009
 
-	// AgentSummaryDefaultTimeRangeDays is deliberately narrower than the
-	// legacy workflow default. The unified summary workspace promises a
-	// visible "最近 7 天" default whenever the user did not select a range.
-	AgentSummaryDefaultTimeRangeDays = 7
+	// AgentSummaryDefaultTimeRangeDays is the unified summary workspace fallback
+	// whenever the user does not explicitly select a time range.
+	AgentSummaryDefaultTimeRangeDays = 30
 
 	// legacySummaryDefaultTimeRangeDays is used only when the caller does not
 	// provide the configured legacy default.
