@@ -116,7 +116,7 @@ func TestMaterializeWorkspaceAgentContextMaterializesTeamDefaultRange(t *testing
 	if err != nil {
 		t.Fatalf("materialize context: %v", err)
 	}
-	if got.TimeRange == nil || got.TimeRange.Label != "最近一个月（默认）" {
+	if got.TimeRange == nil || got.TimeRange.Label != "最近 30 天（默认）" {
 		t.Fatalf("time range=%#v, want materialized team default", got.TimeRange)
 	}
 	start, err := time.Parse(time.RFC3339, got.TimeRange.Start)

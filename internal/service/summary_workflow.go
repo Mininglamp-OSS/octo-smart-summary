@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"gorm.io/gorm"
@@ -28,9 +29,9 @@ const (
 	// semantically different workflow requests.
 	WorkflowIdempotencyMismatchCode = 40009
 
-	// AgentSummaryDefaultTimeRangeDays is the unified summary workspace fallback
-	// whenever the user does not explicitly select a time range.
-	AgentSummaryDefaultTimeRangeDays = 30
+	// AgentSummaryDefaultTimeRangeDays remains exported for callers while the
+	// canonical product default lives beside startup validation in config.
+	AgentSummaryDefaultTimeRangeDays = config.SummaryWorkspaceDefaultTimeRangeDays
 
 	// legacySummaryDefaultTimeRangeDays is used only when the caller does not
 	// provide the configured legacy default.

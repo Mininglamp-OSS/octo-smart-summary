@@ -45,7 +45,7 @@ All configuration is done via environment variables.
 | `MAX_MESSAGES_PER_CHANNEL` | Max messages per channel (-1 = no limit) | No | `-1` |
 | `MAP_MAX_TOKENS` | Override map-phase token budget (0 = auto) | No | `0` |
 | `DEFAULT_TIME_RANGE_DAYS` | Default lookback when a legacy summary request omits its time range. Must be greater than `0` and no greater than `MAX_TIME_RANGE_DAYS`. | No | `31` |
-| `MAX_TIME_RANGE_DAYS` | Maximum lookback accepted by the unified summary workspace and enforced by its worker fetch path. Applies to both personal and team workflows created from the workspace. Must be at least `7` and greater than or equal to `DEFAULT_TIME_RANGE_DAYS`. | No | `90` |
+| `MAX_TIME_RANGE_DAYS` | Maximum lookback accepted by the unified summary workspace and enforced by its worker fetch path. Applies to both personal and team workflows created from the workspace. Must be at least `30` and greater than or equal to `DEFAULT_TIME_RANGE_DAYS`. | No | `90` |
 | `AGENT_TRACE` | Emit a per-request agent latency trace (`[agent-trace]` log lines): total wall clock split into planning / tools / unaccounted, per-step planner latency and prompt size, and slowest tool spans. Roughly a few dozen lines per request, so it is off by default and intended for diagnosing a specific slow request. Logs sizes, counts, durations, step numbers and registered tool names only — never message content, prompt text, tool arguments, or user/channel names. | No | `false` |
 | `CHARS_PER_TOKEN_CJK` | Characters per token for CJK text | No | `1` |
 | `CHARS_PER_TOKEN_ASCII` | Characters per token for ASCII text | No | `4` |

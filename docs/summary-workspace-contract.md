@@ -57,6 +57,8 @@ resolved scope is returned.
 the server default, or a conversational instruction. Explicit conversational
 ranges, including non-preset ranges such as three days or two weeks, are parsed
 by the Agent and declared through `set_summary_scope` before message retrieval.
+When no range is selected, the server materializes a fixed 30-day window and
+labels it `最近 30 天（默认）`.
 The tool rejects inverted ranges, ranges over 90 days, and labels over 256
 characters before any retrieval starts. Incidental, questioned, negated,
 complained-about, or historical mentions do not replace the current range.

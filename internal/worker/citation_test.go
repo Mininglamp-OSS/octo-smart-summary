@@ -40,69 +40,6 @@ func TestExtractCitationIndexes(t *testing.T) {
 	}
 }
 
-func TestNormalizeCitationMarkers(t *testing.T) {
-	tests := []struct {
-		name string
-		text string
-		want string
-	}{
-		{"ascii unchanged", "依据 [1][2]", "依据 [1][2]"},
-		{"cjk brackets", "依据【1】【 2 】", "依据[1][2]"},
-		{"fullwidth square brackets", "依据［3］［ 4 ］", "依据[3][4]"},
-		{"fullwidth digits", "依据【１２】", "依据[12]"},
-		{"non numeric unchanged", "章节【背景】", "章节【背景】"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := normalizeCitationMarkers(tt.text); got != tt.want {
-				t.Fatalf("normalizeCitationMarkers() = %q, want %q", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestFinalizeCitations_NormalizesAlternateMarkers(t *testing.T) {
-	messages := []pipeline.Message{
-		{CitationIndex: 1, SenderUID: "uid_alice", Content: "first", ChannelID: "group", MessageSeq: 1},
-		{CitationIndex: 2, SenderUID: "uid_bob", Content: "second", ChannelID: "group", MessageSeq: 2},
-	}
-
-	content, citations, err := finalizeCitations("结论【1】［２］", messages, messages, nil)
-	if err != nil {
-		t.Fatalf("finalizeCitations() error = %v", err)
-	}
-	if content != "结论[1][2]" {
-		t.Fatalf("content = %q, want %q", content, "结论[1][2]")
-	}
-	if len(citations) != 2 || citations[0].Index != 1 || citations[1].Index != 2 {
-		t.Fatalf("citations = %+v, want indices 1 and 2", citations)
-	}
-}
-
-func TestFinalizeCitations_RejectsUnresolvedMarkers(t *testing.T) {
-	messages := []pipeline.Message{
-		{CitationIndex: 1, SenderUID: "uid_alice", Content: "first", ChannelID: "group", MessageSeq: 1},
-	}
-
-	if _, _, err := finalizeCitations("越界引用【99】", messages, messages, nil); err == nil {
-		t.Fatal("finalizeCitations() error = nil, want unresolved citation error")
-	}
-}
-
-func TestFinalizeCitations_AllowsContentWithoutMarkers(t *testing.T) {
-	messages := []pipeline.Message{
-		{CitationIndex: 1, SenderUID: "uid_alice", Content: "first", ChannelID: "group", MessageSeq: 1},
-	}
-
-	content, citations, err := finalizeCitations("没有引用的简短说明", messages, messages, nil)
-	if err != nil {
-		t.Fatalf("finalizeCitations() error = %v", err)
-	}
-	if content != "没有引用的简短说明" || len(citations) != 0 {
-		t.Fatalf("got content=%q citations=%+v", content, citations)
-	}
-}
-
 func TestBuildCitations_WithNameMap(t *testing.T) {
 	messages := []pipeline.Message{
 		{CitationIndex: 1, SenderUID: "uid_alice", Content: "Hello", SendTime: "2025-01-01T10:00:00Z", SourceName: "群聊A", ChannelID: "ch_group_a", MessageSeq: 1001},

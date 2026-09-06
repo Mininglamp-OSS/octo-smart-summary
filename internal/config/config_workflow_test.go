@@ -98,7 +98,7 @@ func TestValidateSummaryTimeRanges(t *testing.T) {
 		{name: "non-positive default", defaultDays: 0, maxDays: 90, wantError: "DEFAULT_TIME_RANGE_DAYS"},
 		{name: "non-positive max", defaultDays: 31, maxDays: 0, wantError: "MAX_TIME_RANGE_DAYS"},
 		{name: "max below default", defaultDays: 31, maxDays: 7, wantError: "greater than or equal"},
-		{name: "max below workspace default", defaultDays: 5, maxDays: 5, wantError: "at least 7"},
+		{name: "max below workspace default", defaultDays: 5, maxDays: 29, wantError: "at least 30"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -35,7 +35,7 @@ func PeekChannelTool() (Tool, Handler) {
 					},
 					"time_start": map[string]interface{}{
 						"type":        "string",
-						"description": "起始时间 RFC3339，留空则用最近 30 天",
+						"description": "起始时间 RFC3339，留空则用最近 7 天；Workspace 会使用服务端已确认的范围覆盖此默认值",
 					},
 					"time_end": map[string]interface{}{
 						"type":        "string",
@@ -89,7 +89,7 @@ func PeekChannelTool() (Tool, Handler) {
 		}
 
 		now := time.Now()
-		timeStart := now.AddDate(0, 0, -30).Unix()
+		timeStart := now.AddDate(0, 0, -7).Unix()
 		timeEnd := now.Unix()
 
 		if req.TimeStart != "" {

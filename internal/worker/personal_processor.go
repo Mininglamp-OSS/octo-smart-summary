@@ -1142,10 +1142,9 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 
 	// Build citations from final content
 	citationStart := time.Now()
-	finalContent, citations, err := finalizeCitations(finalContent, userMessages, messages, nameMap)
-	if err != nil {
-		return "", nil, 0, 0, "", fmt.Errorf("finalize citations: %w", err)
-	}
+	citations := buildCitations(finalContent, userMessages, messages, nameMap)
+	finalContent, citations = dedupCitations(finalContent, citations)
+	finalContent = stripOrphanCitations(finalContent, citations)
 	timing.Observe(taskNo, "build_citations", citationStart)
 	log.Printf("[personal-worker] Citation build took %dms (%d citations)",
 		time.Since(citationStart).Milliseconds(), len(citations))

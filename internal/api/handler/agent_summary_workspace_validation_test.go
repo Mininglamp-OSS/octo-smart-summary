@@ -92,7 +92,7 @@ func TestSummaryWorkspaceRecentChannelDoesNotExpandPastEffectiveRange(t *testing
 	}
 }
 
-func TestMaterializeTemplateOnlyContextPinsRecentChannelAndOneMonth(t *testing.T) {
+func TestMaterializeTemplateOnlyContextPinsRecentChannelAndThirtyDays(t *testing.T) {
 	imDB := newSummaryWorkspaceIMValidationDB(t)
 	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
 	if err := imDB.Exec(`INSERT INTO message (message_seq, from_uid, channel_id, channel_type, timestamp, payload, is_deleted) VALUES (1, 'actor', 'group-a', 2, ?, X'01', 0)`, now.Add(-time.Hour).Unix()).Error; err != nil {
@@ -118,7 +118,7 @@ func TestMaterializeTemplateOnlyContextPinsRecentChannelAndOneMonth(t *testing.T
 	}
 }
 
-func TestMaterializeOpenScopeAgentContextPinsOneMonth(t *testing.T) {
+func TestMaterializeOpenScopeAgentContextPinsThirtyDays(t *testing.T) {
 	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
 	coordinator := &summaryWorkspaceCoordinator{now: func() time.Time { return now }}
 

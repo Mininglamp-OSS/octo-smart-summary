@@ -18,6 +18,11 @@ const (
 	AgentSummaryV2Off    = "off"
 	AgentSummaryV2Shadow = "shadow"
 	AgentSummaryV2On     = "on"
+
+	// SummaryWorkspaceDefaultTimeRangeDays is the server-authoritative fallback
+	// used when a Workspace request does not provide an explicit time range.
+	SummaryWorkspaceDefaultTimeRangeDays  = 30
+	SummaryWorkspaceDefaultTimeRangeLabel = "最近 30 天"
 )
 
 // NormalizeAgentSummaryV2Mode trims and lowercases the raw env value, mapping
@@ -326,10 +331,10 @@ func ValidateSummaryTimeRanges(defaultDays, maxDays int) error {
 	if maxDays < defaultDays {
 		return fmt.Errorf("MAX_TIME_RANGE_DAYS (%d) must be greater than or equal to DEFAULT_TIME_RANGE_DAYS (%d)", maxDays, defaultDays)
 	}
-	// The unified Agent workspace intentionally defaults to a seven-day window.
+	// The unified Agent workspace intentionally defaults to a 30-day window.
 	// Reject a ceiling that would let both binaries start but make every
 	// default-range workspace request fail at runtime.
-	const workspaceDefaultDays = 7
+	const workspaceDefaultDays = SummaryWorkspaceDefaultTimeRangeDays
 	if maxDays < workspaceDefaultDays {
 		return fmt.Errorf("MAX_TIME_RANGE_DAYS (%d) must be at least %d for the summary workspace default", maxDays, workspaceDefaultDays)
 	}
