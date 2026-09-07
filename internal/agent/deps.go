@@ -50,5 +50,15 @@ func GetSummaryDeps() (summaryDB *gorm.DB, imDB *gorm.DB, octoClient *service.Oc
 	return summDeps.summaryDB, summDeps.imDB, summDeps.octoClient, summDeps.cfg
 }
 
+// GetSummaryConfig returns the currently injected tool configuration without
+// requiring the dependency bundle to have been initialized. Workspace setup
+// uses it for shard-aware read-only channel discovery; tests that construct a
+// handler directly safely receive the zero value and apply local defaults.
+func GetSummaryConfig() config.Config {
+	depsMu.RLock()
+	defer depsMu.RUnlock()
+	return summDeps.cfg
+}
+
 // ChannelInfo is an alias for pipeline.ChannelInfo for convenience in tool handlers.
 type ChannelInfo = pipeline.ChannelInfo

@@ -77,6 +77,11 @@ func classifyToolError(toolName string, err error) ToolErrorEnvelope {
 		env.ErrorCode, env.Retryable, env.Fatal = "COVERAGE_INCOMPLETE", true, false
 		return env
 	}
+	var outsideScope *ErrChannelOutsideSelectedScope
+	if errors.As(err, &outsideScope) {
+		env.ErrorCode, env.Retryable, env.Fatal = "CHANNEL_OUTSIDE_SELECTED_SCOPE", false, false
+		return env
+	}
 
 	switch {
 	case strings.Contains(low, "panicked"):

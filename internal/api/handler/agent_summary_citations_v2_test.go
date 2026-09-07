@@ -58,7 +58,7 @@ func seedV2Scenario(t *testing.T, db *gorm.DB) {
 
 	// Save-time discovery sees all three.
 	all := []pipeline.Message{alice, bob, charlie}
-	handle := cache.Store(all, "test-user")
+	handle := cache.Store(all, "test-user", "session-1")
 	seedEvidenceRow(t, db, "test-user", "session-1", handle, all)
 
 	// The run for this request froze BEFORE Charlie arrived: 2-message pool,

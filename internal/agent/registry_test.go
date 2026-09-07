@@ -64,3 +64,34 @@ func TestRegistry_Dispatch(t *testing.T) {
 		})
 	}
 }
+
+func TestRegistry_TerminalRegistrationAndDispatch(t *testing.T) {
+	reg := NewRegistry()
+	schema := Tool{Type: "function", Function: ToolFunction{Name: "finish"}}
+	reg.RegisterTerminal(schema, func(context.Context, json.RawMessage) (TerminalOutcome, error) {
+		return TerminalOutcome{VisibleContent: "done", ResultType: "example", Payload: json.RawMessage(`{"ok":true}`)}, nil
+	})
+
+	if !reg.Has("finish") || !reg.IsTerminal("finish") {
+		t.Fatal("terminal tool is not visible through registry lookup")
+	}
+	if got := len(reg.Schemas()); got != 1 {
+		t.Fatalf("Schemas len = %d, want 1", got)
+	}
+	if _, err := reg.Dispatch(context.Background(), "finish", nil); err == nil || !strings.Contains(err.Error(), "DispatchTerminal") {
+		t.Fatalf("ordinary Dispatch accepted terminal tool: %v", err)
+	}
+	outcome, err := reg.DispatchTerminal(context.Background(), "finish", nil)
+	if err != nil {
+		t.Fatalf("DispatchTerminal: %v", err)
+	}
+	if outcome.VisibleContent != "done" || outcome.ResultType != "example" {
+		t.Fatalf("outcome = %+v", outcome)
+	}
+
+	reg.RegisterTerminal(Tool{Type: "function", Function: ToolFunction{Name: "panic"}},
+		func(context.Context, json.RawMessage) (TerminalOutcome, error) { panic("kaboom") })
+	if _, err := reg.DispatchTerminal(context.Background(), "panic", nil); err == nil || !strings.Contains(err.Error(), "panicked") {
+		t.Fatalf("terminal panic was not recovered: %v", err)
+	}
+}

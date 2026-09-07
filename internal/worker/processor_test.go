@@ -3,6 +3,9 @@
 package worker
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -826,6 +829,47 @@ func TestScheduledAutoDispatch_SkipsNonPendingOrNonAccepted(t *testing.T) {
 	}
 	if len(targets) != 1 || targets[0] != refIDs[2] {
 		t.Fatalf("only the accepted+pending participant should be dispatched, got %v want [%d]", targets, refIDs[2])
+	}
+}
+
+func TestScanStuckPersonalTasks_RetriggersEveryAcceptedPendingParticipant(t *testing.T) {
+	db := setupProcessorTestDB(t)
+	task, refIDs := seedAutoScheduledMultiTask(t, db, 3, model.SchedConfirmAuto)
+	if err := db.Model(&model.PersonalResult{}).Where("task_id = ?", task.ID).
+		Update("created_at", timezone.Now().Add(-6*time.Minute)).Error; err != nil {
+		t.Fatalf("age personal results: %v", err)
+	}
+
+	var triggered []int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var request model.WorkerTriggerRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode trigger: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if request.Type != "personal_summary" || request.TaskID != task.ID {
+			t.Errorf("unexpected trigger: %#v", request)
+		}
+		triggered = append(triggered, request.ParticipantRefID)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	scanStuckPersonalTasks(db, server.URL)
+
+	if len(triggered) != len(refIDs) {
+		t.Fatalf("triggered participants = %v, want %v", triggered, refIDs)
+	}
+	want := make(map[int64]bool, len(refIDs))
+	for _, id := range refIDs {
+		want[id] = true
+	}
+	for _, id := range triggered {
+		if !want[id] {
+			t.Fatalf("unexpected participant trigger %d; got %v want %v", id, triggered, refIDs)
+		}
 	}
 }
 

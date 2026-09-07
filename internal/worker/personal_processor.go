@@ -721,12 +721,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	}
 
 	// Fetch messages via personal pipeline (Layer 0-5)
-	var channelScopeOpts *pipeline.ChannelScopeOptions
-	if p.cfg.ChannelScopeEnabled {
-		channelScopeOpts = &pipeline.ChannelScopeOptions{
-			Enabled: true,
-		}
-	}
+	channelScopeOpts := channelScopeOptionsForTask(p.cfg.ChannelScopeEnabled, task.SpaceID, task.AgentSessionID, false, true)
 
 	fetchStart := time.Now()
 	messages, intentResult, err := pipeline.ResolveAndFetchMessagesForPersonal(
@@ -1180,6 +1175,12 @@ func sanitizeErrorForUser(errMsg string) string {
 		return "AI 处理超时，请稍后重试"
 	case strings.Contains(errMsg, "all") && strings.Contains(errMsg, "chunk(s) failed"):
 		return "AI 服务暂时不可用，所有分片处理失败"
+	case strings.Contains(errMsg, "explicit summary source is unavailable in the current space"):
+		return "所选聊天不属于当前空间或你已失去访问权限，请重新选择"
+	case strings.Contains(errMsg, "explicit summary source is not shared by every participant"):
+		return "所选聊天并非所有参与者都可访问，请调整聊天或参与者"
+	case strings.Contains(errMsg, "no selected summary source is available to this participant"):
+		return "你已无法访问任何所选聊天，无法生成个人总结"
 	default:
 		// Do not leak raw internal errors (may contain DSN, IPs, stack traces).
 		// Raw error is already logged by the caller via log.Printf.

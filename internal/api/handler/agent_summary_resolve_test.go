@@ -245,6 +245,38 @@ func TestResolveOriginChannelFromSession_SkipsMalformedJSON(t *testing.T) {
 	}
 }
 
+func TestResolveOriginChannelFromSession_IgnoresWorkspaceMessages(t *testing.T) {
+	db, skip := setupResolveTestDB(t)
+	if skip {
+		return
+	}
+	handler := &AgentSummaryHandler{db: db}
+	const sessionID = "shared-origin-session"
+
+	workspaceToolCalls := `[{"id":"workspace","type":"function","function":{"name":"fetch_channel","arguments":"{\"channel_id\":\"WORKSPACE\",\"channel_type\":2}"}}]`
+	legacyToolCalls := `[{"id":"legacy","type":"function","function":{"name":"fetch_channel","arguments":"{\"channel_id\":\"LEGACY\",\"channel_type\":1}"}}]`
+	if err := db.Create(&model.AgentMessage{
+		SpaceID: "space-1", UserID: "test-user", SessionID: sessionID,
+		Role: "assistant", ToolCalls: &workspaceToolCalls,
+	}).Error; err != nil {
+		t.Fatalf("seed workspace tool call: %v", err)
+	}
+	if err := db.Create(&model.AgentMessage{
+		UserID: "test-user", SessionID: sessionID,
+		Role: "assistant", ToolCalls: &legacyToolCalls,
+	}).Error; err != nil {
+		t.Fatalf("seed Legacy tool call: %v", err)
+	}
+
+	channelID, channelType, err := handler.resolveOriginChannelFromSession(context.Background(), sessionID, "test-user")
+	if err != nil {
+		t.Fatalf("resolve Legacy origin: %v", err)
+	}
+	if channelID != "LEGACY" || channelType != 1 {
+		t.Fatalf("resolved origin=%q/%d, want LEGACY/1", channelID, channelType)
+	}
+}
+
 // TestResolveOriginChannelFromSession_DBError tests that a real DB error
 // (not "not found") is returned as an error, not empty result.
 // We simulate this by using a closed database connection.
@@ -253,11 +285,11 @@ func TestResolveOriginChannelFromSession_DBError(t *testing.T) {
 	if skip {
 		return
 	}
-	
+
 	// Close the DB connection to force an error
 	sqlDB, _ := db.DB()
 	sqlDB.Close()
-	
+
 	handler := &AgentSummaryHandler{db: db}
 
 	channelID, channelType, err := handler.resolveOriginChannelFromSession(context.Background(), "any-session", "test-user")

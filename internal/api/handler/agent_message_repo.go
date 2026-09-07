@@ -15,6 +15,12 @@ import (
 // 这里只做数量兜底（取 200 与 window*8 的较大者，window*8 覆盖单轮可能多条 tool 消息）。
 const maxHistoryRows = 200
 
+// legacyAgentMessageSpaceID is the storage namespace used by the pre-workspace
+// Agent chat endpoints. Workspace rows always carry a non-empty space_id and
+// must never be visible to or mutated by these legacy paths, even when a user
+// reuses the same public session_id in both experiences.
+const legacyAgentMessageSpaceID = ""
+
 // agentHistoryStore 抽象多轮记忆的读写，便于 handler 单测注入 mock（无需真 DB）。
 //
 // 权限模型（SUM-158 blocker 1 修复）：所有查询必须携带 userID，服务端从鉴权
@@ -44,7 +50,7 @@ func (r *agentMessageRepo) LoadHistory(ctx context.Context, sessionID, userID st
 	// id DESC + Limit 命中 idx_user_session_created(user_id, session_id, id) 只扫最近后缀，
 	// 避免全表拉取。
 	if err := r.db.WithContext(ctx).
-		Where("user_id = ? AND session_id = ?", userID, sessionID).
+		Where("space_id = ? AND user_id = ? AND session_id = ?", legacyAgentMessageSpaceID, userID, sessionID).
 		Order("id DESC").
 		Limit(maxHistoryRows).
 		Find(&rows).Error; err != nil {
@@ -93,6 +99,7 @@ func (r *agentMessageRepo) AppendMessages(ctx context.Context, sessionID, userID
 	rows := make([]model.AgentMessage, 0, len(msgs))
 	for i := range msgs {
 		row := model.AgentMessage{
+			SpaceID:         legacyAgentMessageSpaceID,
 			SessionID:       sessionID,
 			UserID:          userID,
 			Role:            msgs[i].Role,

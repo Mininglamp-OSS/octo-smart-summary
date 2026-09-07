@@ -338,11 +338,9 @@ func (h *TaskHandler) resolveAuthorizedBotSources(ctx context.Context, ownerUID,
 				// derivation as the authorization primitive. deriveDMPeer
 				// returns "" when neither half of the canonical id is the
 				// owner, which is the only correct behaviour for a channel
-				// the owner is not a party to. channel.PeerUID (populated
-				// by pipeline.getPeerUID, which does NOT re-check that the
-				// remaining half is the owner) is used purely as a
-				// cross-check: any disagreement rejects rather than picks
-				// one.
+				// the owner is not a party to. channel.PeerUID is derived by
+				// the same owner-anchored rule and is used as a cross-check:
+				// any disagreement rejects rather than picking one value.
 				peer := deriveDMPeer(canonicalID, ownerUID)
 				if peer == "" {
 					// Not a DM the owner is a party to — reject as

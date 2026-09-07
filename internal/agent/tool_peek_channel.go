@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
@@ -34,7 +35,7 @@ func PeekChannelTool() (Tool, Handler) {
 					},
 					"time_start": map[string]interface{}{
 						"type":        "string",
-						"description": "起始时间 RFC3339，留空则用最近 7 天",
+						"description": "起始时间 RFC3339，留空则用最近 7 天；Workspace 会使用服务端已确认的范围覆盖此默认值",
 					},
 					"time_end": map[string]interface{}{
 						"type":        "string",
@@ -75,6 +76,14 @@ func PeekChannelTool() (Tool, Handler) {
 			log.Printf("[peek_channel] rejecting call: agent did not supply channel_type. channel=%s", req.ChannelID)
 			return "", fmt.Errorf("channel_type is required (1=DM, 2=Group, 5=Thread); check reference material's candidate channels for the correct value")
 		}
+		if restricted, allowed := ChannelAllowedByScope(ctx, req.ChannelID, req.ChannelType); restricted && !allowed {
+			return "", &ErrChannelOutsideSelectedScope{ChannelID: req.ChannelID, ChannelType: req.ChannelType}
+		}
+		sessionID, _ := ctx.Value(ContextKeySessionID).(string)
+		if sessionID == "" {
+			return "", fmt.Errorf("missing session_id in context")
+		}
+		lookupChannelID := pipeline.NormalizeDMChannelID(req.ChannelID, uid, req.ChannelType)
 		if req.Limit <= 0 {
 			req.Limit = 10
 		}
@@ -93,11 +102,16 @@ func PeekChannelTool() (Tool, Handler) {
 				timeEnd = t.Unix()
 			}
 		}
+		resolvedStart, resolvedEnd := ResolveAllowedTimeRange(ctx, time.Unix(timeStart, 0), time.Unix(timeEnd, 0))
+		timeStart, timeEnd = resolvedStart.Unix(), resolvedEnd.Unix()
 
 		summaryDB, imDB, _, cfg := GetSummaryDeps()
 
 		// Security: validate channel accessibility for system-injected uid
 		options := []pipeline.ChannelQueryOption{pipeline.WithIncludeArchived(req.IncludeArchived)}
+		if spaceID := strings.TrimSpace(WorkspaceSpaceID(ctx)); spaceID != "" {
+			options = append(options, pipeline.WithSpaceID(spaceID))
+		}
 		if !req.IncludeArchived {
 			options = append(options, pipeline.WithSelectedThreads(SelectedArchivedChannelIDs(ctx)))
 		}
@@ -111,7 +125,7 @@ func PeekChannelTool() (Tool, Handler) {
 			allowedSet[ch.ChannelID] = true
 		}
 
-		if !allowedSet[req.ChannelID] {
+		if !allowedSet[lookupChannelID] {
 			errResult := map[string]interface{}{
 				"error":      "channel not accessible",
 				"channel_id": req.ChannelID,
@@ -127,9 +141,9 @@ func PeekChannelTool() (Tool, Handler) {
 
 		// Enrich messages with SenderName, SourceName, ChannelType before caching.
 		// See tool_fetch_channel.go for detailed rationale (SUM-46 Blocker A fix).
-		enrichMessagesWithMetadata(ctx, messages, req.ChannelID, accessibleChannels, imDB)
+		enrichMessagesWithMetadata(ctx, messages, lookupChannelID, accessibleChannels, imDB)
 
-		handle := messageCache.Store(messages, uid)
+		handle := messageCache.Store(messages, uid, sessionID)
 		// Persist evidence to DB for citation fallback on cache miss (Stage 3 Blocker C).
 		// #161 P1-B (yujiawei): evidence is the sole discovery source for
 		// citation building — surface write failures as tool errors, see

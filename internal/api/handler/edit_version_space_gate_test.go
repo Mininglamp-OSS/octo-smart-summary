@@ -44,7 +44,7 @@ func setupVersionGateRouter(h *EditHandler) *gin.Engine {
 	return r
 }
 
-// seedEmptySpaceVersionTask seeds a space_id='' task owned by creator1 with one
+// seedEmptySpaceVersionTask seeds a space_id=” task owned by creator1 with one
 // SummaryResult version. Returns (taskID, resultID).
 func seedEmptySpaceVersionTask(t *testing.T, db *gorm.DB) (int64, int64) {
 	t.Helper()
@@ -84,8 +84,8 @@ func doGetWithSpace(r *gin.Engine, path, userID, spaceID string) *httptest.Respo
 }
 
 // 4.11: ListSummaryVersions with NO X-Space-Id against a real creator of a
-// space_id='' task must 404/40008 and NOT return the version list.
-// FAIL-before: empty header -> `space_id=''` matched -> 200 with versions.
+// space_id=” task must 404/40008 and NOT return the version list.
+// FAIL-before: empty header -> `space_id=”` matched -> 200 with versions.
 func TestListSummaryVersions_EmptySpaceHeader_Returns404(t *testing.T) {
 	db := setupEditDB(t)
 	taskID, _ := seedEmptySpaceVersionTask(t, db)
@@ -107,8 +107,8 @@ func TestListSummaryVersions_EmptySpaceHeader_Returns404(t *testing.T) {
 }
 
 // 4.11: GetSummaryVersion with NO X-Space-Id against a real creator of a
-// space_id='' task must 404/40008 and NOT return the version content.
-// FAIL-before: empty header -> `space_id=''` matched -> 200 with the version.
+// space_id=” task must 404/40008 and NOT return the version content.
+// FAIL-before: empty header -> `space_id=”` matched -> 200 with the version.
 func TestGetSummaryVersion_EmptySpaceHeader_Returns404(t *testing.T) {
 	db := setupEditDB(t)
 	taskID, resultID := seedEmptySpaceVersionTask(t, db)

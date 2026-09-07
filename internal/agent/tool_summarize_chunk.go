@@ -173,7 +173,7 @@ func getSessionMessagePool(sessionID, uid string) ([]pipeline.Message, error) {
 		}
 
 		// Prefer cache (avoids JSON unmarshal on the hot path)
-		if cached := cache.Retrieve(ev.Handle, uid); cached != nil {
+		if cached := cache.Retrieve(ev.Handle, uid, sessionID); cached != nil {
 			for _, msg := range cached {
 				key := fmt.Sprintf("%s:%d", msg.ChannelID, msg.MessageSeq)
 				if !seenKey[key] {
@@ -284,7 +284,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 			return "", err
 		}
 
-		messages := messageCache.Retrieve(req.MessagesHandle, uid)
+		messages := messageCache.Retrieve(req.MessagesHandle, uid, sessionID)
 		if messages == nil {
 			return "", fmt.Errorf("invalid or expired messages_handle: %s", req.MessagesHandle)
 		}
@@ -310,6 +310,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 		if v2 {
 			globalPool = applyFrozenManifest(ctx, uid, sessionID, runID, globalPool)
 		}
+		setSummaryCitationWindow(ctx, globalPool)
 
 		// Build a map from (channel_id, message_seq) to CitationIndex
 		citationMap := make(map[string]int)

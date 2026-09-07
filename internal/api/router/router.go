@@ -17,7 +17,7 @@ import (
 // 合并上游后统一签名：customTemplateLimit(上游模板) + streamHub(上游 SSE) + agent 原始 LLM 配置
 // (agent chat/summary handler 用) + 变参 llm(上游 refine/personal 用的 *service.LLMClient，
 // 可选，须置于末尾)。
-func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middleware.TokenResolver, botAuthResolver middleware.BotTokenResolver, workerTriggerURL string, candidateQueryLimit int, featureTeamSchedule bool, customTemplateLimit int, streamHub *streaming.Hub, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int, llmFallbackModels []string, llm ...*service.LLMClient) *gin.Engine {
+func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middleware.TokenResolver, botAuthResolver middleware.BotTokenResolver, workerTriggerURL string, candidateQueryLimit int, featureTeamSchedule, summaryWorkbenchEnabled bool, customTemplateLimit int, streamHub *streaming.Hub, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int, llmFallbackModels []string, llm ...*service.LLMClient) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
 
@@ -166,18 +166,22 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	// (not from LLM params); the summary profile injects it into tool handlers for
 	// channel/message-level permission isolation. db backs multi-turn history.
 	agentChatH := handler.NewAgentChatHandler(db, llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens, llmFallbackModels)
+	agentChatH.ConfigureSummaryWorkspace(imDB, workerTriggerURL, summaryWorkbenchEnabled)
+	v1.GET("/summary-workbench/capabilities", agentChatH.SummaryWorkspaceCapabilities)
 	agentGroup := r.Group("/api/v1/agent")
 	agentGroup.Use(middleware.StrictAuthMiddleware(authResolver), middleware.StrictSpaceMiddleware())
 	{
 		agentGroup.POST("/chat", agentChatH.Chat)
 		agentGroup.POST("/chat/stream", agentChatH.ChatStream)
 		agentGroup.GET("/chat/history", agentChatH.History)
+		agentGroup.POST("/summary-sessions/:session/proposals/:version/confirm", agentChatH.ConfirmSummaryWorkspaceProposal)
 	}
 
 	// Agent summary: persists agent-generated summaries.
 	// (The old /summaries/:id/refine route was removed in favor of the
 	// reference-based chat flow — see CHAT-REFERENCE-BASED-DESIGN-v1.)
 	agentSummaryH := handler.NewAgentSummaryHandler(db, imDB, llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
+	agentSummaryH.ConfigureSummaryWorkspace(summaryWorkbenchEnabled)
 	v1.POST("/summaries/agent", agentSummaryH.CreateAgentSummary)
 	// Document "AI 速览": ephemeral streaming quick-glance, never persisted. See
 	// handler/document_preview.go.

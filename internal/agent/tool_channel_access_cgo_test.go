@@ -62,6 +62,7 @@ func setupAgentImDB(t *testing.T) *gorm.DB {
 	db.Exec(`CREATE TABLE thread_member (thread_id INTEGER NOT NULL, uid TEXT NOT NULL)`)
 	db.Exec(`CREATE TABLE group_member (group_no TEXT NOT NULL, uid TEXT NOT NULL, is_deleted INTEGER DEFAULT 0, role INTEGER DEFAULT 0)`)
 	db.Exec(`CREATE TABLE conversation_extra (uid TEXT, channel_id TEXT, channel_type INTEGER, updated_at INTEGER DEFAULT 0)`)
+	db.Exec(`CREATE TABLE space_member (space_id TEXT NOT NULL, uid TEXT NOT NULL, status INTEGER DEFAULT 1)`)
 	return db
 }
 
@@ -95,7 +96,7 @@ func TestFetchChannelTool_AccessControl(t *testing.T) {
 		t.Fatalf("Expected tool name 'fetch_channel', got %s", toolObj.Function.Name)
 	}
 
-	ctx := context.Background()
+	ctx := context.WithValue(context.Background(), ContextKeySessionID, "fetch-access-session")
 	testUID := "user-1"
 
 	t.Run("AccessDenied_ChannelNotInAllowedSet", func(t *testing.T) {
@@ -188,7 +189,7 @@ func TestPeekChannelTool_AccessControl(t *testing.T) {
 		t.Fatalf("Expected tool name 'peek_channel', got %s", toolObj.Function.Name)
 	}
 
-	ctx := context.Background()
+	ctx := context.WithValue(context.Background(), ContextKeySessionID, "peek-access-session")
 	testUID := "user-2"
 
 	t.Run("AccessDenied_ChannelNotInAllowedSet", func(t *testing.T) {
@@ -254,6 +255,30 @@ func TestPeekChannelTool_AccessControl(t *testing.T) {
 	})
 }
 
+func TestChannelReadToolsAcceptLogicalDMID(t *testing.T) {
+	db := setupAgentImDB(t)
+	db.Exec(`INSERT INTO conversation_extra (uid, channel_id, channel_type, updated_at) VALUES ('user-dm', 'peer-dm', 1, 1)`)
+	db.Exec(`INSERT INTO space_member (space_id, uid, status) VALUES ('space-a', 'peer-dm', 1)`)
+
+	SetSummaryDeps(nil, db, nil, config.Config{MsgTableCount: 1, MaxMessagesPerChannel: 10})
+	defer SetSummaryDeps(nil, nil, nil, config.Config{})
+
+	ctx := context.WithValue(context.Background(), ContextKeyUID, "user-dm")
+	ctx = context.WithValue(ctx, ContextKeySessionID, "logical-dm-session")
+	ctx = WithWorkspaceSpaceID(ctx, "space-a")
+	ctx = WithAllowedChannelScope(ctx, []ChannelScope{{ChannelID: "peer-dm", ChannelType: 1}})
+
+	_, fetch := FetchChannelTool()
+	if result, err := fetch(ctx, json.RawMessage(`{"channel_id":"peer-dm","channel_type":1,"time_start":"2024-01-01T00:00:00Z","time_end":"2024-01-02T00:00:00Z"}`)); err != nil && (strings.Contains(err.Error(), "not accessible") || strings.Contains(result, "channel not accessible")) {
+		t.Fatalf("fetch rejected accessible logical DM id: result=%q err=%v", result, err)
+	}
+
+	_, peek := PeekChannelTool()
+	if result, err := peek(ctx, json.RawMessage(`{"channel_id":"peer-dm","channel_type":1}`)); err != nil && (strings.Contains(err.Error(), "not accessible") || strings.Contains(result, "channel not accessible")) {
+		t.Fatalf("peek rejected accessible logical DM id: result=%q err=%v", result, err)
+	}
+}
+
 // TestSelectedArchivedChannelsBridge locks the UI-selection bridge across all
 // four channel tools. The selected archived thread is visible without the LLM
 // setting include_archived; a selected ID the user does not belong to remains
@@ -271,6 +296,7 @@ func TestSelectedArchivedChannelsBridge(t *testing.T) {
 	defer SetSummaryDeps(nil, nil, nil, config.Config{})
 
 	ctx := context.WithValue(context.Background(), ContextKeyUID, "user-1")
+	ctx = context.WithValue(ctx, ContextKeySessionID, "archived-channel-session")
 	ctx = context.WithValue(ctx, ContextKeyAllowedArchivedChannels, map[string]bool{
 		"grp1____arch":   true,
 		"grp2____secret": true,
@@ -315,5 +341,53 @@ func TestSelectedArchivedChannelsBridge(t *testing.T) {
 	secretResult, secretErr := fetch(ctx, json.RawMessage(`{"channel_id":"grp2____secret","channel_type":5,"time_start":"2024-01-01T00:00:00Z","time_end":"2024-01-02T00:00:00Z"}`))
 	if secretErr == nil || !strings.Contains(secretResult, "channel not accessible") {
 		t.Fatalf("non-member selected ID bypassed access: result=%s err=%v", secretResult, secretErr)
+	}
+}
+
+func TestListChannelsOnlyDiscoversUntilScopeDeclaration(t *testing.T) {
+	db := setupAgentImDB(t)
+	db.Exec(`INSERT INTO "group" (group_no, name, space_id, status, creator) VALUES ('channel-A', 'Group A', 'test-space', 1, 'user-1'), ('channel-B', 'Group B', 'test-space', 1, 'user-2')`)
+	db.Exec(`INSERT INTO group_member (group_no, uid, is_deleted, role) VALUES ('channel-A', 'user-1', 0, 0), ('channel-B', 'user-2', 0, 0)`)
+
+	SetSummaryDeps(nil, db, nil, config.Config{})
+	defer SetSummaryDeps(nil, nil, nil, config.Config{})
+
+	_, list := ListChannelsTool()
+	base := context.WithValue(context.Background(), ContextKeyUID, "user-1")
+
+	discoverable := WithDiscoverableChannelScope(base)
+	result, err := list(discoverable, json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("list_channels: %v", err)
+	}
+	if !strings.Contains(result, `"scope_discovered":true`) {
+		t.Fatalf("result did not report discovered candidates: %s", result)
+	}
+	if restricted, allowed := ChannelAllowedByScope(discoverable, "channel-A", 2); !restricted || allowed {
+		t.Fatalf("discovery unexpectedly made channel-A fetchable: (%v,%v)", restricted, allowed)
+	}
+	if err := DeclareWorkspaceScopeChange(discoverable, WorkspaceScopeChange{
+		SourceMode: WorkspaceSourceReplace,
+		Channels:   []ChannelScope{{ChannelID: "channel-A", ChannelType: 2}},
+	}); err != nil {
+		t.Fatalf("declare listed channel: %v", err)
+	}
+	if restricted, allowed := ChannelAllowedByScope(discoverable, "channel-A", 2); !restricted || !allowed {
+		t.Fatalf("declared channel-A was not made fetchable: (%v,%v)", restricted, allowed)
+	}
+	if restricted, allowed := ChannelAllowedByScope(discoverable, "channel-B", 2); !restricted || allowed {
+		t.Fatalf("inaccessible channel-B was granted: (%v,%v)", restricted, allowed)
+	}
+
+	closed := WithAllowedChannelScope(base, []ChannelScope{{ChannelID: "channel-A", ChannelType: 2}})
+	result, err = list(closed, json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("closed-scope list_channels: %v", err)
+	}
+	if !strings.Contains(result, `"scope_discovered":false`) {
+		t.Fatalf("closed scope incorrectly reported expansion: %s", result)
+	}
+	if restricted, allowed := ChannelAllowedByScope(closed, "channel-B", 2); !restricted || allowed {
+		t.Fatalf("closed scope expanded to channel-B: (%v,%v)", restricted, allowed)
 	}
 }

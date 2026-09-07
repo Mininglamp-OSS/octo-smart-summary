@@ -26,6 +26,7 @@ func TestClassifyToolError(t *testing.T) {
 		{"http 5xx", "fetch_channel", errors.New("LLM API error: status=503 body=busy"), "UPSTREAM_ERROR", true, false},
 		{"network", "fetch_channel", errors.New("network boom"), "TRANSIENT_TOOL_ERROR", true, false},
 		{"db connection", "fetch_channel", errors.New("driver: bad connection"), "TRANSIENT_TOOL_ERROR", true, false},
+		{"outside selected scope", "fetch_channel", &ErrChannelOutsideSelectedScope{ChannelID: "group-2", ChannelType: 2}, "CHANNEL_OUTSIDE_SELECTED_SCOPE", false, false},
 		{"channel-scoped permission", "fetch_channel", errors.New("channel not accessible by user"), "PERMISSION_DENIED", false, false},
 		{"identity", "summarize_chunk", errors.New("missing user identity in context"), "PERMISSION_DENIED", false, true},
 		{"invalid args", "fetch_channel", errors.New("parse args: bad json"), "INVALID_ARGUMENT", true, false},

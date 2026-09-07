@@ -111,6 +111,7 @@ func setupPipelineImDB(t *testing.T) *gorm.DB {
 	db.Exec(`CREATE TABLE thread_member (thread_id INTEGER NOT NULL, uid TEXT NOT NULL)`)
 	db.Exec(`CREATE TABLE group_member (group_no TEXT NOT NULL, uid TEXT NOT NULL, is_deleted INTEGER DEFAULT 0, role INTEGER DEFAULT 0)`)
 	db.Exec(`CREATE TABLE conversation_extra (uid TEXT, channel_id TEXT, channel_type INTEGER, updated_at INTEGER DEFAULT 0)`)
+	db.Exec(`CREATE TABLE space_member (space_id TEXT NOT NULL, uid TEXT NOT NULL, status INTEGER DEFAULT 1)`)
 	// Single message shard ("message") is enough for tableCount=1.
 	db.Exec("CREATE TABLE message (message_seq INTEGER, from_uid TEXT, channel_id TEXT, channel_type INTEGER, timestamp INTEGER, payload BLOB, is_deleted INTEGER DEFAULT 0)")
 	return db
@@ -162,6 +163,176 @@ func TestGetUserChannels_NoSelection_ExcludesArchivedAndDeleted(t *testing.T) {
 	}
 	if threads["grp1____thC"] {
 		t.Errorf("deleted thread must never be discovered, got %v", threads)
+	}
+}
+
+func seedSpaceScopedChannels(db *gorm.DB) {
+	db.Exec(`INSERT INTO "group" (group_no, name, space_id, status, creator, updated_at) VALUES
+		('grp-a', 'Space A group', 'space-a', 1, 'user1', 20),
+		('grp-b', 'Space B group', 'space-b', 1, 'user1', 10)`)
+	db.Exec(`INSERT INTO group_member (group_no, uid, is_deleted, role) VALUES
+		('grp-a', 'user1', 0, 0), ('grp-a', 'user2', 0, 0),
+		('grp-b', 'user1', 0, 0), ('grp-b', 'user2', 0, 0)`)
+	db.Exec(`INSERT INTO thread (id, short_id, name, group_no, status, message_count, creator_uid, updated_at) VALUES
+		(11, 'thread-a', 'Space A thread', 'grp-a', 1, 1, 'user1', 20),
+		(12, 'thread-b', 'Space B thread', 'grp-b', 1, 1, 'user1', 10)`)
+	db.Exec(`INSERT INTO conversation_extra (uid, channel_id, channel_type, updated_at) VALUES
+		('user1', 'peer-a', 1, 30),
+		('user1', 'peer-b', 1, 20),
+		('user1', 'peer-inactive', 1, 10),
+		('user1', 'user1', 1, 5)`)
+	db.Exec(`INSERT INTO space_member (space_id, uid, status) VALUES
+		('space-a', 'user1', 1),
+		('space-a', 'peer-a', 1),
+		('space-b', 'peer-b', 1),
+		('space-a', 'peer-inactive', 0)`)
+}
+
+func TestGetUserChannels_WithSpaceID_FiltersGroupsThreadsAndDMPeers(t *testing.T) {
+	db := setupPipelineImDB(t)
+	seedSpaceScopedChannels(db)
+
+	channels, err := GetUserChannels(context.Background(), "user1", db, WithSpaceID("space-a"))
+	if err != nil {
+		t.Fatalf("GetUserChannels: %v", err)
+	}
+
+	byID := make(map[string]ChannelInfo, len(channels))
+	dmPeers := make(map[string]bool)
+	for _, channel := range channels {
+		byID[channel.ChannelID] = channel
+		if channel.ChannelType == 1 {
+			dmPeers[channel.PeerUID] = true
+		}
+	}
+	if _, ok := byID["grp-a"]; !ok {
+		t.Fatalf("current-Space group missing: %+v", channels)
+	}
+	if _, ok := byID["grp-a____thread-a"]; !ok {
+		t.Fatalf("current-Space thread missing: %+v", channels)
+	}
+	if _, ok := byID["grp-b"]; ok {
+		t.Fatalf("cross-Space group leaked: %+v", channels)
+	}
+	if _, ok := byID["grp-b____thread-b"]; ok {
+		t.Fatalf("cross-Space thread leaked: %+v", channels)
+	}
+	if !dmPeers["peer-a"] || !dmPeers["user1"] || dmPeers["peer-b"] || dmPeers["peer-inactive"] {
+		t.Fatalf("DM peers must be active members of space-a, got %v", dmPeers)
+	}
+}
+
+func TestResolveAndFetch_NoSources_TeamWorkflowStaysInsideTaskSpace(t *testing.T) {
+	db := setupPipelineImDB(t)
+	seedSpaceScopedChannels(db)
+
+	start := time.Now().Add(-24 * time.Hour)
+	end := time.Now().Add(time.Hour)
+	messages, _, err := ResolveAndFetchMessagesForPersonal(
+		context.Background(), "user1", []string{"user2"}, nil, nil, "",
+		start, end, db, echoOctoClient("user1", "user2"), "batch", nil, nil,
+		1, 0, 2, 1, &ChannelScopeOptions{SpaceID: "space-a"}, nil,
+	)
+	if err != nil {
+		t.Fatalf("ResolveAndFetchMessagesForPersonal: %v", err)
+	}
+
+	seen := make(map[string]bool)
+	for _, message := range messages {
+		seen[message.ChannelID] = true
+		if message.ChannelID == "grp-b" || message.ChannelID == "grp-b____thread-b" {
+			t.Fatalf("cross-Space message leaked into team workflow: %+v", message)
+		}
+	}
+	if !seen["grp-a"] || !seen["grp-a____thread-a"] {
+		t.Fatalf("expected current-Space group and thread messages, got channels %v", seen)
+	}
+}
+
+func TestResolveAndFetch_WorkspacePersonalKeepsOnlyParticipantSources(t *testing.T) {
+	db := setupPipelineImDB(t)
+	if err := db.Exec(`INSERT INTO "group" (group_no, name, space_id, status, creator, updated_at) VALUES
+		('group-a', 'Group A', 'space-a', 1, 'creator', 20),
+		('group-b', 'Group B', 'space-a', 1, 'creator', 10)`).Error; err != nil {
+		t.Fatalf("seed groups: %v", err)
+	}
+	if err := db.Exec(`INSERT INTO group_member (group_no, uid, is_deleted, role) VALUES
+		('group-a', 'member-a', 0, 0),
+		('group-b', 'member-b', 0, 0)`).Error; err != nil {
+		t.Fatalf("seed memberships: %v", err)
+	}
+
+	sources := []map[string]interface{}{
+		{"source_id": "group-a", "source_type": 1, "source_name": "Group A"},
+		{"source_id": "group-b", "source_type": 1, "source_name": "Group B"},
+	}
+	start := time.Now().Add(-24 * time.Hour)
+	end := time.Now().Add(time.Hour)
+
+	if _, _, err := ResolveAndFetchMessagesForPersonal(
+		context.Background(), "member-a", nil, nil, sources, "",
+		start, end, db, echoOctoClient("member-a"), "batch", nil, nil,
+		1, 0, 2, 1, &ChannelScopeOptions{SpaceID: "space-a", WorkspaceTask: true}, nil,
+	); err == nil {
+		t.Fatal("strict explicit-source coverage unexpectedly accepted group-b for member-a")
+	}
+
+	legacyMessages, _, err := ResolveAndFetchMessagesForPersonal(
+		context.Background(), "member-a", nil, nil, sources, "",
+		start, end, db, echoOctoClient("member-a"), "batch", nil, nil,
+		1, 0, 2, 1, &ChannelScopeOptions{SpaceID: "space-a"}, nil,
+	)
+	if err != nil {
+		t.Fatalf("legacy partial-source fetch: %v", err)
+	}
+	if len(legacyMessages) == 0 {
+		t.Fatal("legacy partial-source fetch returned no messages")
+	}
+	for _, message := range legacyMessages {
+		if message.ChannelID != "group-a" {
+			t.Fatalf("legacy task kept inaccessible source %q; want only group-a", message.ChannelID)
+		}
+	}
+
+	messages, _, err := ResolveAndFetchMessagesForPersonal(
+		context.Background(), "member-a", nil, nil, sources, "",
+		start, end, db, echoOctoClient("member-a"), "batch", nil, nil,
+		1, 0, 2, 1, &ChannelScopeOptions{SpaceID: "space-a", ParticipantSourceSubset: true, WorkspaceTask: true}, nil,
+	)
+	if err != nil {
+		t.Fatalf("participant-subset fetch: %v", err)
+	}
+	if len(messages) == 0 {
+		t.Fatal("participant-subset fetch returned no messages")
+	}
+	for _, message := range messages {
+		if message.ChannelID != "group-a" {
+			t.Fatalf("participant received inaccessible source %q; want only group-a", message.ChannelID)
+		}
+	}
+}
+
+func TestResolveAndFetch_WorkspacePersonalRejectsNoAccessibleSelectedSource(t *testing.T) {
+	db := setupPipelineImDB(t)
+	if err := db.Exec(`INSERT INTO "group" (group_no, name, space_id, status, creator, updated_at) VALUES
+		('group-b', 'Group B', 'space-a', 1, 'creator', 10)`).Error; err != nil {
+		t.Fatalf("seed group: %v", err)
+	}
+	if err := db.Exec(`INSERT INTO group_member (group_no, uid, is_deleted, role) VALUES
+		('group-b', 'member-b', 0, 0)`).Error; err != nil {
+		t.Fatalf("seed membership: %v", err)
+	}
+
+	start := time.Now().Add(-24 * time.Hour)
+	end := time.Now().Add(time.Hour)
+	_, _, err := ResolveAndFetchMessagesForPersonal(
+		context.Background(), "member-a", nil, nil,
+		[]map[string]interface{}{{"source_id": "group-b", "source_type": 1, "source_name": "Group B"}}, "",
+		start, end, db, echoOctoClient("member-a"), "batch", nil, nil,
+		1, 0, 2, 1, &ChannelScopeOptions{SpaceID: "space-a", ParticipantSourceSubset: true}, nil,
+	)
+	if err == nil || err.Error() != "no selected summary source is available to this participant" {
+		t.Fatalf("error = %v, want no accessible selected-source error", err)
 	}
 }
 

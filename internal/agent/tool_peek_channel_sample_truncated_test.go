@@ -38,6 +38,7 @@ func TestPeekChannelSampleTruncated(t *testing.T) {
 
 	_, handler := PeekChannelTool()
 	ctx := context.WithValue(context.Background(), ContextKeyUID, "user-2")
+	ctx = context.WithValue(ctx, ContextKeySessionID, "peek-sample-session")
 	now := time.Now().Unix()
 	payload := []byte(`{"type":1,"content":"hello"}`)
 	// 'peek-alias' CRC32-shards to message3 (tableCount=5 default); seed the

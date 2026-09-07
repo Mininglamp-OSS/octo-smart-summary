@@ -6,22 +6,26 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
+	"github.com/google/uuid"
 )
 
-// messageCache is an in-memory cache for fetched messages with owner isolation.
-// Handles are bound to uid; Retrieve validates ownership before returning data.
+// messageCache is an in-memory cache for fetched messages with owner and
+// conversation-scope isolation. A handle is valid only for the exact
+// (uid, sessionID) pair that minted it. summary_workspace supplies its derived
+// Agent session id here (space + public session + scope version), while Legacy
+// supplies its existing public session id.
 var messageCache = newMessageCache()
 
 type cacheEntry struct {
 	messages  []pipeline.Message
 	uid       string
+	sessionID string
 	createdAt time.Time
 }
 
 type msgCache struct {
 	mu      sync.RWMutex
 	store   map[string]cacheEntry
-	counter int
 	maxSize int           // max number of entries before eviction
 	ttl     time.Duration // time-to-live for entries
 }
@@ -34,9 +38,13 @@ func newMessageCache() *msgCache {
 	}
 }
 
-// Store saves messages bound to a uid and returns a unique handle.
-// The handle encodes the uid for ownership validation on Retrieve.
-func (c *msgCache) Store(messages []pipeline.Message, uid string) string {
+// Store saves messages bound to an exact uid/session identity and returns a
+// unique opaque handle. Identity is stored in the entry rather than trusted
+// from the handle text.
+func (c *msgCache) Store(messages []pipeline.Message, uid, sessionID string) string {
+	if uid == "" || sessionID == "" {
+		return ""
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -48,19 +56,22 @@ func (c *msgCache) Store(messages []pipeline.Message, uid string) string {
 		c.evictOldest()
 	}
 
-	c.counter++
-	handle := fmt.Sprintf("msg_%s_%d", safeHandleUID(uid), c.counter)
+	handle := fmt.Sprintf("msg_%s_%s", safeHandleUID(uid), uuid.NewString())
 	c.store[handle] = cacheEntry{
 		messages:  messages,
 		uid:       uid,
+		sessionID: sessionID,
 		createdAt: time.Now(),
 	}
 	return handle
 }
 
-// Retrieve fetches messages by handle, validating that the requesting uid matches the owner.
-// Returns nil if handle not found or uid mismatch.
-func (c *msgCache) Retrieve(handle, uid string) []pipeline.Message {
+// Retrieve fetches messages by handle, validating the exact owner and session
+// identity. Returns nil for a missing, expired, or cross-session handle.
+func (c *msgCache) Retrieve(handle, uid, sessionID string) []pipeline.Message {
+	if handle == "" || uid == "" || sessionID == "" {
+		return nil
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -70,7 +81,7 @@ func (c *msgCache) Retrieve(handle, uid string) []pipeline.Message {
 	}
 
 	// Ownership validation
-	if entry.uid != uid {
+	if entry.uid != uid || entry.sessionID != sessionID {
 		return nil
 	}
 
@@ -136,5 +147,4 @@ func ResetForTest() {
 	messageCache.mu.Lock()
 	defer messageCache.mu.Unlock()
 	messageCache.store = make(map[string]cacheEntry)
-	messageCache.counter = 0
 }

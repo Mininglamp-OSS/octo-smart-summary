@@ -7,7 +7,8 @@ package agent
 // only and is NOT sent over SSE.
 //
 // Phase enum (6-tier, stable contract with the frontend):
-//   understand | retrieve | filter | distill | compose | reply
+//
+//	understand | retrieve | filter | distill | compose | reply
 var ToolLabels = map[string]struct {
 	Phase string
 	Label string
@@ -18,11 +19,13 @@ var ToolLabels = map[string]struct {
 	"peek_channel":             {Phase: "understand", Label: "预览频道"},
 	"get_current_time":         {Phase: "understand", Label: "获取当前时间"},
 	"extract_time_range":       {Phase: "understand", Label: "解析时间范围"},
+	"set_summary_scope":        {Phase: "understand", Label: "确认总结范围"},
 	"fetch_channel":            {Phase: "retrieve", Label: "抓取消息"},
 	"search_messages":          {Phase: "retrieve", Label: "搜索消息"},
 	"filter_relevant":          {Phase: "filter", Label: "筛选相关消息"},
 	"summarize_chunk":          {Phase: "distill", Label: "分块总结"},
 	"merge_summaries":          {Phase: "compose", Label: "合并结果"},
+	"emit_summary_response":    {Phase: "reply", Label: "整理结果"},
 }
 
 // GetToolLabel returns the abstract phase (and internal-only label) for a tool.

@@ -527,5 +527,8 @@ func schedulerTriggerWorker(workerTriggerURL string, req model.WorkerTriggerRequ
 		log.Printf("[scheduler] trigger worker POST failed: %v", err)
 		return
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		log.Printf("[scheduler] trigger worker returned HTTP %d", resp.StatusCode)
+	}
 }

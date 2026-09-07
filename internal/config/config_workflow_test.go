@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -11,6 +12,7 @@ func TestLoad_WorkflowConfigs(t *testing.T) {
 		t.Setenv("ENABLE_INTENT_SHORTCUT", "")
 		t.Setenv("MAX_SAFETY_LIMIT", "")
 		t.Setenv("DEFAULT_TIME_RANGE_DAYS", "")
+		t.Setenv("MAX_TIME_RANGE_DAYS", "")
 		t.Setenv("SKIP_MAP_REDUCE_THRESHOLD", "")
 		t.Setenv("TOKENIZER_HTTP_TIMEOUT", "")
 		t.Setenv("MESSAGE_FETCH_BACKEND", "")
@@ -33,6 +35,9 @@ func TestLoad_WorkflowConfigs(t *testing.T) {
 		if cfg.DefaultTimeRangeDays != 31 {
 			t.Errorf("DefaultTimeRangeDays = %d, want 31", cfg.DefaultTimeRangeDays)
 		}
+		if cfg.MaxTimeRangeDays != 90 {
+			t.Errorf("MaxTimeRangeDays = %d, want 90", cfg.MaxTimeRangeDays)
+		}
 		if cfg.SkipMapReduceThreshold != 0 {
 			t.Errorf("SkipMapReduceThreshold = %d, want 0 (uses fallback)", cfg.SkipMapReduceThreshold)
 		}
@@ -46,6 +51,7 @@ func TestLoad_WorkflowConfigs(t *testing.T) {
 		t.Setenv("ENABLE_INTENT_SHORTCUT", "false")
 		t.Setenv("MAX_SAFETY_LIMIT", "50000")
 		t.Setenv("DEFAULT_TIME_RANGE_DAYS", "14")
+		t.Setenv("MAX_TIME_RANGE_DAYS", "60")
 		t.Setenv("SKIP_MAP_REDUCE_THRESHOLD", "150000")
 		t.Setenv("TOKENIZER_HTTP_TIMEOUT", "20")
 		t.Setenv("MESSAGE_FETCH_BACKEND", "mysql")
@@ -68,11 +74,70 @@ func TestLoad_WorkflowConfigs(t *testing.T) {
 		if cfg.DefaultTimeRangeDays != 14 {
 			t.Errorf("DefaultTimeRangeDays = %d, want 14", cfg.DefaultTimeRangeDays)
 		}
+		if cfg.MaxTimeRangeDays != 60 {
+			t.Errorf("MaxTimeRangeDays = %d, want 60", cfg.MaxTimeRangeDays)
+		}
 		if cfg.SkipMapReduceThreshold != 150000 {
 			t.Errorf("SkipMapReduceThreshold = %d, want 150000", cfg.SkipMapReduceThreshold)
 		}
 		if cfg.TokenizerHTTPTimeout != 20 {
 			t.Errorf("TokenizerHTTPTimeout = %d, want 20", cfg.TokenizerHTTPTimeout)
+		}
+	})
+}
+
+func TestValidateSummaryTimeRanges(t *testing.T) {
+	tests := []struct {
+		name        string
+		defaultDays int
+		maxDays     int
+		wantError   string
+	}{
+		{name: "valid defaults", defaultDays: 31, maxDays: 90},
+		{name: "equal values", defaultDays: 31, maxDays: 31},
+		{name: "non-positive default", defaultDays: 0, maxDays: 90, wantError: "DEFAULT_TIME_RANGE_DAYS"},
+		{name: "non-positive max", defaultDays: 31, maxDays: 0, wantError: "MAX_TIME_RANGE_DAYS"},
+		{name: "max below default", defaultDays: 31, maxDays: 7, wantError: "greater than or equal"},
+		{name: "max below workspace default", defaultDays: 5, maxDays: 29, wantError: "at least 30"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateSummaryTimeRanges(tt.defaultDays, tt.maxDays)
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("error = %v, want substring %q", err, tt.wantError)
+			}
+		})
+	}
+}
+
+func TestLoadPreservesLegacyTimeRangeConfiguration(t *testing.T) {
+	t.Run("zero default falls back instead of crash looping", func(t *testing.T) {
+		t.Setenv("DEFAULT_TIME_RANGE_DAYS", "0")
+		t.Setenv("MAX_TIME_RANGE_DAYS", "")
+		cfg := Load()
+		if cfg.DefaultTimeRangeDays != 31 || cfg.MaxTimeRangeDays != 90 {
+			t.Fatalf("ranges=(%d,%d), want (31,90)", cfg.DefaultTimeRangeDays, cfg.MaxTimeRangeDays)
+		}
+		if err := ValidateSummaryTimeRanges(cfg.DefaultTimeRangeDays, cfg.MaxTimeRangeDays); err != nil {
+			t.Fatalf("normalized legacy config must validate: %v", err)
+		}
+	})
+
+	t.Run("unset max expands around an existing larger default", func(t *testing.T) {
+		t.Setenv("DEFAULT_TIME_RANGE_DAYS", "120")
+		t.Setenv("MAX_TIME_RANGE_DAYS", "")
+		cfg := Load()
+		if cfg.DefaultTimeRangeDays != 120 || cfg.MaxTimeRangeDays != 120 {
+			t.Fatalf("ranges=(%d,%d), want (120,120)", cfg.DefaultTimeRangeDays, cfg.MaxTimeRangeDays)
+		}
+		if err := ValidateSummaryTimeRanges(cfg.DefaultTimeRangeDays, cfg.MaxTimeRangeDays); err != nil {
+			t.Fatalf("legacy config with unset new ceiling must validate: %v", err)
 		}
 	})
 }

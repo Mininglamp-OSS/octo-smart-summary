@@ -13,7 +13,7 @@ import (
 // A route-table assertion proves the handler binding and that the endpoint is
 // not mounted on the bot group.
 func TestAttentionRouteCoexistsWithSummaryIDRoute(t *testing.T) {
-	r := SetupPublic(nil, nil, nil, nil, fixedBotResolver{}, "", 0, false, 0, nil, "", "", "", 0, 0, nil)
+	r := SetupPublic(nil, nil, nil, nil, fixedBotResolver{}, "", 0, false, false, 0, nil, "", "", "", 0, 0, nil)
 
 	routes := r.Routes()
 

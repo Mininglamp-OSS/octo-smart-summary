@@ -423,6 +423,7 @@ func TestPersonalDraft_GateInTx_TxScopedPublishedCheck_BlocksAfterFastPath_40016
 		t.Errorf("gate-in-tx 40016 must not trigger meta_summary")
 	}
 }
+
 // T25 — Fast-path stale-task.Status race (OCT-62 gpt blocker).
 //
 // Fixture: seedDraftableTask leaves task.status=Completed; then

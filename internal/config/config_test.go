@@ -98,3 +98,17 @@ func TestLoad_SummaryCustomTemplateLimitDefault(t *testing.T) {
 		t.Fatalf("SummaryCustomTemplateLimit=%d want 30", cfg.SummaryCustomTemplateLimit)
 	}
 }
+
+func TestLoad_SummaryWorkbenchEnabledDefaultsOff(t *testing.T) {
+	t.Setenv("SUMMARY_WORKBENCH_ENABLED", "")
+	if cfg := Load(); cfg.SummaryWorkbenchEnabled {
+		t.Fatal("SummaryWorkbenchEnabled=true, want false by default")
+	}
+}
+
+func TestLoad_SummaryWorkbenchEnabledFromEnvironment(t *testing.T) {
+	t.Setenv("SUMMARY_WORKBENCH_ENABLED", "true")
+	if cfg := Load(); !cfg.SummaryWorkbenchEnabled {
+		t.Fatal("SummaryWorkbenchEnabled=false, want true")
+	}
+}

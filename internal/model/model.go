@@ -161,12 +161,11 @@ type SummaryTask struct {
 	// trigger_type=agent summaries where the user picked one or more existing
 	// summaries as reference material via the chat UI.
 	ReferencedTaskIDs *string `gorm:"column:referenced_task_ids;type:text" json:"-"`
-	// AgentSessionID / AgentMessageID / SnapshotVersion are the safe-save
-	// audit trail for trigger_type=Agent tasks (SUM-BE2). They record the
-	// exact assistant reply and client-declared snapshot version at save time,
-	// so a reviewer can trace which draft became this summary. Legacy clients
-	// leave SnapshotVersion at 0 even though snapshot_json uses the v1 envelope;
-	// non-agent tasks leave all three fields at their zero values.
+	// AgentSessionID / AgentMessageID / SnapshotVersion are the Agent provenance
+	// trail. Synchronously saved Agent summaries populate all three fields;
+	// asynchronous workflows launched by the unified workspace populate
+	// AgentSessionID so the worker can retain workspace-specific source policy.
+	// Legacy clients leave all three fields at their zero values.
 	AgentSessionID  string `gorm:"column:agent_session_id;type:varchar(128);not null;default:'';index:idx_summary_task_agent_session" json:"agent_session_id,omitempty"`
 	AgentMessageID  int64  `gorm:"column:agent_message_id;not null;default:0" json:"agent_message_id,omitempty"`
 	SnapshotVersion int    `gorm:"column:snapshot_version;type:int;not null;default:0" json:"snapshot_version,omitempty"`

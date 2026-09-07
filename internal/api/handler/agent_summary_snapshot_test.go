@@ -27,6 +27,7 @@ func TestBuildSnapshotV1(t *testing.T) {
 		{UserID: "test-user", SessionID: sessionID, Role: "tool", Name: "fetch_channel", Content: "result1", CreatedAt: time.Now()},
 		{UserID: "test-user", SessionID: sessionID, Role: "tool", Name: "search_messages", Content: "result2", CreatedAt: time.Now()},
 		{UserID: "test-user", SessionID: sessionID, Role: "tool", Name: "fetch_channel", Content: "result3", CreatedAt: time.Now()},
+		{SpaceID: "space-1", UserID: "test-user", SessionID: sessionID, Role: "tool", Name: "workspace_only", Content: "must not leak", CreatedAt: time.Now()},
 	}
 	for _, msg := range toolMessages {
 		if err := db.Create(&msg).Error; err != nil {
@@ -89,6 +90,11 @@ func TestBuildSnapshotV1(t *testing.T) {
 	}
 	if !foundSearch {
 		t.Errorf("expected 'search_messages x 1' in tool_summary, got %v", snap.ToolSummary)
+	}
+	for _, entry := range snap.ToolSummary {
+		if entry == "workspace_only x 1" {
+			t.Fatalf("Legacy snapshot included workspace tool trace: %v", snap.ToolSummary)
+		}
 	}
 
 	// Verify tool_summary is sorted alphabetically

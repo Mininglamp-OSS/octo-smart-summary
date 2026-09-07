@@ -139,6 +139,136 @@ func compactSummaryToolHistory(history []Message) []Message {
 	return out
 }
 
+// stripTerminalToolHistory removes terminal protocol messages before an old
+// transcript is sent back to the planner. Terminal arguments contain the full
+// structured draft and must not become durable conversational history. Mixed
+// turns keep their ordinary tool calls/results, while terminal-only attempts
+// are dropped as a unit.
+func stripTerminalToolHistory(history []Message, terminalTool string) []Message {
+	if terminalTool == "" || len(history) == 0 {
+		return history
+	}
+	out := make([]Message, 0, len(history))
+	var terminalIDs map[string]struct{}
+	for _, message := range history {
+		if message.Role == "assistant" && len(message.ToolCalls) > 0 {
+			terminalIDs = make(map[string]struct{})
+			for _, call := range message.ToolCalls {
+				if call.Function.Name == terminalTool && call.ID != "" {
+					terminalIDs[call.ID] = struct{}{}
+				}
+			}
+			filtered, keep := withoutTerminalToolCalls(message, terminalTool)
+			if keep {
+				out = append(out, filtered)
+			}
+			continue
+		}
+		if message.Role == "tool" {
+			_, terminalID := terminalIDs[message.ToolCallID]
+			if message.Name == terminalTool || terminalID {
+				continue
+			}
+			out = append(out, message)
+			continue
+		}
+		terminalIDs = nil
+		out = append(out, message)
+	}
+	return out
+}
+
+// withoutTerminalToolCalls returns a copy safe for durable history. A message
+// containing only terminal calls is discarded, even if it also has text: the
+// whole assistant turn is one failed/accepted terminal protocol attempt.
+func withoutTerminalToolCalls(message Message, terminalTool string) (Message, bool) {
+	if terminalTool == "" || len(message.ToolCalls) == 0 {
+		return message, true
+	}
+	filtered := make([]ToolCall, 0, len(message.ToolCalls))
+	for _, call := range message.ToolCalls {
+		if call.Function.Name != terminalTool {
+			filtered = append(filtered, call)
+		}
+	}
+	if len(filtered) == 0 {
+		return Message{}, false
+	}
+	removedTerminal := len(filtered) != len(message.ToolCalls)
+	message.ToolCalls = filtered
+	// Content belongs to the whole assistant turn. If that turn attempted the
+	// terminal tool, it may duplicate the draft carried in terminal arguments;
+	// retain only the ordinary tool protocol, not the accompanying draft text.
+	if removedTerminal {
+		message.Content = ""
+	}
+	return message, true
+}
+
+// sanitizeToolProtocolHistory removes a truncated prefix before the first user
+// turn and drops assistant/tool groups that are no longer fully paired. This is
+// the final guard before a persisted workspace transcript reaches an OpenAI-
+// compatible endpoint: a database LIMIT can otherwise start on an orphan tool
+// result, and filtering an old terminal call can expose an incomplete group.
+func sanitizeToolProtocolHistory(history []Message) []Message {
+	start := -1
+	for i := range history {
+		if history[i].Role == "user" {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		return nil
+	}
+
+	out := make([]Message, 0, len(history)-start)
+	for i := start; i < len(history); {
+		message := history[i]
+		if message.Role == "tool" {
+			i++ // orphaned by LIMIT/filtering
+			continue
+		}
+		if message.Role != "assistant" || len(message.ToolCalls) == 0 {
+			out = append(out, message)
+			i++
+			continue
+		}
+
+		j := i + 1
+		results := make(map[string]struct{}, len(message.ToolCalls))
+		for j < len(history) && history[j].Role == "tool" {
+			results[history[j].ToolCallID] = struct{}{}
+			j++
+		}
+		complete := true
+		for _, call := range message.ToolCalls {
+			if call.ID == "" {
+				complete = false
+				break
+			}
+			if _, ok := results[call.ID]; !ok {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			out = append(out, message)
+			allowed := make(map[string]struct{}, len(message.ToolCalls))
+			for _, call := range message.ToolCalls {
+				allowed[call.ID] = struct{}{}
+			}
+			for k := i + 1; k < j; k++ {
+				if _, ok := allowed[history[k].ToolCallID]; ok {
+					out = append(out, history[k])
+				}
+			}
+		}
+		i = j
+	}
+	return out
+}
+
 func isHistoricalToolError(content string) bool {
 	trimmed := strings.TrimSpace(content)
 	if strings.HasPrefix(trimmed, "错误:") {

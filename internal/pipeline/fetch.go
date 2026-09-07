@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"log"
@@ -22,9 +23,13 @@ var (
 	// Default: 100000. Set via config.Config.MaxSafetyLimit.
 	MaxSafetyLimit = 100000
 
-	// DefaultTimeRangeDays is the default/max time range in days.
-	// Default: 31. Set via config.Config.DefaultTimeRangeDays.
+	// DefaultTimeRangeDays preserves the legacy fallback when no time range is
+	// supplied. It is intentionally separate from the selectable upper bound.
 	DefaultTimeRangeDays = 31
+
+	// MaxTimeRangeDays is the largest time range accepted by summary entry
+	// points and the fetch pipeline.
+	MaxTimeRangeDays = 90
 
 	// EnableIntentShortcut controls whether to enable short-circuit detection.
 	// Default: true. Set via config.Config.EnableIntentShortcut.
@@ -67,6 +72,7 @@ type LLMCallFn func(ctx context.Context, prompt string) (string, error)
 type channelQuery struct {
 	selectedThreadIDs []string
 	includeArchived   bool
+	spaceID           string
 }
 
 // ChannelQueryOption configures GetUserChannels discovery.
@@ -86,6 +92,13 @@ func WithSelectedThreads(ids []string) ChannelQueryOption {
 // Active threads only, so auto/background summaries stay archived-free.
 func WithIncludeArchived(v bool) ChannelQueryOption {
 	return func(q *channelQuery) { q.includeArchived = v }
+}
+
+// WithSpaceID constrains channel discovery to one Space. Groups and threads
+// are filtered by their parent group's space_id. DMs do not carry a space_id,
+// so they are retained only when the peer is an active member of this Space.
+func WithSpaceID(spaceID string) ChannelQueryOption {
+	return func(q *channelQuery) { q.spaceID = strings.TrimSpace(spaceID) }
 }
 
 // GetUserChannels discovers all channels (group + DM + thread) for a user. (Layer 1)
@@ -118,6 +131,12 @@ func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB, opts ...Cha
 		SpaceID     string `gorm:"column:space_id"`
 	}
 	var groups []groupRow
+	groupSpaceCond := ""
+	groupArgs := []interface{}{uid}
+	if q.spaceID != "" {
+		groupSpaceCond = " AND g.space_id = ?"
+		groupArgs = append(groupArgs, q.spaceID)
+	}
 	err := imDB.WithContext(ctx).Raw(`
 		SELECT g.group_no AS channel_id,
 		       2 AS channel_type,
@@ -128,8 +147,9 @@ func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB, opts ...Cha
 		WHERE gm.uid = ?
 		  AND gm.is_deleted = 0
 		  AND g.status = 1
+		  `+groupSpaceCond+`
 		ORDER BY g.updated_at DESC
-	`, uid).Scan(&groups).Error
+	`, groupArgs...).Scan(&groups).Error
 	if err != nil {
 		return nil, fmt.Errorf("query groups: %w", err)
 	}
@@ -158,12 +178,44 @@ func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB, opts ...Cha
 	if err != nil {
 		log.Printf("[pipeline] query DM channels error: %v", err)
 	}
+	activeSpacePeers := make(map[string]bool)
+	if q.spaceID != "" && len(dms) > 0 {
+		peerSet := make(map[string]struct{}, len(dms))
+		for _, d := range dms {
+			normalized := NormalizeDMChannelID(d.ChannelID, uid, model.ChannelTypeDM)
+			if peerUID := strings.TrimSpace(getPeerUID(normalized, uid)); peerUID != "" {
+				peerSet[peerUID] = struct{}{}
+			}
+		}
+		peers := make([]string, 0, len(peerSet))
+		for peerUID := range peerSet {
+			peers = append(peers, peerUID)
+		}
+		if len(peers) > 0 {
+			var rows []struct {
+				UID string `gorm:"column:uid"`
+			}
+			if err := imDB.WithContext(ctx).
+				Table("space_member").
+				Select("uid").
+				Where("space_id = ? AND status = 1 AND uid IN ?", q.spaceID, peers).
+				Scan(&rows).Error; err != nil {
+				return nil, fmt.Errorf("query active DM peers in space %s: %w", q.spaceID, err)
+			}
+			for _, row := range rows {
+				activeSpacePeers[row.UID] = true
+			}
+		}
+	}
 	for _, d := range dms {
-		peerUID := getPeerUID(d.ChannelID, uid)
-		normalized := NormalizeDMChannelID(d.ChannelID, uid, 1)
+		normalized := NormalizeDMChannelID(d.ChannelID, uid, model.ChannelTypeDM)
+		peerUID := getPeerUID(normalized, uid)
+		if q.spaceID != "" && !activeSpacePeers[peerUID] {
+			continue
+		}
 		channels = append(channels, ChannelInfo{
 			ChannelID:   normalized,
-			ChannelType: 1,
+			ChannelType: model.ChannelTypeDM,
 			ChannelName: fmt.Sprintf("私聊-%s", peerUID),
 			PeerUID:     peerUID,
 		})
@@ -191,6 +243,11 @@ func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB, opts ...Cha
 		threadStatusCond = "(t.status = 1 OR (t.status = 2 AND CONCAT(t.group_no, '____', t.short_id) IN ?))"
 		threadArgs = append(threadArgs, q.selectedThreadIDs)
 	}
+	threadSpaceCond := ""
+	if q.spaceID != "" {
+		threadSpaceCond = " AND g.space_id = ?"
+		threadArgs = append(threadArgs, q.spaceID)
+	}
 	threadQuery := `
 		SELECT CONCAT(t.group_no, '____', t.short_id) AS channel_id,
 		       5 AS channel_type,
@@ -207,6 +264,7 @@ func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB, opts ...Cha
 			  AND gm.is_deleted = 0
 		)
 		  AND ` + threadStatusCond + `
+		  ` + threadSpaceCond + `
 		  AND g.status = 1
 		ORDER BY t.updated_at DESC
 	`
@@ -246,12 +304,15 @@ func isValidMessageTable(table string, tableCount int) bool {
 func getPeerUID(channelID, selfUID string) string {
 	parts := strings.SplitN(channelID, "@", 2)
 	if len(parts) != 2 {
-		return channelID
+		return ""
 	}
 	if parts[0] == selfUID {
 		return parts[1]
 	}
-	return parts[0]
+	if parts[1] == selfUID {
+		return parts[0]
+	}
+	return ""
 }
 
 // NormalizeDMChannelID canonicalises the WuKongIM DM channel_id ("uid_a@uid_b")
@@ -385,6 +446,60 @@ func ApplySourceConstraints(userChannels []ChannelInfo, specifiedSources []map[s
 		}
 	}
 	return result
+}
+
+func filterAvailableSpecifiedSources(userChannels []ChannelInfo, specifiedSources []map[string]interface{}, selfUID string) []map[string]interface{} {
+	if len(specifiedSources) == 0 {
+		return specifiedSources
+	}
+	available := make(map[string]struct{}, len(userChannels))
+	for _, channel := range userChannels {
+		available[channel.ChannelID] = struct{}{}
+	}
+	filtered := make([]map[string]interface{}, 0, len(specifiedSources))
+	for _, source := range specifiedSources {
+		id, _ := source["source_id"].(string)
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		id = NormalizeDMChannelID(id, selfUID, mapFrontendSourceType(sourceType(source)))
+		if _, ok := available[id]; ok {
+			filtered = append(filtered, source)
+		}
+	}
+	return filtered
+}
+
+func validateExplicitSourceCoverage(userChannels []ChannelInfo, specifiedSources []map[string]interface{}, selfUID string) error {
+	return validateExplicitSourceCoverageWithMessage(userChannels, specifiedSources, selfUID, "explicit summary source is unavailable in the current space")
+}
+
+func validateExplicitParticipantSourceCoverage(userChannels []ChannelInfo, specifiedSources []map[string]interface{}, selfUID string) error {
+	return validateExplicitSourceCoverageWithMessage(userChannels, specifiedSources, selfUID, "explicit summary source is not shared by every participant")
+}
+
+func validateExplicitSourceCoverageWithMessage(userChannels []ChannelInfo, specifiedSources []map[string]interface{}, selfUID, message string) error {
+	if len(specifiedSources) == 0 {
+		return nil
+	}
+	requested := make(map[string]struct{}, len(specifiedSources))
+	for _, source := range specifiedSources {
+		id, _ := source["source_id"].(string)
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		requested[NormalizeDMChannelID(id, selfUID, mapFrontendSourceType(sourceType(source)))] = struct{}{}
+	}
+	available := make(map[string]struct{}, len(userChannels))
+	for _, channel := range userChannels {
+		available[channel.ChannelID] = struct{}{}
+	}
+	for id := range requested {
+		if _, ok := available[id]; !ok {
+			return errors.New(message)
+		}
+	}
+	return nil
 }
 
 // Deprecated: use ResolveChannelScope instead.
@@ -691,6 +806,13 @@ func IntersectParticipantChannels(ctx context.Context, creatorChannels []Channel
 	return result, nil
 }
 
+func applyParticipantChannelScope(ctx context.Context, creatorChannels []ChannelInfo, participantUIDs []string, imDB *gorm.DB, scope *ChannelScopeOptions, opts ...ChannelQueryOption) ([]ChannelInfo, error) {
+	if scope != nil && scope.ParticipantSourceUnion {
+		return creatorChannels, nil
+	}
+	return IntersectParticipantChannels(ctx, creatorChannels, participantUIDs, imDB, opts...)
+}
+
 // FilterByMutualActivity keeps only messages from channels where both
 // the creator and at least one participant have sent messages. (Layer 4.5)
 func FilterByMutualActivity(messages []Message, creatorUID string, participantUIDs []string) []Message {
@@ -859,6 +981,9 @@ func FilterMessagesByRelevance(messages []Message, topic string, participantUIDs
 // Returns messages, intent result (for target person filtering), and error.
 func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, participantUIDs []string, participantNames []string, specifiedSources []map[string]interface{}, topic string, timeStart, timeEnd time.Time, imDB *gorm.DB, octoClient octoSearchClient, messageFetchBackend string, toolCallFn LLMToolCallFn, llmFn LLMCallFn, tableCount int, maxPerChannel int, fetchConcurrency int, octoSearchPollSec int, channelScopeOpts *ChannelScopeOptions, reportStage func(string)) ([]Message, *IntentResult, error) {
 	maxDays := DefaultTimeRangeDays
+	if channelScopeOpts != nil && channelScopeOpts.WorkspaceTask {
+		maxDays = MaxTimeRangeDays
+	}
 	if timeEnd.Sub(timeStart) > time.Duration(maxDays)*24*time.Hour {
 		return nil, nil, fmt.Errorf("时间范围不能超过 %d 天", maxDays)
 	}
@@ -869,7 +994,45 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 	pipelineStart := time.Now()
 	originalStart, originalEnd := timeStart, timeEnd
 
-	// Convert specifiedSources to string slice for shortcut detection
+	// Layer 1: channel discovery (needed before intent recognition for memberMap)
+	l1Start := time.Now()
+	selectedThreads := selectedThreadChannelIDs(specifiedSources)
+	channelQueryOpts := []ChannelQueryOption{WithSelectedThreads(selectedThreads)}
+	if channelScopeOpts != nil && strings.TrimSpace(channelScopeOpts.SpaceID) != "" {
+		channelQueryOpts = append(channelQueryOpts, WithSpaceID(channelScopeOpts.SpaceID))
+	}
+	userChannels, err := GetUserChannels(ctx, creatorUID, imDB, channelQueryOpts...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("channel discovery: %w", err)
+	}
+	log.Printf("[pipeline-personal] Layer 1 (channel discovery) took %dms (%d channels)",
+		time.Since(l1Start).Milliseconds(), len(userChannels))
+	if channelScopeOpts != nil && channelScopeOpts.ParticipantSourceSubset {
+		requestedSourceCount := len(specifiedSources)
+		specifiedSources = filterAvailableSpecifiedSources(userChannels, specifiedSources, creatorUID)
+		if requestedSourceCount > 0 && len(specifiedSources) == 0 {
+			return nil, nil, errors.New("no selected summary source is available to this participant")
+		}
+		if len(specifiedSources) != requestedSourceCount {
+			log.Printf("[pipeline-personal] participant source scope reduced from %d to %d source(s)", requestedSourceCount, len(specifiedSources))
+		}
+	} else if channelScopeOpts != nil && channelScopeOpts.WorkspaceTask {
+		if err := validateExplicitSourceCoverage(userChannels, specifiedSources, creatorUID); err != nil {
+			return nil, nil, err
+		}
+	} else {
+		requestedSourceCount := len(specifiedSources)
+		specifiedSources = filterAvailableSpecifiedSources(userChannels, specifiedSources, creatorUID)
+		if requestedSourceCount > 0 && len(specifiedSources) == 0 {
+			return nil, nil, errors.New("explicit summary source is unavailable in the current space")
+		}
+		if len(specifiedSources) != requestedSourceCount {
+			log.Printf("[pipeline-personal] legacy source scope reduced from %d to %d source(s)", requestedSourceCount, len(specifiedSources))
+		}
+	}
+
+	// Convert the effective specifiedSources to a string slice for shortcut
+	// detection. Participant-subset mode may have removed inaccessible sources.
 	var sourceIDs []string
 	for _, src := range specifiedSources {
 		if id, ok := src["source_id"].(string); ok && id != "" {
@@ -877,23 +1040,32 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 		}
 	}
 
-	// Layer 1: channel discovery (needed before intent recognition for memberMap)
-	l1Start := time.Now()
-	selectedThreads := selectedThreadChannelIDs(specifiedSources)
-	userChannels, err := GetUserChannels(ctx, creatorUID, imDB, WithSelectedThreads(selectedThreads))
-	if err != nil {
-		return nil, nil, fmt.Errorf("channel discovery: %w", err)
-	}
-	log.Printf("[pipeline-personal] Layer 1 (channel discovery) took %dms (%d channels)",
-		time.Since(l1Start).Milliseconds(), len(userChannels))
-
-	// Layer 1.5: intersect with participant channels
+	// Layer 1.5: legacy workflows require every participant to share every
+	// channel. Unified-workspace team workflows instead authorise participants
+	// against the selected-group member union before task creation, so their
+	// explicit creator-authorised sources must remain intact here.
 	l15Start := time.Now()
-	userChannels, err = IntersectParticipantChannels(ctx, userChannels, participantUIDs, imDB, WithSelectedThreads(selectedThreads))
+	userChannels, err = applyParticipantChannelScope(ctx, userChannels, participantUIDs, imDB, channelScopeOpts, channelQueryOpts...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("intersect participant channels: %w", err)
 	}
-	log.Printf("[pipeline-personal] Layer 1.5 (participant intersect) took %dms (%d channels)",
+	if channelScopeOpts == nil || !channelScopeOpts.ParticipantSourceUnion {
+		if channelScopeOpts != nil && channelScopeOpts.WorkspaceTask {
+			if err := validateExplicitParticipantSourceCoverage(userChannels, specifiedSources, creatorUID); err != nil {
+				return nil, nil, err
+			}
+		} else {
+			requestedSourceCount := len(specifiedSources)
+			specifiedSources = filterAvailableSpecifiedSources(userChannels, specifiedSources, creatorUID)
+			if requestedSourceCount > 0 && len(specifiedSources) == 0 {
+				return nil, nil, errors.New("explicit summary source is not shared by every participant")
+			}
+			if len(specifiedSources) != requestedSourceCount {
+				log.Printf("[pipeline-personal] legacy participant scope reduced from %d to %d source(s)", requestedSourceCount, len(specifiedSources))
+			}
+		}
+	}
+	log.Printf("[pipeline-personal] Layer 1.5 (participant scope) took %dms (%d channels)",
 		time.Since(l15Start).Milliseconds(), len(userChannels))
 
 	// Build memberMap for intent recognition (before LLM call)

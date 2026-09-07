@@ -43,12 +43,27 @@ func NarrowChannelsByTopicTool() (Tool, Handler) {
 		if err := json.Unmarshal(args, &req); err != nil {
 			return "", fmt.Errorf("parse args: %w", err)
 		}
+		uid := uidFromContext(ctx)
+		if uid == "" {
+			return "", fmt.Errorf("missing user identity in context")
+		}
 
-		summaryDB, _, _, cfg := GetSummaryDeps()
+		_, imDB, _, cfg := GetSummaryDeps()
 
-		var candidates []pipeline.ChannelInfo
+		accessible, err := pipeline.GetUserChannels(ctx, uid, imDB, pipeline.WithSpaceID(WorkspaceSpaceID(ctx)))
+		if err != nil {
+			return "", fmt.Errorf("get user channels: %w", err)
+		}
+		accessible = RestrictDiscoveredChannels(ctx, accessible)
+		requested := make(map[string]struct{}, len(req.ChannelIDs))
 		for _, id := range req.ChannelIDs {
-			candidates = append(candidates, pipeline.ChannelInfo{ChannelID: id})
+			requested[id] = struct{}{}
+		}
+		candidates := make([]pipeline.ChannelInfo, 0, len(requested))
+		for _, channel := range accessible {
+			if _, ok := requested[channel.ChannelID]; ok {
+				candidates = append(candidates, channel)
+			}
 		}
 
 		llmFn := func(ctx context.Context, prompt string) (string, error) {
@@ -75,8 +90,8 @@ func NarrowChannelsByTopicTool() (Tool, Handler) {
 		// rest of the run: every later clean fetch still reports the untouched
 		// candidates as never-fetched gaps. A pass-through is the absence of a scope
 		// decision, not a decision to cover everything.
-		if uid, ok := ctx.Value(ContextKeyUID).(string); ok && didNarrow {
-			recordDiscoveredChannels(ctx, summaryDB, uid, channelIDsOf(narrowed))
+		if didNarrow {
+			AuthorizeDiscoveredChannels(ctx, narrowed)
 		}
 
 		result := map[string]interface{}{
@@ -92,4 +107,9 @@ func NarrowChannelsByTopicTool() (Tool, Handler) {
 	}
 
 	return schema, handler
+}
+
+func uidFromContext(ctx context.Context) string {
+	uid, _ := ctx.Value(ContextKeyUID).(string)
+	return uid
 }

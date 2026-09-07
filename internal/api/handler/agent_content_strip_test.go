@@ -7,18 +7,18 @@ import (
 
 func TestStripAgentPreamble(t *testing.T) {
 	tests := []struct {
-		name  string
-		in    string
-		want  string
+		name string
+		in   string
+		want string
 	}{
 		{
-			name:  "empty input passes through",
-			in:    "",
-			want:  "",
+			name: "empty input passes through",
+			in:   "",
+			want: "",
 		},
 		{
 			name: "typical bug case (task 51): opener then heading",
-			in: "好的。根据引用的老总结内容,我现在将其转化为更结构化、去除口语化表达的专业版本。这是一份**迭代模式**的改写——我基于老内容的完整信息进行文字加工和结构优化,无需调用新工具。\n\n---\n\n## 📊 Summary 服务上线项目总结报告\n\n### 一、项目概览\n",
+			in:   "好的。根据引用的老总结内容,我现在将其转化为更结构化、去除口语化表达的专业版本。这是一份**迭代模式**的改写——我基于老内容的完整信息进行文字加工和结构优化,无需调用新工具。\n\n---\n\n## 📊 Summary 服务上线项目总结报告\n\n### 一、项目概览\n",
 			want: "---\n\n## 📊 Summary 服务上线项目总结报告\n\n### 一、项目概览\n",
 		},
 		{

@@ -96,6 +96,48 @@ func TestCreateAgentSummary_BE2_MessageIDCrossUser_404(t *testing.T) {
 	}
 }
 
+func TestCreateAgentSummary_BE2_LegacySaveDeletesOnlyLegacyMessages(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	r := setupAgentSummaryRouter(h)
+	const sessionID = "sess-space-isolation"
+
+	legacy := seedAssistantMessage(t, db, "test-user", sessionID, "legacy summary")
+	workspace := model.AgentMessage{
+		SpaceID: "test-space", UserID: "test-user", SessionID: sessionID,
+		Role: "assistant", Content: "workspace conversation",
+	}
+	if err := db.Create(&workspace).Error; err != nil {
+		t.Fatalf("seed workspace message: %v", err)
+	}
+
+	w := doAgentSave(t, r, map[string]interface{}{
+		"session_id":          sessionID,
+		"origin_channel_id":   "chan-1",
+		"origin_channel_type": 1,
+		"agent_message_id":    legacy.ID,
+		"snapshot_version":    1,
+	}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("Legacy save want 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var legacyCount, workspaceCount int64
+	if err := db.Model(&model.AgentMessage{}).
+		Where("space_id = ? AND user_id = ? AND session_id = ?", legacyAgentMessageSpaceID, "test-user", sessionID).
+		Count(&legacyCount).Error; err != nil {
+		t.Fatalf("count Legacy messages: %v", err)
+	}
+	if err := db.Model(&model.AgentMessage{}).
+		Where("space_id = ? AND user_id = ? AND session_id = ?", "test-space", "test-user", sessionID).
+		Count(&workspaceCount).Error; err != nil {
+		t.Fatalf("count workspace messages: %v", err)
+	}
+	if legacyCount != 0 || workspaceCount != 1 {
+		t.Fatalf("post-save message counts Legacy/workspace=%d/%d, want 0/1", legacyCount, workspaceCount)
+	}
+}
+
 func TestCreateAgentSummary_BE2_MessageIDWrongSession_404(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
 	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)

@@ -1305,7 +1305,7 @@ func seedScheduleMultiRound(t *testing.T, db *gorm.DB, schedID, otherSchedID int
 		return task.ID
 	}
 
-	firstRound = seedRound("TST-SCH-R1", schedID, model.TriggerManual)    // first round trigger_type=1
+	firstRound = seedRound("TST-SCH-R1", schedID, model.TriggerManual)     // first round trigger_type=1
 	latestRound = seedRound("TST-SCH-R2", schedID, model.TriggerScheduled) // scheduled round trigger_type=2
 
 	if otherSchedID != 0 {
@@ -1855,9 +1855,9 @@ func TestFix5_PeekDetectsRebindMismatch_AndIsRetryable(t *testing.T) {
 	var staleOutOfTxScheduleID *int64 // nil == "task looked manual a moment ago"
 
 	var (
-		livePeek  *int64
-		peekErr   error
-		mismatch  bool
+		livePeek *int64
+		peekErr  error
+		mismatch bool
 	)
 	if err := db.Transaction(func(tx *gorm.DB) error {
 		// This is exactly what the patched Leave/RemoveMember do at the top of the tx.
@@ -2013,7 +2013,7 @@ func TestAuthorizeTaskAccess_WrongSpace_Returns404(t *testing.T) {
 	}
 }
 
-// P1-F1: an EMPTY X-Space-Id now also 404s (space_id='' matches no real task),
+// P1-F1: an EMPTY X-Space-Id now also 404s (space_id=” matches no real task),
 // confirming P1-F3: the empty-space cross-space read path is sealed by F1 with no
 // middleware change.
 func TestAuthorizeTaskAccess_EmptySpace_Returns404(t *testing.T) {
@@ -2166,7 +2166,7 @@ func TestGetPersonal_WrongSpace_Returns404(t *testing.T) {
 
 // seedEmptySpaceTask seeds a task whose SpaceID is the empty string, plus a
 // participant and a completed personal_result for `participant1`, mirroring the
-// shape seedTask/seedMultiPersonTask use but with space_id=''.
+// shape seedTask/seedMultiPersonTask use but with space_id=”.
 func seedEmptySpaceTask(t *testing.T, db *gorm.DB) int64 {
 	t.Helper()
 	now := timezone.Now()
@@ -2195,8 +2195,8 @@ func seedEmptySpaceTask(t *testing.T, db *gorm.DB) int64 {
 }
 
 // P1-F3: authorizeTaskAccess (GetSummary) — a genuine participant of a
-// space_id='' task, calling with NO X-Space-Id header, must STILL get 404/40008.
-// FAIL-before: the empty-header query `space_id=''` matched this seeded task and
+// space_id=” task, calling with NO X-Space-Id header, must STILL get 404/40008.
+// FAIL-before: the empty-header query `space_id=”` matched this seeded task and
 // returned 200 (cross-space read of an anomalous row). PASS-after: the spaceID==""
 // short-circuit 404s before the query.
 func TestAuthorizeTaskAccess_EmptySpaceHeader_EmptySpaceTask_Returns404(t *testing.T) {
@@ -2210,9 +2210,9 @@ func TestAuthorizeTaskAccess_EmptySpaceHeader_EmptySpaceTask_Returns404(t *testi
 	assertCrossSpace404(t, w)
 }
 
-// P1-F3: Accept — empty X-Space-Id against a real participant of a space_id=''
+// P1-F3: Accept — empty X-Space-Id against a real participant of a space_id=”
 // task must 404/40008 and must NOT mutate the participant. FAIL-before: the
-// empty-header requireTaskInSpace query matched (space_id='') and the accept
+// empty-header requireTaskInSpace query matched (space_id=”) and the accept
 // proceeded; PASS-after: 404, participant untouched.
 func TestAccept_EmptySpaceHeader_Returns404(t *testing.T) {
 	db := setupMembersTestDB(t)
@@ -2233,7 +2233,7 @@ func TestAccept_EmptySpaceHeader_Returns404(t *testing.T) {
 	}
 }
 
-// P1-F3: Submit — empty X-Space-Id against a real participant of a space_id=''
+// P1-F3: Submit — empty X-Space-Id against a real participant of a space_id=”
 // task must 404/40008 and must NOT mark the report submitted. FAIL-before: the
 // empty-header requireTaskInSpace query matched and submit set submitted_at;
 // PASS-after: 404, submitted_at stays nil.
@@ -2260,7 +2260,7 @@ func TestSubmit_EmptySpaceHeader_Returns404(t *testing.T) {
 }
 
 // P1-F3: GetPersonal — empty X-Space-Id against a real participant (with a
-// personal_result) of a space_id='' task must 404/40008, not leak the report.
+// personal_result) of a space_id=” task must 404/40008, not leak the report.
 // FAIL-before: the empty-header requireTaskInSpace query matched and the report
 // was returned; PASS-after: 404.
 func TestGetPersonal_EmptySpaceHeader_Returns404(t *testing.T) {
@@ -2379,10 +2379,10 @@ func TestAddMembers_TaskCompleted_Allowed(t *testing.T) {
 // GetMembers (here) now hard-gates spaceID=="" -> 40008 before any query.
 // ---------------------------------------------------------------------------
 
-// Bug 1: empty X-Space-Id against a real participant of a space_id='' task must
+// Bug 1: empty X-Space-Id against a real participant of a space_id=” task must
 // 40008 (not leak the report) -- the requireTaskInSpace empty-space hard gate now
 // runs BEFORE the participant lookup. FAIL-before: the participant check ran
-// first (or the empty-header query matched space_id='') and the edit proceeded;
+// first (or the empty-header query matched space_id=”) and the edit proceeded;
 // PASS-after: 40008 and the report stays untouched.
 func TestPersonalEdit_EmptySpaceHeader_Returns404(t *testing.T) {
 	db := setupMembersTestDB(t)
@@ -2433,9 +2433,9 @@ func TestPersonalEdit_CrossSpaceNonParticipant_Returns404NotLeak(t *testing.T) {
 // explicit here for the empty-space helper's intent).
 
 // Bug 2: GetMembers with an EMPTY X-Space-Id must 40008 and must NOT return a
-// roster -- the GET path is not behind StrictSpaceMiddleware and space_id=''
+// roster -- the GET path is not behind StrictSpaceMiddleware and space_id=”
 // rows exist, so without the spaceID=="" hard gate the empty-header query
-// `space_id=''` would match the seeded task and leak its member list.
+// `space_id=”` would match the seeded task and leak its member list.
 // FAIL-before: empty header -> roster returned (200); PASS-after: 40008, no roster.
 func TestGetMembers_EmptySpaceHeader_Returns404NoRoster(t *testing.T) {
 	db := setupMembersTestDB(t)

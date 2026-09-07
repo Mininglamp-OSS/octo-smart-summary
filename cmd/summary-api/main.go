@@ -25,6 +25,9 @@ import (
 
 func main() {
 	cfg := config.Load()
+	if err := config.ValidateSummaryTimeRanges(cfg.DefaultTimeRangeDays, cfg.MaxTimeRangeDays); err != nil {
+		log.Fatalf("[config] invalid summary time range: %v", err)
+	}
 
 	// Instrument every llmfallback.Run in this process (agent chat, agent
 	// tools, worker Map/Reduce, API refine). Must run before any LLM client
@@ -35,9 +38,8 @@ func main() {
 	if cfg.MaxSafetyLimit > 0 {
 		pipeline.MaxSafetyLimit = cfg.MaxSafetyLimit
 	}
-	if cfg.DefaultTimeRangeDays > 0 {
-		pipeline.DefaultTimeRangeDays = cfg.DefaultTimeRangeDays
-	}
+	pipeline.DefaultTimeRangeDays = cfg.DefaultTimeRangeDays
+	pipeline.MaxTimeRangeDays = cfg.MaxTimeRangeDays
 	// EnableIntentShortcut defaults to true, so we always apply it
 	pipeline.EnableIntentShortcut = cfg.EnableIntentShortcut
 
@@ -124,7 +126,7 @@ func main() {
 	}
 	// 合并上游后统一签名：上游 streamHub(SSE)+ 上游模板参数 + agent handler 所需的原始 LLM 配置
 	// + 变参 refineLLM(上游 refine/personal 用)。
-	publicRouter := router.SetupPublic(summaryDB, imDB, hub, authResolver, httpResolver, cfg.WorkerTriggerURL, cfg.CandidateQueryLimit, cfg.FeatureTeamSchedule, cfg.SummaryCustomTemplateLimit, streamHub, cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMFallbackModels, refineLLM)
+	publicRouter := router.SetupPublic(summaryDB, imDB, hub, authResolver, httpResolver, cfg.WorkerTriggerURL, cfg.CandidateQueryLimit, cfg.FeatureTeamSchedule, cfg.SummaryWorkbenchEnabled, cfg.SummaryCustomTemplateLimit, streamHub, cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMFallbackModels, refineLLM)
 	publicSrv := &http.Server{
 		Addr:    ":" + cfg.APIPort,
 		Handler: publicRouter,

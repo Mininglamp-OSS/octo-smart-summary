@@ -12,13 +12,13 @@ import (
 // on fetched messages. This fixes citation metadata loss (SUM-46 Blocker A).
 //
 // Rationale for tool-layer enrichment:
-// - pipeline.FetchMessagesFromChannel only fills 5 fields (SenderUID, ChannelID,
-//   Timestamp, SendTime, Content) to keep pipeline focused on message retrieval
-// - tool layer already has accessibleChannels (from security check) containing
-//   ChannelName and ChannelType
-// - batch user resolution follows existing patterns (worker/processor.go:888,
-//   pipeline/resolve_channel.go:604)
-// - no circular dependency risk, cleaner separation of concerns
+//   - pipeline.FetchMessagesFromChannel only fills 5 fields (SenderUID, ChannelID,
+//     Timestamp, SendTime, Content) to keep pipeline focused on message retrieval
+//   - tool layer already has accessibleChannels (from security check) containing
+//     ChannelName and ChannelType
+//   - batch user resolution follows existing patterns (worker/processor.go:888,
+//     pipeline/resolve_channel.go:604)
+//   - no circular dependency risk, cleaner separation of concerns
 func enrichMessagesWithMetadata(
 	ctx context.Context,
 	messages []pipeline.Message,

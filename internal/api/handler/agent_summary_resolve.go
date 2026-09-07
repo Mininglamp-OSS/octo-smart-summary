@@ -43,7 +43,7 @@ func (h *AgentSummaryHandler) resolveOriginChannelFromSession(
 	// to find the chronologically earliest tool invocations.
 	var assistantMessages []model.AgentMessage
 	err = h.db.WithContext(ctx).
-		Where("user_id = ? AND session_id = ? AND role = ? AND tool_calls IS NOT NULL", userID, sessionID, "assistant").
+		Where("space_id = ? AND user_id = ? AND session_id = ? AND role = ? AND tool_calls IS NOT NULL", legacyAgentMessageSpaceID, userID, sessionID, "assistant").
 		Order("id ASC").
 		Find(&assistantMessages).Error
 	if err != nil {

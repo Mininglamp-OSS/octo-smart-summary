@@ -22,6 +22,9 @@ import (
 
 func main() {
 	cfg := config.Load()
+	if err := config.ValidateSummaryTimeRanges(cfg.DefaultTimeRangeDays, cfg.MaxTimeRangeDays); err != nil {
+		log.Fatalf("[config] invalid summary time range: %v", err)
+	}
 
 	// Instrument every llmfallback.Run in this process (agent chat, agent
 	// tools, worker Map/Reduce, API refine). Must run before any LLM client
@@ -32,9 +35,8 @@ func main() {
 	if cfg.MaxSafetyLimit > 0 {
 		pipeline.MaxSafetyLimit = cfg.MaxSafetyLimit
 	}
-	if cfg.DefaultTimeRangeDays > 0 {
-		pipeline.DefaultTimeRangeDays = cfg.DefaultTimeRangeDays
-	}
+	pipeline.DefaultTimeRangeDays = cfg.DefaultTimeRangeDays
+	pipeline.MaxTimeRangeDays = cfg.MaxTimeRangeDays
 	// EnableIntentShortcut defaults to true, so we always apply it
 	pipeline.EnableIntentShortcut = cfg.EnableIntentShortcut
 

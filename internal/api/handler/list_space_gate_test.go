@@ -34,7 +34,7 @@ import (
 
 // seedEmptySpaceListTask seeds a task whose SpaceID is the empty string, owned
 // by creator1, into the list test DB. If the empty-space hard gate were absent,
-// a header-less list call would run `space_id='' AND creator_id='creator1'`,
+// a header-less list call would run `space_id=” AND creator_id='creator1'`,
 // match this row, and return total=1 (the fail-open the guard must prevent).
 func seedEmptySpaceListTask(t *testing.T, db *gorm.DB) {
 	t.Helper()
@@ -50,9 +50,9 @@ func seedEmptySpaceListTask(t *testing.T, db *gorm.DB) {
 	db.Create(&model.SummaryParticipant{TaskID: task.ID, UserID: "participant1", UserName: "P1"})
 }
 
-// 4.11: the creator of a space_id='' task, listing with NO X-Space-Id header,
+// 4.11: the creator of a space_id=” task, listing with NO X-Space-Id header,
 // must get 404/40008 and NO task rows — the header-deletion bypass is closed.
-// FAIL-before: empty header -> query `space_id=''` matches the seeded row ->
+// FAIL-before: empty header -> query `space_id=”` matches the seeded row ->
 // 200 with total=1 (cross-space roster of an anomalous row leaks). PASS-after:
 // the spaceID=="" short-circuit 404s before any query.
 func TestListSummaries_EmptySpaceHeader_Returns404NoLeak(t *testing.T) {

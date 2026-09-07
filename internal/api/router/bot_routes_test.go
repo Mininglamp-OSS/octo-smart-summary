@@ -18,7 +18,7 @@ func (r fixedBotResolver) ResolveBot(context.Context, string) (middleware.BotIde
 }
 
 func TestBotSummaryRoutesAreMountedBehindBotAuth(t *testing.T) {
-	r := SetupPublic(nil, nil, nil, nil, fixedBotResolver{}, "", 0, false, 0, nil, "", "", "", 0, 0, nil)
+	r := SetupPublic(nil, nil, nil, nil, fixedBotResolver{}, "", 0, false, false, 0, nil, "", "", "", 0, 0, nil)
 	for _, path := range []string{
 		"/api/v1/bot/summaries",
 		"/api/v1/bot/summaries/42",
@@ -34,7 +34,7 @@ func TestBotSummaryRoutesAreMountedBehindBotAuth(t *testing.T) {
 }
 
 func TestBotSummaryRoutesRejectHumanTokenAndClientSpace(t *testing.T) {
-	r := SetupPublic(nil, nil, nil, nil, fixedBotResolver{}, "", 0, false, 0, nil, "", "", "", 0, 0, nil)
+	r := SetupPublic(nil, nil, nil, nil, fixedBotResolver{}, "", 0, false, false, 0, nil, "", "", "", 0, 0, nil)
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/bot/summaries", nil)
 	req.Header.Set("Token", "human-session-token")

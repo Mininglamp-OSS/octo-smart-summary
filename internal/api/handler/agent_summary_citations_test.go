@@ -67,7 +67,7 @@ func TestBuildCitationsForSession_WithMarkersAndMessages(t *testing.T) {
 			ChannelType: 1,
 		},
 	}
-	handle := cache.Store(messages, "test-user")
+	handle := cache.Store(messages, "test-user", "session-1")
 
 	// Insert tool message with handle
 	toolReturn := map[string]interface{}{
@@ -116,6 +116,47 @@ func TestBuildCitationsForSession_WithMarkersAndMessages(t *testing.T) {
 	}
 }
 
+func TestBuildCitationsForSession_CacheIsBoundToSessionIdentity(t *testing.T) {
+	agent.ResetForTest()
+	db, skip := setupTestDB(t)
+	if skip {
+		return
+	}
+
+	uid := "test-user"
+	sessionA := "summaryws:space-a:public-1:scope-1"
+	sessionB := "summaryws:space-b:public-1:scope-1"
+	cacheMessage := []pipeline.Message{{
+		ChannelID: "channel-a", MessageSeq: 1, SenderUID: "alice", SenderName: "Alice",
+		Content: "cache from space A", Timestamp: 100,
+	}}
+	evidenceMessage := []pipeline.Message{{
+		ChannelID: "channel-b", MessageSeq: 2, SenderUID: "bob", SenderName: "Bob",
+		Content: "evidence from space B", Timestamp: 200,
+	}}
+	handle := agent.GetMessageCache().Store(cacheMessage, uid, sessionA)
+
+	// Same-session lookup must use the hot cache. Invalid fallback JSON makes a
+	// cache miss observable as zero citations instead of accidentally passing.
+	now := time.Now()
+	if err := db.Create(&model.AgentMessageEvidence{
+		UserID: uid, SessionID: sessionA, Handle: handle, Evidence: "not-json", CreatedAt: now, UpdatedAt: now,
+	}).Error; err != nil {
+		t.Fatalf("seed session A evidence: %v", err)
+	}
+	seedEvidenceRow(t, db, uid, sessionB, handle, evidenceMessage)
+	h := &AgentSummaryHandler{db: db}
+
+	citsA, err := h.buildCitationsForSession(context.Background(), sessionA, "Alice [1]", uid, "")
+	if err != nil || len(citsA) != 1 || citsA[0].Sender != "Alice" {
+		t.Fatalf("same-session cache lookup = %#v, err=%v", citsA, err)
+	}
+	citsB, err := h.buildCitationsForSession(context.Background(), sessionB, "Bob [1]", uid, "")
+	if err != nil || len(citsB) != 1 || citsB[0].Sender != "Bob" {
+		t.Fatalf("cross-space lookup reused foreign cache entry: %#v, err=%v", citsB, err)
+	}
+}
+
 // Test 2: 无 [n] 标记 → 返回空数组
 func TestBuildCitationsForSession_NoMarkers(t *testing.T) {
 	agent.ResetForTest()
@@ -135,7 +176,7 @@ func TestBuildCitationsForSession_NoMarkers(t *testing.T) {
 			Timestamp:  1704103200,
 		},
 	}
-	handle := cache.Store(messages, "test-user")
+	handle := cache.Store(messages, "test-user", "session-1")
 
 	// Insert tool message
 	toolReturn := map[string]interface{}{
@@ -288,7 +329,7 @@ func TestBuildCitationsForSession_PeekChannelMultipleMessages(t *testing.T) {
 			ChannelType: 1,
 		},
 	}
-	handle := cache.Store(messages, "test-user")
+	handle := cache.Store(messages, "test-user", "session-1")
 
 	// peek_channel returns handle (full messages in cache)
 	toolReturn := map[string]interface{}{

@@ -19,6 +19,9 @@ type Policy struct {
 	MaxSteps    int
 	MaxTokens   int
 	StepTimeout time.Duration
+	// TerminalTool makes successful completion require one registered terminal
+	// tool call. Empty preserves the legacy free-text completion behavior.
+	TerminalTool string
 }
 
 // Event represents a progress event during runner execution.
@@ -85,8 +88,8 @@ func (r *Runner) ToolSchemas() []Tool {
 
 // Run 无状态单轮入口：委托 RunWithHistory（history=nil），保持旧签名零回归。
 func (r *Runner) Run(ctx context.Context, system, userInput string) (string, error) {
-	reply, _, err := r.RunWithHistory(ctx, system, nil, userInput)
-	return reply, err
+	result, _, err := r.RunWithHistoryOutcome(ctx, system, nil, userInput)
+	return result.Reply, err
 }
 
 // RunWithHistory 在给定历史之上驱动多轮"思考→调工具→回喂"回环，直到模型收敛或触顶。
@@ -94,6 +97,14 @@ func (r *Runner) Run(ctx context.Context, system, userInput string) (string, err
 // 返回最终回复 + 本回合新产生的消息（user + assistant(含 tool_calls) + tool），供上层落库；
 // 新消息不含 system，也不含传入的 history。
 func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Message, userInput string) (string, []Message, error) {
+	result, newMsgs, err := r.RunWithHistoryOutcome(ctx, system, history, userInput)
+	return result.Reply, newMsgs, err
+}
+
+// RunWithHistoryOutcome is the structured completion API. Legacy profiles
+// return RunResult{Reply: ...}; profiles with Policy.TerminalTool also return
+// the validated terminal payload without conflating it with the visible reply.
+func (r *Runner) RunWithHistoryOutcome(ctx context.Context, system string, history []Message, userInput string) (RunResult, []Message, error) {
 	// Keep Map output out of the planner transcript. Every run gets an isolated,
 	// request-scoped store shared by summarize_chunk and merge_summaries through
 	// the tool context. It deliberately shadows any store on the parent context so
@@ -120,7 +131,15 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 
 	msgs := make([]Message, 0, len(history)+2)
 	msgs = append(msgs, Message{Role: "system", Content: system})
-	msgs = append(msgs, compactSummaryToolHistory(history)...)
+	// Older deployments persisted terminal tool calls, including the full draft
+	// payload in their arguments. Never feed those arguments back to the model.
+	// New turns avoid persisting them below; this filter makes the migration safe
+	// for already-written history as well.
+	historyForPlanner := stripTerminalToolHistory(history, r.policy.TerminalTool)
+	if r.policy.TerminalTool != "" {
+		historyForPlanner = sanitizeToolProtocolHistory(historyForPlanner)
+	}
+	msgs = append(msgs, compactSummaryToolHistory(historyForPlanner)...)
 	msgs = append(msgs, userMsg)
 
 	// newMsgs 只累积本回合新增（user + 各 assistant + 各 tool），供落库；不含 system/history。
@@ -170,16 +189,21 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 		cancel()
 		trace.AddStep(step+1, planMs, promptChars, promptMsgs, turnCompletionTokens(turn, err))
 		if err != nil {
-			return "", nil, err
+			return RunResult{}, nil, err
 		}
 		totalTokens += turn.Tokens
+
+		terminalOnly := len(turn.ToolCalls) == 1 &&
+			r.policy.TerminalTool != "" &&
+			turn.ToolCalls[0].Function.Name == r.policy.TerminalTool &&
+			r.reg.IsTerminal(r.policy.TerminalTool)
 
 		// A final answer is not valid while this request still has Map outputs that
 		// have not passed through one successful Reduce covering every handle. The
 		// model can otherwise skip merge_summaries (or ignore its parse error) and
 		// confidently answer from partial Map text. Nudge it without persisting the
 		// rejected draft; at the final step fail closed.
-		if len(turn.ToolCalls) == 0 {
+		if len(turn.ToolCalls) == 0 || terminalOnly {
 			store, storeErr := summaryHandleStoreFromContext(ctx)
 			if storeErr == nil && (store.PendingMapFailures() > 0 || store.NeedsReduce()) {
 				pendingMaps := store.PendingMapFailures()
@@ -187,7 +211,7 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 				log.Printf("[agent] step %d/%d: final answer attempted with pending summary work (map_failures=%d anonymous_map_failures=%d reduce_needed=%t)",
 					step+1, r.policy.MaxSteps, pendingMaps, anonymousMaps, store.NeedsReduce())
 				if step >= r.policy.MaxSteps-1 {
-					return "", nil, errors.New("successful Map retries and Reduce required before final answer")
+					return RunResult{}, nil, errors.New("successful Map retries and Reduce required before final answer")
 				}
 				instruction := "本次请求仍有未合并的 Map 结果。请先调用 merge_summaries，并在 summary_handles 中原样传入本次请求产生的全部 summary_handle；不要复制摘要正文，也不要直接输出最终答案。"
 				if pendingMaps > 0 {
@@ -196,12 +220,50 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 						instruction = "本次请求仍有 summarize_chunk 参数无效或缺少 messages_handle。请修正参数，使用本次请求中正确的 messages_handle 逐一重试失败的 Map 调用；每个失败调用都需要一次后续成功。全部 Map 成功后，再调用 merge_summaries 合并全部 summary_handle；不要直接输出最终答案。"
 					}
 				}
+				// A terminal call still needs an assistant/tool pair in the transient
+				// transcript, even though the completeness gate rejected it.
+				// The handler is deliberately not invoked: a pending Map/Reduce is an
+				// earlier, authoritative gate. Failed terminal attempts are never durable:
+				// their arguments may contain the complete draft payload.
+				if terminalOnly {
+					tc := turn.ToolCalls[0]
+					assistantMsg := Message{Role: "assistant", Content: turn.Content, ToolCalls: turn.ToolCalls}
+					msgs = append(msgs, assistantMsg)
+					toolStart := time.Now()
+					r.emitToolEvent("tool_start", tc.Function.Name, step+1, r.policy.MaxSteps, 0)
+					result := "错误: 本次请求仍有未完成的 Map/Reduce，emit_summary_response 未被接受。"
+					elapsed := time.Since(toolStart).Milliseconds()
+					if trace.Active() {
+						trace.AddTool(tc.Function.Name, elapsed)
+						trace.CloseStep(step+1, elapsed, []string{tc.Function.Name})
+					}
+					r.emitToolEvent("tool_end", tc.Function.Name, step+1, r.policy.MaxSteps, elapsed)
+					toolMsg := Message{Role: "tool", ToolCallID: tc.ID, Name: tc.Function.Name, Content: result}
+					msgs = append(msgs, toolMsg)
+					r.emitStepEnd(stepStart, step+1, true)
+				}
 				msgs = append(msgs, Message{
 					Role:    "user",
 					Content: instruction,
 				})
 				continue
 			}
+		}
+
+		// A terminal-policy profile cannot finish with model-authored free text.
+		// Reject it in-memory and ask for the registered terminal tool; neither the
+		// rejected content nor this runtime nudge is persisted.
+		if len(turn.ToolCalls) == 0 && r.policy.TerminalTool != "" {
+			log.Printf("[agent] step %d/%d: free-text final rejected; terminal tool %s is required",
+				step+1, r.policy.MaxSteps, r.policy.TerminalTool)
+			if step >= r.policy.MaxSteps-1 {
+				return RunResult{}, nil, errors.New("terminal tool required before final answer")
+			}
+			msgs = append(msgs, Message{
+				Role:    "user",
+				Content: "请仅通过 " + r.policy.TerminalTool + " 工具提交本轮最终结果，不要直接输出文本；该工具必须是本轮唯一的工具调用。",
+			})
+			continue
 		}
 
 		// SUM-158 blocker follow-up: 无工具调用 且 有 content = 模型给出最终答案，正常出口。
@@ -218,7 +280,7 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 			log.Printf("[agent] step %d/%d: LLM returned empty content and no tool_calls; nudging model to produce a final answer",
 				step+1, r.policy.MaxSteps)
 			if step >= r.policy.MaxSteps-1 {
-				return "", nil, errors.New("LLM returned empty response with no tool_calls at final step")
+				return RunResult{}, nil, errors.New("LLM returned empty response with no tool_calls at final step")
 			}
 			// Nudge lives only on the in-memory msgs slice (not newMsgs) so the
 			// poison assistant + nudge don't get persisted into session history.
@@ -262,7 +324,52 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 					newMsgs[i].RunID = runID
 				}
 			}
-			return turn.Content, newMsgs, nil
+			return RunResult{Reply: turn.Content}, newMsgs, nil
+		}
+
+		if terminalOnly {
+			tc := turn.ToolCalls[0]
+			assistantMsg := Message{Role: "assistant", Content: turn.Content, ToolCalls: turn.ToolCalls}
+			msgs = append(msgs, assistantMsg)
+
+			toolStart := time.Now()
+			r.emitToolEvent("tool_start", tc.Function.Name, step+1, r.policy.MaxSteps, 0)
+			outcome, terminalErr := r.reg.DispatchTerminal(ctx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+			toolElapsed := time.Since(toolStart).Milliseconds()
+			if trace.Active() {
+				trace.AddTool(tc.Function.Name, toolElapsed)
+				trace.CloseStep(step+1, toolElapsed, []string{tc.Function.Name})
+			}
+			r.emitToolEvent("tool_end", tc.Function.Name, step+1, r.policy.MaxSteps, toolElapsed)
+
+			toolContent := terminalOutcomeToolResult(outcome)
+			if terminalErr != nil {
+				toolContent = "错误: " + terminalErr.Error()
+			}
+			toolMsg := Message{Role: "tool", ToolCallID: tc.ID, Name: tc.Function.Name, Content: toolContent}
+			msgs = append(msgs, toolMsg)
+			r.emitStepEnd(stepStart, step+1, true)
+
+			if terminalErr != nil {
+				if step >= r.policy.MaxSteps-1 {
+					return RunResult{}, nil, errors.New("terminal tool failed at final step: " + terminalErr.Error())
+				}
+				continue
+			}
+
+			finalMsg := Message{
+				Role:            "assistant",
+				Content:         outcome.VisibleContent,
+				RunID:           runID,
+				OutputTruncated: runID != "" && truncationTracker.value(),
+			}
+			newMsgs = append(newMsgs, finalMsg)
+			if runID != "" {
+				for i := range newMsgs {
+					newMsgs[i].RunID = runID
+				}
+			}
+			return RunResult{Reply: outcome.VisibleContent, Terminal: &outcome}, newMsgs, nil
 		}
 
 		// 回喂 assistant 轮次（必须携带原始 tool_calls，否则下游 tool 消息无处挂靠）。
@@ -272,7 +379,9 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 			ToolCalls: turn.ToolCalls,
 		}
 		msgs = append(msgs, assistantMsg)
-		newMsgs = append(newMsgs, assistantMsg)
+		if durableAssistant, ok := withoutTerminalToolCalls(assistantMsg, r.policy.TerminalTool); ok {
+			newMsgs = append(newMsgs, durableAssistant)
+		}
 
 		// 单跳内多工具并发执行；结果按原索引回填以保证顺序稳定、无数据竞争。
 		// Use the outer request ctx (300s ChatStream backstop) — NOT stepCtx.
@@ -298,7 +407,9 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 				Content:    results[i],
 			}
 			msgs = append(msgs, toolMsg)
-			newMsgs = append(newMsgs, toolMsg)
+			if !r.reg.IsTerminal(tc.Function.Name) {
+				newMsgs = append(newMsgs, toolMsg)
+			}
 		}
 
 		stepElapsed := time.Since(stepStart).Milliseconds()
@@ -323,6 +434,8 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 				// makes the next planner turn skip merge_summaries, wasting one full
 				// LLM call before the gate can nudge it back.
 				instruction = "已达token预算，但本次请求仍有未合并的 Map 结果。下一步只调用 merge_summaries，传入全部 summary_handle；Reduce 成功后再直接输出最终答案。"
+			} else if r.policy.TerminalTool != "" {
+				instruction = "已达token预算，请基于现有信息仅调用 " + r.policy.TerminalTool + " 提交最终结果；不要直接输出文本，也不要再调用其他工具。"
 			}
 			msgs = append(msgs, Message{
 				Role:    "user",
@@ -330,7 +443,44 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 			})
 		}
 	}
-	return "", nil, errors.New("max steps exceeded")
+	return RunResult{}, nil, errors.New("max steps exceeded")
+}
+
+func (r *Runner) emitToolEvent(eventType, toolName string, step, ofSteps int, elapsedMs int64) {
+	if r.OnEvent == nil {
+		return
+	}
+	r.OnEvent(Event{
+		Type:      eventType,
+		Tool:      toolName,
+		Step:      step,
+		OfSteps:   ofSteps,
+		ElapsedMs: elapsedMs,
+	})
+}
+
+func (r *Runner) emitStepEnd(stepStart time.Time, step int, hasTools bool) {
+	if r.OnEvent == nil {
+		return
+	}
+	r.OnEvent(Event{
+		Type:         "step_end",
+		Step:         step,
+		OfSteps:      r.policy.MaxSteps,
+		ElapsedMs:    time.Since(stepStart).Milliseconds(),
+		StepHasTools: hasTools,
+	})
+}
+
+func terminalOutcomeToolResult(outcome TerminalOutcome) string {
+	data, err := json.Marshal(map[string]interface{}{
+		"accepted":    true,
+		"result_type": outcome.ResultType,
+	})
+	if err != nil {
+		return `{"accepted":true}`
+	}
+	return string(data)
 }
 
 // runTools 分发一跳内的全部 tool_calls，各自独立 ctx，错误转结果字符串（不中断）。
@@ -356,16 +506,28 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 	all := make([]int, 0, len(calls))
 	fetches := make([]int, 0, len(calls))
 	rest := make([]int, 0, len(calls))
+	discoveries := make([]int, 0, len(calls))
+	scopeSetters := make([]int, 0, 1)
+	afterScope := make([]int, 0, len(calls))
 	hasSummarize := false
 	for i, tc := range calls {
 		all = append(all, i)
-		if tc.Function.Name == "fetch_channel" {
+		phase := r.reg.Phase(tc.Function.Name)
+		if phase == ToolPhaseFetch {
 			fetches = append(fetches, i)
 		} else {
 			rest = append(rest, i)
 		}
-		if tc.Function.Name == "summarize_chunk" {
+		if phase == ToolPhaseSummarize {
 			hasSummarize = true
+		}
+		switch phase {
+		case ToolPhaseScopePreparation:
+			discoveries = append(discoveries, i)
+		case ToolPhaseScopeCommit:
+			scopeSetters = append(scopeSetters, i)
+		default:
+			afterScope = append(afterScope, i)
 		}
 	}
 	// Hook outcomes are reported once, after every phase has finished, so the
@@ -373,6 +535,38 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 	// phase boundaries. Reporting per phase would let a phase-1 failure latch
 	// before a phase-2 success for the same (tool, target) could clear it.
 	defer r.reportToolHookOutcomes(hookOutcomes)
+	if len(scopeSetters) > 0 {
+		if len(discoveries) > 0 {
+			r.runToolBatch(toolCtx, calls, discoveries, results, hookOutcomes, step, ofSteps)
+		}
+		// A successful scope declaration is final for the turn. Execute setters
+		// serially in model order so a duplicate deterministically receives the
+		// repairable "already declared" tool error instead of racing for the lock.
+		for _, index := range scopeSetters {
+			r.runToolBatch(toolCtx, calls, []int{index}, results, hookOutcomes, step, ofSteps)
+		}
+		remainingFetches := make([]int, 0, len(afterScope))
+		remainingRest := make([]int, 0, len(afterScope))
+		remainingHasSummarize := false
+		for _, index := range afterScope {
+			phase := r.reg.Phase(calls[index].Function.Name)
+			if phase == ToolPhaseFetch {
+				remainingFetches = append(remainingFetches, index)
+			} else {
+				remainingRest = append(remainingRest, index)
+			}
+			if phase == ToolPhaseSummarize {
+				remainingHasSummarize = true
+			}
+		}
+		if len(remainingFetches) > 0 && remainingHasSummarize {
+			r.runToolBatch(toolCtx, calls, remainingFetches, results, hookOutcomes, step, ofSteps)
+			r.runToolBatch(toolCtx, calls, remainingRest, results, hookOutcomes, step, ofSteps)
+		} else if len(afterScope) > 0 {
+			r.runToolBatch(toolCtx, calls, afterScope, results, hookOutcomes, step, ofSteps)
+		}
+		return results
+	}
 	if len(fetches) > 0 && hasSummarize {
 		r.runToolBatch(toolCtx, calls, fetches, results, hookOutcomes, step, ofSteps)
 		r.runToolBatch(toolCtx, calls, rest, results, hookOutcomes, step, ofSteps)
@@ -401,7 +595,20 @@ func (r *Runner) runToolBatch(toolCtx context.Context, calls []ToolCall, indexes
 				})
 			}
 
-			out, err := r.reg.Dispatch(toolCtx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+			// A terminal tool is accepted only when it is the sole call in the
+			// planner turn. The unique-call path is handled by
+			// RunWithHistoryOutcome before runTools; reaching here therefore means
+			// it was mixed with another call (or duplicated). Do not invoke the
+			// terminal handler, but still return a paired tool result so the next
+			// planner turn can repair the protocol.
+			terminalRejected := r.reg.IsTerminal(tc.Function.Name)
+			var out string
+			var err error
+			if terminalRejected {
+				err = errors.New("terminal tool must be the only tool call in its step")
+			} else {
+				out, err = r.reg.Dispatch(toolCtx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+			}
 			if tc.Function.Name == "summarize_chunk" {
 				// toolCtx, not the caller's ctx: the store lives on the request-scoped
 				// context that toolCtx wraps, and using it keeps every lookup on this
@@ -450,6 +657,10 @@ func (r *Runner) runToolBatch(toolCtx context.Context, calls []ToolCall, indexes
 			}
 
 			if err != nil {
+				if terminalRejected {
+					results[i] = "错误: " + err.Error()
+					return
+				}
 				// SS-07b: structured error envelope when V2 is on so the planner
 				// can tell retryable from fatal (defect #5); off → the exact legacy
 				// "错误: <text>" string, byte-identical. Fatal failures are surfaced

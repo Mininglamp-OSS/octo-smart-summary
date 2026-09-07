@@ -17,7 +17,7 @@ import (
 // asserts the MOUNTED route rejects an unauthenticated request with 401, the same
 // seam bot_routes_test uses for the bot group.
 func TestDocumentPreviewRouteIsMountedBehindAuth(t *testing.T) {
-	r := SetupPublic(nil, nil, nil, nil, fixedBotResolver{}, "", 0, false, 0, nil, "", "", "", 0, 0, nil)
+	r := SetupPublic(nil, nil, nil, nil, fixedBotResolver{}, "", 0, false, false, 0, nil, "", "", "", 0, 0, nil)
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/summaries/document/preview", nil)
 	r.ServeHTTP(w, req)
@@ -36,7 +36,7 @@ func TestDocumentPreviewRouteIsMountedBehindAuth(t *testing.T) {
 // for a module that lives in another repository, so a silent regression here breaks a
 // cross-repo contract with nothing to catch it.
 func TestRetryAfterIsExposedToCrossOriginClients(t *testing.T) {
-	r := SetupPublic(nil, nil, nil, nil, fixedBotResolver{}, "", 0, false, 0, nil, "", "", "", 0, 0, nil)
+	r := SetupPublic(nil, nil, nil, nil, fixedBotResolver{}, "", 0, false, false, 0, nil, "", "", "", 0, 0, nil)
 
 	// The header must be present on the ACTUAL response, not only on the preflight —
 	// Expose-Headers governs what the browser lets script read from the real response,

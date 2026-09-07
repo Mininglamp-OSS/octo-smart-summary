@@ -261,6 +261,20 @@ func (s *Store) SetStatus(ctx context.Context, userID, runID, status string) err
 		Updates(map[string]interface{}{"status": status, "updated_at": now()}).Error
 }
 
+// FinishRunning marks a successfully completed Agent execution as terminal
+// without overwriting a fatal status recorded concurrently by a tool-error hook.
+func (s *Store) FinishRunning(ctx context.Context, userID, runID string) error {
+	if userID == "" || runID == "" {
+		return nil
+	}
+	return s.db.WithContext(ctx).Model(&model.AgentSummaryRun{}).
+		Where("run_id = ? AND user_id = ? AND status = ?", runID, userID, model.RunStatusRunning).
+		Updates(map[string]interface{}{
+			"status":     model.RunStatusFinished,
+			"updated_at": now(),
+		}).Error
+}
+
 // ClearFailedStatusForReplay resets a run whose status was latched to failed by a
 // PREVIOUS attempt under the same idempotency tuple, so a fresh attempt starts
 // from a clean slate.
@@ -390,17 +404,11 @@ func (s *Store) AddDroppedMessages(ctx context.Context, userID, runID string, co
 		}).Error
 }
 
-// RecordDiscoveredChannels unions channel ids the run learned are in scope.
-//
-// For an open-scope run the Spec pins nothing, so this is the only way the gate
-// can tell "fetched everything in scope" from "found 12 channels and fetched 2".
-// Union rather than replace: discovery happens across several tool calls
-// (list_channels, narrow_channels_by_topic, find_shared_channels) and each sees
-// only its own slice.
-func (s *Store) RecordDiscoveredChannels(ctx context.Context, userID, runID string, channelIDs []string) error {
-	if len(channelIDs) == 0 {
-		return nil
-	}
+// SetDeclaredChannels replaces the final channel set declared by
+// set_summary_scope. Discovery may yield many candidates, but only the final
+// declaration is authoritative. Replacement semantics also make an idempotent
+// retry that narrows B+C to C converge on C instead of retaining stale B.
+func (s *Store) SetDeclaredChannels(ctx context.Context, userID, runID string, channelIDs []string) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var run model.AgentSummaryRun
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -408,24 +416,17 @@ func (s *Store) RecordDiscoveredChannels(ctx context.Context, userID, runID stri
 			First(&run).Error; err != nil {
 			return err
 		}
-		discovered, err := decodeChannels(run.DiscoveredChannels)
-		if err != nil {
-			return fmt.Errorf("decode discovered_channels: %w", err)
-		}
-		before := len(discovered)
+		declared := make([]string, 0, len(channelIDs))
 		for _, id := range channelIDs {
 			if id != "" {
-				discovered = addChannel(discovered, id)
+				declared = addChannel(declared, id)
 			}
 		}
-		if len(discovered) == before {
-			return nil
-		}
-		discoveredJSON, _ := json.Marshal(discovered)
+		declaredJSON, _ := json.Marshal(declared)
 		return tx.Model(&model.AgentSummaryRun{}).
 			Where("run_id = ? AND user_id = ?", runID, userID).
 			Updates(map[string]interface{}{
-				"discovered_channels": string(discoveredJSON),
+				"discovered_channels": string(declaredJSON),
 				"updated_at":          now(),
 			}).Error
 	})

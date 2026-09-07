@@ -22,11 +22,16 @@ var embeddedPrompts embed.FS
 // ToolFactory 返回一个工具的 schema + handler。所有工具在 toolFactories 集中登记。
 type ToolFactory func() (Tool, Handler)
 
+// TerminalToolFactory returns a schema plus the handler whose successful
+// result ends the Agent loop.
+type TerminalToolFactory func() (Tool, TerminalHandler)
+
 // toolFactories 是全部可用工具的中央登记表：key = 工具名，供 Profile 按名挑选。
 // 新增工具只需在此加一行，再在对应 Profile 的 Tools 里引用其名字。
 var toolFactories = map[string]ToolFactory{
 	"get_current_time":   GetCurrentTimeTool,
 	"extract_time_range": ExtractTimeRangeTool,
+	"set_summary_scope":  SetSummaryScopeTool,
 	// Summary tools (Stage 2)
 	"list_channels":            ListChannelsTool,
 	"narrow_channels_by_topic": NarrowChannelsByTopicTool,
@@ -37,6 +42,21 @@ var toolFactories = map[string]ToolFactory{
 	"filter_relevant":          FilterRelevantTool,
 	"summarize_chunk":          SummarizeChunkTool,
 	"merge_summaries":          MergeSummariesTool,
+}
+
+var toolPhases = map[string]ToolPhase{
+	"get_current_time":         ToolPhaseScopePreparation,
+	"extract_time_range":       ToolPhaseScopePreparation,
+	"list_channels":            ToolPhaseScopePreparation,
+	"narrow_channels_by_topic": ToolPhaseScopePreparation,
+	"find_shared_channels":     ToolPhaseScopePreparation,
+	"set_summary_scope":        ToolPhaseScopeCommit,
+	"fetch_channel":            ToolPhaseFetch,
+	"summarize_chunk":          ToolPhaseSummarize,
+}
+
+var terminalToolFactories = map[string]TerminalToolFactory{
+	"emit_summary_response": EmitSummaryResponseTool,
 }
 
 // Profile 描述一个 agent 场景：提示词文件名（不含 .md）+ 允许的工具名单 + 策略。
@@ -77,6 +97,23 @@ var profiles = map[string]Profile{
 		// surfaced as `[agent] chat runner error: context deadline exceeded`.
 		// AGENT_STEP_TIMEOUT env still overrides at GetProfile time (see below).
 		Policy: Policy{MaxSteps: 15, MaxTokens: 120000, StepTimeout: 240 * time.Second},
+	},
+	"summary_workspace": {
+		PromptFile: "summary_workspace",
+		Tools: []string{
+			"get_current_time", "extract_time_range",
+			"set_summary_scope",
+			"list_channels", "narrow_channels_by_topic", "find_shared_channels",
+			"peek_channel", "fetch_channel", "search_messages",
+			"filter_relevant", "summarize_chunk", "merge_summaries",
+			"emit_summary_response",
+		},
+		Policy: Policy{
+			MaxSteps:     24,
+			MaxTokens:    120000,
+			StepTimeout:  240 * time.Second,
+			TerminalTool: "emit_summary_response",
+		},
 	},
 }
 
@@ -120,12 +157,17 @@ func LoadPrompt(name string) (string, error) {
 func BuildRegistry(toolNames []string) (*Registry, error) {
 	reg := NewRegistry()
 	for _, name := range toolNames {
-		factory, ok := toolFactories[name]
-		if !ok {
-			return nil, fmt.Errorf("unknown tool %q (not in toolFactories)", name)
+		if factory, ok := toolFactories[name]; ok {
+			schema, handler := factory()
+			reg.RegisterWithPhase(schema, handler, GetToolPhase(name))
+			continue
 		}
-		schema, handler := factory()
-		reg.Register(schema, handler)
+		if factory, ok := terminalToolFactories[name]; ok {
+			schema, handler := factory()
+			reg.RegisterTerminal(schema, handler)
+			continue
+		}
+		return nil, fmt.Errorf("unknown tool %q (not in toolFactories or terminalToolFactories)", name)
 	}
 	return reg, nil
 }
@@ -151,6 +193,20 @@ func GetProfile(name string) (Profile, error) {
 // GetToolFactory returns a tool factory by name. Used for per-request registry construction.
 func GetToolFactory(name string) (ToolFactory, bool) {
 	f, ok := toolFactories[name]
+	return f, ok
+}
+
+// GetToolPhase returns the execution phase registered for a tool factory.
+// Unclassified tools remain freely concurrent.
+func GetToolPhase(name string) ToolPhase {
+	return toolPhases[name]
+}
+
+// GetTerminalToolFactory returns a terminal tool factory by name. Per-request
+// registries use it when they need to wrap terminal handlers with trusted
+// request context.
+func GetTerminalToolFactory(name string) (TerminalToolFactory, bool) {
+	f, ok := terminalToolFactories[name]
 	return f, ok
 }
 

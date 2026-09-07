@@ -75,6 +75,7 @@ func PersistEvidence(db *gorm.DB, ctx context.Context, handle string, messages [
 		log.Printf("[evidence] upsert failed handle=%s session=%s: %v", handle, sessionID, err)
 		return err
 	}
+	markSummaryCitationEvidence(ctx, messages)
 	log.Printf("[evidence] persisted %d messages handle=%s session=%s", len(messages), handle, sessionID)
 	return nil
 }

@@ -181,3 +181,67 @@ func TestRunnerCompactsLegacySummaryHistoryBeforePlanner(t *testing.T) {
 		}
 	}
 }
+
+func TestStripTerminalToolHistoryRemovesDraftArgumentsAndKeepsOrdinaryPairs(t *testing.T) {
+	history := []Message{
+		{Role: "user", Content: "old request"},
+		{Role: "assistant", ToolCalls: []ToolCall{mkToolCall("emit-only", "emit_summary_response", validPreviewTerminalArgs)}},
+		{Role: "tool", ToolCallID: "emit-only", Name: "emit_summary_response", Content: `{"accepted":true}`},
+		{Role: "assistant", Content: "synthetic final"},
+		{Role: "assistant", Content: "# draft that must not persist", ToolCalls: []ToolCall{
+			mkToolCall("emit-mixed", "emit_summary_response", validPreviewTerminalArgs),
+			mkToolCall("ordinary", "echo", `{"value":"ok"}`),
+		}},
+		{Role: "tool", ToolCallID: "emit-mixed", Name: "emit_summary_response", Content: "error"},
+		{Role: "tool", ToolCallID: "ordinary", Name: "echo", Content: "ok"},
+	}
+
+	got := stripTerminalToolHistory(history, "emit_summary_response")
+	for _, msg := range got {
+		if msg.Name == "emit_summary_response" || msg.ToolCallID == "emit-only" || msg.ToolCallID == "emit-mixed" {
+			t.Fatalf("terminal tool result remained: %+v", got)
+		}
+		for _, call := range msg.ToolCalls {
+			if call.Function.Name == "emit_summary_response" || strings.Contains(call.Function.Arguments, "# 正文") {
+				t.Fatalf("terminal call arguments remained: %+v", got)
+			}
+		}
+	}
+	if len(got) != 4 || len(got[2].ToolCalls) != 1 || got[2].ToolCalls[0].Function.Name != "echo" || got[3].ToolCallID != "ordinary" {
+		t.Fatalf("ordinary protocol pair was not preserved: %+v", got)
+	}
+	if got[2].Content != "" {
+		t.Fatalf("mixed terminal turn retained draft-like assistant content: %q", got[2].Content)
+	}
+}
+
+func TestStripTerminalToolHistoryScopesToolCallIDsToOneAssistantTurn(t *testing.T) {
+	history := []Message{
+		{Role: "user", Content: "first"},
+		{Role: "assistant", ToolCalls: []ToolCall{mkToolCall("reused", "emit_summary_response", validPreviewTerminalArgs)}},
+		{Role: "tool", ToolCallID: "reused", Name: "emit_summary_response", Content: "rejected"},
+		{Role: "user", Content: "second"},
+		{Role: "assistant", ToolCalls: []ToolCall{mkToolCall("reused", "echo", `{}`)}},
+		{Role: "tool", ToolCallID: "reused", Name: "echo", Content: "ok"},
+	}
+	got := stripTerminalToolHistory(history, "emit_summary_response")
+	if len(got) != 4 || got[2].ToolCalls[0].Function.Name != "echo" || got[3].Name != "echo" {
+		t.Fatalf("a reused id in a later ordinary turn was removed: %+v", got)
+	}
+}
+
+func TestSanitizeToolProtocolHistoryDropsTruncatedPrefixAndUnpairedGroups(t *testing.T) {
+	history := []Message{
+		{Role: "tool", ToolCallID: "orphan", Name: "echo", Content: "orphan"},
+		{Role: "assistant", Content: "prefix"},
+		{Role: "user", Content: "kept turn"},
+		{Role: "assistant", ToolCalls: []ToolCall{mkToolCall("missing", "echo", `{}`)}},
+		{Role: "assistant", ToolCalls: []ToolCall{mkToolCall("paired", "echo", `{}`)}},
+		{Role: "tool", ToolCallID: "paired", Name: "echo", Content: "ok"},
+		{Role: "assistant", Content: "final"},
+	}
+	got := sanitizeToolProtocolHistory(history)
+	if len(got) != 4 || got[0].Role != "user" || got[1].ToolCalls[0].ID != "paired" || got[2].ToolCallID != "paired" || got[3].Content != "final" {
+		t.Fatalf("sanitized history = %+v", got)
+	}
+}

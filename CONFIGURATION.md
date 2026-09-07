@@ -22,6 +22,7 @@ All configuration is done via environment variables.
 | `LLM_TIMEOUT` | LLM request timeout in seconds | No | `180` |
 | `AGENT_STEP_TIMEOUT` | Maximum duration in seconds for one agent planning step; streaming requests remain capped by the 300-second request deadline | No | `240` |
 | `AGENT_SUMMARY_V2_MODE` | Rollout flag for the Stage-2 agent-summary contract. `off` (default) keeps the pre-SS-03 path byte-identical: no run row is persisted and no new query runs. `shadow` / `on` enable the V2 path: each submit persists a SummaryRun/SummarySpec keyed by `(user_id, session_id, request_id)`, the citation manifest is frozen once per run, the save-time citation pass adopts the frozen ordinals of the run named by the request's `request_id` (falling back to the legacy recompute when the request carries none), and messages fetched after the freeze are dropped from chunk input instead of reaching the model as citation `[0]`. `shadow` and `on` behave identically today; the split is reserved for later stages. Unrecognized values fall back to `off` (fail safe — never fail into the new path). See `internal/agent/summary_v2.go`. | No | `off` |
+| `SUMMARY_WORKBENCH_ENABLED` | Environment-level rollout and rollback switch for the unified smart-summary workbench. `true` advertises and serves the v2 workspace APIs; unset, `false`, or invalid values fail closed to the legacy entry and reject workspace chat, history, confirmation, and workspace-preview save operations. Changing the value requires restarting the API deployment, but does not require rebuilding the Web image. | No | `false` |
 | `SUMMARY_REPAIR_MAX_ROUNDS` | Maximum number of distinct pre-freeze coverage gaps the agent may block for repair in one run. Calls fanned out by the same planner step share one decision; an unchanged gap on a later step is allowed through. Before each block, the gate reserves four downstream steps for Map, Reduce, a possible runner nudge, and the final answer, plus two steps for every still-available repair round; with the default of `2`, the first block therefore requires eight remaining steps. `0` disables the gate. | No | `2` |
 | `LLM_MAX_TOKENS` | Maximum tokens for LLM response | No | `4096` |
 | `LLM_TEMPERATURE` | Sampling temperature for LLM | No | `0.3` |
@@ -43,12 +44,14 @@ All configuration is done via environment variables.
 | `MAX_MESSAGES_PER_PARTICIPANT` | Max messages per participant in map phase | No | `5000` |
 | `MAX_MESSAGES_PER_CHANNEL` | Max messages per channel (-1 = no limit) | No | `-1` |
 | `MAP_MAX_TOKENS` | Override map-phase token budget (0 = auto) | No | `0` |
+| `DEFAULT_TIME_RANGE_DAYS` | Default lookback when a legacy summary request omits its time range. Must be greater than `0` and no greater than `MAX_TIME_RANGE_DAYS`. | No | `31` |
+| `MAX_TIME_RANGE_DAYS` | Maximum lookback accepted by the unified summary workspace and enforced by its worker fetch path. Applies to both personal and team workflows created from the workspace. Must be at least `30` and greater than or equal to `DEFAULT_TIME_RANGE_DAYS`. | No | `90` |
 | `AGENT_TRACE` | Emit a per-request agent latency trace (`[agent-trace]` log lines): total wall clock split into planning / tools / unaccounted, per-step planner latency and prompt size, and slowest tool spans. Roughly a few dozen lines per request, so it is off by default and intended for diagnosing a specific slow request. Logs sizes, counts, durations, step numbers and registered tool names only — never message content, prompt text, tool arguments, or user/channel names. | No | `false` |
 | `CHARS_PER_TOKEN_CJK` | Characters per token for CJK text | No | `1` |
 | `CHARS_PER_TOKEN_ASCII` | Characters per token for ASCII text | No | `4` |
 | `SUMMARY_CHAT_CANDIDATE_LIMIT` | Candidate query limit (-1 = no limit) | No | `-1` |
 | `FETCH_CONCURRENCY` | Parallel channel message fetch concurrency | No | `10` |
-| `CHANNEL_SCOPE_ENABLED` | Enable channel scope narrowing | No | `true` |
+| `CHANNEL_SCOPE_ENABLED` | Enable LLM-based channel scope narrowing. Space isolation is always enforced and is not controlled by this flag. | No | `true` |
 | `TOOL_CALL_TIMEOUT` | Tool call per-attempt timeout in seconds | No | `30` |
 
 ## LLM Gateway Options

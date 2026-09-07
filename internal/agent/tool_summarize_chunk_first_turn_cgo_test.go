@@ -107,11 +107,11 @@ func TestGetSessionMessagePool_CacheHotPath(t *testing.T) {
 	if err := seedEvidence(db, uid, sessionID, handle, messages); err != nil {
 		t.Fatalf("seed evidence: %v", err)
 	}
-	messageCache.Store(messages, uid)
+	messageCache.Store(messages, uid, sessionID)
 	// NB: messageCache.Store returns a fresh handle; overwrite the entry at
 	// our known handle for the test predicate.
 	messageCache.mu.Lock()
-	messageCache.store[handle] = cacheEntry{messages: messages, uid: uid, createdAt: time.Now()}
+	messageCache.store[handle] = cacheEntry{messages: messages, uid: uid, sessionID: sessionID, createdAt: time.Now()}
 	messageCache.mu.Unlock()
 
 	SetSummaryDeps(db, nil, nil, config.Config{})
@@ -245,7 +245,7 @@ func TestSummarizeChunkManifestMissesRecordedAsDropped(t *testing.T) {
 		{ChannelID: "ch1", MessageSeq: 2, Timestamp: 2_000, Content: "post-freeze A"},
 		{ChannelID: "ch1", MessageSeq: 3, Timestamp: 3_000, Content: "post-freeze B"},
 	}
-	handle := messageCache.Store(messages, uid)
+	handle := messageCache.Store(messages, uid, sessionID)
 	t.Cleanup(func() {
 		messageCache.mu.Lock()
 		delete(messageCache.store, handle)

@@ -37,7 +37,7 @@ func TestMetricsIsInternalOnly(t *testing.T) {
 		Position: llmfallback.PositionPrimary, OK: true,
 	})
 
-	public := SetupPublic(nil, nil, nil, nil, nil, "", 0, false, 0, nil, "", "", "", 0, 0, nil)
+	public := SetupPublic(nil, nil, nil, nil, nil, "", 0, false, false, 0, nil, "", "", "", 0, 0, nil)
 	for _, r := range public.Routes() {
 		if r.Method != http.MethodGet {
 			continue

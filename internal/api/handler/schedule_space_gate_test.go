@@ -47,7 +47,7 @@ func seedEmptySpaceSchedule(t *testing.T, db *gorm.DB) int64 {
 }
 
 // 4.11: ListSchedules with NO X-Space-Id must 404/40008, never returning the
-// space_id='' schedule.
+// space_id=” schedule.
 func TestListSchedules_EmptySpaceHeader_Returns404(t *testing.T) {
 	db := newScheduleTestDB(t)
 	seedEmptySpaceSchedule(t, db)
@@ -58,7 +58,7 @@ func TestListSchedules_EmptySpaceHeader_Returns404(t *testing.T) {
 }
 
 // 4.11: GetSchedule with NO X-Space-Id must 404/40008, never returning the
-// space_id='' schedule.
+// space_id=” schedule.
 func TestGetSchedule_EmptySpaceHeader_Returns404(t *testing.T) {
 	db := newScheduleTestDB(t)
 	schedID := seedEmptySpaceSchedule(t, db)

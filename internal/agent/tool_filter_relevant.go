@@ -59,15 +59,19 @@ func FilterRelevantTool() (Tool, Handler) {
 		if !ok || uid == "" {
 			return "", fmt.Errorf("missing user identity in context")
 		}
+		sessionID, _ := ctx.Value(ContextKeySessionID).(string)
+		if sessionID == "" {
+			return "", fmt.Errorf("missing session_id in context")
+		}
 
-		messages := messageCache.Retrieve(req.MessagesHandle, uid)
+		messages := messageCache.Retrieve(req.MessagesHandle, uid, sessionID)
 		if messages == nil {
 			return "", fmt.Errorf("invalid or expired messages_handle: %s", req.MessagesHandle)
 		}
 
 		filtered := pipeline.FilterMessagesByRelevance(messages, req.Topic, req.ParticipantUIDs, req.ParticipantNames)
 
-		newHandle := messageCache.Store(filtered, uid)
+		newHandle := messageCache.Store(filtered, uid, sessionID)
 
 		// Also persist to evidence table so citation recovery survives the
 		// 30-min in-memory TTL. #161 P1-B (yujiawei): evidence is the sole

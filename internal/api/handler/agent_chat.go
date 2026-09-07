@@ -75,11 +75,25 @@ func resolveChatProfile(reqProfile string, hasChannels, hasReferences bool) (pro
 }
 
 // maxMessageLen 是单条用户 message 的最大字符数（rune），超长直接 400，避免超长入参打爆上游。
-const maxMessageLen = 8192
+const (
+	maxMessageLen               = 8192
+	maxAgentChatRequestBodySize = 512 << 10
+)
 
 // sessionIDPattern 约束前端生成的 session_id：仅字母数字下划线连字符、1..128 长。
 // 既防注入/异常键，也与 DB varchar(128) 对齐。
 var sessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
+// summaryWorkspaceSessionIDPattern constrains session ids on the summary
+// workspace routes only. The workspace stores session ids in
+// utf8mb4_0900_bin columns (agent_summary_session / agent_summary_turn) while
+// agent_message keeps the table-default utf8mb4_unicode_ci, so a case-variant
+// id would share one message pool on fresh installs: transcript bleed across
+// sessions and the expiry sweep deleting a live session's messages
+// (yujiawei review 5087701899 P1, owner decision 2026-09-03: reject rather
+// than normalise). Client session ids are minted lowercase; a workspace
+// request carrying an uppercase id is a caller bug and fails fast with 400.
+var summaryWorkspaceSessionIDPattern = regexp.MustCompile(`^[a-z0-9_-]{1,128}$`)
 
 // requestIDPattern 约束客户端生成的 request_id（V2 幂等键，可选）。与
 // session_id 同字符集、同 1..128 长——它流入 uk_run_request 的 VARCHAR(128)
@@ -113,6 +127,11 @@ type AgentChatHandler struct {
 	// AGENT_SUMMARY_V2_MODE != off; nil in the test constructor. When nil or the
 	// flag is off, the chat path is byte-identical to pre-SS-03 behavior.
 	runStore *summaryrun.Store
+
+	// workspace is configured by the public router for the unified smart-summary
+	// entry. Nil keeps legacy/test constructors byte-compatible.
+	workspace             *summaryWorkspaceCoordinator
+	workspaceEntryEnabled bool
 
 	// test-only fields: when set, bypass dynamic runner construction
 	testRunner *agent.Runner
@@ -171,6 +190,8 @@ func (h *AgentChatHandler) buildRunnerForProfile(profileName, uid, sessionID str
 		reg, err = h.buildRegistryWithUID(uid, sessionID, refineRewriteToolNames)
 	case (profileName == "summary" || profileName == "summary_refine") && uid != "":
 		reg, err = h.buildSummaryRegistryWithUID(uid, sessionID)
+	case profileName == summaryWorkspaceProfile && uid != "":
+		reg, err = h.buildRegistryWithUID(uid, sessionID, profile.Tools)
 	default:
 		reg, err = agent.BuildRegistry(profile.Tools)
 	}
@@ -216,17 +237,27 @@ func (h *AgentChatHandler) buildSummaryRegistryWithUID(uid, sessionID string) (*
 func (h *AgentChatHandler) buildRegistryWithUID(uid, sessionID string, toolNames []string) (*agent.Registry, error) {
 	reg := agent.NewRegistry()
 	for _, name := range toolNames {
-		factory, ok := agent.GetToolFactory(name)
-		if !ok {
-			return nil, fmt.Errorf("unknown tool %q", name)
+		if factory, ok := agent.GetToolFactory(name); ok {
+			schema, origHandler := factory()
+			wrappedHandler := func(ctx context.Context, args json.RawMessage) (string, error) {
+				ctx = context.WithValue(ctx, agent.ContextKeyUID, uid)
+				ctx = context.WithValue(ctx, agent.ContextKeySessionID, sessionID)
+				return origHandler(ctx, args)
+			}
+			reg.RegisterWithPhase(schema, wrappedHandler, agent.GetToolPhase(name))
+			continue
 		}
-		schema, origHandler := factory()
-		wrappedHandler := func(ctx context.Context, args json.RawMessage) (string, error) {
-			ctx = context.WithValue(ctx, agent.ContextKeyUID, uid)
-			ctx = context.WithValue(ctx, agent.ContextKeySessionID, sessionID)
-			return origHandler(ctx, args)
+		if factory, ok := agent.GetTerminalToolFactory(name); ok {
+			schema, origHandler := factory()
+			wrappedHandler := func(ctx context.Context, args json.RawMessage) (agent.TerminalOutcome, error) {
+				ctx = context.WithValue(ctx, agent.ContextKeyUID, uid)
+				ctx = context.WithValue(ctx, agent.ContextKeySessionID, sessionID)
+				return origHandler(ctx, args)
+			}
+			reg.RegisterTerminal(schema, wrappedHandler)
+			continue
 		}
-		reg.Register(schema, wrappedHandler)
+		return nil, fmt.Errorf("unknown tool %q", name)
 	}
 	return reg, nil
 }
@@ -238,11 +269,19 @@ func (h *AgentChatHandler) buildRegistryWithUID(uid, sessionID string, toolNames
 // 若空数组或字段缺,当轮 chat 无引用材料(等同普通 chat)。
 // 见 CHAT-REFERENCE-BASED-DESIGN-v1。
 type agentChatRequest struct {
-	Message           string            `json:"message"`
-	SessionID         string            `json:"session_id"`
-	Profile           string            `json:"profile,omitempty"`
-	ReferencedTaskIDs []int64           `json:"referenced_task_ids,omitempty"`
-	SelectedChannels  []selectedChannel `json:"selected_channels,omitempty"`
+	Message string `json:"message"`
+	// InputOrigin distinguishes user-authored requirements from text inserted by
+	// the workbench UI. The distinction is part of routing and idempotency: a
+	// template body is useful configuration, while a generated "start" command
+	// must never be mistaken for the team's actual summary requirement.
+	InputOrigin       string                  `json:"input_origin,omitempty"`
+	SessionID         string                  `json:"session_id"`
+	Profile           string                  `json:"profile,omitempty"`
+	Action            string                  `json:"action,omitempty"`
+	ScopeVersion      int                     `json:"scope_version,omitempty"`
+	SummaryContext    summaryWorkspaceContext `json:"summary_context,omitempty"`
+	ReferencedTaskIDs []int64                 `json:"referenced_task_ids,omitempty"`
+	SelectedChannels  []selectedChannel       `json:"selected_channels,omitempty"`
 
 	// SS-03 (accepted always, acted on only when AGENT_SUMMARY_V2_MODE != off).
 	// RequestID is the client-generated per-submit idempotency key. Optional —
@@ -561,9 +600,14 @@ func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid strin
 // AppendMessages 全程无锁，若同 session 并发进入会读到相同历史各自续写，产生分叉历史；
 // 锁 / 版本号方案留后续，本轮不实现。
 func (h *AgentChatHandler) Chat(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxAgentChatRequestBodySize)
 	var req agentChatRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid request body"})
+		return
+	}
+	if req.Profile == summaryWorkspaceProfile {
+		h.handleSummaryWorkspaceChat(c, req, false)
 		return
 	}
 	if req.Message == "" {
@@ -788,6 +832,22 @@ func (h *AgentChatHandler) History(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, apiResponse{Code: 40100, Message: "missing auth context"})
 		return
 	}
+	if strings.TrimSpace(c.Query("profile")) == summaryWorkspaceProfile {
+		if !h.summaryWorkspaceEntryAvailable() {
+			c.JSON(http.StatusServiceUnavailable, apiResponse{Code: 50300, Message: "summary workspace is disabled"})
+			return
+		}
+		// Workspace route: lowercase-only session ids (collation divergence
+		// guard, see summaryWorkspaceSessionIDPattern). The generic pattern
+		// above already ran; this rejects case variants the workspace tables
+		// would store byte-exact while agent_message matches case-insensitively.
+		if !summaryWorkspaceSessionIDPattern.MatchString(sessionID) {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "session_id 非法"})
+			return
+		}
+		h.handleSummaryWorkspaceHistory(c, sessionID, uid)
+		return
+	}
 
 	ctx := c.Request.Context()
 	history, err := h.store.LoadHistory(ctx, sessionID, uid)
@@ -846,9 +906,14 @@ func (s *sseSink) write(event string, payload []byte) {
 // Context timeout: 300s (longer than Chat's 120s for map-reduce workloads).
 // Database persistence: same as Chat (AppendMessages only on success, no progress events stored).
 func (h *AgentChatHandler) ChatStream(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxAgentChatRequestBodySize)
 	var req agentChatRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid request body"})
+		return
+	}
+	if req.Profile == summaryWorkspaceProfile {
+		h.handleSummaryWorkspaceChat(c, req, true)
 		return
 	}
 	if req.Message == "" {

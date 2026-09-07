@@ -14,9 +14,9 @@ import (
 // Heuristic (owner decision Q3 = A, see
 // CHAT-REFERENCE-PREVIEW-AND-RANGE-SAVE-v1):
 //
-//   Find the first markdown heading (# / ## / ### / ...) or horizontal rule (---).
-//   If the text before it is < 500 chars AND is not itself a heading/rule,
-//   treat it as preamble and strip.
+//	Find the first markdown heading (# / ## / ### / ...) or horizontal rule (---).
+//	If the text before it is < 500 chars AND is not itself a heading/rule,
+//	treat it as preamble and strip.
 //
 // Deliberately conservative: pure prose summaries with no heading pass through
 // unchanged (the 500-char cap ensures we don't strip a real intro paragraph).

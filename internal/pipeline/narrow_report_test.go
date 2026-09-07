@@ -33,6 +33,19 @@ func TestNarrowByTopicReportDistinguishesPassThrough(t *testing.T) {
 		}
 	})
 
+	t.Run("an explicit all-channel selection is still an authoritative decision", func(t *testing.T) {
+		all := func(ctx context.Context, prompt string) (string, error) {
+			return `["c1","c2","c3"]`, nil
+		}
+		got, narrowed := NarrowByTopicReport(context.Background(), "所有群聊", candidates, all)
+		if !narrowed {
+			t.Fatal("narrowed = false, want true for a successful explicit all-channel selection")
+		}
+		if len(got) != len(candidates) {
+			t.Fatalf("result = %+v, want every authorised candidate", got)
+		}
+	})
+
 	for _, tc := range []struct {
 		name  string
 		topic string

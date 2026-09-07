@@ -1,8 +1,12 @@
 package agent
 
 import (
+	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
 
@@ -17,14 +21,14 @@ func TestMessageCache_BasicOperations(t *testing.T) {
 		{SenderName: "Bob", Content: "World"},
 	}
 	uid := "user-abc123"
-	handle := messageCache.Store(msgs, uid)
+	handle := messageCache.Store(msgs, uid, "session-1")
 
 	if handle == "" {
 		t.Fatal("store should return non-empty handle")
 	}
 
 	// Retrieve with correct uid
-	retrieved := messageCache.Retrieve(handle, uid)
+	retrieved := messageCache.Retrieve(handle, uid, "session-1")
 	if retrieved == nil {
 		t.Fatal("retrieve should return messages")
 	}
@@ -33,15 +37,102 @@ func TestMessageCache_BasicOperations(t *testing.T) {
 	}
 
 	// Retrieve with wrong uid (ownership mismatch)
-	wrongRetrieved := messageCache.Retrieve(handle, "other-user")
+	wrongRetrieved := messageCache.Retrieve(handle, "other-user", "session-1")
 	if wrongRetrieved != nil {
 		t.Error("wrong uid should return nil (access denied)")
 	}
 
 	// Retrieve invalid handle
-	invalid := messageCache.Retrieve("nonexistent-handle", uid)
+	invalid := messageCache.Retrieve("nonexistent-handle", uid, "session-1")
 	if invalid != nil {
 		t.Error("invalid handle should return nil")
+	}
+}
+
+func TestMessageCache_SessionScopeIsolation(t *testing.T) {
+	ResetForTest()
+	uid := "same-user"
+	if handle := messageCache.Store([]pipeline.Message{{Content: "unscoped"}}, uid, ""); handle != "" {
+		t.Fatalf("cache accepted an unscoped handle: %q", handle)
+	}
+	spaceAScope1 := "summaryws:space-a:session-1:scope-1"
+	handle := messageCache.Store([]pipeline.Message{{Content: "scoped"}}, uid, spaceAScope1)
+
+	if got := messageCache.Retrieve(handle, uid, spaceAScope1); len(got) != 1 || got[0].Content != "scoped" {
+		t.Fatalf("same scope retrieve = %#v", got)
+	}
+	for _, other := range []string{
+		"summaryws:space-a:session-2:scope-1", // public session changed
+		"summaryws:space-b:session-1:scope-1", // space changed
+		"summaryws:space-a:session-1:scope-2", // scope version changed
+	} {
+		if got := messageCache.Retrieve(handle, uid, other); got != nil {
+			t.Fatalf("cross identity %q retrieved %#v", other, got)
+		}
+	}
+}
+
+func TestDerivedMessageHandlesInheritSessionScope(t *testing.T) {
+	ResetForTest()
+	SetSummaryDeps(nil, nil, nil, config.Config{})
+	uid, sessionID := "user-1", "summaryws:space-a:session-1:scope-3"
+	ctx := context.WithValue(context.Background(), ContextKeyUID, uid)
+	ctx = context.WithValue(ctx, ContextKeySessionID, sessionID)
+	source := messageCache.Store([]pipeline.Message{
+		{Content: "alpha decision", SenderUID: "alice"},
+		{Content: "unrelated", SenderUID: "bob"},
+	}, uid, sessionID)
+
+	_, search := SearchMessagesTool()
+	searchArgs, _ := json.Marshal(map[string]interface{}{
+		"messages_handle": source,
+		"keywords":        []string{"alpha"},
+	})
+	searchResult, err := search(ctx, searchArgs)
+	if err != nil {
+		t.Fatalf("search same scope: %v", err)
+	}
+	var searched struct {
+		Handle string `json:"messages_handle"`
+	}
+	if err := json.Unmarshal([]byte(searchResult), &searched); err != nil || searched.Handle == "" {
+		t.Fatalf("search result = %q, err=%v", searchResult, err)
+	}
+	if got := messageCache.Retrieve(searched.Handle, uid, sessionID); len(got) != 1 {
+		t.Fatalf("derived search handle in same scope = %#v", got)
+	}
+	if got := messageCache.Retrieve(searched.Handle, uid, "summaryws:space-a:session-1:scope-4"); got != nil {
+		t.Fatalf("derived search handle crossed scope: %#v", got)
+	}
+
+	_, filter := FilterRelevantTool()
+	filterArgs, _ := json.Marshal(map[string]interface{}{
+		"messages_handle":  searched.Handle,
+		"participant_uids": []string{"alice"},
+	})
+	filterResult, err := filter(ctx, filterArgs)
+	if err != nil {
+		t.Fatalf("filter same scope: %v", err)
+	}
+	var filtered struct {
+		Handle string `json:"messages_handle"`
+	}
+	if err := json.Unmarshal([]byte(filterResult), &filtered); err != nil || filtered.Handle == "" {
+		t.Fatalf("filter result = %q, err=%v", filterResult, err)
+	}
+	if got := messageCache.Retrieve(filtered.Handle, uid, sessionID); len(got) != 1 {
+		t.Fatalf("derived filter handle in same scope = %#v", got)
+	}
+	if got := messageCache.Retrieve(filtered.Handle, uid, "summaryws:space-b:session-1:scope-3"); got != nil {
+		t.Fatalf("derived filter handle crossed space: %#v", got)
+	}
+
+	_, summarize := SummarizeChunkTool()
+	wrongCtx := context.WithValue(context.Background(), ContextKeyUID, uid)
+	wrongCtx = context.WithValue(wrongCtx, ContextKeySessionID, "summaryws:space-b:session-1:scope-3")
+	summarizeArgs, _ := json.Marshal(map[string]string{"messages_handle": filtered.Handle})
+	if _, err := summarize(wrongCtx, summarizeArgs); err == nil || !strings.Contains(err.Error(), "invalid or expired messages_handle") {
+		t.Fatalf("summarize cross-space error = %v", err)
 	}
 }
 
@@ -53,16 +144,16 @@ func TestMessageCache_StoreRetrieveCycle(t *testing.T) {
 	uid2 := "user-bbb"
 
 	// First store with different uids
-	h1 := messageCache.Store([]pipeline.Message{{Content: "msg1"}}, uid1)
-	h2 := messageCache.Store([]pipeline.Message{{Content: "msg2"}}, uid2)
+	h1 := messageCache.Store([]pipeline.Message{{Content: "msg1"}}, uid1, "session-1")
+	h2 := messageCache.Store([]pipeline.Message{{Content: "msg2"}}, uid2, "session-2")
 
 	if h1 == h2 {
 		t.Error("handles should be unique")
 	}
 
 	// Retrieve both with correct uids
-	r1 := messageCache.Retrieve(h1, uid1)
-	r2 := messageCache.Retrieve(h2, uid2)
+	r1 := messageCache.Retrieve(h1, uid1, "session-1")
+	r2 := messageCache.Retrieve(h2, uid2, "session-2")
 
 	if len(r1) != 1 || r1[0].Content != "msg1" {
 		t.Errorf("r1 mismatch: %+v", r1)
@@ -72,9 +163,17 @@ func TestMessageCache_StoreRetrieveCycle(t *testing.T) {
 	}
 
 	// Cross-uid access should fail
-	rWrong := messageCache.Retrieve(h1, uid2)
+	rWrong := messageCache.Retrieve(h1, uid2, "session-1")
 	if rWrong != nil {
 		t.Error("cross-uid access should return nil")
+	}
+}
+
+func TestMessageCache_HandlesDoNotCollideAcrossCacheInstances(t *testing.T) {
+	first := newMessageCache().Store([]pipeline.Message{{Content: "first"}}, "user-1", "session-1")
+	second := newMessageCache().Store([]pipeline.Message{{Content: "second"}}, "user-1", "session-1")
+	if first == "" || second == "" || first == second {
+		t.Fatalf("independent cache handles collided: first=%q second=%q", first, second)
 	}
 }
 

@@ -59,6 +59,15 @@ type AgentSummaryHandler struct {
 	// beforeDraftLoad is a test-only synchronization hook used to exercise
 	// the race where another request commits after idempotency preflight.
 	beforeDraftLoad func()
+	// nil preserves legacy/test construction. Production sets this explicitly;
+	// false rejects workspace preview saves while leaving legacy saves intact.
+	workspaceEnabled *bool
+}
+
+func (h *AgentSummaryHandler) ConfigureSummaryWorkspace(enabled bool) {
+	if h != nil {
+		h.workspaceEnabled = &enabled
+	}
 }
 
 // refineRunner is the minimal subset of *agent.Runner used by RefineAgentSummary.
@@ -119,6 +128,13 @@ type createAgentSummaryReq struct {
 	// must also be >0 (enforced by service.ValidateAgentSave).
 	AgentMessageID  int64 `json:"agent_message_id,omitempty"`
 	SnapshotVersion int   `json:"snapshot_version,omitempty"`
+	// ScopeVersion + ExpectedArtifactVersion opt this request into the unified
+	// summary workspace's strict save boundary. Pointers distinguish an omitted
+	// legacy field from an explicitly invalid zero. In workspace mode the server
+	// validates both optimistic versions against the authoritative session and
+	// latest preview rows before persisting any formal summary.
+	ScopeVersion            *int `json:"scope_version,omitempty"`
+	ExpectedArtifactVersion *int `json:"expected_artifact_version,omitempty"`
 }
 
 // CreateAgentSummary handles POST /api/v1/summaries/agent.
@@ -152,6 +168,15 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	}
 	if agent.SummaryV2Enabled() && req.RequestID != "" && !requestIDPattern.MatchString(req.RequestID) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "request_id 非法"})
+		return
+	}
+	workspaceSave := isWorkspacePreviewSave(req)
+	if workspaceSave && h.workspaceEnabled != nil && !*h.workspaceEnabled {
+		c.JSON(http.StatusServiceUnavailable, apiResponse{Code: 50300, Message: "summary workspace is disabled"})
+		return
+	}
+	if err := validateWorkspacePreviewSaveRequest(req); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: err.Error()})
 		return
 	}
 	req.Title = strings.TrimSpace(req.Title)
@@ -190,6 +215,10 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "valid Idempotency-Key header is required"})
 		return
 	}
+	if workspaceSave && idempotencyKey == "" {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "valid Idempotency-Key header is required"})
+		return
+	}
 	var requestHash string
 	if idempotencyKey != "" {
 		if !validAgentSaveIdempotencyKey(idempotencyKey) {
@@ -211,14 +240,45 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		}
 	}
 
-	if req.OriginChannelID == nil {
-		// Not provided → resolve from session tool traces
-		resolvedID, resolvedType, err := h.resolveOriginChannelFromSession(c.Request.Context(), req.SessionID, userID)
-		if err != nil {
-			// DB error or other real failure → 500
-			log.Printf("[handler] resolveOriginChannelFromSession failed session=%s: %v", req.SessionID, err)
-			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "resolve origin channel failed"})
+	var workspaceCandidate workspacePreviewSaveCandidate
+	if workspaceSave {
+		candidate, loadErr := loadWorkspacePreviewForSave(
+			h.db.WithContext(c.Request.Context()), spaceID, userID, req, false,
+		)
+		if loadErr != nil {
+			if errors.Is(loadErr, errWorkspacePreviewSaveStale) {
+				writeWorkspacePreviewSaveConflict(c)
+				return
+			}
+			log.Printf("[handler] CreateAgentSummary load workspace preview failed space=%s user=%s session=%s: %v", spaceID, userID, req.SessionID, loadErr)
+			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "读取工作台草稿失败"})
 			return
+		}
+		workspaceCandidate = candidate
+		applyWorkspaceScopeToSaveRequest(&req, workspaceCandidate)
+		// The persisted scope has already passed the workspace contract's stricter
+		// normalization, but keep the legacy cap invariant explicit for downstream
+		// origin/citation code.
+		req.ReferencedTaskIDs = dedupReferencedTaskIDs(req.ReferencedTaskIDs)
+	}
+
+	if req.OriginChannelID == nil {
+		// Legacy saves may recover an omitted origin from their tool transcript.
+		// Workspace saves must not: the legacy lookup is keyed only by
+		// (user, public session) and cannot enforce the workspace's space boundary.
+		// Their persisted scope is authoritative; a reference-only preview falls
+		// through to the permission-checked referenced-summary origin below.
+		var resolvedID string
+		var resolvedType int
+		if !workspaceSave {
+			var resolveErr error
+			resolvedID, resolvedType, resolveErr = h.resolveOriginChannelFromSession(c.Request.Context(), req.SessionID, userID)
+			if resolveErr != nil {
+				// DB error or other real failure → 500
+				log.Printf("[handler] resolveOriginChannelFromSession failed session=%s: %v", req.SessionID, resolveErr)
+				c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "resolve origin channel failed"})
+				return
+			}
 		}
 		if resolvedID == "" {
 			// SUM-24 fallback failed (no fetch_channel in session — typical for
@@ -358,36 +418,51 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	if h.beforeDraftLoad != nil {
 		h.beforeDraftLoad()
 	}
-	draftMsg, err := loadAgentMessageForSave(h.db.WithContext(c.Request.Context()), req.SessionID, userID, req.AgentMessageID)
-	if err != nil {
-		if errors.Is(err, errNoAgentOutput) {
-			// A concurrent winner may have committed after our preflight and
-			// deleted the shared draft. Re-check the durable binding before
-			// reporting a missing output so an overlapping retry still replays.
-			if idempotencyKey != "" {
-				existing, mismatched, ok, stale, ferr := findAgentSaveIdempotentTaskWithHash(
-					c.Request.Context(), h.db, spaceID, userID, idempotencyKey, requestHash,
-				)
-				if ferr != nil {
-					log.Printf("[handler] CreateAgentSummary idempotency retry lookup failed space=%s user=%s key=%s: %v", spaceID, userID, idempotencyKey, ferr)
-					c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "idempotency check failed"})
-					return
+	var (
+		draftMsg model.AgentMessage
+		err      error
+	)
+	if workspaceSave {
+		draftMsg = workspaceCandidate.Message
+	} else {
+		draftMsg, err = loadAgentMessageForSave(h.db.WithContext(c.Request.Context()), req.SessionID, userID, req.AgentMessageID)
+		if err != nil {
+			if errors.Is(err, errNoAgentOutput) {
+				// A concurrent winner may have committed after our preflight and
+				// deleted the shared draft. Re-check the durable binding before
+				// reporting a missing output so an overlapping retry still replays.
+				if idempotencyKey != "" {
+					existing, mismatched, ok, stale, ferr := findAgentSaveIdempotentTaskWithHash(
+						c.Request.Context(), h.db, spaceID, userID, idempotencyKey, requestHash,
+					)
+					if ferr != nil {
+						log.Printf("[handler] CreateAgentSummary idempotency retry lookup failed space=%s user=%s key=%s: %v", spaceID, userID, idempotencyKey, ferr)
+						c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "idempotency check failed"})
+						return
+					}
+					if ok {
+						writeAgentSaveIdempotencyResponse(c, existing, mismatched, stale)
+						return
+					}
 				}
-				if ok {
-					writeAgentSaveIdempotencyResponse(c, existing, mismatched, stale)
-					return
-				}
+				c.JSON(http.StatusBadRequest, apiResponse{Code: 40004, Message: "session 无有效产出,请先在对话中生成总结再保存"})
+				return
 			}
-			c.JSON(http.StatusBadRequest, apiResponse{Code: 40004, Message: "session 无有效产出,请先在对话中生成总结再保存"})
+			log.Printf("[handler] CreateAgentSummary load session %s: %v", req.SessionID, err)
+			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "读取 session 产出失败"})
 			return
 		}
-		log.Printf("[handler] CreateAgentSummary load session %s: %v", req.SessionID, err)
-		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "读取 session 产出失败"})
-		return
+		if strings.TrimSpace(draftMsg.SpaceID) != "" || strings.TrimSpace(draftMsg.ResultType) != "" || draftMsg.TurnID > 0 {
+			c.JSON(http.StatusBadRequest, apiResponse{
+				Code:    40001,
+				Message: "workspace save requires scope_version and expected_artifact_version",
+			})
+			return
+		}
 	}
-	resolvedRequestID := req.RequestID
-	if agent.SummaryV2Enabled() {
-		resolvedRequestID, err = resolveAgentMessageRequestID(
+	runBinding := agentMessageRunBinding{RequestID: req.RequestID}
+	if agent.SummaryV2Enabled() || workspaceSave {
+		runBinding, err = resolveAgentMessageRunBinding(
 			c.Request.Context(), h.db, userID, req.SessionID, req.RequestID, draftMsg,
 		)
 		if err != nil {
@@ -403,7 +478,11 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			return
 		}
 	}
+	resolvedRequestID := runBinding.RequestID
 	content := draftMsg.Content
+	if workspaceSave {
+		content = workspaceCandidate.Content
+	}
 	resolvedAgentMessageID := draftMsg.ID
 
 	// Strip conversational preamble that agents sometimes leak despite prompt
@@ -414,11 +493,13 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	//   「好的。根据引用的老总结内容,我现在将其转化为...」
 	// then the actual `## Summary 服务上线项目总结报告`. Stripping the opener
 	// keeps the deliverable clean without asking users to hand-edit each time.
-	stripped := stripAgentPreamble(content)
-	if stripped != content {
-		log.Printf("[handler] CreateAgentSummary session %s: stripped %d chars of preamble", req.SessionID, len(content)-len(stripped))
+	if !workspaceSave {
+		stripped := stripAgentPreamble(content)
+		if stripped != content {
+			log.Printf("[handler] CreateAgentSummary session %s: stripped %d chars of preamble", req.SessionID, len(content)-len(stripped))
+		}
+		content = stripped
 	}
-	content = stripped
 
 	// SUM-BE1 (revised per SUM-9): real agent_save gate. Run the shared
 	// validator with the server-trusted content (post-strip) so a caller
@@ -472,9 +553,20 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 
 	now := timezone.Now()
 
-	// Time-range fields are non-null in the schema. Agent-created summaries do
-	// not carry a real range yet (the range lives inside the deliverable text);
-	// use now/now as a neutral placeholder so ordering still works.
+	// Legacy Agent saves do not carry a structured range and retain their
+	// historical now/now placeholder. A workspace preview, however, is saved
+	// from its server-owned scope: preserve an explicit range, or use the same
+	// visible seven-day default as the workspace Workflow path.
+	timeRangeStart, timeRangeEnd := now, now
+	if workspaceSave {
+		workspaceRange, rangeErr := workspaceAgentSaveTimeRange(workspaceCandidate.Scope, now)
+		if rangeErr != nil {
+			log.Printf("[handler] CreateAgentSummary invalid workspace time range space=%s user=%s session=%s: %v", spaceID, userID, req.SessionID, rangeErr)
+			writeWorkspacePreviewSaveConflict(c)
+			return
+		}
+		timeRangeStart, timeRangeEnd = workspaceRange.Start, workspaceRange.End
+	}
 	task := model.SummaryTask{
 		TaskNo:            taskNo,
 		SpaceID:           spaceID,
@@ -482,8 +574,8 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		Title:             title,
 		Topic:             title,
 		SummaryMode:       model.ModeByPerson,
-		TimeRangeStart:    now,
-		TimeRangeEnd:      now,
+		TimeRangeStart:    timeRangeStart,
+		TimeRangeEnd:      timeRangeEnd,
 		Status:            model.StatusCompleted,
 		TriggerType:       model.TriggerAgent,
 		OriginChannelID:   finalChannelID,
@@ -508,6 +600,34 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	var finishGaps []finishgate.Gap
 	var savedCitations []model.Citation
 	err = h.db.Transaction(func(tx *gorm.DB) error {
+		if workspaceSave {
+			lockedCandidate, lockErr := loadWorkspacePreviewForSave(tx, spaceID, userID, req, true)
+			if lockErr != nil {
+				return lockErr
+			}
+			// Use the locked payload as the final content source. AgentMessage.Content
+			// is only the short conversational reply in workspace mode.
+			workspaceCandidate = lockedCandidate
+			draftMsg = lockedCandidate.Message
+			content = lockedCandidate.Content
+			lockedBinding, bindingErr := resolveAgentMessageRunBinding(
+				c.Request.Context(), tx, userID, req.SessionID, req.RequestID, draftMsg,
+			)
+			if bindingErr != nil {
+				if errors.Is(bindingErr, errAgentMessageRunMismatch) {
+					return fmt.Errorf("%w: preview run binding changed", errWorkspacePreviewSaveStale)
+				}
+				return bindingErr
+			}
+			runBinding = lockedBinding
+			resolvedRequestID = lockedBinding.RequestID
+			lockedRange, rangeErr := workspaceAgentSaveTimeRange(lockedCandidate.Scope, now)
+			if rangeErr != nil {
+				return fmt.Errorf("%w: invalid workspace time range", errWorkspacePreviewSaveStale)
+			}
+			task.TimeRangeStart = lockedRange.Start
+			task.TimeRangeEnd = lockedRange.End
+		}
 		if err := tx.Create(&task).Error; err != nil {
 			return fmt.Errorf("create summary_task: %w", err)
 		}
@@ -572,8 +692,24 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			CreatedAt:        now,
 			UpdatedAt:        now,
 		}
-		// Build citations from session tool traces (fallback to empty array on error)
-		cits, cerr := h.buildCitationsForSessionWithDB(c.Request.Context(), tx, req.SessionID, content, userID, req.RequestID)
+		// Build citations from the selected preview's persisted run lineage.
+		// Workspace revisions that did not fetch may inherit only from their
+		// explicit parent preview chain; legacy saves preserve best-effort fallback.
+		var cits []model.Citation
+		var cerr error
+		workspaceCitationFallback := false
+		if workspaceSave {
+			cits, workspaceCitationFallback, cerr = h.buildWorkspacePreviewCitations(
+				c.Request.Context(), tx, userID, req.SessionID, content, workspaceCandidate, runBinding,
+			)
+		} else {
+			cits, cerr = h.buildCitationsForSessionWithDB(
+				c.Request.Context(), tx, req.SessionID, content, userID, resolvedRequestID,
+			)
+		}
+		if cerr != nil && workspaceSave {
+			return cerr
+		}
 		if cerr != nil {
 			log.Printf("[handler] buildCitationsForSession failed session=%s: %v (fallback to empty)", req.SessionID, cerr)
 			cits = nil
@@ -589,10 +725,11 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		// Without this, refined content shows "[n]" markers pointing at an
 		// empty citations array → frontend renders broken/dangling refs.
 		if len(cits) == 0 && len(req.ReferencedTaskIDs) > 0 {
-			borrowedCits, unresolvedMarkers := h.borrowCitationsFromReference(
-				c.Request.Context(), req.ReferencedTaskIDs[0], spaceID, userID)
+			borrowedCits, unresolvedMarkers := h.borrowCitationsFromReferenceWithDB(
+				c.Request.Context(), tx, req.ReferencedTaskIDs[0], spaceID, userID)
 			if len(borrowedCits) > 0 {
 				cits = borrowedCits
+				workspaceCitationFallback = false
 				log.Printf("[handler] CreateAgentSummary borrowed %d citations from referenced task_id=%d session=%s",
 					len(cits), req.ReferencedTaskIDs[0], req.SessionID)
 			} else if len(unresolvedMarkers) > 0 {
@@ -605,14 +742,26 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 				// artifact. Unrelated bracketed integers remain user content.
 				content = stripUnresolvedCitationMarkers(content, unresolvedMarkers)
 				creatorPR.Content = content
+				workspaceCitationFallback = contentHasCitationSequence(content)
 				log.Printf("[handler] CreateAgentSummary stripped dangling citation markers (borrow returned empty) session=%s ref_task_id=%d",
 					req.SessionID, req.ReferencedTaskIDs[0])
 			}
 		}
+		if workspaceSave && len(cits) > 0 && contentHasCitationMarker(content) && !citationsValid(content, cits, true) {
+			return fmt.Errorf("%w: fallback citations do not resolve preview markers", errWorkspacePreviewCitationUnresolved)
+		}
+		if workspaceSave && workspaceCitationFallback && contentHasCitationSequence(content) {
+			return fmt.Errorf("%w: no evidence or referenced artifact resolves preview markers", errWorkspacePreviewCitationUnresolved)
+		}
 		creatorPR.SetCitations(cits)
 		savedCitations = cits
 		// Build v1 snapshot for agent-generated summary
-		snapshot := h.buildSnapshotV1(tx, req.SessionID, userID, &task, req.Sources)
+		var snapshot *model.Snapshot
+		if workspaceSave {
+			snapshot = h.buildSnapshotV1(tx, req.SessionID, userID, &task, req.Sources, spaceID)
+		} else {
+			snapshot = h.buildSnapshotV1(tx, req.SessionID, userID, &task, req.Sources)
+		}
 		creatorPR.SetSnapshot(snapshot)
 		if err := tx.Create(&creatorPR).Error; err != nil {
 			return fmt.Errorf("create creator personal_result: %w", err)
@@ -663,19 +812,20 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			}
 		}
 
-		// Session lifecycle: chat is a "temporary workshop" — once the
-		// deliverable is persisted, DELETE all agent_message rows for this
-		// session so the workshop cannot be revisited (see
-		// CHAT-REFERENCE-BASED-DESIGN-v1 §core mental model).
-		//
-		// Best-effort within the transaction: if the DELETE fails we still
-		// let the whole transaction commit (the summary was saved fine, we
-		// just leave orphan message rows for a cleanup cron). A failure
-		// here should NOT block the user from seeing their saved summary.
-		// owner-scoped：只删本 uid 的记录，防止 session_id 撞车时误删他人（SUM-158 blocker 1）。
-		if err := tx.Where("user_id = ? AND session_id = ?", userID, req.SessionID).Delete(&model.AgentMessage{}).Error; err != nil {
-			log.Printf("[handler] CreateAgentSummary: session cleanup DELETE failed session=%s: %v (summary was saved OK, orphan rows will remain)", req.SessionID, err)
-			// Intentionally do NOT return err — the summary is safely saved.
+		if workspaceSave {
+			// Unified-workspace history remains available after save. Mark both
+			// authoritative rows in the same transaction as the formal summary so
+			// History immediately removes save_preview and concurrent saves fail.
+			if err := markWorkspacePreviewSaved(tx, spaceID, userID, req.SessionID, workspaceCandidate, task.ID); err != nil {
+				return err
+			}
+		} else {
+			// Legacy session lifecycle: chat is a temporary workshop. Preserve the
+			// established best-effort cleanup behavior for callers that did not opt
+			// into the workspace contract.
+			if err := tx.Where("space_id = ? AND user_id = ? AND session_id = ?", legacyAgentMessageSpaceID, userID, req.SessionID).Delete(&model.AgentMessage{}).Error; err != nil {
+				log.Printf("[handler] CreateAgentSummary: session cleanup DELETE failed session=%s: %v (summary was saved OK, orphan rows will remain)", req.SessionID, err)
+			}
 		}
 
 		return nil
@@ -692,6 +842,32 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			return
 		}
 		writeAgentSaveIdempotencyResponse(c, existing, mismatched, stale)
+		return
+	}
+	if errors.Is(err, errWorkspacePreviewCitationUnresolved) {
+		log.Printf("[handler] CreateAgentSummary rejected unresolved workspace citations space=%s user=%s session=%s: %v", spaceID, userID, req.SessionID, err)
+		writeWorkspacePreviewCitationConflict(c)
+		return
+	}
+	if errors.Is(err, errWorkspacePreviewSaveStale) {
+		// A concurrent same-key save may have committed after preflight. Prefer
+		// the durable idempotency binding over a stale-preview response.
+		if idempotencyKey != "" {
+			existing, mismatched, ok, stale, ferr := findAgentSaveIdempotentTaskWithHash(
+				c.Request.Context(), h.db, spaceID, userID, idempotencyKey, requestHash,
+			)
+			if ferr != nil {
+				log.Printf("[handler] CreateAgentSummary workspace replay lookup failed space=%s user=%s key=%s: %v", spaceID, userID, idempotencyKey, ferr)
+				c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "idempotency check failed"})
+				return
+			}
+			if ok {
+				writeAgentSaveIdempotencyResponse(c, existing, mismatched, stale)
+				return
+			}
+		}
+		log.Printf("[handler] CreateAgentSummary rejected stale workspace preview space=%s user=%s session=%s: %v", spaceID, userID, req.SessionID, err)
+		writeWorkspacePreviewSaveConflict(c)
 		return
 	}
 	if err != nil {
@@ -795,11 +971,16 @@ func (h *AgentSummaryHandler) buildSnapshotV1(
 	sessionID, userID string,
 	task *model.SummaryTask,
 	sources []sourceReq,
+	workspaceSpaceID ...string,
 ) *model.Snapshot {
 	// Build tool_summary: count tool invocations by name
 	var toolMessages []model.AgentMessage
-	if err := db.Where("user_id = ? AND session_id = ? AND role = ?", userID, sessionID, "tool").
-		Find(&toolMessages).Error; err != nil {
+	messageSpaceID := legacyAgentMessageSpaceID
+	if len(workspaceSpaceID) > 0 && strings.TrimSpace(workspaceSpaceID[0]) != "" {
+		messageSpaceID = strings.TrimSpace(workspaceSpaceID[0])
+	}
+	toolQuery := db.Where("space_id = ? AND user_id = ? AND session_id = ? AND role = ?", messageSpaceID, userID, sessionID, "tool")
+	if err := toolQuery.Find(&toolMessages).Error; err != nil {
 		log.Printf("[handler] buildSnapshotV1: failed to query tool messages: %v", err)
 		// fallback to empty array on error
 	}

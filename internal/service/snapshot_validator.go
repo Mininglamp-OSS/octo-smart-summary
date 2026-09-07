@@ -112,7 +112,7 @@ func scopeHasSignal(scope model.SnapshotScope) bool {
 //   - explicitTimeRange: whether the caller supplied time_range at all.
 //   - explicitTimeStart / explicitTimeEnd: the caller-supplied endpoints;
 //     when explicitTimeRange is true both must be non-zero.
-//   - maxDays: pipeline.DefaultTimeRangeDays passed explicitly so the
+//   - maxDays: pipeline.MaxTimeRangeDays passed explicitly so the
 //     validator has no runtime dependency on a mutable global.
 func ValidatePersonalWorkflow(
 	actor, title, topic string,

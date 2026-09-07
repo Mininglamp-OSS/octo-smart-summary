@@ -44,12 +44,20 @@ type TaskHandler struct {
 	customTemplateLimit int
 	// attentionCache serves the polling endpoint only. See attention.go for
 	// the TTL and the no-invalidation rationale.
-	attentionCache *attentionCache
+	attentionCache  *attentionCache
+	summaryWorkflow *service.SummaryWorkflowService
 }
 
 // NewTaskHandler creates a new TaskHandler.
 func NewTaskHandler(db, imDB *gorm.DB, workerTriggerURL string) *TaskHandler {
-	return &TaskHandler{db: db, imDB: imDB, workerTriggerURL: workerTriggerURL, customTemplateLimit: defaultCustomTemplateLimit, attentionCache: newAttentionCache()}
+	return &TaskHandler{
+		db:                  db,
+		imDB:                imDB,
+		workerTriggerURL:    workerTriggerURL,
+		customTemplateLimit: defaultCustomTemplateLimit,
+		attentionCache:      newAttentionCache(),
+		summaryWorkflow:     service.NewSummaryWorkflowService(db, imDB, pipeline.DefaultTimeRangeDays, pipeline.DefaultTimeRangeDays),
+	}
 }
 
 func (h *TaskHandler) SetCustomTemplateLimit(limit int) {
@@ -345,233 +353,87 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: err.Error()})
 		return
 	}
-
-	if req.ConfirmTimeoutHours <= 0 {
-		req.ConfirmTimeoutHours = 24
-	}
-
-	effectiveUID := req.UID
-	if effectiveUID == "" {
-		effectiveUID = userID
-	}
-
-	// Auto-fill sources from origin_channel BEFORE validation so the
-	// scope-signal check sees the expanded source list. Note this runs even
-	// when origin_channel_type is out of range — the shared validator below
-	// still rejects the malformed origin_channel_type before any DB write.
-	if len(req.Sources) == 0 && req.OriginChannelID != "" && req.OriginChannelType >= model.OriginChannelGroup && req.OriginChannelType <= model.OriginChannelDM {
-		req.Sources = []sourceReq{{
-			SourceType: req.OriginChannelType,
-			SourceID:   req.OriginChannelID,
-		}}
-	}
-
-	// Resolve time range up-front so the shared validator sees the caller's
-	// intended range. Only pass a real range into the validator when the
-	// caller sent one — leaving TimeStart/TimeEnd zero on scopeInput keeps
-	// the pre-refactor behaviour where the server-computed default range
-	// never triggered the span check.
-	maxDays := pipeline.DefaultTimeRangeDays
-	var timeStart, timeEnd time.Time
-	explicitTimeRange := req.TimeRange != nil
-	if explicitTimeRange {
-		timeStart = req.TimeRange.Start
-		timeEnd = req.TimeRange.End
-	} else {
-		timeEnd = timezone.Now()
-		timeStart = timeEnd.Add(-time.Duration(maxDays) * 24 * time.Hour)
-	}
-
-	// SUM-BE1 (revised per SUM-9): call the shared validator with the ACTUAL
-	// model.SnapshotScope the pipeline downstream will use. ChannelIDs come
-	// from req.Sources (post-origin-channel autofill above); TimeRange
-	// carries the caller-supplied range (only when explicit, so the default
-	// server-computed range still passes untouched). No parallel DTO — the
-	// shared model.SnapshotScope is the validation input.
-	scope := model.SnapshotScope{
-		ChannelIDs: channelIDsFromSources(req.Sources),
-	}
-	if explicitTimeRange {
-		scope.TimeRange = model.TimeRangeJSON{
-			Start: timeStart.Format(time.RFC3339),
-			End:   timeEnd.Format(time.RFC3339),
-		}
-	}
-	var validatorStart, validatorEnd time.Time
-	if explicitTimeRange {
-		validatorStart, validatorEnd = timeStart, timeEnd
-	}
-	if bizE := service.ValidatePersonalWorkflow(
-		userID,
-		req.Title, req.Topic,
-		scope,
-		len(req.Sources),
-		req.OriginChannelID, req.OriginChannelType,
-		explicitTimeRange,
-		validatorStart, validatorEnd,
-		maxDays,
-	); bizE != nil {
-		bizErr(c, bizE)
+	keyHeader := http.CanonicalHeaderKey("Idempotency-Key")
+	keyValues, keyPresent := c.Request.Header[keyHeader]
+	idempotencyKey := strings.TrimSpace(c.GetHeader(keyHeader))
+	if keyPresent && (len(keyValues) != 1 || idempotencyKey == "") {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "valid Idempotency-Key header is required"})
 		return
 	}
 
-	summaryMode := model.ModeByPerson
-
-	// Resolve sources: use user-specified sources directly.
-	// When no sources are specified, the pipeline Layer 3 (NarrowByTopic)
-	// will use LLM to select relevant channels from all user channels.
-	var sourceList []sourceReq
-	if len(req.Sources) > 0 {
-		sourceList = req.Sources
+	workflowInput := service.LegacyCreateSummaryWorkflowInput{
+		ActorID:             userID,
+		CreatorID:           req.UID,
+		SpaceID:             spaceID,
+		Title:               req.Title,
+		Topic:               req.Topic,
+		ConfirmTimeoutHours: req.ConfirmTimeoutHours,
+		OriginChannelID:     req.OriginChannelID,
+		OriginChannelType:   req.OriginChannelType,
+		IdempotencyKey:      idempotencyKey,
 	}
-	// R10: dedup by (source_type, source_id) before insert.
-	// uk_summary_source_task_type_id (migration 20260814-01) would turn a
-	// duplicate client input into a 500; the create endpoint previously
-	// silently persisted the duplicates, so dedup here preserves the old
-	// accepting behaviour while keeping the table structurally clean.
-	if len(sourceList) > 1 {
-		deduped := make([]sourceReq, 0, len(sourceList))
-		seen := make(map[string]struct{}, len(sourceList))
-		for _, s := range sourceList {
-			key := fmt.Sprintf("%d:%s", s.SourceType, s.SourceID)
-			if _, dup := seen[key]; dup {
-				continue
-			}
-			seen[key] = struct{}{}
-			deduped = append(deduped, s)
+	if req.TimeRange != nil {
+		workflowInput.TimeRange = &service.SummaryWorkflowTimeRange{
+			Start: req.TimeRange.Start,
+			End:   req.TimeRange.End,
 		}
-		sourceList = deduped
 	}
-
-	if len(req.Participants) == 0 {
-		req.Participants = []participantReq{{UserID: effectiveUID}}
+	workflowInput.Sources = make([]service.SummaryWorkflowSource, 0, len(req.Sources))
+	for _, source := range req.Sources {
+		workflowInput.Sources = append(workflowInput.Sources, service.SummaryWorkflowSource{
+			SourceType: source.SourceType,
+			SourceID:   source.SourceID,
+		})
 	}
-
-	taskNo := service.GenerateTaskNo()
-	title := req.Title
-	if title == "" {
-		title = req.Topic
-	}
-	if title == "" {
-		title = "总结-" + taskNo[len(taskNo)-8:]
+	workflowInput.Participants = make([]service.SummaryWorkflowParticipant, 0, len(req.Participants))
+	for _, participant := range req.Participants {
+		workflowInput.Participants = append(workflowInput.Participants, service.SummaryWorkflowParticipant{
+			UserID:   participant.UserID,
+			UserName: participant.UserName,
+		})
 	}
 
-	initialStatus := model.StatusPending
-	dl := timezone.Now().Add(time.Duration(req.ConfirmTimeoutHours) * time.Hour)
-	confirmDeadline := &dl
-
-	task := model.SummaryTask{
-		TaskNo:            taskNo,
-		SpaceID:           spaceID,
-		CreatorID:         effectiveUID,
-		Title:             title,
-		Topic:             req.Topic,
-		SummaryMode:       summaryMode,
-		TimeRangeStart:    timeStart,
-		TimeRangeEnd:      timeEnd,
-		Status:            initialStatus,
-		TriggerType:       model.TriggerManual,
-		ConfirmDeadline:   confirmDeadline,
-		OriginChannelID:   req.OriginChannelID,
-		OriginChannelType: req.OriginChannelType,
+	workflow := h.summaryWorkflow
+	if workflow == nil {
+		workflow = service.NewSummaryWorkflowService(h.db, h.imDB, pipeline.DefaultTimeRangeDays, pipeline.DefaultTimeRangeDays)
 	}
-
-	log.Printf("[handler] CreateSummary space=%s user=%s mode=%d", spaceID, effectiveUID, summaryMode)
-
-	var creatorParticipantID int64
-	err := h.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(&task).Error; err != nil {
-			return err
-		}
-		for _, s := range sourceList {
-			src := model.SummarySource{
-				TaskID:     task.ID,
-				SourceType: s.SourceType,
-				SourceID:   s.SourceID,
-				SourceName: service.ResolveSourceNameWithType(s.SourceID, s.SourceType, h.imDB),
-			}
-			if err := tx.Create(&src).Error; err != nil {
-				return err
-			}
-		}
-		now := timezone.Now()
-		creatorP := model.SummaryParticipant{
-			TaskID:      task.ID,
-			UserID:      effectiveUID,
-			UserName:    service.ResolveUserName(effectiveUID),
-			Status:      model.ParticipantAccepted,
-			ConfirmedAt: &now,
-		}
-		if err := tx.Create(&creatorP).Error; err != nil {
-			return err
-		}
-
-		creatorPR := model.PersonalResult{
-			TaskID:           task.ID,
-			ParticipantRefID: creatorP.ID,
-			UserID:           effectiveUID,
-			WorkerStatus:     model.PersonalStatusPending,
-			CreatedAt:        now,
-			UpdatedAt:        now,
-		}
-		if err := tx.Create(&creatorPR).Error; err != nil {
-			return err
-		}
-		if err := tx.Model(&creatorP).Update("personal_result_id", creatorPR.ID).Error; err != nil {
-			return err
-		}
-		creatorParticipantID = creatorP.ID
-
-		seenParticipant := map[string]struct{}{effectiveUID: {}}
-		for _, p := range req.Participants {
-			if p.UserID == effectiveUID {
-				continue
-			}
-			// De-duplicate repeated participant ids up front: the
-			// (task_id,user_id) unique index would otherwise turn a duplicate
-			// payload into a 1062 -> 500 instead of a clean insert.
-			if _, dup := seenParticipant[p.UserID]; dup {
-				continue
-			}
-			seenParticipant[p.UserID] = struct{}{}
-			pp := model.SummaryParticipant{
-				TaskID: task.ID,
-				UserID: p.UserID,
-				UserName: func() string {
-					if p.UserName != "" {
-						return p.UserName
-					}
-					return service.ResolveUserName(p.UserID)
-				}(),
-			}
-			if err := tx.Create(&pp).Error; err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	created, err := workflow.CreateFromLegacyHTTP(c.Request.Context(), workflowInput)
 	if err != nil {
-		log.Printf("[handler] CreateSummary tx error: %v", err)
+		var idempotencyErr *service.SummaryWorkflowIdempotencyError
+		if errors.As(err, &idempotencyErr) {
+			c.JSON(idempotencyErr.BizError.HTTPStatus, apiResponse{
+				Code:    idempotencyErr.BizError.Code,
+				Message: idempotencyErr.BizError.Message,
+				Data: gin.H{
+					"existing_task_id": idempotencyErr.ExistingTaskID,
+					"reason":           idempotencyErr.Reason,
+					"recovery_action":  idempotencyErr.RecoveryAction,
+				},
+			})
+			return
+		}
+		var bizE *service.BizError
+		if errors.As(err, &bizE) {
+			bizErr(c, bizE)
+			return
+		}
+		log.Printf("[handler] CreateSummary service error: %v", err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
 		return
 	}
 
-	// Trigger personal worker for creator (async, after tx committed)
-	if creatorParticipantID > 0 {
-		go h.triggerWorker(model.WorkerTriggerRequest{
-			Type:             "personal_summary",
-			TaskID:           task.ID,
-			ParticipantRefID: creatorParticipantID,
-		})
+	log.Printf("[handler] CreateSummary space=%s user=%s target=%s replayed=%t", spaceID, created.Task.CreatorID, created.Target, created.Replayed)
+	if created.WorkerTrigger != nil {
+		go h.triggerWorker(*created.WorkerTrigger)
 	}
 
 	result := gin.H{
-		"task_id":    task.ID,
-		"task_no":    task.TaskNo,
-		"status":     task.Status,
-		"created_at": task.CreatedAt.Format(time.RFC3339),
+		"task_id":    created.Task.ID,
+		"task_no":    created.Task.TaskNo,
+		"status":     created.Task.Status,
+		"created_at": created.Task.CreatedAt.Format(time.RFC3339),
 	}
-	if len(req.Sources) == 0 {
+	if created.Inferred {
 		result["inferred"] = true
 	}
 	ok(c, result)

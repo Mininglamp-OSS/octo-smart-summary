@@ -16,8 +16,8 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 )
 
-// TestFindSharedChannelsDoesNotRecordScopeWithoutParticipants pins round-7 P1-2
-// AT THE CALL SITE.
+// TestFindSharedChannelsOnlyRecordsDeclaredScope pins the separation between
+// discovery candidates and the final fetchable/coverage scope at the call site.
 //
 // It has to be pinned here and not on IntersectParticipantChannels: mutation
 // verification showed the guard in tool_find_shared.go could be deleted with
@@ -31,11 +31,7 @@ import (
 // through a sibling handler the exact input list_channels was deliberately
 // stopped from recording two rounds ago. `required` in the tool schema is
 // advisory metadata sent to the model, not validation.
-//
-// Because the stored union is monotonic, one such call poisons the rest of the
-// run: every later clean single-channel fetch still reports the other visible
-// channels as never-fetched gaps, shipped to clients via SS-11.
-func TestFindSharedChannelsDoesNotRecordScopeWithoutParticipants(t *testing.T) {
+func TestFindSharedChannelsOnlyRecordsDeclaredScope(t *testing.T) {
 	imDB := setupAgentImDB(t)
 	// user-1 can see three channels.
 	for _, id := range []string{"chan-A", "chan-B", "chan-C"} {
@@ -61,8 +57,12 @@ func TestFindSharedChannelsDoesNotRecordScopeWithoutParticipants(t *testing.T) {
 		t.Fatalf("create run: %v", err)
 	}
 
-	ctx := context.WithValue(context.Background(), ContextKeyUID, "user-1")
-	ctx = context.WithValue(ctx, ContextKeyRunID, run.RunID)
+	openContext := func() context.Context {
+		ctx := context.WithValue(context.Background(), ContextKeyUID, "user-1")
+		ctx = context.WithValue(ctx, ContextKeyRunID, run.RunID)
+		ctx = WithWorkspaceSpaceID(ctx, "test-space")
+		return WithDiscoverableChannelScope(ctx)
+	}
 
 	_, handler := FindSharedChannelsTool()
 
@@ -83,33 +83,43 @@ func TestFindSharedChannelsDoesNotRecordScopeWithoutParticipants(t *testing.T) {
 	}
 
 	t.Run("empty participant list records nothing", func(t *testing.T) {
+		ctx := openContext()
 		if _, err := handler(ctx, json.RawMessage(`{"participant_uids": []}`)); err != nil {
 			t.Fatalf("handler: %v", err)
 		}
-		if got := discovered(); len(got) != 0 {
-			t.Fatalf("discovered_channels = %v, want empty — with no participants this is the full visible surface, not scope", got)
+		if err := DeclareWorkspaceScopeChange(ctx, WorkspaceScopeChange{SourceMode: WorkspaceSourceReplace, Channels: []ChannelScope{{ChannelID: "chan-A", ChannelType: model.ChannelTypeGroup}}}); err == nil {
+			t.Fatal("empty participant query authorized the full visible surface")
 		}
 	})
 
 	t.Run("omitted participant list records nothing", func(t *testing.T) {
+		ctx := openContext()
 		if _, err := handler(ctx, json.RawMessage(`{}`)); err != nil {
 			t.Fatalf("handler: %v", err)
 		}
-		if got := discovered(); len(got) != 0 {
-			t.Fatalf("discovered_channels = %v, want empty", got)
+		if err := DeclareWorkspaceScopeChange(ctx, WorkspaceScopeChange{SourceMode: WorkspaceSourceReplace, Channels: []ChannelScope{{ChannelID: "chan-A", ChannelType: model.ChannelTypeGroup}}}); err == nil {
+			t.Fatal("omitted participant query authorized the full visible surface")
 		}
 	})
 
-	t.Run("a real intersection is still recorded", func(t *testing.T) {
+	t.Run("a real intersection is recorded only after declaration", func(t *testing.T) {
 		// user-2 shares only chan-B.
 		imDB.Exec(`INSERT INTO group_member (group_no, uid, is_deleted, role) VALUES ('chan-B', 'user-2', 0, 0)`)
 
+		ctx := openContext()
 		if _, err := handler(ctx, json.RawMessage(`{"participant_uids": ["user-2"]}`)); err != nil {
 			t.Fatalf("handler: %v", err)
 		}
+		if got := discovered(); len(got) != 0 {
+			t.Fatalf("discovery alone recorded final coverage scope: %v", got)
+		}
+		_, setScope := SetSummaryScopeTool()
+		if _, err := setScope(ctx, json.RawMessage(`{"source_mode":"replace","channels":[{"channel_id":"chan-B","channel_type":2}]}`)); err != nil {
+			t.Fatalf("declare shared channel: %v", err)
+		}
 		got := discovered()
 		if len(got) == 0 {
-			t.Fatal("a genuine intersection must still be recorded as scope, got nothing")
+			t.Fatal("declared shared intersection must be recorded as final scope")
 		}
 		for _, id := range got {
 			if id != "chan-B" {
