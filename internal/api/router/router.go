@@ -2,6 +2,7 @@ package router
 
 import (
 	"net/http"
+	"os"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/handler"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/ws"
@@ -60,6 +61,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	personalH.SetLLM(refineLLM)
 	streamH := handler.NewStreamHandler(db, streamHub)
 	shareH := handler.NewShareHandler(db, imDB)
+	contentReadH := handler.NewContentReadHandler(db, os.Getenv("SUMMARY_CONTENT_READ_SPACES"))
 
 	// Bot-facing mount (read plus owner-scoped create). Identity and space both come from
 	// verify-bot; this group deliberately does not use the human-token or space middleware.
@@ -91,6 +93,9 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		// response cache after a user action.
 		v1.GET("/summaries/attention", taskH.GetAttention)
 		v1.GET("/summaries/:id", taskH.GetSummary)
+		v1.GET("/summaries/:id/contents", contentReadH.Catalog)
+		v1.GET("/summaries/:id/contents/:content_id/versions", contentReadH.Versions)
+		v1.GET("/summaries/:id/contents/:content_id/versions/:version_id", contentReadH.Version)
 		v1.POST("/summaries/:id/shares", shareH.Create)
 		v1.GET("/summary-shares/:share_id", shareH.Get)
 		v1.DELETE("/summary-shares/:share_id", shareH.Revoke)

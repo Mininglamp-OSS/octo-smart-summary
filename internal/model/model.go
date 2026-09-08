@@ -169,6 +169,12 @@ type SummaryTask struct {
 	AgentSessionID  string `gorm:"column:agent_session_id;type:varchar(128);not null;default:'';index:idx_summary_task_agent_session" json:"agent_session_id,omitempty"`
 	AgentMessageID  int64  `gorm:"column:agent_message_id;not null;default:0" json:"agent_message_id,omitempty"`
 	SnapshotVersion int    `gorm:"column:snapshot_version;type:int;not null;default:0" json:"snapshot_version,omitempty"`
+	// CreatedVia records provenance, never the most recent execution engine.
+	// Unknown legacy provenance must not be inferred from TriggerScheduled.
+	CreatedVia         string `gorm:"column:created_via;type:varchar(16);not null;default:'unknown'" json:"created_via"`
+	GenerationSpecJSON JSON   `gorm:"column:generation_spec_json;type:json" json:"-"`
+	ConfigRevision     int64  `gorm:"column:config_revision;not null;default:0" json:"config_revision"`
+	ContentRevision    int64  `gorm:"column:content_revision;not null;default:0" json:"content_revision"`
 }
 
 // SummaryBotCreateIdempotency binds one bot request key to the task created
@@ -319,23 +325,30 @@ type TeamCitation struct {
 
 // SummaryResult represents the final summary output.
 type SummaryResult struct {
-	ID                int64      `gorm:"primaryKey;autoIncrement" json:"id"`
-	TaskID            int64      `gorm:"column:task_id;not null" json:"task_id"`
-	Content           string     `gorm:"column:content;type:mediumtext;not null" json:"content"`
-	CitationsJSON     string     `gorm:"column:citations_json;type:mediumtext" json:"-"`
-	TeamCitationsJSON string     `gorm:"column:team_citations_json;type:mediumtext" json:"-"`
-	TotalMsgCount     int        `gorm:"column:total_msg_count;not null;default:0" json:"total_msg_count"`
-	TotalTokenUsed    int        `gorm:"column:total_token_used;not null;default:0" json:"total_token_used"`
-	ModelVersion      string     `gorm:"column:model_version;type:varchar(50);not null;default:''" json:"model_version"`
-	Version           int        `gorm:"column:version;not null;default:1" json:"version"`
-	OperationType     string     `gorm:"column:operation_type;type:varchar(32);not null;default:'generate'" json:"operation_type"`
-	OperationNote     string     `gorm:"column:operation_note;type:text" json:"operation_note"`
-	ParentResultID    *int64     `gorm:"column:parent_result_id" json:"parent_result_id,omitempty"`
-	CreatedBy         string     `gorm:"column:created_by;type:varchar(64);not null;default:''" json:"created_by"`
-	EditedAt          *time.Time `gorm:"column:edited_at" json:"edited_at"`
-	GeneratedAt       time.Time  `gorm:"column:generated_at;not null" json:"generated_at"`
-	CreatedAt         time.Time  `gorm:"column:created_at;not null" json:"created_at"`
-	UpdatedAt         time.Time  `gorm:"column:updated_at;not null" json:"updated_at"`
+	ID                     int64      `gorm:"primaryKey;autoIncrement" json:"id"`
+	TaskID                 int64      `gorm:"column:task_id;not null" json:"task_id"`
+	Content                string     `gorm:"column:content;type:mediumtext;not null" json:"content"`
+	CitationsJSON          string     `gorm:"column:citations_json;type:mediumtext" json:"-"`
+	TeamCitationsJSON      string     `gorm:"column:team_citations_json;type:mediumtext" json:"-"`
+	TotalMsgCount          int        `gorm:"column:total_msg_count;not null;default:0" json:"total_msg_count"`
+	TotalTokenUsed         int        `gorm:"column:total_token_used;not null;default:0" json:"total_token_used"`
+	ModelVersion           string     `gorm:"column:model_version;type:varchar(50);not null;default:''" json:"model_version"`
+	Version                int        `gorm:"column:version;not null;default:1" json:"version"`
+	OperationType          string     `gorm:"column:operation_type;type:varchar(32);not null;default:'generate'" json:"operation_type"`
+	OperationNote          string     `gorm:"column:operation_note;type:text" json:"operation_note"`
+	ParentResultID         *int64     `gorm:"column:parent_result_id" json:"parent_result_id,omitempty"`
+	CreatedBy              string     `gorm:"column:created_by;type:varchar(64);not null;default:''" json:"created_by"`
+	EditedAt               *time.Time `gorm:"column:edited_at" json:"edited_at"`
+	GeneratedAt            time.Time  `gorm:"column:generated_at;not null" json:"generated_at"`
+	CreatedAt              time.Time  `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt              time.Time  `gorm:"column:updated_at;not null" json:"updated_at"`
+	ContentRevision        int64      `gorm:"column:content_revision;not null;default:0" json:"content_revision"`
+	BaseContentRevision    int64      `gorm:"column:base_content_revision;not null;default:0" json:"base_content_revision"`
+	GenerationSpecSnapshot JSON       `gorm:"column:generation_spec_snapshot;type:json" json:"-"`
+	GenerationID           *string    `gorm:"column:generation_id;type:varchar(36);uniqueIndex:uk_result_generation" json:"generation_id,omitempty"`
+	EditedBy               string     `gorm:"column:edited_by;type:varchar(64);not null;default:''" json:"edited_by,omitempty"`
+	RestoredFromVersionID  *int64     `gorm:"column:restored_from_version_id" json:"-"`
+	RestoredAt             *time.Time `gorm:"column:restored_at" json:"restored_at,omitempty"`
 }
 
 // GetCitations deserializes CitationsJSON into a slice of Citation.

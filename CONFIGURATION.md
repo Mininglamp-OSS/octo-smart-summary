@@ -2,6 +2,23 @@
 
 All configuration is done via environment variables.
 
+## Formal-content compatibility reads (development phase)
+
+`SUMMARY_CONTENT_READ_SPACES` is an exact, comma-separated Space allowlist for
+the additive `/api/v1/summaries/:id/contents` and content-scoped version GET APIs.
+It defaults to empty; `*` does not enable all Spaces. Restart the API after
+changing it. It is independent of `SUMMARY_WORKBENCH_ENABLED`.
+
+This first migration phase does **not** enable new edits, restores, generation,
+schedule writes or history retention. The response explicitly returns disabled
+write capabilities and `write_protocol_not_enabled`. Keep the current UI and
+legacy writer behavior until all API/worker/scheduler paths use the shared
+protocol. GET never creates a personal V1 or repairs history.
+
+Apply the forward-compatible schema before serving these reads. Retain the
+new schema on rollback. Do not activate new write semantics or disable legacy
+cleanup using the read flag alone.
+
 ## Environment Variables
 
 | Variable | Description | Required | Default |

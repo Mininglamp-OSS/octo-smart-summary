@@ -1,0 +1,23 @@
+services:
+  auth:
+    image: node:22.16.0-bookworm
+    command: ["node", "/fixtures/auth.mjs"]
+    volumes:
+      - ./auth.mjs:/fixtures/auth.mjs:ro
+    networks: [isolated]
+  api:
+    image: octo-summary-api:versioning-contract-20260908
+    ports: ["127.0.0.1:28341:8080"]
+    environment:
+      MYSQL_DSN: "root@tcp(octo-summary-versioning-test-mysql:3306)/summary_versioning_test?parseTime=true"
+      IM_MYSQL_DSN: "root@tcp(octo-summary-versioning-test-mysql:3306)/summary_versioning_test?parseTime=true"
+      OCTO_API_URL: "http://auth:8089"
+      WORKER_TRIGGER_URL: "http://unused-worker:8082"
+      SUMMARY_CONTENT_READ_SPACES: "fixture-space"
+      SUMMARY_NOTIFY_ENABLED: "false"
+    networks: [isolated]
+    depends_on: [auth]
+networks:
+  isolated:
+    external: true
+    name: octo-summary-versioning-test
