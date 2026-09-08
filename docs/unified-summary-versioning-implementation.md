@@ -1,6 +1,6 @@
 # Unified summary versioning implementation
 
-Source: `agent-workflow-unified-summary-versioning-plan.md`, reviewed September 8, 2026. Backend base `391134c`; frontend base `9e33837a`.
+Source: `agent-workflow-unified-summary-versioning-plan.md`, reviewed September 8, 2026. Backend base `391134c`; frontend initially based on `9e33837a`, then rebased and reverified on `2a41ee1d` when upstream advanced during development.
 
 ## Behavior list
 

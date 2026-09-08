@@ -1,6 +1,9 @@
 # Unified summary versioning: compatibility slice verification
 
-Date: September 8, 2026. Backend base `391134c`; frontend base `9e33837a`.
+Date: September 8, 2026. Backend base `391134c`; frontend base `2a41ee1d`.
+Local code commits: backend `c928ab6`, frontend `10d7ae85`. The frontend was
+rebased from the initial `9e33837a` baseline after upstream PR #1640 landed
+during this implementation; the checks below were repeated on the new base.
 
 ## Delivery status
 
@@ -32,10 +35,10 @@ policy or user-facing UI entry is enabled. No PR is ready.
 | Full `go test -race -shuffle=on -count=1 -timeout 10m ./...` with CI's native tokenizer library | Passed |
 | Final focused content/handler/router tests with race detector and real MySQL DSN | Passed |
 | `CGO_ENABLED=0 go vet ./...` and `git diff --check` | Passed |
-| Summary package Vitest | 74 files, 1,162 tests passed |
+| Summary package Vitest | 82 files, 1,230 tests passed |
 | Frontend `pnpm i18n:check` | Passed |
 | Frontend `pnpm --filter @octo/web build` | Passed |
-| Frontend package typecheck | 5,901 diagnostics; identical to pristine upstream after path/line normalization, no new diagnostics |
+| Frontend package typecheck | 6,025 diagnostics; identical to pristine `2a41ee1d` upstream after path/line normalization, no new diagnostics |
 | MySQL 8 old-schema upgrade and migration replay | Passed; legacy V7 with two retained rows initializes content revision 2 |
 | MySQL admission/uniqueness | 12 separate connections produce exactly one active-slot winner; duplicate request/schedule/output rejected |
 | API image HTTP smoke | Passed; seven versions, provisional V1, team privacy, namespace/Space/auth checks |
