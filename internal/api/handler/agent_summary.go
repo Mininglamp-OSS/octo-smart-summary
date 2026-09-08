@@ -639,7 +639,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		// same way the instant path (CreateSummary) does, so the detail chip
 		// shows a human-readable name instead of a raw channel id; the
 		// client-supplied name is deliberately NOT trusted (the instant path
-		// drops it too — see task.go's CreateSummary). ResolveSourceNameWithType
+		// drops it too — see task.go's CreateSummary). ResolveSourceNameForActor
 		// handles a nil imDB with a deterministic "来源-xxxxxxxx" fallback.
 		//
 		// R10: dedup by (source_type, source_id) — uk_summary_source_task_type_id
@@ -659,7 +659,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 				TaskID:     createdTaskID,
 				SourceType: s.SourceType,
 				SourceID:   s.SourceID,
-				SourceName: service.ResolveSourceNameWithType(s.SourceID, s.SourceType, h.imDB),
+				SourceName: service.ResolveSourceNameForActor(s.SourceID, s.SourceType, task.CreatorID, h.imDB),
 			}
 			if err := tx.Create(&src).Error; err != nil {
 				return fmt.Errorf("create summary_source: %w", err)

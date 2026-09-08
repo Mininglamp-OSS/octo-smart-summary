@@ -217,18 +217,11 @@ func (h *TaskHandler) pickDisplayResult(taskID int64) (model.SummaryResult, bool
 }
 
 // displaySourceName returns the user-visible name for a persisted
-// summary_source row. A non-empty stored name is a creation-time snapshot
-// and is returned as-is (a later group rename must not rewrite history).
-// An empty name — rows written before the agent path resolved names
-// (POST /summaries/agent stored source_id only until this PR) — falls back
-// to a live IM DB lookup so list/detail/share show a readable name instead
-// of a raw channel id. ResolveSourceNameWithType handles nil imDB and
-// lookup misses with a deterministic "来源-xxxxxxxx" placeholder.
-func displaySourceName(s model.SummarySource, imDB *gorm.DB) string {
-	if strings.TrimSpace(s.SourceName) != "" {
-		return s.SourceName
-	}
-	return service.ResolveSourceNameWithType(s.SourceID, s.SourceType, imDB)
+// summary_source row. Real name snapshots remain unchanged; empty names and
+// exact canonical-DM bug placeholders are resolved from the creator's
+// perspective, not the viewer's. Nil IM DB and lookup misses degrade safely.
+func displaySourceName(s model.SummarySource, creatorID string, imDB *gorm.DB) string {
+	return service.ResolveStoredSourceName(s, creatorID, imDB)
 }
 
 func (h *TaskHandler) resolveSummaryTaskParam(c *gin.Context) (int64, bool) {
@@ -697,7 +690,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			srcList = append(srcList, gin.H{
 				"source_type": s.SourceType,
 				"source_id":   s.SourceID,
-				"source_name": displaySourceName(s, h.imDB),
+				"source_name": displaySourceName(s, t.CreatorID, h.imDB),
 			})
 		}
 
@@ -971,7 +964,7 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		srcList = append(srcList, gin.H{
 			"source_type": s.SourceType,
 			"source_id":   s.SourceID,
-			"source_name": displaySourceName(s, h.imDB),
+			"source_name": displaySourceName(s, task.CreatorID, h.imDB),
 		})
 	}
 
