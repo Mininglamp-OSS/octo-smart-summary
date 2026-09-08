@@ -167,6 +167,42 @@ func RecordLLMSince(taskNo, purpose string, start time.Time, tokens int) {
 	RecordLLM(taskNo, purpose, time.Since(start), tokens)
 }
 
+// PurposeClass collapses a free-text LLMCall.Purpose into one of a small,
+// closed set of stable identifiers.
+//
+// Why this exists (#231 S3): Purpose is a human-readable string, and one of its
+// values is built as fmt.Sprintf("Map: 分块总结 chunk#%d", idx) — the chunk index
+// is unbounded. Purpose is fine as a log line, but the moment it is used as a
+// metric label it becomes a cardinality bomb: one time series per chunk index,
+// per task, forever. Any metric that wants to break down by call kind MUST label
+// on PurposeClass, never on the raw Purpose. The chunk index stays in the log
+// only.
+//
+// The returned set is closed: intent, map_chunk, map_single, reduce,
+// team_reduce, post_retrieval_narrow, other. New purposes fall through to
+// "other" rather than silently widening the label space — add a case here (and
+// a test) when a new call site is introduced.
+func PurposeClass(purpose string) string {
+	switch {
+	case purpose == "意图识别":
+		return "intent"
+	// Order matters: the chunk-map prefix is the unbounded one and must be
+	// matched before any looser "Map:" rule.
+	case strings.HasPrefix(purpose, "Map: 分块总结 chunk#"):
+		return "map_chunk"
+	case strings.HasPrefix(purpose, "Map: 单次总结") || purpose == "单次总结":
+		return "map_single"
+	case strings.HasPrefix(purpose, "团队汇总"):
+		return "team_reduce"
+	case strings.HasPrefix(purpose, "Reduce"):
+		return "reduce"
+	case strings.Contains(purpose, "PostRetrievalNarrow"):
+		return "post_retrieval_narrow"
+	default:
+		return "other"
+	}
+}
+
 func ensureReportFile() *os.File {
 	reportOnce.Do(func() {
 		acctMu.Lock()

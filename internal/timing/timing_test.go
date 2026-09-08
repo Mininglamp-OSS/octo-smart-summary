@@ -1,6 +1,7 @@
 package timing
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -320,5 +321,48 @@ func TestRecordLLM_Empty(t *testing.T) {
 
 	if count != 0 {
 		t.Error("RecordLLM with empty taskNo should not record")
+	}
+}
+
+// TestPurposeClass_ClosedSet asserts every real call-site purpose maps to its
+// stable class, and — the point of #231 S3 — that the unbounded chunk index in
+// "Map: 分块总结 chunk#%d" collapses to a single class rather than one label
+// value per chunk.
+func TestPurposeClass_ClosedSet(t *testing.T) {
+	cases := []struct {
+		purpose string
+		want    string
+	}{
+		{"意图识别", "intent"},
+		{"Map: 分块总结 chunk#1", "map_chunk"},
+		{"Map: 分块总结 chunk#2", "map_chunk"},
+		{"Map: 分块总结 chunk#9999", "map_chunk"},
+		{"Map: 单次总结(跳过Map-Reduce)", "map_single"},
+		{"单次总结", "map_single"},
+		{"Reduce: 最终总结", "reduce"},
+		{"Reduce: 合并分块总结", "reduce"},
+		{"Reduce", "reduce"},
+		{"团队汇总: 合并各成员总结", "team_reduce"},
+		{"检索后裁剪 PostRetrievalNarrow", "post_retrieval_narrow"},
+		{"something new nobody classified", "other"},
+		{"", "other"},
+	}
+	for _, c := range cases {
+		if got := PurposeClass(c.purpose); got != c.want {
+			t.Errorf("PurposeClass(%q) = %q, want %q", c.purpose, got, c.want)
+		}
+	}
+}
+
+// TestPurposeClass_ChunkIndexIsBounded is the cardinality guard: a thousand
+// distinct chunk indices must produce exactly one class, or the label space is
+// unbounded and this function has failed its only job.
+func TestPurposeClass_ChunkIndexIsBounded(t *testing.T) {
+	seen := map[string]struct{}{}
+	for i := 0; i < 1000; i++ {
+		seen[PurposeClass(fmt.Sprintf("Map: 分块总结 chunk#%d", i))] = struct{}{}
+	}
+	if len(seen) != 1 {
+		t.Errorf("chunk-map purposes produced %d classes, want 1 — cardinality is not bounded: %v", len(seen), seen)
 	}
 }
