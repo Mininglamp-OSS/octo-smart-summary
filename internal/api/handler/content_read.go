@@ -79,6 +79,16 @@ func (h *ContentReadHandler) Version(c *gin.Context) {
 	h.respond(c, result, err)
 }
 
+func (h *ContentReadHandler) Generation(c *gin.Context) {
+	spaceID, taskID, actorID, valid := h.request(c)
+	if !valid {
+		return
+	}
+	result, err := h.service.Generation(c.Request.Context(), spaceID, taskID, actorID,
+		c.Param("content_id"), c.Param("generation_id"))
+	h.respond(c, result, err)
+}
+
 func (h *ContentReadHandler) respond(c *gin.Context, value any, err error) {
 	if err == nil {
 		ok(c, value)
@@ -89,6 +99,6 @@ func (h *ContentReadHandler) respond(c *gin.Context, value any, err error) {
 		c.JSON(ce.HTTPStatus, apiResponse{Code: ce.HTTPStatus * 100, Message: ce.Code, Detail: ce.Code})
 		return
 	}
-	log.Printf("[summary-content] read failed: %v", err)
+	log.Printf("[summary-content] operation failed: %v", err)
 	c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error", Detail: "internal_error"})
 }

@@ -26,11 +26,31 @@ func contentTestDB(t *testing.T) *gorm.DB {
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	if err := db.AutoMigrate(&model.SummaryTask{}, &model.SummaryParticipant{}, &model.SummarySchedule{},
 		&model.SummaryResult{}, &model.PersonalResult{}, &model.PersonalResultVersion{},
-		&model.SummaryGenerationRun{}, &model.SummaryContentAudit{}); err != nil {
+		&contentTestGenerationRun{}, &contentTestAudit{}); err != nil {
 		t.Fatal(err)
 	}
 	return db
 }
+
+// sqlite3 recognizes DATETIME but not MySQL's DATETIME(6) as a timestamp.
+// Production migrations and the MySQL concurrency suite retain microseconds.
+type contentTestGenerationRun struct {
+	model.SummaryGenerationRun
+	EffectiveAt  time.Time  `gorm:"column:effective_at;type:datetime;not null"`
+	ScheduledFor *time.Time `gorm:"column:scheduled_for;type:datetime;uniqueIndex:uk_generation_schedule_slot"`
+	LeaseUntil   *time.Time `gorm:"column:lease_until;type:datetime;index:idx_generation_recovery"`
+	CreatedAt    time.Time  `gorm:"column:created_at;type:datetime;not null"`
+	UpdatedAt    time.Time  `gorm:"column:updated_at;type:datetime;not null"`
+}
+
+func (contentTestGenerationRun) TableName() string { return "summary_generation_run" }
+
+type contentTestAudit struct {
+	model.SummaryContentAudit
+	CreatedAt time.Time `gorm:"column:created_at;type:datetime;not null"`
+}
+
+func (contentTestAudit) TableName() string { return "summary_content_audit" }
 
 func seedContentTask(t *testing.T, db *gorm.DB, id int64, users ...string) model.SummaryTask {
 	t.Helper()

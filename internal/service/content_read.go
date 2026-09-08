@@ -11,9 +11,9 @@ import (
 	"gorm.io/gorm"
 )
 
-// ContentService is the authenticated formal-content boundary. In the
-// compatibility phase it advertises read capabilities only: no UI can enable
-// new mutations before API, worker and scheduler share the write protocol.
+// ContentService is the authenticated formal-content boundary. Transactional
+// command methods are tested independently; production still advertises read
+// capabilities only until API, worker and scheduler share the write protocol.
 type ContentService struct{ db *gorm.DB }
 
 func NewContentService(db *gorm.DB) *ContentService { return &ContentService{db: db} }
@@ -174,11 +174,22 @@ func (s *ContentService) Catalog(ctx context.Context, spaceID string, taskID int
 		if current != nil {
 			s.filterVersion(a, target, actorID, current)
 		}
+		var active []model.SummaryGenerationRun
+		if err := s.db.WithContext(ctx).Where("task_id = ? AND active_slot IS NOT NULL", taskID).
+			Where("content_id = ? OR scope = ?", target.ID(), "task").Limit(1).Find(&active).Error; err != nil {
+			return out, err
+		}
+		var activeRun *model.SummaryGenerationRun
+		if len(active) == 1 && active[0].SpaceID == spaceID &&
+			(active[0].ContentID == target.ID() || active[0].Scope == "task") {
+			activeRun = &active[0]
+		}
 		out.Contents = append(out.Contents, FormalContent{
 			ContentID: target.ID(), Kind: target.Kind, OwnerID: target.UserID,
 			IsMain: target == a.main, ContentRevision: revision, CurrentVersion: current,
 			Capabilities: compatibilityContentCapabilities(), Integrity: integrity,
 			GenerationConfig: compatibilityGenerationConfig(a.task),
+			ActiveGeneration: activeRun,
 		})
 	}
 	return out, nil
@@ -294,6 +305,9 @@ func (s *ContentService) Versions(ctx context.Context, spaceID string, taskID in
 			v.IsCurrent, v.ContentRevision = true, current.ContentRevision
 		}
 		s.filterVersion(a, target, actorID, v)
+		if err := s.markCandidate(ctx, target, v); err != nil {
+			return FormalVersionPage{}, err
+		}
 	}
 	return out, nil
 }
@@ -329,7 +343,26 @@ func (s *ContentService) Version(ctx context.Context, spaceID string, taskID int
 		v.IsCurrent, v.ContentRevision = true, current.ContentRevision
 	}
 	s.filterVersion(a, target, actorID, v)
+	if err := s.markCandidate(ctx, target, v); err != nil {
+		return nil, err
+	}
 	return v, nil
+}
+
+func (s *ContentService) markCandidate(ctx context.Context, target ContentTarget, v *FormalContentVersion) error {
+	if v.GenerationID == nil || v.IsCurrent {
+		return nil
+	}
+	var runs []model.SummaryGenerationRun
+	if err := s.db.WithContext(ctx).Where("id = ? AND task_id = ?", *v.GenerationID, target.TaskID).
+		Limit(1).Find(&runs).Error; err != nil {
+		return err
+	}
+	if len(runs) == 1 && runs[0].SpaceID == target.SpaceID && runs[0].ContentID == target.ID() &&
+		runs[0].OutputVersionID == v.VersionID && runs[0].Status == "conflict" && !runs[0].Applied {
+		v.PendingApplication = true
+	}
+	return nil
 }
 
 // ParseContentReadSpaces accepts an exact allowlist; "*" is intentionally not a

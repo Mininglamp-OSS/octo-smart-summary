@@ -1,4 +1,4 @@
-# Unified summary versioning: compatibility slice verification
+# Unified summary versioning verification
 
 Date: September 8, 2026. Backend base `391134c`; frontend base `2a41ee1d`.
 Local code commits: backend `c928ab6`, frontend `10d7ae85`. The frontend was
@@ -7,9 +7,11 @@ during this implementation; the checks below were repeated on the new base.
 
 ## Delivery status
 
-The first compatibility slice is implemented and tested. The overall versioning
-plan is **not complete**. No new write operation, schedule behavior, retention
-policy or user-facing UI entry is enabled. No PR is ready.
+The compatibility and transactional service slices are implemented and tested.
+The overall versioning plan is **not complete**. Production command routes remain
+unmounted until legacy writers/cleaners, worker polling and scheduling adopt the
+protocol. No new schedule behavior, retention policy or user-facing UI action is
+enabled. No PR is ready.
 
 ## Implemented
 
@@ -44,8 +46,61 @@ policy or user-facing UI entry is enabled. No PR is ready.
 | API image HTTP smoke | Passed; seven versions, provisional V1, team privacy, namespace/Space/auth checks |
 | GET mutation check after image smoke | Legacy personal task 102 still has zero formal version rows |
 
-MySQL tests verify **schema-level** uniqueness, not the as-yet-unimplemented
-cross-engine run lifecycle, runtime lease recovery or write CAS.
+The initial compatibility checks above verified schema-level uniqueness. The
+continuation below adds runtime tests, without claiming all legacy writers now
+use the coordinator.
+
+## Transactional service continuation (September 8, 2026)
+
+1. Result/personal edit and restore require current-version/revision CAS.
+   Provisional V1 materializes only inside the first write; evidenced legacy
+   divergence is normalized with audit, never a hidden edit version. Restore
+   preserves the current ID/number and historical source, copies both citation
+   pools and the source snapshot, and leaves configuration/schedules unchanged.
+2. Durable refinement freezes authorized content/evidence and supports request
+   idempotency, admission slots, expiry recovery, execution fencing, cancellation,
+   single output, persisted conflict candidates and explicit application. The
+   model adapter has no retrieval/tools interface and emits no IM notification.
+   Permission revocation terminates and releases the run atomically.
+3. Shared time resolvers cover absolute, rolling, natural calendar and incremental
+   windows with explicit Shanghai, half-open boundaries. Late schedule slots
+   preserve recurrence phase and month-end anchors. They are not yet wired to
+   Workflow retrieval or the production scheduler.
+4. Command handlers are mounted only in isolated tests. Read DTOs expose active
+   runs/pending candidates and add an authenticated generation GET endpoint.
+   Frontend Service/bridge contracts cover commands and run response validation;
+   no UI actions are connected or visually accepted.
+5. A dedicated Docker test image runs the service runtime suite against isolated
+   MySQL, without touching 28140, external LLMs, credentials or notifications.
+
+### Runtime verification
+
+| Check | Result |
+|---|---|
+| Backend full `go test -race ./...` with native tokenizer library | Passed |
+| MySQL 12-connection edit CAS | One successful edit, no duplicate lazy V1 |
+| MySQL 12-connection runtime admission | One live content run |
+| MySQL 12 concurrent completion callbacks | All acknowledge one output version |
+| MySQL audit-failure injection | Body/revision and lazy baseline roll back together |
+| Both storage adapters | Edit/refine/restore, conflict/apply, cancellation, expired-token fencing and seven retained versions passed |
+| Task/content admission primitive | Distinct children coexist; independent runs and duplicate children rejected |
+| Frozen model adapter | Uses frozen input; team creator never receives member message evidence |
+| Time resolver tests | Rolling 60 days, calendar boundaries/leap day, incremental gaps and weekly/month-end/cron late slots passed |
+| Final focused backend tests, with race detector and real MySQL | Service, handler and router passed |
+| Final Summary Vitest suite | 82 files, 1,236 tests passed |
+| Frontend production build and i18n | Passed |
+| Frontend typecheck | Same 6,025 diagnostics as pristine upstream, no added/removed diagnostics after path/line/footer normalization |
+| Existing isolated HTTP compatibility smoke | Passed again against the original compatibility API image |
+| Dedicated runtime Docker image | MySQL/runtime/time suites passed with Shanghai process and DSN timezone |
+
+Runtime image: `octo-summary-runtime-tests:versioning-20260908`.
+Retained container: `octo-summary-runtime-tests-20260908` (exited successfully).
+Commands are in `tests/content-contract-mirror/README.md`.
+
+This is a service integration-test image, not a deployed Web workflow. It does
+not prove real Workflow execution, configuration authorization/projection,
+applied-success schedule watermarks, legacy prune/requeue safety, UI confirmation
+flows or complete 28140 acceptance.
 
 ## Local environments
 
@@ -64,10 +119,11 @@ system-wide library path.
 
 ## Next implementation gates
 
-1. Transactional edit/restore/lazy normalization, current-row CAS and audits;
-   never silently append hidden edit versions.
-2. Shared generation admission/idempotency/expiry recovery/conflicting-output
-   application, with every old API/worker/scheduler writer and pruner adapted.
+1. Adapt every old API/worker/scheduler writer and cleaner to the tested protocol;
+   preserve personal IDs/current content during requeue and disable managed
+   history pruning before enabling any commands.
+2. Connect durable worker polling and full-generation commits while preserving
+   task-level exclusion and parallel team-member execution.
 3. Authorized executable configuration, transactionally consistent Workflow
    projections, common time resolution, schedules and notification semantics.
 4. Actual Workbench UI actions, operation confirmations, run refresh/cancel/

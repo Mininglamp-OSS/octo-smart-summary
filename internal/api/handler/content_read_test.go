@@ -25,7 +25,7 @@ func TestContentReadHandlerAllowlistAndAuthorization(t *testing.T) {
 	sqlDB, _ := db.DB()
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	if err := db.AutoMigrate(&model.SummaryTask{}, &model.SummaryParticipant{}, &model.SummaryResult{},
-		&model.PersonalResult{}, &model.PersonalResultVersion{}); err != nil {
+		&model.PersonalResult{}, &model.PersonalResultVersion{}, &model.SummaryGenerationRun{}); err != nil {
 		t.Fatal(err)
 	}
 	task := model.SummaryTask{ID: 1, TaskNo: "ST-content", SpaceID: "s", CreatorID: "owner", SummaryMode: 1}

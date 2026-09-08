@@ -771,14 +771,7 @@ func cleanUnreferencedTeamCitations(content string, citations []model.TeamCitati
 }
 
 func buildRefineSystemPrompt() string {
-	return `你是专业的工作总结编辑助手。请根据用户的修改意见，对“当前总结”做局部调整。
-
-要求：
-- 尽量保留用户没有要求修改的内容、结构和引用编号。
-- 不要重新发散总结，不要补充当前总结里没有依据的新事实。
-- 如果只是语气、长短、结构调整，应保持事实含义不变。
-- 保留 Markdown 格式。
-- 只输出修改后的完整总结正文，不要输出解释、前后缀或代码块。`
+	return service.RefineSystemPrompt()
 }
 
 func stripMarkdownFence(s string) string {

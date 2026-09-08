@@ -96,6 +96,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		v1.GET("/summaries/:id/contents", contentReadH.Catalog)
 		v1.GET("/summaries/:id/contents/:content_id/versions", contentReadH.Versions)
 		v1.GET("/summaries/:id/contents/:content_id/versions/:version_id", contentReadH.Version)
+		v1.GET("/summaries/:id/contents/:content_id/generations/:generation_id", contentReadH.Generation)
 		v1.POST("/summaries/:id/shares", shareH.Create)
 		v1.GET("/summary-shares/:share_id", shareH.Get)
 		v1.DELETE("/summary-shares/:share_id", shareH.Revoke)

@@ -23,6 +23,33 @@ SUMMARY_CONTENT_MYSQL_TEST_DSN='root@tcp(127.0.0.1:28306)/summary_versioning_tes
 CGO_ENABLED=0 go test ./internal/service -run TestContentMySQL -count=1 -v
 ```
 
-The tests create uniquely named disposable databases. They verify real MySQL
-migration replay and unique-index arbitration; they do not yet prove runtime
-lease recovery, coordinated legacy writers or output CAS.
+The tests create uniquely named disposable databases. They verify migration
+replay, unique-index arbitration, transactional edit/restore, runtime admission/
+CAS, duplicate completion, audit-failure rollback and lease recovery. They do not
+prove legacy writer/cleaner or scheduler integration; production command routes
+remain deliberately unmounted.
+
+## Runtime test image
+
+This image runs a Go test binary, not a user-facing API/Web app. The build context
+excludes Git metadata, checkpoints and environment files. It calls no external
+LLM or notification service.
+
+```sh
+docker build -f tests/content-contract-mirror/Dockerfile.runtime-tests \
+  -t octo-summary-runtime-tests:versioning-20260908 .
+docker run --name octo-summary-runtime-tests-20260908 --read-only \
+  --network octo-summary-versioning-test \
+  -e 'SUMMARY_CONTENT_MYSQL_TEST_DSN=root@tcp(octo-summary-versioning-test-mysql:3306)/summary_versioning_test?parseTime=true&loc=Asia%2FShanghai' \
+  octo-summary-runtime-tests:versioning-20260908
+```
+
+The named container is retained after exit. Inspect its recorded result with:
+
+```sh
+docker logs octo-summary-runtime-tests-20260908
+```
+
+Use a new explicit container name for another run; do not replace or delete mirror
+containers. The empty root password belongs only to the isolated disposable DB
+described above.

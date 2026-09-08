@@ -51,6 +51,7 @@ type FormalContentVersion struct {
 	GenerationID           *string              `json:"generation_id,omitempty"`
 	Provisional            bool                 `json:"provisional"`
 	IsCurrent              bool                 `json:"is_current"`
+	PendingApplication     bool                 `json:"pending_application"`
 	EditedAt               *time.Time           `json:"edited_at,omitempty"`
 	EditedBy               string               `json:"edited_by,omitempty"`
 	RestoredFromVersionID  string               `json:"restored_from_version_id,omitempty"`

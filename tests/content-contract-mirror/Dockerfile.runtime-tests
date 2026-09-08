@@ -1,0 +1,14 @@
+FROM golang:1.25-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY internal ./internal
+COPY migrations ./migrations
+RUN CGO_ENABLED=0 go test -c -o /bin/content-runtime-tests ./internal/service
+
+FROM alpine:3.19
+ENV TZ=Asia/Shanghai
+RUN apk add --no-cache ca-certificates tzdata
+COPY --from=builder /bin/content-runtime-tests /bin/content-runtime-tests
+ENTRYPOINT ["/bin/content-runtime-tests"]
+CMD ["-test.run", "TestContentMySQL|TestGenerationTime|TestGenerationIncremental|TestGenerationNatural", "-test.v"]
