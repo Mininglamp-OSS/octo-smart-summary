@@ -175,6 +175,8 @@ type SummaryTask struct {
 	GenerationSpecJSON JSON   `gorm:"column:generation_spec_json;type:json" json:"-"`
 	ConfigRevision     int64  `gorm:"column:config_revision;not null;default:0" json:"config_revision"`
 	ContentRevision    int64  `gorm:"column:content_revision;not null;default:0" json:"content_revision"`
+	// Sticky enrollment survives rollback; compatibility writers must respect it.
+	ContentProtocolVersion int `gorm:"column:content_protocol_version;not null;default:0" json:"-"`
 }
 
 // SummaryBotCreateIdempotency binds one bot request key to the task created

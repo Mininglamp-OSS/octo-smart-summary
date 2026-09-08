@@ -218,7 +218,7 @@ func (h *PersonalHandler) Accept(c *gin.Context) {
 	// the same pattern bootstrapCreatorParticipant uses in the worker (zero DB/schema
 	// change, pure application-level idempotency).
 	var prCompleted bool
-	err := h.db.Transaction(func(tx *gorm.DB) error {
+	err := service.WithLegacyContentWrite(h.db, taskID, func(tx *gorm.DB) error {
 		// Update participant to accepted
 		if err := tx.Model(&participant).Updates(map[string]interface{}{
 			"status":       model.ParticipantAccepted,
@@ -330,6 +330,10 @@ func (h *PersonalHandler) Accept(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
+		if bizError, isBiz := err.(*service.BizError); isBiz {
+			bizErr(c, bizError)
+			return
+		}
 		log.Printf("[personal] accept tx error: %v", err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
 		return
@@ -514,7 +518,7 @@ func (h *PersonalHandler) Submit(c *gin.Context) {
 	// (manual OR system) ever sets submitted_at; the loser sees RowsAffected==0 and
 	// returns the idempotent "already submitted" response WITHOUT rewriting source.
 	var alreadySubmitted bool
-	err := h.db.Transaction(func(tx *gorm.DB) error {
+	err := service.WithLegacyContentWrite(h.db, taskID, func(tx *gorm.DB) error {
 		res := tx.Model(&model.PersonalResult{}).
 			Where("id = ? AND submitted_at IS NULL", pr.ID).
 			Updates(map[string]interface{}{
@@ -545,6 +549,10 @@ func (h *PersonalHandler) Submit(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
+		if bizError, isBiz := err.(*service.BizError); isBiz {
+			bizErr(c, bizError)
+			return
+		}
 		log.Printf("[personal] submit transaction error: %v", err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
 		return
@@ -654,7 +662,7 @@ func (h *PersonalHandler) PersonalEdit(c *gin.Context) {
 	// result write"), so without reviving the task here the edit would never make
 	// it into the team summary. reviveCompletedForRecompute is race-safe + a strict
 	// no-op for any task not Completed / not BY_PERSON.
-	if err := h.db.Transaction(func(tx *gorm.DB) error {
+	if err := service.WithLegacyContentWrite(h.db, taskID, func(tx *gorm.DB) error {
 		result := tx.Model(&model.PersonalResult{}).
 			Where("id = ?", pr.ID).
 			Updates(map[string]interface{}{
@@ -688,6 +696,10 @@ func (h *PersonalHandler) PersonalEdit(c *gin.Context) {
 	}); err != nil {
 		if errors.Is(err, errPersonalResultGone) {
 			c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "个人总结不存在"})
+			return
+		}
+		if bizError, isBiz := err.(*service.BizError); isBiz {
+			bizErr(c, bizError)
 			return
 		}
 		log.Printf("[personal] personal-edit update error task=%d user=%s: %v", taskID, userID, err)
@@ -898,7 +910,7 @@ func (h *PersonalHandler) PersonalDraft(c *gin.Context) {
 	// Wrapping in a Transaction is mildly redundant for a single UPDATE +
 	// SELECT, but kept for shape-parity with PersonalEdit and to give a future
 	// audit-log write a ready insertion point.
-	if err := h.db.Transaction(func(tx *gorm.DB) error {
+	if err := service.WithLegacyContentWrite(h.db, taskID, func(tx *gorm.DB) error {
 		// v2 §2.4 gate-in-tx: acquire the task-row lock BEFORE any read/write on
 		// summary_result / personal_result. This mirrors worker
 		// saveLatestResultAndCompleteTask (scheduled_replace_helpers.go:370-374),
@@ -1025,7 +1037,7 @@ func (h *PersonalHandler) PersonalDraft(c *gin.Context) {
 		}
 		return nil
 	}); err != nil {
-		if errors.Is(err, errTaskGone) {
+		if errors.Is(err, errTaskGone) || errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "任务不存在"})
 			return
 		}
@@ -1043,6 +1055,10 @@ func (h *PersonalHandler) PersonalDraft(c *gin.Context) {
 		}
 		if errors.Is(err, errDraftRegenerating) {
 			c.JSON(http.StatusConflict, apiResponse{Code: 40009, Message: "内容已被重新生成，请刷新后重试"})
+			return
+		}
+		if bizError, isBiz := err.(*service.BizError); isBiz {
+			bizErr(c, bizError)
 			return
 		}
 		log.Printf("[personal] personal-draft update error task=%d user=%s: %v", taskID, userID, err)
@@ -1230,7 +1246,7 @@ func (h *PersonalHandler) AddMembers(c *gin.Context) {
 
 	addedCount := 0
 
-	err := h.db.Transaction(func(tx *gorm.DB) error {
+	err := service.WithLegacyContentWrite(h.db, taskID, func(tx *gorm.DB) error {
 		// Load existing participants once for idempotency.
 		var existing []model.SummaryParticipant
 		if err := tx.Where("task_id = ?", taskID).Find(&existing).Error; err != nil {
@@ -1344,6 +1360,10 @@ func (h *PersonalHandler) AddMembers(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
+		if bizError, isBiz := err.(*service.BizError); isBiz {
+			bizErr(c, bizError)
+			return
+		}
 		log.Printf("[personal] add-members tx error task=%d: %v", taskID, err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
 		return
@@ -1416,10 +1436,16 @@ func (h *PersonalHandler) Leave(c *gin.Context) {
 			if _, err := lockOptionalScheduleForUpdate(tx, *task.ScheduleID); err != nil {
 				return err
 			}
+			if err := service.CheckLegacyScheduleContent(tx, task.SpaceID, *task.ScheduleID); err != nil {
+				return err
+			}
 		}
 		var lockTask model.SummaryTask
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Select("id").First(&lockTask, taskID).Error; err != nil {
+			First(&lockTask, taskID).Error; err != nil {
+			return err
+		}
+		if err := service.CheckLegacyContentWrite(lockTask); err != nil {
 			return err
 		}
 		// FIX-SCHEDULE-ALLROUNDS: under a schedule, the same schedule_id spawns
@@ -1483,6 +1509,10 @@ func (h *PersonalHandler) Leave(c *gin.Context) {
 	}); err != nil {
 		if isScheduleRetryableConflict(err) {
 			writeRetryableRebindConflict(c)
+			return
+		}
+		if bizError, isBiz := err.(*service.BizError); isBiz {
+			bizErr(c, bizError)
 			return
 		}
 		log.Printf("[personal] leave tx error task=%d user=%s: %v", taskID, userID, err)
@@ -1570,10 +1600,16 @@ func (h *PersonalHandler) RemoveMember(c *gin.Context) {
 			if _, err := lockOptionalScheduleForUpdate(tx, *task.ScheduleID); err != nil {
 				return err
 			}
+			if err := service.CheckLegacyScheduleContent(tx, task.SpaceID, *task.ScheduleID); err != nil {
+				return err
+			}
 		}
 		var lockTask model.SummaryTask
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Select("id").First(&lockTask, taskID).Error; err != nil {
+			First(&lockTask, taskID).Error; err != nil {
+			return err
+		}
+		if err := service.CheckLegacyContentWrite(lockTask); err != nil {
 			return err
 		}
 		// FIX-SCHEDULE-ALLROUNDS: see Leave for the full rationale. A schedule
@@ -1626,6 +1662,10 @@ func (h *PersonalHandler) RemoveMember(c *gin.Context) {
 	}); err != nil {
 		if isScheduleRetryableConflict(err) {
 			writeRetryableRebindConflict(c)
+			return
+		}
+		if bizError, isBiz := err.(*service.BizError); isBiz {
+			bizErr(c, bizError)
 			return
 		}
 		log.Printf("[personal] remove-member tx error task=%d uid=%s: %v", taskID, uid, err)

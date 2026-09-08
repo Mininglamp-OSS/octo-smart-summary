@@ -105,6 +105,21 @@ func claimAndRequeueScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.Summar
 		if lockedSched.IsActive != 1 || lockedSched.NextRunAt == nil || !lockedSched.NextRunAt.Equal(*sched.NextRunAt) || lockedSched.NextRunAt.After(now) {
 			return nil
 		}
+		// Check enrollment before advancing or disabling the old schedule. A
+		// managed task keeps its last successful body, pointers and time anchors.
+		var boundTasks []model.SummaryTask
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("schedule_id = ? AND deleted_at IS NULL", lockedSched.ID).
+			Order("id DESC").Limit(1).Find(&boundTasks).Error; err != nil {
+			return err
+		}
+		protocolTask := model.SummaryTask{SpaceID: lockedSched.SpaceID}
+		if len(boundTasks) == 1 {
+			protocolTask = boundTasks[0]
+		}
+		if err := service.CheckLegacyContentWrite(protocolTask); err != nil {
+			return err
+		}
 
 		nextRun, err := service.NextRunScheduledAdvance(lockedSched.CronExpr, lockedSched.IntervalDays, lockedSched.IntervalMonths, lockedSched.RunTime, lockedSched.DayOfWeek, lockedSched.DayOfMonth, lockedSched.AnchorDOM, *lockedSched.NextRunAt, now)
 		if err != nil {
@@ -178,6 +193,11 @@ func claimAndRequeueScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.Summar
 			return nil
 		}
 
+		// Roll back the whole legacy claim, including schedule time advancement.
+		// Coordinated scheduling must take over before this Space is activated.
+		if err := service.CheckLegacyContentWrite(task); err != nil {
+			return err
+		}
 		if err := preservePersonalResultVersionsBeforeRequeue(tx, task.ID); err != nil {
 			return err
 		}
@@ -246,6 +266,9 @@ func claimAndRequeueScheduledTask(db *gorm.DB, imDB *gorm.DB, sched model.Summar
 }
 
 func preservePersonalResultVersionsBeforeRequeue(tx *gorm.DB, taskID int64) error {
+	if err := service.LockLegacyContentTask(tx, taskID); err != nil {
+		return err
+	}
 	var rows []model.PersonalResult
 	if err := tx.Where("task_id = ?", taskID).Find(&rows).Error; err != nil {
 		return err
@@ -366,7 +389,7 @@ func scanConfirmTimeouts(db *gorm.DB) {
 
 	// Find MANUAL tasks with confirm_deadline passed that still have WaitingConfirm participants
 	var taskIDs []int64
-	db.Model(&model.SummaryTask{}).
+	db.Scopes(service.LegacyTaskScope).Model(&model.SummaryTask{}).
 		Where("confirm_deadline < ? AND confirm_deadline IS NOT NULL AND deleted_at IS NULL AND trigger_type = ? AND status NOT IN (?, ?, ?)",
 			now, model.TriggerManual, model.StatusCompleted, model.StatusFailed, model.StatusCancelled).
 		Pluck("id", &taskIDs)
@@ -375,12 +398,13 @@ func scanConfirmTimeouts(db *gorm.DB) {
 		return
 	}
 
-	// Auto-decline timed-out participants
-	result := db.Model(&model.SummaryParticipant{}).
-		Where("task_id IN ? AND status = ?", taskIDs, model.ParticipantPending).
-		Update("status", model.ParticipantDeclined)
-	if result.RowsAffected > 0 {
-		log.Printf("[scheduler] auto-declined %d timed-out participants", result.RowsAffected)
+	// Recheck enrollment under each task lock; a stale ID scan is not a fence.
+	for _, taskID := range taskIDs {
+		_ = service.WithLegacyContentWrite(db, taskID, func(tx *gorm.DB) error {
+			return tx.Model(&model.SummaryParticipant{}).
+				Where("task_id = ? AND status = ?", taskID, model.ParticipantPending).
+				Update("status", model.ParticipantDeclined).Error
+		})
 	}
 }
 
@@ -392,7 +416,7 @@ func scanStuckTasks(db *gorm.DB, maxRetry int, notifier *notify.Notifier) {
 	now := timezone.Now()
 
 	// Reset tasks that can still retry (also handle NULL deadline for legacy data)
-	result := db.Model(&model.SummaryTask{}).
+	result := db.Scopes(service.LegacyTaskScope).Model(&model.SummaryTask{}).
 		Where("status = ? AND (processing_deadline IS NULL OR processing_deadline < ?) AND retry_count < ?",
 			model.StatusProcessing, now, maxRetry-1).
 		Updates(map[string]interface{}{
@@ -414,14 +438,14 @@ func scanStuckTasks(db *gorm.DB, maxRetry int, notifier *notify.Notifier) {
 	// the snapshot used, so concurrent transitions are absorbed (RowsAffected==0
 	// means another worker / cancel got there first; we skip).
 	var toFail []int64
-	db.Model(&model.SummaryTask{}).
+	db.Scopes(service.LegacyTaskScope).Model(&model.SummaryTask{}).
 		Where("status = ? AND (processing_deadline IS NULL OR processing_deadline < ?) AND retry_count >= ?",
 			model.StatusProcessing, now, maxRetry-1).
 		Pluck("id", &toFail)
 
 	var failedIDs []int64
 	for _, id := range toFail {
-		res := db.Model(&model.SummaryTask{}).
+		res := db.Scopes(service.LegacyTaskScope).Model(&model.SummaryTask{}).
 			Where("id = ? AND status = ? AND (processing_deadline IS NULL OR processing_deadline < ?) AND retry_count >= ?",
 				id, model.StatusProcessing, now, maxRetry-1).
 			Updates(map[string]interface{}{
@@ -446,7 +470,7 @@ func scanStuckTasks(db *gorm.DB, maxRetry int, notifier *notify.Notifier) {
 			if err := db.First(&task, id).Error; err != nil {
 				continue
 			}
-			if task.Status != model.StatusFailed {
+			if task.Status != model.StatusFailed || service.ContentProtocolRequired(task) {
 				continue
 			}
 			errMsg := ""
@@ -470,18 +494,21 @@ func scanStuckPersonalTasks(db *gorm.DB, workerTriggerURL string) {
 		model.ParticipantProcessing, leaseTimeout).Find(&stuck)
 
 	for _, p := range stuck {
-		// Reset personal_result to PENDING
-		db.Model(&model.PersonalResult{}).
-			Where("participant_ref_id = ? AND worker_status = ?", p.ID, model.PersonalStatusProcessing).
-			Updates(map[string]interface{}{
-				"worker_status":  model.PersonalStatusPending,
-				"workflow_stage": "",
-			})
-		// Reset participant to accepted
-		db.Model(&p).Updates(map[string]interface{}{
-			"status":            model.ParticipantAccepted,
-			"worker_started_at": nil,
+		err := service.WithLegacyContentWrite(db, p.TaskID, func(tx *gorm.DB) error {
+			if err := tx.Model(&model.PersonalResult{}).
+				Where("participant_ref_id = ? AND worker_status = ?", p.ID, model.PersonalStatusProcessing).
+				Updates(map[string]interface{}{
+					"worker_status": model.PersonalStatusPending, "workflow_stage": "",
+				}).Error; err != nil {
+				return err
+			}
+			return tx.Model(&p).Updates(map[string]interface{}{
+				"status": model.ParticipantAccepted, "worker_started_at": nil,
+			}).Error
 		})
+		if err != nil {
+			continue
+		}
 		log.Printf("[scheduler] reset stuck personal task for participant %d", p.ID)
 
 		// Re-trigger personal worker
@@ -499,6 +526,10 @@ func scanStuckPersonalTasks(db *gorm.DB, workerTriggerURL string) {
 		model.ParticipantAccepted).Find(&acceptedStuck)
 
 	for _, p := range acceptedStuck {
+		var task model.SummaryTask
+		if err := db.First(&task, p.TaskID).Error; err != nil || service.ContentProtocolRequired(task) {
+			continue
+		}
 		var pr model.PersonalResult
 		if err := db.Where("participant_ref_id = ? AND worker_status = ? AND created_at < ?",
 			p.ID, model.PersonalStatusPending, stuckTimeout).First(&pr).Error; err != nil {

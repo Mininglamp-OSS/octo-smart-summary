@@ -1376,7 +1376,7 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 	nextVer, _ := service.GetNextVersion(h.db, taskID)
 	now := timezone.Now()
 
-	err = h.db.Transaction(func(tx *gorm.DB) error {
+	err = service.WithLegacyContentWrite(h.db, taskID, func(tx *gorm.DB) error {
 		// Atomic status transition: only proceed if the task is still in a
 		// terminal state. This prevents concurrent regenerate requests from
 		// both passing the pre-check and duplicating work. Also resets
@@ -2000,6 +2000,20 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 			if lockedSched == nil {
 				// schedule already gone; fall through to single-task soft-delete below.
 			} else if lockedSched.CreatorID == userID {
+				// Lock every affected task before invalidating its durable runs.
+				// The schedule lock serializes group operations; individual content
+				// commits never acquire a schedule lock.
+				var affected []model.SummaryTask
+				if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+					Where("schedule_id = ? AND deleted_at IS NULL", lockedSched.ID).
+					Order("id ASC").Find(&affected).Error; err != nil {
+					return err
+				}
+				for _, affectedTask := range affected {
+					if err := service.CancelContentGenerationsForDeletion(tx, affectedTask); err != nil {
+						return err
+					}
+				}
 				// Stop the schedule.
 				if err := tx.Model(&model.SummarySchedule{}).
 					Where("id = ? AND deleted_at IS NULL", lockedSched.ID).
@@ -2031,6 +2045,9 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 			}
 		}
 
+		if err := service.CancelContentGenerationsForDeletion(tx, liveTask); err != nil {
+			return err
+		}
 		return tx.Model(&liveTask).Updates(map[string]interface{}{
 			"status":     -1,
 			"deleted_at": now,
@@ -2068,7 +2085,10 @@ func (h *TaskHandler) CancelSummary(c *gin.Context) {
 		return
 	}
 
-	result := h.db.Model(&model.SummaryTask{}).
+	if !allowLegacyContentCommand(c, *task) {
+		return
+	}
+	result := h.db.Scopes(service.LegacyTaskScope).Model(&model.SummaryTask{}).
 		Where("id = ? AND status IN (?, ?, ?)", task.ID,
 			model.StatusPending, model.StatusWaitingConfirm, model.StatusProcessing).
 		Updates(map[string]interface{}{

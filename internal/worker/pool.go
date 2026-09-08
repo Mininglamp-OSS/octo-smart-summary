@@ -28,6 +28,25 @@ func (p *WorkerPool) Submit(fn func()) {
 	}()
 }
 
+// TrySubmit never parks a polling loop behind a slow model call. Producers must
+// stop before Drain, just as with Submit.
+func (p *WorkerPool) TrySubmit(fn func()) bool {
+	select {
+	case p.sem <- struct{}{}:
+		p.wg.Add(1)
+		go func() {
+			defer func() {
+				<-p.sem
+				p.wg.Done()
+			}()
+			fn()
+		}()
+		return true
+	default:
+		return false
+	}
+}
+
 // Drain waits for all submitted tasks to finish.
 func (p *WorkerPool) Drain() {
 	p.wg.Wait()

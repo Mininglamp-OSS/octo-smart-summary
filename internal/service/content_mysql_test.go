@@ -98,7 +98,7 @@ func TestContentMySQLLegacyUpgradeAndReadOnlyProjection(t *testing.T) {
 	}
 	sqlDB, _ := db.DB()
 	n, err := summarydb.RunMigrations(sqlDB)
-	if err != nil || n != 2 {
+	if err != nil || n != 3 {
 		t.Fatalf("upgrade migrations=%d: %v", n, err)
 	}
 	if n, err := summarydb.RunMigrations(sqlDB); err != nil || n != 0 {

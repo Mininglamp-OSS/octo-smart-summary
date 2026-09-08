@@ -7,11 +7,13 @@ during this implementation; the checks below were repeated on the new base.
 
 ## Delivery status
 
-The compatibility and transactional service slices are implemented and tested.
-The overall versioning plan is **not complete**. Production command routes remain
-unmounted until legacy writers/cleaners, worker polling and scheduling adopt the
-protocol. No new schedule behavior, retention policy or user-facing UI action is
-enabled. No PR is ready.
+The compatibility, transactional service, legacy-write fences and durable refine
+Worker slices are implemented and tested. The overall versioning plan is **not
+complete**. Production command routes remain unmounted and all user-facing write
+capabilities remain false. Old managed operations now fail safely; complete
+generation, collaboration and scheduling still need actual coordinated adapters.
+Keep `SUMMARY_CONTENT_WRITE_SPACES` unset outside isolated fixtures until those
+adapters and the UI are ready. No PR is ready.
 
 ## Implemented
 
@@ -102,6 +104,56 @@ not prove real Workflow execution, configuration authorization/projection,
 applied-success schedule watermarks, legacy prune/requeue safety, UI confirmation
 flows or complete 28140 acceptance.
 
+## Legacy-write fence and Worker continuation (September 8, 2026)
+
+1. Added forward-only `20260908-03` migration and a sticky task protocol marker.
+   Successful coordinated normalization enrolls atomically; an audit/write failure
+   rolls back enrollment. The migration recognizes earlier generation/audit rows.
+   Withdrawing runtime flags cannot re-enable old restore/prune behavior.
+2. API and Worker share a separate, exact `SUMMARY_CONTENT_WRITE_SPACES` allowlist.
+   Read-only enrollment still cannot enable writes or change retention. Both
+   history stores retain all managed versions; cleaner decisions and deletes
+   serialize with enrollment using the task lock.
+3. Old edit/refine/restore/draft/regenerate commits, collaboration mutations,
+   personal callbacks/failure updates, task claims and scheduler requeue/retry
+   paths are fenced. Old refine rechecks after the model returns. Rejected old
+   scheduling does not clear bodies, reset pointers/revisions or advance time
+   anchors. Schedule-touching transactions keep schedule-before-task lock order.
+4. `ContentGenerationWorker` is wired into the real worker entry point. It scans
+   committed refinements at startup and periodically without an HTTP wakeup,
+   uses bounded non-blocking pool admission, and leaves interrupted runs
+   recoverable after lease expiry. Deleting enrolled tasks cancels active runs
+   in the deletion transaction, fencing late results.
+5. Added API, service, Worker and real-MySQL regression coverage. The SQLite
+   concurrent-failure fixture now uses `BEGIN IMMEDIATE` because SQLite ignores
+   `FOR UPDATE`; an additional 12-connection MySQL test proves production retry
+   accumulation with the new task lock.
+
+These fences are **not** implementations of coordinated full generation,
+member requeue, configuration projection or scheduled execution. In particular,
+the current rollout flag blocks old initial/full generation in its Space.
+Do not enable it for a user Space as a completed feature.
+
+| Final check for this slice | Result |
+|---|---|
+| Full backend `go test -race ./... -count=1`, with real MySQL DSN | Passed |
+| `CGO_ENABLED=0 go vet ./...` | Passed |
+| Focused API/Worker/service race tests | Passed, including post-LLM legacy rejection and soft-delete 404 regression |
+| Concurrent MySQL enrollment / old writer / history cleaner | Old writer rejected; seven versions retained |
+| Deletion/cancellation transaction | Failed deletion rolls back cancellation; successful deletion rejects late output |
+| Real Worker startup, flag isolation, restart and saturation | Passed against MySQL; one committed output after recovery |
+| Legacy concurrent failure accounting | 12 connections produce exactly 12 retry increments |
+| Expanded runtime image, service binary | Passed MySQL runtime, enrollment/deletion and time tests |
+| Expanded runtime image, Worker binary | Passed all four `TestContentWorker` cases against MySQL |
+
+Expanded image: `octo-summary-runtime-tests:legacy-fence-20260908`.
+Retained successful containers: `octo-summary-legacy-fence-tests-20260908`
+and `octo-summary-content-worker-tests-20260908`.
+This still runs test binaries, **not** Web/API end-to-end acceptance.
+The frontend worktree remains unchanged at `6b3ed202`; 28140 and the older
+28341 compatibility API remain unchanged. No external model call, production
+write, notification, branch push or PR was performed.
+
 ## Local environments
 
 Backend: `/home/mlamp/worktrees/summary-versioning-backend`.
@@ -119,11 +171,11 @@ system-wide library path.
 
 ## Next implementation gates
 
-1. Adapt every old API/worker/scheduler writer and cleaner to the tested protocol;
-   preserve personal IDs/current content during requeue and disable managed
-   history pruning before enabling any commands.
-2. Connect durable worker polling and full-generation commits while preserving
-   task-level exclusion and parallel team-member execution.
+1. Replace compatibility rejection with actual unified adapters for legacy
+   commands, Agent formal V1, collaboration and full generation. Preserve
+   personal IDs/current content during requeue before enabling commands.
+2. Add coordinated full-generation commits while preserving task-level exclusion
+   and parallel team-member execution; refine polling is now connected.
 3. Authorized executable configuration, transactionally consistent Workflow
    projections, common time resolution, schedules and notification semantics.
 4. Actual Workbench UI actions, operation confirmations, run refresh/cancel/

@@ -496,13 +496,13 @@ func TestMarkPersonalFailed_MaxRetry_SinglePerson_FailsTask(t *testing.T) {
 // 🟠 Closeout: retry_count atomic increment (no lost updates under concurrency).
 // ---------------------------------------------------------------------------
 
-// newFileBackedTestDB builds a file-backed sqlite (WAL + busy_timeout) so multiple
-// goroutines can run concurrent write transactions for real -- ":memory:" sqlite
-// shares a single in-process db that defeats true write concurrency. Mirrors
-// newSchedulerTestDB's schema.
+// SQLite ignores FOR UPDATE. BEGIN IMMEDIATE reserves its single writer before
+// the compatibility task read; deferred read->write upgrades otherwise return
+// SQLITE_BUSY without honoring busy_timeout. MySQL task-lock behavior is tested
+// separately by TestContentWorkerLegacyFailureCASMySQL.
 func newFileBackedTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	dsn := filepath.Join(t.TempDir(), "retry.db") + "?_busy_timeout=10000&_journal_mode=WAL"
+	dsn := filepath.Join(t.TempDir(), "retry.db") + "?_busy_timeout=10000&_journal_mode=WAL&_txlock=immediate"
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("open db: %v", err)

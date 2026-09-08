@@ -201,6 +201,12 @@ const PersonalResultVersionKeepLimit = 5
 // Hand-edited rows are retained as user data, and the current display pointer is
 // never pruned even when it points to an older restored version.
 func PruneSummaryResultVersions(db *gorm.DB, taskID int64, keep int) error {
+	return preserveContentHistory(db, taskID, func(tx *gorm.DB) error {
+		return pruneLegacySummaryResultVersions(tx, taskID, keep)
+	})
+}
+
+func pruneLegacySummaryResultVersions(db *gorm.DB, taskID int64, keep int) error {
 	if keep <= 0 {
 		keep = SummaryResultVersionKeepLimit
 	}
@@ -303,6 +309,12 @@ func GetNextPersonalVersion(db *gorm.DB, taskID int64, userID string) (int, erro
 // The current_version_id pointer is always retained, including after restoring
 // an older version.
 func PrunePersonalResultVersions(db *gorm.DB, taskID int64, userID string, keep int) error {
+	return preserveContentHistory(db, taskID, func(tx *gorm.DB) error {
+		return pruneLegacyPersonalResultVersions(tx, taskID, userID, keep)
+	})
+}
+
+func pruneLegacyPersonalResultVersions(db *gorm.DB, taskID int64, userID string, keep int) error {
 	if keep <= 0 {
 		keep = PersonalResultVersionKeepLimit
 	}

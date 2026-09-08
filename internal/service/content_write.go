@@ -201,6 +201,13 @@ func (l *lockedContent) normalize(actor string, now time.Time) error {
 	if err := l.setCurrent(v, false); err != nil {
 		return err
 	}
+	if l.access.task.ContentProtocolVersion < ContentContractVersion {
+		if err := db.Model(&model.SummaryTask{}).Where("id = ?", l.target.TaskID).
+			Update("content_protocol_version", ContentContractVersion).Error; err != nil {
+			return err
+		}
+		l.access.task.ContentProtocolVersion = ContentContractVersion
+	}
 	if normalized {
 		return l.audit(actor, "normalize", "", 0, now)
 	}

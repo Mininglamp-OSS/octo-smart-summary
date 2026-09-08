@@ -481,6 +481,9 @@ func loadBoundTaskForScheduleUpdate(tx *gorm.DB, lockedSched model.SummarySchedu
 	if task.CreatorID != userID {
 		return model.SummaryTask{}, service.NewBizError(40004, "无权限修改", http.StatusForbidden)
 	}
+	if err := service.CheckLegacyContentWrite(task); err != nil {
+		return model.SummaryTask{}, err
+	}
 	return task, nil
 }
 
@@ -1538,6 +1541,9 @@ func loadTaskForTaskScope(tx *gorm.DB, spaceID, userID string, taskID int64, fea
 	}
 	if task.CreatorID != userID {
 		return model.SummaryTask{}, service.NewBizError(40004, "仅创建者可绑定定时", http.StatusForbidden)
+	}
+	if err := service.CheckLegacyContentWrite(task); err != nil {
+		return model.SummaryTask{}, err
 	}
 	// Refuse binding a schedule to a multi-person task (same measure as the worker guard);
 	// otherwise the scheduler would skip it every cycle, leaving a silently dead timer.
