@@ -15,8 +15,9 @@ package handler
 //  2. Read side — rows already persisted with an empty source_name (10 live
 //     rows at report time) are resolved live on list/detail/share via
 //     displaySourceName. A non-empty stored name is a creation-time snapshot
-//     and is NEVER overwritten (a later group rename must not rewrite
-//     history — same semantics as the instant path).
+//     and is not overwritten (a later group rename must not rewrite
+//     history — same semantics as the instant path). The narrowly scoped
+//     canonical-DM placeholder exception is covered by source_name_dm_test.go.
 //
 // Every test below must go RED if its corresponding fix line is reverted.
 

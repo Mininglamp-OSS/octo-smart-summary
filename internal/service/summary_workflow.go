@@ -458,7 +458,7 @@ func (s *SummaryWorkflowService) persist(ctx context.Context, in normalizedSumma
 				TaskID:     task.ID,
 				SourceType: source.SourceType,
 				SourceID:   source.SourceID,
-				SourceName: ResolveSourceNameWithType(source.SourceID, source.SourceType, s.imDB),
+				SourceName: ResolveSourceNameForActor(source.SourceID, source.SourceType, in.creatorID, s.imDB),
 			}
 			if err := tx.Create(&row).Error; err != nil {
 				return err

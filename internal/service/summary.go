@@ -41,6 +41,14 @@ func GenerateTaskNo() string {
 // ResolveSourceNameWithType returns source name from IM DB with type suffix.
 // sourceType: 1=group, 2=thread, 3=DM (private chat)
 func ResolveSourceNameWithType(sourceID string, sourceType int, imDB *gorm.DB) string {
+	return ResolveSourceNameForActor(sourceID, sourceType, "", imDB)
+}
+
+// ResolveSourceNameForActor resolves both legacy peer UIDs and canonical
+// uid_a@uid_b private-chat IDs. actorID must be the trusted source owner (the
+// task creator), never the current viewer or a client-supplied display name.
+// Only the lookup key changes; the persisted/retrieval source ID stays intact.
+func ResolveSourceNameForActor(sourceID string, sourceType int, actorID string, imDB *gorm.DB) string {
 	if imDB == nil {
 		return fallbackSourceName(sourceID, sourceType)
 	}
@@ -104,13 +112,47 @@ func ResolveSourceNameWithType(sourceID string, sourceType int, imDB *gorm.DB) s
 		}
 		return threadFallbackName(groupName, shortID)
 	case 3: // DM (private chat)
+		peerID := sourceID
+		if strings.Contains(sourceID, "@") {
+			peerID = sourceNameDMPeerID(sourceID, actorID)
+			if peerID == "" {
+				return fallbackSourceName(sourceID, sourceType)
+			}
+		}
 		var name string
-		err := imDB.Table("user").Where("uid = ?", sourceID).Pluck("name", &name).Error
-		if err == nil && name != "" {
+		err := imDB.Table("user").Where("uid = ?", peerID).Pluck("name", &name).Error
+		if err == nil && strings.TrimSpace(name) != "" {
 			return name + "(私聊)"
 		}
 	}
 	return fallbackSourceName(sourceID, sourceType)
+}
+
+func sourceNameDMPeerID(sourceID, actorID string) string {
+	parts := strings.Split(sourceID, "@")
+	if actorID == "" || len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" || parts[0] == parts[1] {
+		return ""
+	}
+	if parts[0] == actorID {
+		return parts[1]
+	}
+	if parts[1] == actorID {
+		return parts[0]
+	}
+	return ""
+}
+
+// ResolveStoredSourceName preserves creation-time name snapshots. Empty names
+// can be resolved live. The only nonempty exception is the exact placeholder
+// produced by the canonical-DM lookup bug; no historical rows are rewritten.
+func ResolveStoredSourceName(source model.SummarySource, creatorID string, imDB *gorm.DB) string {
+	canonicalDMPlaceholder := source.SourceType == model.SourceDirect &&
+		sourceNameDMPeerID(source.SourceID, creatorID) != "" &&
+		source.SourceName == fallbackSourceName(source.SourceID, source.SourceType)
+	if strings.TrimSpace(source.SourceName) != "" && !canonicalDMPlaceholder {
+		return source.SourceName
+	}
+	return ResolveSourceNameForActor(source.SourceID, source.SourceType, creatorID, imDB)
 }
 
 // fallbackSourceName returns a placeholder source name.
