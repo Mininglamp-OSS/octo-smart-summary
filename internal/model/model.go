@@ -283,6 +283,13 @@ func (SummaryChunk) TableName() string { return "summary_chunk" }
 type Citation struct {
 	Index         int          `json:"index"`
 	Sender        string       `json:"sender"`
+	// SenderIsBot marks whether the citation's sender is a bot. Sourced
+	// from pipeline.Message.SenderIsBot (filled by the same batch resolver
+	// that populates Sender). Same judgement as the candidates API so the
+	// frontend sees a consistent bot flag across endpoints. Included in
+	// JSON unconditionally so the frontend can filter by it — a `false`
+	// value is meaningful (this sender is confirmed not a bot).
+	SenderIsBot   bool         `json:"sender_is_bot"`
 	Content       string       `json:"content"`
 	SentAt        string       `json:"sent_at"`
 	Source        string       `json:"source"`
@@ -295,10 +302,11 @@ type Citation struct {
 
 // ContextMsg represents a surrounding message used as context for a citation.
 type ContextMsg struct {
-	Sender     string `json:"sender"`
-	Content    string `json:"content"`
-	SentAt     string `json:"sent_at"`
-	MessageSeq int64  `json:"message_seq"`
+	Sender      string `json:"sender"`
+	SenderIsBot bool   `json:"sender_is_bot"`
+	Content     string `json:"content"`
+	SentAt      string `json:"sent_at"`
+	MessageSeq  int64  `json:"message_seq"`
 }
 
 // TeamCitation represents a [Pn] reference in a team summary pointing to a participant.

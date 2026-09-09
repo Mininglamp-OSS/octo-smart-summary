@@ -87,6 +87,7 @@ func buildCitations(text string, messages []pipeline.Message, allMessages []pipe
 			citations = append(citations, model.Citation{
 				Index:         msg.CitationIndex,
 				Sender:        sender,
+				SenderIsBot:   msg.SenderIsBot,
 				Content:       content,
 				SentAt:        msg.SendTime,
 				Source:        msg.SourceName,
@@ -213,10 +214,11 @@ func toContextMsg(msg pipeline.Message, nameMap map[string]string) model.Context
 		}
 	}
 	return model.ContextMsg{
-		Sender:     sender,
-		Content:    truncateRunes(msg.Content, 200),
-		SentAt:     msg.SendTime,
-		MessageSeq: msg.MessageSeq,
+		Sender:      sender,
+		SenderIsBot: msg.SenderIsBot,
+		Content:     truncateRunes(msg.Content, 200),
+		SentAt:      msg.SendTime,
+		MessageSeq:  msg.MessageSeq,
 	}
 }
 

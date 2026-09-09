@@ -13,6 +13,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"gorm.io/driver/sqlite"
@@ -1338,5 +1339,57 @@ func TestManualConfirm_MultiPerson_DoesNotDispatch(t *testing.T) {
 
 	if len(dispatched) != 0 {
 		t.Fatalf("manual (non-scheduled) CONFIRM multi-person must NOT dispatch participants from processTask (they wait for confirmation); got %v", dispatched)
+	}
+}
+
+// TestBatchResolveUserNames_UserQueryFailsRobotTableStillRuns pins the
+// fail-open contract on the worker resolver: if the `user` query fails
+// (e.g. table missing, permission error), the resolver must still run
+// the `robot` table leg and return whatever partial botSet it can build.
+// Before this test the resolver returned early on user-query error and
+// silently dropped robot-table classification (PR #237 review by
+// Jerry-Xin, P2 non-blocking).
+func TestBatchResolveUserNames_UserQueryFailsRobotTableStillRuns(t *testing.T) {
+	imDB, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open imDB: %v", err)
+	}
+	sqlDB, err := imDB.DB()
+	if err != nil {
+		t.Fatalf("get sql.DB: %v", err)
+	}
+	defer sqlDB.Close()
+
+	// Deliberately DO NOT create the `user` table — the user query
+	// will fail with "no such table: user". Only create the robot
+	// table so the second leg can still execute.
+	if _, err := sqlDB.Exec(`CREATE TABLE robot (robot_id TEXT PRIMARY KEY)`); err != nil {
+		t.Fatalf("create robot table: %v", err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO robot (robot_id) VALUES ('u_bot_a'), ('u_bot_b')`); err != nil {
+		t.Fatalf("seed robot rows: %v", err)
+	}
+
+	p := &Processor{imDB: imDB}
+	messages := []pipeline.Message{
+		{SenderUID: "u_bot_a"},
+		{SenderUID: "u_bot_b"},
+		{SenderUID: "u_unknown"},
+	}
+
+	nameMap, botSet := p.batchResolveUserNames(messages)
+
+	// nameMap is empty because the user query failed — acceptable.
+	if len(nameMap) != 0 {
+		t.Errorf("expected empty nameMap on user-query failure, got %v", nameMap)
+	}
+	// botSet MUST still contain the two robot-table entries. If the
+	// resolver early-returned on user-query failure, this map is empty
+	// and the assertion fails.
+	if !botSet["u_bot_a"] || !botSet["u_bot_b"] {
+		t.Errorf("botSet lost robot-table entries after user-query failure: %v", botSet)
+	}
+	if botSet["u_unknown"] {
+		t.Errorf("u_unknown should not be classified as bot: %v", botSet)
 	}
 }

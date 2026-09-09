@@ -852,11 +852,19 @@ func joinStrings(ss []string) string {
 }
 
 // batchResolveUserNames queries the IM DB for display names of the given message senders.
-// Returns a map from UID to display name. UIDs that cannot be resolved are omitted.
-func (p *Processor) batchResolveUserNames(messages []pipeline.Message) map[string]string {
+// Returns a map from UID to display name and a set of UIDs that are bots.
+// UIDs that cannot be resolved are omitted from nameMap; botSet is a positive
+// set so callers can check membership with a single lookup.
+//
+// Bot judgement matches the candidates API (internal/api/handler/candidates.go):
+// a UID is a bot when user.robot=1 OR the UID appears in the robot table.
+// Two IM sources are unioned so system bots (BotFather etc., which have
+// robot=0 on the user row but a matching robot table row) are still flagged.
+func (p *Processor) batchResolveUserNames(messages []pipeline.Message) (map[string]string, map[string]bool) {
 	nameMap := make(map[string]string)
+	botSet := make(map[string]bool)
 	if p.imDB == nil || len(messages) == 0 {
-		return nameMap
+		return nameMap, botSet
 	}
 
 	// Collect unique UIDs
@@ -867,7 +875,7 @@ func (p *Processor) batchResolveUserNames(messages []pipeline.Message) map[strin
 		}
 	}
 	if len(uidSet) == 0 {
-		return nameMap
+		return nameMap, botSet
 	}
 
 	uids := make([]string, 0, len(uidSet))
@@ -875,21 +883,46 @@ func (p *Processor) batchResolveUserNames(messages []pipeline.Message) map[strin
 		uids = append(uids, uid)
 	}
 
-	// Batch query from user table
+	// Batch query from user table — select robot flag alongside name so a
+	// single roundtrip covers both fields.
 	type userRow struct {
-		UID  string `gorm:"column:uid"`
-		Name string `gorm:"column:name"`
+		UID   string `gorm:"column:uid"`
+		Name  string `gorm:"column:name"`
+		Robot int    `gorm:"column:robot"`
 	}
 	var rows []userRow
-	if err := p.imDB.Raw("SELECT uid, name FROM `user` WHERE uid IN ?", uids).Scan(&rows).Error; err != nil {
+	if err := p.imDB.Raw("SELECT uid, name, robot FROM `user` WHERE uid IN ?", uids).Scan(&rows).Error; err != nil {
+		// Fall through to the robot table query below instead of an
+		// early return: the two SQLs are independent and the fail-open
+		// design (documented in PR #237) requires either leg to keep
+		// working when the other fails. Aligns with the agent-side
+		// resolver in agent/message_enrichment.go (PR #237 review by
+		// Jerry-Xin, P2 non-blocking).
 		log.Printf("[processor] batch resolve user names: %v", err)
-		return nameMap
-	}
-	for _, r := range rows {
-		if r.Name != "" {
-			nameMap[r.UID] = r.Name
+	} else {
+		for _, r := range rows {
+			if r.Name != "" {
+				nameMap[r.UID] = r.Name
+			}
+			if r.Robot == 1 {
+				botSet[r.UID] = true
+			}
 		}
 	}
-	log.Printf("[processor] resolved %d/%d user names", len(nameMap), len(uids))
-	return nameMap
+
+	// Union with the robot table so system bots with robot=0 on the user
+	// row (BotFather etc.) are still flagged. Same query shape as
+	// candidates.go's WHERE u.uid NOT IN (SELECT robot_id FROM robot).
+	var robotIDs []string
+	if err := p.imDB.Raw("SELECT robot_id FROM `robot` WHERE robot_id IN ?", uids).Scan(&robotIDs).Error; err != nil {
+		log.Printf("[processor] batch resolve robot table: %v", err)
+		// Fall through: nameMap and partial botSet are still valid.
+	} else {
+		for _, rid := range robotIDs {
+			botSet[rid] = true
+		}
+	}
+
+	log.Printf("[processor] resolved %d/%d user names, %d bots", len(nameMap), len(uids), len(botSet))
+	return nameMap, botSet
 }

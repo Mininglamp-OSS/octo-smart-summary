@@ -749,10 +749,10 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 
 	// Resolve sender names (for display in summary)
 	resolveStart := time.Now()
-	nameMap := p.batchResolveUserNames(messages)
+	nameMap, botSet := p.batchResolveUserNames(messages)
 	timing.Observe(taskNo, "resolve_user_names", resolveStart)
-	log.Printf("[personal-worker] batchResolveUserNames took %dms (%d names)",
-		time.Since(resolveStart).Milliseconds(), len(nameMap))
+	log.Printf("[personal-worker] batchResolveUserNames took %dms (%d names, %d bots)",
+		time.Since(resolveStart).Milliseconds(), len(nameMap), len(botSet))
 
 	// Get target person info from unified intent recognition (returned from fetch)
 	var targetUIDs []string
@@ -847,6 +847,18 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		} else {
 			userMessages[i].SenderName = userMessages[i].SenderUID
 		}
+		// SenderIsBot rides on the same batch resolver — botSet has the
+		// UIDs that user.robot=1 OR appear in the robot table. A missing
+		// UID (no user row, no robot row) is treated as not-a-bot, which
+		// matches the candidates API's default exclusion behaviour.
+		userMessages[i].SenderIsBot = botSet[userMessages[i].SenderUID]
+	}
+	// Also fill SenderIsBot on the full message pool (`messages`) — buildCitations
+	// receives it as allMessages and reads SenderIsBot to fill ContextMsg,
+	// so context lines around a citation carry the same bot flag as the
+	// citation itself.
+	for i := range messages {
+		messages[i].SenderIsBot = botSet[messages[i].SenderUID]
 	}
 
 	// Assign CitationIndex to all messages (evidence pool)

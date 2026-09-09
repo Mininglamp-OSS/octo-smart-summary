@@ -55,6 +55,13 @@ type Message struct {
 	MessageSeq    int64  `json:"message_seq"`
 	SenderUID     string `json:"sender_uid"`
 	SenderName    string `json:"sender_name"`
+	// SenderIsBot marks whether the sender is a bot (IM user.robot=1 OR
+	// uid present in the robot table). Filled alongside SenderName by the
+	// same batch resolver — see worker.batchResolveUserNames and
+	// agent.enrichMessagesWithMetadata. Judgement kept identical to the
+	// candidates API (internal/api/handler/candidates.go), so the frontend
+	// sees the same bot classification wherever it queries.
+	SenderIsBot   bool   `json:"sender_is_bot"`
 	ChannelID     string `json:"channel_id"`
 	ChannelType   int    `json:"channel_type"`
 	Timestamp     int64  `json:"timestamp"`

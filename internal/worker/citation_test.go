@@ -486,3 +486,78 @@ func TestExtractTeamCitations_CarriesPersonalResultAndTaskID(t *testing.T) {
 		t.Errorf("P2 missing convenience fields: %+v", got[1])
 	}
 }
+
+// TestBuildCitations_PropagatesSenderIsBot pins the contract that
+// pipeline.Message.SenderIsBot flows through to Citation.SenderIsBot and
+// ContextMsg.SenderIsBot. This is the only backend-visible marker the frontend
+// gets for "the sender of this citation is a bot", so a silent drop would
+// make the whole feature invisible without any other test failing.
+//
+// Paired-guard style: covers both a bot and a human citation, and checks the
+// context messages inherit the flag from the original pipeline.Message they
+// were derived from — so a context line quoting a bot in the middle of a
+// human-anchored citation still reads as bot on the frontend.
+func TestBuildCitations_PropagatesSenderIsBot(t *testing.T) {
+	// allMessages is the untrimmed pool used to build ContextBefore/After.
+	// Two channels are seeded so both citations exercise the context path.
+	allMessages := []pipeline.Message{
+		// ch_dev: bot-anchored citation with a human context line before it.
+		{MessageSeq: 10, ChannelID: "ch_dev", SenderUID: "uid_alice", SenderIsBot: false, Content: "morning", SendTime: "2025-01-15T09:00:00Z", SourceName: "开发群"},
+		{MessageSeq: 11, ChannelID: "ch_dev", SenderUID: "uid_bot_ci", SenderIsBot: true, Content: "PR #42 merged", SendTime: "2025-01-15T09:01:00Z", SourceName: "开发群", CitationIndex: 1},
+		{MessageSeq: 12, ChannelID: "ch_dev", SenderUID: "uid_bot_pager", SenderIsBot: true, Content: "deploy started", SendTime: "2025-01-15T09:02:00Z", SourceName: "开发群"},
+		// ch_ops: human-anchored citation with a bot context line after it.
+		{MessageSeq: 20, ChannelID: "ch_ops", SenderUID: "uid_bob", SenderIsBot: false, Content: "rolling out fix", SendTime: "2025-01-15T09:03:00Z", SourceName: "运维群", CitationIndex: 2},
+		{MessageSeq: 21, ChannelID: "ch_ops", SenderUID: "uid_bot_watch", SenderIsBot: true, Content: "alert cleared", SendTime: "2025-01-15T09:04:00Z", SourceName: "运维群"},
+	}
+	cited := []pipeline.Message{allMessages[1], allMessages[3]}
+
+	nameMap := map[string]string{
+		"uid_alice":     "Alice",
+		"uid_bob":       "Bob",
+		"uid_bot_ci":    "CI Bot",
+		"uid_bot_pager": "Pager Bot",
+		"uid_bot_watch": "Watch Bot",
+	}
+
+	citations := buildCitations("bot said [1], human said [2]", cited, allMessages, nameMap)
+	if len(citations) != 2 {
+		t.Fatalf("expected 2 citations, got %d", len(citations))
+	}
+
+	// c1: bot-anchored — Citation.SenderIsBot must be true.
+	c1 := citations[0]
+	if !c1.SenderIsBot {
+		t.Errorf("c1 (bot-anchored, uid=%q): SenderIsBot=false, want true", cited[0].SenderUID)
+	}
+	if c1.Sender != "CI Bot" {
+		t.Errorf("c1.Sender = %q, want %q", c1.Sender, "CI Bot")
+	}
+	// Its context_before[0] is a HUMAN — bot flag must be false there,
+	// otherwise ContextMsg is leaking the citation's flag onto its neighbours.
+	if len(c1.ContextBefore) != 1 {
+		t.Fatalf("c1.ContextBefore length = %d, want 1", len(c1.ContextBefore))
+	}
+	if c1.ContextBefore[0].SenderIsBot {
+		t.Errorf("c1.ContextBefore[0] (human): SenderIsBot=true, want false — flag is bleeding across messages")
+	}
+	// Its context_after[0] is a BOT — bot flag must be true.
+	if len(c1.ContextAfter) != 1 {
+		t.Fatalf("c1.ContextAfter length = %d, want 1", len(c1.ContextAfter))
+	}
+	if !c1.ContextAfter[0].SenderIsBot {
+		t.Errorf("c1.ContextAfter[0] (bot uid=%q): SenderIsBot=false, want true", allMessages[2].SenderUID)
+	}
+
+	// c2: human-anchored — Citation.SenderIsBot must be false.
+	c2 := citations[1]
+	if c2.SenderIsBot {
+		t.Errorf("c2 (human-anchored, uid=%q): SenderIsBot=true, want false", cited[1].SenderUID)
+	}
+	// Its context_after[0] is a BOT — ContextMsg flag must independently reflect that.
+	if len(c2.ContextAfter) != 1 {
+		t.Fatalf("c2.ContextAfter length = %d, want 1", len(c2.ContextAfter))
+	}
+	if !c2.ContextAfter[0].SenderIsBot {
+		t.Errorf("c2.ContextAfter[0] (bot uid=%q): SenderIsBot=false, want true", allMessages[4].SenderUID)
+	}
+}

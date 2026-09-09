@@ -55,38 +55,74 @@ func enrichMessagesWithMetadata(
 		uids = append(uids, uid)
 	}
 
-	// Batch query user table
+	// Batch query user table — select robot flag alongside name so a single
+	// roundtrip covers both fields. SenderIsBot is filled from the union of
+	// (user.robot=1) OR (uid IN robot table), keeping judgement identical to
+	// the candidates API (internal/api/handler/candidates.go) and the worker
+	// path (worker.batchResolveUserNames). Two IM sources are unioned so
+	// system bots (BotFather etc.) with robot=0 on the user row are still
+	// flagged via their robot table membership.
 	nameMap := make(map[string]string)
+	botSet := make(map[string]bool)
 	if len(uids) > 0 && imDB != nil {
 		type userRow struct {
-			UID  string `gorm:"column:uid"`
-			Name string `gorm:"column:name"`
+			UID   string `gorm:"column:uid"`
+			Name  string `gorm:"column:name"`
+			Robot int    `gorm:"column:robot"`
 		}
 		var rows []userRow
 		if err := imDB.WithContext(ctx).Raw(
-			"SELECT uid, name FROM `user` WHERE uid IN ? AND name != ''",
+			"SELECT uid, name, robot FROM `user` WHERE uid IN ?",
 			uids,
 		).Scan(&rows).Error; err != nil {
 			log.Printf("[agent] enrich: batch resolve user names failed: %v", err)
 		} else {
 			for _, r := range rows {
-				nameMap[r.UID] = r.Name
+				// Bot classification must NOT depend on name presence:
+				// programmatically provisioned bots can have an empty
+				// name row but still be robot=1. Gating botSet on the
+				// name filter caused an agent-vs-worker mismatch (see
+				// PR #237 review by Jerry-Xin, P1 blocking).
+				if r.Name != "" {
+					nameMap[r.UID] = r.Name
+				}
+				if r.Robot == 1 {
+					botSet[r.UID] = true
+				}
 			}
 			log.Printf("[agent] enrich: resolved %d/%d user names", len(nameMap), len(uids))
 		}
+
+		// Union with the robot table so system bots with robot=0 on the
+		// user row are still flagged. Non-fatal: on error we keep the
+		// partial botSet from the user query above.
+		var robotIDs []string
+		if err := imDB.WithContext(ctx).Raw(
+			"SELECT robot_id FROM `robot` WHERE robot_id IN ?",
+			uids,
+		).Scan(&robotIDs).Error; err != nil {
+			log.Printf("[agent] enrich: batch resolve robot table failed: %v", err)
+		} else {
+			for _, rid := range robotIDs {
+				botSet[rid] = true
+			}
+		}
 	}
 
-	// 3. Populate all three missing fields on each message
+	// 3. Populate all fields on each message
 	for i := range messages {
 		// SenderName from batch-resolved map
 		if name, ok := nameMap[messages[i].SenderUID]; ok {
 			messages[i].SenderName = name
 		}
+		// SenderIsBot from batch-resolved bot set (missing UID => false,
+		// same default as candidates.go's exclusion behaviour).
+		messages[i].SenderIsBot = botSet[messages[i].SenderUID]
 		// SourceName and ChannelType from accessibleChannels
 		messages[i].SourceName = channelName
 		messages[i].ChannelType = channelType
 	}
 
-	log.Printf("[agent] enrich: populated metadata for %d messages (channel=%s, source=%s, type=%d)",
-		len(messages), targetChannelID, channelName, channelType)
+	log.Printf("[agent] enrich: populated metadata for %d messages (channel=%s, source=%s, type=%d, bots=%d)",
+		len(messages), targetChannelID, channelName, channelType, len(botSet))
 }

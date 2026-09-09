@@ -43,19 +43,26 @@ func TestEnrichMessagesWithMetadata_PopulatesAllFields(t *testing.T) {
 	_, err = sqlDB.Exec(`
 		CREATE TABLE user (
 			uid TEXT PRIMARY KEY,
-			name TEXT NOT NULL
+			name TEXT NOT NULL,
+			robot INTEGER NOT NULL DEFAULT 0
 		)
 	`)
 	if err != nil {
 		t.Fatalf("failed to create user table: %v", err)
 	}
+	// robot table must exist too — enrichment unions user.robot with the
+	// robot table to match candidates.go's judgement.
+	_, err = sqlDB.Exec(`CREATE TABLE robot (robot_id TEXT PRIMARY KEY)`)
+	if err != nil {
+		t.Fatalf("failed to create robot table: %v", err)
+	}
 
 	// Insert test users
 	_, err = sqlDB.Exec(`
-		INSERT INTO user (uid, name) VALUES
-		('u_alice', '张三'),
-		('u_bob', '李四'),
-		('u_charlie', '王五')
+		INSERT INTO user (uid, name, robot) VALUES
+		('u_alice', '张三', 0),
+		('u_bob', '李四', 0),
+		('u_charlie', '王五', 0)
 	`)
 	if err != nil {
 		t.Fatalf("failed to insert test users: %v", err)
@@ -160,12 +167,14 @@ func TestEnrichMessagesWithMetadata_BatchResolveNoPlusOne(t *testing.T) {
 	}
 	defer sqlDB.Close()
 
-	_, err = sqlDB.Exec(`CREATE TABLE user (uid TEXT PRIMARY KEY, name TEXT NOT NULL)`)
+	_, err = sqlDB.Exec(`CREATE TABLE user (uid TEXT PRIMARY KEY, name TEXT NOT NULL, robot INTEGER NOT NULL DEFAULT 0)`)
 	if err != nil {
 		t.Fatalf("failed to create user table: %v", err)
 	}
-
-	// Insert 100 users
+	_, err = sqlDB.Exec(`CREATE TABLE robot (robot_id TEXT PRIMARY KEY)`)
+	if err != nil {
+		t.Fatalf("failed to create robot table: %v", err)
+	}
 	for i := 0; i < 100; i++ {
 		uid := sql.NullString{String: "u_" + string(rune(i)), Valid: true}
 		name := sql.NullString{String: "User" + string(rune(i)), Valid: true}
@@ -218,10 +227,11 @@ func TestEnrichMessagesWithMetadata_BatchResolveNoPlusOne(t *testing.T) {
 	ctx := context.Background()
 	enrichMessagesWithMetadata(ctx, messages, "group_large", channels, db)
 
-	// We expect EXACTLY 1 batch query for all 100 users
-	// If we see 100 queries, that's N+1 and the test should fail
-	if queryCount != 1 {
-		t.Errorf("expected 1 batch query, got %d (N+1 detected!)", queryCount)
+	// We expect EXACTLY 2 batch queries — one against user, one against
+	// robot — for all 100 users. Both are O(1) w.r.t. message count. If
+	// we see anywhere near 100 queries, that's N+1 and the test should fail.
+	if queryCount != 2 {
+		t.Errorf("expected 2 batch queries (user + robot), got %d (N+1 detected!)", queryCount)
 	}
 }
 
@@ -241,13 +251,17 @@ func TestEnrichMessagesWithMetadata_MissingUserGraceful(t *testing.T) {
 	}
 	defer sqlDB.Close()
 
-	_, err = sqlDB.Exec(`CREATE TABLE user (uid TEXT PRIMARY KEY, name TEXT NOT NULL)`)
+	_, err = sqlDB.Exec(`CREATE TABLE user (uid TEXT PRIMARY KEY, name TEXT NOT NULL, robot INTEGER NOT NULL DEFAULT 0)`)
 	if err != nil {
 		t.Fatalf("failed to create user table: %v", err)
 	}
+	_, err = sqlDB.Exec(`CREATE TABLE robot (robot_id TEXT PRIMARY KEY)`)
+	if err != nil {
+		t.Fatalf("failed to create robot table: %v", err)
+	}
 
 	// Only insert one user
-	_, err = sqlDB.Exec(`INSERT INTO user (uid, name) VALUES ('u_alice', '张三')`)
+	_, err = sqlDB.Exec(`INSERT INTO user (uid, name, robot) VALUES ('u_alice', '张三', 0)`)
 	if err != nil {
 		t.Fatalf("failed to insert test user: %v", err)
 	}
@@ -280,4 +294,84 @@ func TestEnrichMessagesWithMetadata_MissingUserGraceful(t *testing.T) {
 	}
 
 	log.Printf("[test] gracefully handled missing user (no crash)")
+}
+
+// TestEnrichMessagesWithMetadata_SenderIsBotUnion pins the SenderIsBot
+// judgement to match candidates.go's rule: union of (user.robot=1) OR
+// (uid IN robot table). A regression that drops either source would break
+// bot filtering silently — this test guards both sides plus the negative
+// (a plain human user stays SenderIsBot=false).
+func TestEnrichMessagesWithMetadata_SenderIsBotUnion(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	if err != nil {
+		t.Fatalf("failed to open in-memory db: %v", err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("failed to get sql.DB: %v", err)
+	}
+	defer sqlDB.Close()
+
+	_, err = sqlDB.Exec(`CREATE TABLE user (uid TEXT PRIMARY KEY, name TEXT NOT NULL, robot INTEGER NOT NULL DEFAULT 0)`)
+	if err != nil {
+		t.Fatalf("failed to create user table: %v", err)
+	}
+	_, err = sqlDB.Exec(`CREATE TABLE robot (robot_id TEXT PRIMARY KEY)`)
+	if err != nil {
+		t.Fatalf("failed to create robot table: %v", err)
+	}
+
+	// Four users covering all legs of the union PLUS the empty-name bot
+	// regression that motivated the fix (PR #237 review, P1 blocking):
+	//   u_human       — user row with robot=0, absent from robot table     ⇒ false
+	//   u_flagged     — user row with robot=1                                ⇒ true (leg 1)
+	//   u_system      — user row with robot=0, present in robot table       ⇒ true (leg 2)
+	//   u_bot_noname  — user row with robot=1 AND name='' (programmatically
+	//                   provisioned bot); must NOT be filtered out at SQL
+	//                   layer or the classification silently drops.         ⇒ true (leg 3)
+	_, err = sqlDB.Exec(`
+		INSERT INTO user (uid, name, robot) VALUES
+		('u_human',      '张三',      0),
+		('u_flagged',    'CI机器人',   1),
+		('u_system',     'BotFather', 0),
+		('u_bot_noname', '',          1)
+	`)
+	if err != nil {
+		t.Fatalf("failed to seed user rows: %v", err)
+	}
+	_, err = sqlDB.Exec(`INSERT INTO robot (robot_id) VALUES ('u_system')`)
+	if err != nil {
+		t.Fatalf("failed to seed robot rows: %v", err)
+	}
+
+	messages := []pipeline.Message{
+		{SenderUID: "u_human", ChannelID: "g", Content: "hi"},
+		{SenderUID: "u_flagged", ChannelID: "g", Content: "PR merged"},
+		{SenderUID: "u_system", ChannelID: "g", Content: "system notice"},
+		{SenderUID: "u_bot_noname", ChannelID: "g", Content: "auto post"},
+	}
+	channels := []pipeline.ChannelInfo{
+		{ChannelID: "g", ChannelType: 2, ChannelName: "test"},
+	}
+
+	enrichMessagesWithMetadata(context.Background(), messages, "g", channels, db)
+
+	want := map[string]bool{
+		"u_human":      false,
+		"u_flagged":    true,
+		"u_system":     true,
+		"u_bot_noname": true,
+	}
+	for i, msg := range messages {
+		expected, ok := want[msg.SenderUID]
+		if !ok {
+			t.Fatalf("unexpected uid %q at index %d", msg.SenderUID, i)
+		}
+		if msg.SenderIsBot != expected {
+			t.Errorf("message[%d] uid=%q: SenderIsBot=%v, want %v",
+				i, msg.SenderUID, msg.SenderIsBot, expected)
+		}
+	}
 }
