@@ -25,6 +25,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmfallback"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/gin-gonic/gin"
@@ -313,16 +314,18 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 		{Role: "user", Content: documentPreviewInstruction},
 		{Role: "user", Content: previewBody},
 	}
-	_, _, err := client.CallStream(genCtx, messages, documentPreviewTemperature, func(delta string) error {
-		if delta == "" {
+	_, _, err := client.CallStream(
+		llmfallback.WithPath(genCtx, llmfallback.PathDocumentPreview),
+		messages, documentPreviewTemperature, func(delta string) error {
+			if delta == "" {
+				return nil
+			}
+			if werr := writeSSE(w, "delta", previewEvent{Type: "delta", Content: delta}); werr != nil {
+				return werr
+			}
+			w.Flush()
 			return nil
-		}
-		if werr := writeSSE(w, "delta", previewEvent{Type: "delta", Content: delta}); werr != nil {
-			return werr
-		}
-		w.Flush()
-		return nil
-	})
+		})
 	if err != nil {
 		// Same rationale as the fetch path: a disconnected client is not a generation
 		// failure, and the error frame would be written to a socket nobody reads. The

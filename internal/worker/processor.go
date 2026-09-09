@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmfallback"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/notify"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
@@ -762,7 +763,9 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 	}
 	llmFn := func(ctx context.Context, prompt string) (string, error) {
 		callStart := time.Now()
-		out, err := p.llm.CallRaw(ctx, prompt)
+		// CallRaw delegates to Call, which sets no path of its own, so without
+		// this tag every post-retrieval narrowing call lands in path="unknown".
+		out, err := p.llm.CallRaw(llmfallback.WithPath(ctx, llmfallback.PathWorkerNarrow), prompt)
 		timing.RecordLLMSince(task.TaskNo, "检索后裁剪 PostRetrievalNarrow", callStart, 0)
 		return out, err
 	}

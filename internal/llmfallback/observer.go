@@ -15,6 +15,15 @@ const (
 	PathWorkerReduce Path = "worker_reduce"
 	PathAPIRefine    Path = "api_refine"
 	PathToolCall     Path = "tool_call"
+	// PathDocumentPreview is the AI 速览 streaming endpoint
+	// (POST /api/v1/summaries/document/preview). It is a live route with real
+	// traffic whose latency previously landed in PathUnknown.
+	PathDocumentPreview Path = "document_preview"
+	// PathWorkerNarrow is the worker's post-retrieval narrowing call
+	// (PostRetrievalNarrow, via CallRaw). It runs on every worker task, so
+	// leaving it in PathUnknown mixed real recurring traffic into the
+	// catch-all bucket.
+	PathWorkerNarrow Path = "worker_narrow"
 )
 
 // SwitchReason explains why Run advanced from one model to the next. The three

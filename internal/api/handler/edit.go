@@ -274,7 +274,7 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 	}
 
 	llmCtx, cancel := context.WithTimeout(
-		llmfallback.WithPath(c.Request.Context(), llmfallback.PathAPIRefine), 90*time.Second)
+		llmfallback.WithPath(c.Request.Context(), llmfallback.PathAPIRefine), refineTimeout())
 	defer cancel()
 	newContent, tokens, usedModel, err := h.llm.CallWithModel(llmCtx, []service.ChatMessage{
 		{Role: "system", Content: buildRefineSystemPrompt()},
@@ -441,7 +441,7 @@ func (h *EditHandler) RefineSummaryStream(c *gin.Context) {
 	}
 
 	llmCtx, cancel := context.WithTimeout(
-		llmfallback.WithPath(c.Request.Context(), llmfallback.PathAPIRefine), 90*time.Second)
+		llmfallback.WithPath(c.Request.Context(), llmfallback.PathAPIRefine), refineTimeout())
 	defer cancel()
 	newContent, tokens, usedModel, err := h.llm.CallStreamWithModel(llmCtx, []service.ChatMessage{
 		{Role: "system", Content: buildRefineSystemPrompt()},
