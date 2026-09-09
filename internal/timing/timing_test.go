@@ -1,6 +1,7 @@
 package timing
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -320,5 +321,79 @@ func TestRecordLLM_Empty(t *testing.T) {
 
 	if count != 0 {
 		t.Error("RecordLLM with empty taskNo should not record")
+	}
+}
+
+// productionPurposes is the census of every literal (or literal-shaped) value
+// passed to RecordLLM/RecordLLMSince in non-test code at head, paired with the
+// class it MUST map to. Keep this in sync with the call-site census when a new
+// RecordLLM* site is added — the retrieval-prep entries are "检索预处理: " + the
+// closed forceFn set plus the no-force "(tool-call)" case.
+var productionPurposes = []struct {
+	purpose string
+	want    string
+}{
+	{"检索预处理(tool-call)", "retrieval_prep"},
+	{"检索预处理: recognize_intent", "intent"},
+	{"检索预处理: extract_time_range", "extract_time_range"},
+	{"检索预处理: resolve_channel_scope", "resolve_channel_scope"},
+	{"检索预处理: resolve_topic_target", "resolve_topic_target"},
+	{"检索后裁剪 PostRetrievalNarrow", "post_retrieval_narrow"},
+	{"Map: 单次总结(跳过Map-Reduce)", "map_single"},
+	{"Map: 分块总结 chunk#0", "map_chunk"},
+	{"Map: 分块总结 chunk#7", "map_chunk"},
+	{"Reduce: 合并分块总结", "reduce"},
+	{"团队汇总: 合并各成员总结", "team_reduce"},
+}
+
+// TestPurposeClass_RealCallSites pins every production purpose value to its
+// class. Built from the RecordLLM* census rather than the report-rendering
+// strings, so misclassifying any real family fails here.
+func TestPurposeClass_RealCallSites(t *testing.T) {
+	for _, c := range productionPurposes {
+		if got := PurposeClass(c.purpose); got != c.want {
+			t.Errorf("PurposeClass(%q) = %q, want %q", c.purpose, got, c.want)
+		}
+	}
+}
+
+// TestPurposeClass_NoProductionPurposeIsOther is the anti-vacuity guard the
+// review asked for: no real call-site value may land in the "other" junk drawer.
+// Misclassifying any current production family (e.g. dropping the retrieval-prep
+// cases) turns this red, where a table of speculative literals would not.
+func TestPurposeClass_NoProductionPurposeIsOther(t *testing.T) {
+	for _, c := range productionPurposes {
+		if got := PurposeClass(c.purpose); got == "other" {
+			t.Errorf("production purpose %q classified as %q — real latency would be buried in the unclassified bucket", c.purpose, got)
+		}
+	}
+}
+
+// TestPurposeClass_UnknownFallsThrough documents the closed-set contract: a
+// value no call site emits, including a would-be-new forced function, lands in
+// "other" rather than silently widening the label space.
+func TestPurposeClass_UnknownFallsThrough(t *testing.T) {
+	for _, p := range []string{
+		"",
+		"something new nobody classified",
+		"检索预处理: brand_new_forced_fn",
+		"ReducerDebug", // must NOT be caught by the reduce rule
+	} {
+		if got := PurposeClass(p); got != "other" {
+			t.Errorf("PurposeClass(%q) = %q, want other", p, got)
+		}
+	}
+}
+
+// TestPurposeClass_ChunkIndexIsBounded is the cardinality guard: a thousand
+// distinct chunk indices must produce exactly one class, or the label space is
+// unbounded and this function has failed its only job.
+func TestPurposeClass_ChunkIndexIsBounded(t *testing.T) {
+	seen := map[string]struct{}{}
+	for i := 0; i < 1000; i++ {
+		seen[PurposeClass(fmt.Sprintf("Map: 分块总结 chunk#%d", i))] = struct{}{}
+	}
+	if len(seen) != 1 {
+		t.Errorf("chunk-map purposes produced %d classes, want 1 — cardinality is not bounded: %v", len(seen), seen)
 	}
 }

@@ -167,6 +167,64 @@ func RecordLLMSince(taskNo, purpose string, start time.Time, tokens int) {
 	RecordLLM(taskNo, purpose, time.Since(start), tokens)
 }
 
+// PurposeClass collapses a free-text LLMCall.Purpose into one of a small,
+// closed set of stable identifiers.
+//
+// Why this exists (#231 S3): Purpose is a human-readable string, and one of its
+// values is built as fmt.Sprintf("Map: 分块总结 chunk#%d", idx) — the chunk index
+// is unbounded. Purpose is fine as a log line, but the moment it is used as a
+// metric label it becomes a cardinality bomb: one time series per chunk index,
+// per task, forever. Any metric that wants to break down by call kind MUST label
+// on PurposeClass, never on the raw Purpose. The chunk index stays in the log
+// only.
+//
+// The cases below are the census of every RecordLLM/RecordLLMSince call site at
+// head. The retrieval-prep family is split per forced function rather than
+// merged into one class: the forced-function set is closed (recognize_intent,
+// extract_time_range, resolve_channel_scope, resolve_topic_target — see
+// internal/pipeline/*), so per-function classes stay bounded, and #220 needs
+// recognize_intent's latency percentile as a distinct input — merging would
+// bury it.
+//
+// The returned set is closed: intent, extract_time_range, resolve_channel_scope,
+// resolve_topic_target, retrieval_prep, post_retrieval_narrow, map_single,
+// map_chunk, reduce, team_reduce, other. New purposes fall through to "other"
+// rather than silently widening the label space — add a case here (and a test)
+// when a new call site is introduced.
+func PurposeClass(purpose string) string {
+	switch {
+	// Retrieval-prep tool calls: purpose is "检索预处理: " + forceFn, or
+	// "检索预处理(tool-call)" when no function is forced (see
+	// worker/{processor,personal_processor}.go). Match the closed forceFn set
+	// exactly so an unforeseen value falls through to "other" rather than
+	// silently joining a class.
+	case purpose == "检索预处理: recognize_intent":
+		return "intent"
+	case purpose == "检索预处理: extract_time_range":
+		return "extract_time_range"
+	case purpose == "检索预处理: resolve_channel_scope":
+		return "resolve_channel_scope"
+	case purpose == "检索预处理: resolve_topic_target":
+		return "resolve_topic_target"
+	case purpose == "检索预处理(tool-call)":
+		return "retrieval_prep"
+	case strings.Contains(purpose, "PostRetrievalNarrow"):
+		return "post_retrieval_narrow"
+	// Order matters: the chunk-map prefix is the unbounded one and must be
+	// matched before any looser "Map:" rule.
+	case strings.HasPrefix(purpose, "Map: 分块总结 chunk#"):
+		return "map_chunk"
+	case strings.HasPrefix(purpose, "Map: 单次总结"):
+		return "map_single"
+	case strings.HasPrefix(purpose, "团队汇总"):
+		return "team_reduce"
+	case purpose == "Reduce" || strings.HasPrefix(purpose, "Reduce:"):
+		return "reduce"
+	default:
+		return "other"
+	}
+}
+
 func ensureReportFile() *os.File {
 	reportOnce.Do(func() {
 		acctMu.Lock()
