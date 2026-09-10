@@ -780,6 +780,14 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		return
 	}
 
+	// Enforce the per-claim citation cap only for citation-producing summary
+	// profiles. General chat has no [n] citation vocabulary, so treating code
+	// such as matrix[1][2][3][4] as citations would corrupt ordinary replies.
+	// Runs BEFORE persistence so stored history matches what the user is shown.
+	if profileName == "summary" || profileName == "summary_refine" {
+		reply, newMsgs = agent.CapFinalAnswer(req.SessionID, reply, newMsgs)
+	}
+
 	// 成功回复后才落库；落库失败不阻断本次回复（宁可丢本回合历史，也不只落 user 造脏历史）。
 	// user_id 与 LoadHistory 保持一致，杜绝跨用户污染（SUM-158 blocker 1）。
 	if err := h.store.AppendMessages(ctx, req.SessionID, uid, newMsgs); err != nil {
@@ -1107,11 +1115,16 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		h.writeSSEErrorViaSinkWithDetail(sink, 50000, "agent chat failed", safeErrorDetail(err))
 		return
 	}
+	// Same summary-only final-body cap as Chat(); general chat replies must
+	// preserve bracketed expressions byte-for-byte.
+	if profileName == "summary" || profileName == "summary_refine" {
+		reply, newMsgs = agent.CapFinalAnswer(req.SessionID, reply, newMsgs)
+	}
+
 	// Persist messages on success (same as Chat). owner-scoped by uid（SUM-158 blocker 1）。
 	if err := h.store.AppendMessages(ctx, req.SessionID, uid, newMsgs); err != nil {
 		log.Printf("[agent] append messages error: %v", err)
 	}
-
 	// Emit done event with final reply
 	h.writeSSEDoneViaSink(sink, reply, req.SessionID, v2RunID)
 	traceOutcome = "ok"

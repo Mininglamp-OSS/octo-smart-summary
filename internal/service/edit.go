@@ -1,14 +1,14 @@
 package service
 
 import (
-	"regexp"
 	"strconv"
 	"strings"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citation"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 )
 
-var citationRefRe = regexp.MustCompile(`\[(\d{1,5})\]`)
+var citationRefRe = citation.MarkerRe
 
 func CleanUnreferencedCitations(content string, citations []model.Citation) []model.Citation {
 	referenced := extractReferencedIndices(content)

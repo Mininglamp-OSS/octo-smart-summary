@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/gin-gonic/gin"
 )
@@ -122,6 +123,25 @@ func TestAgentChatOK(t *testing.T) {
 	}
 	if resp.Data.SessionID != "sess-42" {
 		t.Fatalf("expected session_id passthrough sess-42, got %q", resp.Data.SessionID)
+	}
+}
+
+func TestGeneralChatDoesNotCapBracketedExpressions(t *testing.T) {
+	t.Setenv(config.MaxCitationsPerClaimEnvVar, "3")
+	const want = "matrix[1][2][3][4]"
+	h := newTestAgentChatHandler(want)
+	r := setupAgentChatRouter(h)
+
+	w := doChat(t, r, "show indexing", "sess-chat-brackets")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), want) {
+		t.Fatalf("general chat reply was citation-capped: %s", w.Body.String())
+	}
+	stored := h.store.(*fakeHistoryStore).byKey[fakeHistoryKey("sess-chat-brackets", testAgentChatUID)]
+	if len(stored) != 2 || stored[1].Content != want {
+		t.Fatalf("general chat history was citation-capped: %+v", stored)
 	}
 }
 
@@ -534,6 +554,31 @@ func TestChatStreamSuccess(t *testing.T) {
 	history, _ := store.LoadHistory(context.Background(), "sess-stream", testAgentChatUID)
 	if len(history) == 0 {
 		t.Fatal("expected AppendMessages to persist messages, but history is empty")
+	}
+}
+
+func TestGeneralChatStreamDoesNotCapBracketedExpressions(t *testing.T) {
+	t.Setenv(config.MaxCitationsPerClaimEnvVar, "3")
+	const want = "matrix[1][2][3][4]"
+	store := newFakeHistoryStore()
+	h := newTestAgentChatHandler(want)
+	h.store = store
+	r := setupAgentChatStreamRouter(h)
+
+	w := httptest.NewRecorder()
+	body := strings.NewReader(`{"message":"show indexing","session_id":"sess-stream-brackets"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agent/chat/stream", body)
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), want) {
+		t.Fatalf("general chat stream reply was citation-capped: %s", w.Body.String())
+	}
+	stored := store.byKey[fakeHistoryKey("sess-stream-brackets", testAgentChatUID)]
+	if len(stored) != 2 || stored[1].Content != want {
+		t.Fatalf("general chat stream history was citation-capped: %+v", stored)
 	}
 }
 

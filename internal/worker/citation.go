@@ -2,30 +2,31 @@ package worker
 
 import (
 	"fmt"
+	"log"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citation"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
 
-var citationRe = regexp.MustCompile(`\[(\d{1,5})\]`)
+// citationRe is the single process-wide citation-marker pattern, now owned by
+// internal/citation so the agent Map path (which must not import
+// internal/worker) enforces the cap against the very same definition
+// buildCitations / dedupCitations / stripOrphanCitations match on. Aliased
+// rather than re-declared: two copies of this regexp is exactly how a marker
+// one stage deletes becomes a marker another stage still counts.
+var citationRe = citation.MarkerRe
 var multiSpaceRe = regexp.MustCompile(`[ \t]{2,}`)
 var emptyLineRe = regexp.MustCompile(`(?m)^[ \t]*$\n`)
 
 // extractCitationIndexes extracts all [n] citation indexes from text.
 func extractCitationIndexes(text string) []int {
-	matches := citationRe.FindAllStringSubmatch(text, -1)
-	var indexes []int
-	seen := make(map[int]bool)
-	for _, m := range matches {
-		if n, err := strconv.Atoi(m[1]); err == nil && !seen[n] {
-			indexes = append(indexes, n)
-			seen[n] = true
-		}
-	}
+	indexes := citation.Numbers(text)
 	sort.Ints(indexes)
 	return indexes
 }
@@ -255,14 +256,32 @@ func dedupCitations(text string, citations []model.Citation) (string, []model.Ci
 
 	if len(remap) > 0 {
 		// Replace remapped indexes in text.
-		newText = citationRe.ReplaceAllStringFunc(newText, func(match string) string {
-			sub := citationRe.FindStringSubmatch(match)
-			n, _ := strconv.Atoi(sub[1])
-			if target, ok := remap[n]; ok {
-				return fmt.Sprintf("[%d]", target)
+		//
+		// Index-based, not ReplaceAllStringFunc, so the citation.IsCitableAt
+		// guard can be applied: a numeric markdown link label must keep its
+		// number, or `[1](url)` silently becomes `[2](url)` and points the
+		// reader at a source that says something else.
+		var b strings.Builder
+		b.Grow(len(newText))
+		prev := 0
+		for _, m := range citationRe.FindAllStringSubmatchIndex(newText, -1) {
+			if !citation.IsCitableAt(newText, m[0], m[1]) {
+				continue
 			}
-			return match
-		})
+			n, err := strconv.Atoi(newText[m[2]:m[3]])
+			if err != nil {
+				continue
+			}
+			target, ok := remap[n]
+			if !ok {
+				continue
+			}
+			b.WriteString(newText[prev:m[0]])
+			fmt.Fprintf(&b, "[%d]", target)
+			prev = m[1]
+		}
+		b.WriteString(newText[prev:])
+		newText = b.String()
 
 		// Collapse consecutive identical markers: [1][1][1] -> [1]
 		newText = collapseConsecutiveMarkers(newText)
@@ -270,14 +289,37 @@ func dedupCitations(text string, citations []model.Citation) (string, []model.Ci
 
 	// Global dedup: for each [n], keep only the first occurrence.
 	// Runs after remap so duplicates created by remap are also caught.
-	seen := make(map[string]bool)
-	newText = citationRe.ReplaceAllStringFunc(newText, func(match string) string {
-		if seen[match] {
-			return ""
+	//
+	// Guarded by citation.IsCitableAt for the same reason as the remap pass,
+	// and the failure here was worse: a numeric link label occupying the
+	// FIRST occurrence slot made the dedup delete the genuine citation that
+	// followed it, leaving a claim with a backing citation row and no marker.
+	//
+	//	in:  See [1](https://example.com). Conclusion[1]
+	//	out: See [1](https://example.com). Conclusion      <- citation lost
+	seen := make(map[int]bool)
+	{
+		var b strings.Builder
+		b.Grow(len(newText))
+		prev := 0
+		for _, m := range citationRe.FindAllStringSubmatchIndex(newText, -1) {
+			if !citation.IsCitableAt(newText, m[0], m[1]) {
+				continue
+			}
+			n, err := strconv.Atoi(newText[m[2]:m[3]])
+			if err != nil {
+				continue
+			}
+			if !seen[n] {
+				seen[n] = true
+				continue
+			}
+			b.WriteString(newText[prev:m[0]])
+			prev = m[1]
 		}
-		seen[match] = true
-		return match
-	})
+		b.WriteString(newText[prev:])
+		newText = b.String()
+	}
 	newText = multiSpaceRe.ReplaceAllString(newText, " ")
 	newText = emptyLineRe.ReplaceAllString(newText, "")
 	newText = strings.TrimSpace(newText)
@@ -312,8 +354,20 @@ func dedupCitations(text string, citations []model.Citation) (string, []model.Ci
 // preserved: "[1][2][1]" -> "[1][2][1]".
 //
 // Go's regexp engine (RE2) has no backreferences, so we process manually.
+//
+// Only citable markers participate. A numeric markdown link label is not a
+// citation, so `[1] [1](url)` is not a run and neither occurrence moves; a
+// non-citable marker sitting between two identical citable ones also breaks
+// the run, because the text between them is then not whitespace.
 func collapseConsecutiveMarkers(text string) string {
-	locs := citationRe.FindAllStringIndex(text, -1)
+	all := citationRe.FindAllStringIndex(text, -1)
+	locs := make([][]int, 0, len(all))
+	for _, m := range all {
+		if !citation.IsCitableAt(text, m[0], m[1]) {
+			continue
+		}
+		locs = append(locs, m)
+	}
 	if len(locs) < 2 {
 		return text
 	}
@@ -356,25 +410,138 @@ func collapseConsecutiveMarkers(text string) string {
 
 func isOnlyWhitespace(s string) bool {
 	for _, r := range s {
-		if r != ' ' && r != '\t' && r != '\n' && r != '\r' {
+		if !unicode.IsSpace(r) {
 			return false
 		}
 	}
 	return true
 }
 
+// stripOrphanCitations removes `[n]` markers that have no backing Citation
+// row.
+//
+// Skips non-citable `[n]` forms via citation.IsCitableAt, the same guard
+// CapRuns applies. Without it this function undid exactly the damage that
+// guard exists to prevent, one pipeline stage later:
+//
+//	in:  结论一[1][2]，详见 [999](https://example.com/doc)
+//	out: 结论一[1][2]，详见 (https://example.com/doc)     <- link destroyed
+//
+// A markdown link whose text happens to be a number is not a citation, has no
+// Citation row by construction, and so was deleted from every summary that
+// contained one. Pre-existing, not introduced by the cap — but a guard that
+// protects one of the two paths that need it is not a guard.
 func stripOrphanCitations(text string, citations []model.Citation) string {
 	validSet := make(map[int]bool)
 	for _, c := range citations {
 		validSet[c.Index] = true
 	}
-	result := citationRe.ReplaceAllStringFunc(text, func(match string) string {
-		sub := citationRe.FindStringSubmatch(match)
-		n, _ := strconv.Atoi(sub[1])
-		if validSet[n] {
-			return match
+	var b strings.Builder
+	b.Grow(len(text))
+	prev := 0
+	for _, m := range citationRe.FindAllStringSubmatchIndex(text, -1) {
+		if !citation.IsCitableAt(text, m[0], m[1]) {
+			continue
 		}
-		return ""
-	})
-	return strings.TrimSpace(multiSpaceRe.ReplaceAllString(result, " "))
+		n, err := strconv.Atoi(text[m[2]:m[3]])
+		if err != nil || validSet[n] {
+			continue
+		}
+		b.WriteString(text[prev:m[0]])
+		prev = m[1]
+	}
+	b.WriteString(text[prev:])
+	return strings.TrimSpace(multiSpaceRe.ReplaceAllString(b.String(), " "))
+}
+
+// finalizeCitations is the ONE definition of the worker's final citation
+// pipeline: derive rows, dedup, strip orphans, then cap. It exists as a
+// function so a test cannot exercise a different order than production does —
+// the previous test stopped at buildCitations, and that one-call gap between
+// the test's order and production's order hid a default-on regression for a
+// whole review round.
+//
+// maxCites <= 0 disables the cap (citation.Disabled), in which case this is
+// byte-for-byte the pre-cap pipeline.
+//
+// # Why the cap runs LAST
+//
+// dedupCitations ends with a whole-document dedup: for each [n] it keeps only
+// the FIRST occurrence anywhere in the body and deletes every later repeat.
+// citation.CapRuns keeps the HEAD of each run. Head-keeping is the worst
+// possible survivor policy against a first-occurrence global dedup — the
+// markers the cap preserves are precisely the ones an earlier claim has
+// already consumed, and the tail markers it deletes are the ones that would
+// have survived the dedup.
+//
+// Two claims citing the same source is not a corner case. It is what a real
+// summary looks like: one decisive message supports several conclusions.
+// Capping BEFORE the dedup therefore stripped claims down to zero citations:
+//
+//	in:          结论一：范围已确认[1][2][3]
+//	             结论二：负责人已定[1][2][3][10][11][12]
+//	cap off:     结论二：负责人已定[10][11][12]     <- cited
+//	cap=3 first: 结论二：负责人已定                 <- ZERO citations
+//
+// The cap destroyed a citation that exists without the cap. That violates
+// citation.CapRuns' own stated invariant ("an uncited claim is worse than an
+// over-cited one" — true inside CapRuns, false two calls later), and the Map
+// prompt's "没有引用的结论不允许输出".
+//
+// # Why capping last does not leave orphan Citation rows
+//
+// That concern is real and is what put the cap first to begin with. It is
+// handled by RE-DERIVING: buildCitations is a pure function of (text,
+// messages, allMessages, nameMap) — it reads no state and mutates nothing —
+// so running it again over the capped body returns exactly the rows whose
+// markers are still present.
+//
+// The subtle part is dedupCitations' remap, which rewrites marker NUMBERS
+// when two citations share (sender, content). Re-deriving after it is still
+// correct because the remap has already been applied to the body: the
+// remapped-away numbers are gone from the text, so buildCitations never sees
+// them and cannot resurrect a row for one. TestCapLastSurvivesCitationRemap
+// pins this by asserting the re-derived rows equal dedupCitations' rows minus
+// exactly what the cap removed.
+//
+// And the cap only ever DELETES markers, never adds or renumbers, so it
+// cannot introduce a marker with no backing row either.
+//
+// # What this does NOT bound
+//
+// It does not bound what a STREAMING client sees first. Deltas are emitted
+// straight from the model (CallMapStream / CallReduceStream); every stage in
+// this function runs after the last delta. The live view is reconciled by
+// publishing the final body as a streaming snapshot before Done — see
+// finishStreamDone in personal_processor.go.
+func finalizeCitations(
+	text string,
+	userMessages []pipeline.Message,
+	allMessages []pipeline.Message,
+	nameMap map[string]string,
+	maxCites int,
+) (string, []model.Citation) {
+	citations := buildCitations(text, userMessages, allMessages, nameMap)
+	text, citations = dedupCitations(text, citations)
+	text = stripOrphanCitations(text, citations)
+
+	if maxCites <= 0 {
+		return text, citations
+	}
+
+	capped, st := citation.CapRuns(text, maxCites)
+	if !st.Changed() {
+		// Nothing removed: the body and rows are already consistent, and
+		// skipping the re-derive keeps the no-op path allocation-free and
+		// provably identical to the disabled path.
+		return text, citations
+	}
+	log.Printf("[personal-worker] citation cap max=%d runs=%d capped_runs=%d markers=%d->%d dedup=%d cap=%d longest_run=%d->%d marks (%d->%d chars) bytes=%d->%d",
+		maxCites, st.Runs, st.CappedRuns, st.MarkersBefore, st.MarkersAfter,
+		st.RemovedByDedup, st.RemovedByCap,
+		st.LongestRunBefore, st.LongestRunAfter,
+		st.LongestRunCharsBefore, st.LongestRunCharsAfter,
+		st.BytesBefore, st.BytesAfter)
+
+	return capped, buildCitations(capped, userMessages, allMessages, nameMap)
 }
