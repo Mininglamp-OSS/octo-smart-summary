@@ -1,6 +1,7 @@
 package timing
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/metrics"
 )
 
 func TestRecord(t *testing.T) {
@@ -396,4 +399,56 @@ func TestPurposeClass_ChunkIndexIsBounded(t *testing.T) {
 	if len(seen) != 1 {
 		t.Errorf("chunk-map purposes produced %d classes, want 1 — cardinality is not bounded: %v", len(seen), seen)
 	}
+}
+
+// TestRecord_EmitsStageHistogram checks Record feeds the scrapeable
+// summary_stage_duration_seconds histogram, labelled by the (closed-set) stage
+// name — the metric side of #242 S3-b. Assertions are on presence, not exact
+// counts, because the histograms are process-global and accumulate across the
+// package's other tests.
+func TestRecord_EmitsStageHistogram(t *testing.T) {
+	Record("ST-x", "fetch_messages", 1500*time.Millisecond)
+
+	out := scrapeDefault()
+	for _, want := range []string{
+		"# TYPE summary_stage_duration_seconds histogram",
+		`summary_stage_duration_seconds_bucket{stage="fetch_messages",le="2"}`,
+		`summary_stage_duration_seconds_count{stage="fetch_messages"}`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in exposition:\n%s", want, out)
+		}
+	}
+}
+
+// TestRecordLLM_EmitsPurposeClassHistogram checks RecordLLM fires the
+// summary_llm_duration_seconds histogram labelled by PurposeClass — pulling the
+// trigger on the classifier from #240 (which no metric consumed before). It
+// also confirms the unbounded chunk index is collapsed to purpose_class="map_chunk".
+func TestRecordLLM_EmitsPurposeClassHistogram(t *testing.T) {
+	for i := 0; i < 5; i++ {
+		RecordLLM("ST-y", fmt.Sprintf("Map: 分块总结 chunk#%d", i), 800*time.Millisecond, 100)
+	}
+	RecordLLM("ST-y", "检索预处理: recognize_intent", 300*time.Millisecond, 50)
+
+	out := scrapeDefault()
+	for _, want := range []string{
+		"# TYPE summary_llm_duration_seconds histogram",
+		`summary_llm_duration_seconds_count{purpose_class="map_chunk"}`,
+		`summary_llm_duration_seconds_count{purpose_class="intent"}`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in exposition:\n%s", want, out)
+		}
+	}
+	// The unbounded chunk index must not leak into the label space.
+	if strings.Contains(out, "chunk#") {
+		t.Errorf("raw chunk index leaked into a metric label:\n%s", out)
+	}
+}
+
+func scrapeDefault() string {
+	var buf bytes.Buffer
+	metrics.Default.WritePrometheus(&buf)
+	return buf.String()
 }
