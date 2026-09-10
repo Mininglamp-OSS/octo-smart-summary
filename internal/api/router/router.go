@@ -6,6 +6,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/handler"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/ws"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmobs"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/metrics"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/streaming"
@@ -208,6 +209,9 @@ func SetupInternal(hub *ws.Hub, streamHub ...*streaming.Hub) (*gin.Engine, *hand
 		if m := llmobs.Default(); m != nil {
 			m.WritePrometheus(c.Writer)
 		}
+		// App-level metrics (worker timing stages, agent trace) register into
+		// the shared default registry; render them alongside the LLM metrics.
+		metrics.Default.WritePrometheus(c.Writer)
 	})
 	r.POST("/internal/task-event", intH.TaskEvent)
 	r.POST("/internal/worker-trigger", intH.WorkerTrigger)
