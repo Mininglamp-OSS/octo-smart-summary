@@ -711,10 +711,18 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 		return WorkspaceSnapshot{}, err
 	}
 	history = agent.TruncateHistory(history, h.window)
+	// Trace the agent run so its latency lands in the always-on agent_* metrics
+	// (#242 S3-b), matching the two chat entry points. Scoped to the runner call
+	// itself — the run's wall clock (planning + tools) — not the handler
+	// post-processing below. StartTrace only adds a value to ctx, preserving the
+	// context configured above.
+	ctx, trace := agent.StartTrace(ctx, agentSessionID)
 	result, messages, err := runner.RunWithHistoryOutcome(ctx, system, history, req.Message)
 	if err != nil {
+		trace.Report("error")
 		return WorkspaceSnapshot{}, err
 	}
+	trace.Report("ok")
 	if result.Terminal == nil {
 		return WorkspaceSnapshot{}, errors.New("summary workspace Agent did not emit a terminal result")
 	}

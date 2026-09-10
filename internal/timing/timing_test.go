@@ -452,3 +452,35 @@ func scrapeDefault() string {
 	metrics.Default.WritePrometheus(&buf)
 	return buf.String()
 }
+
+// knownStages is the census of stage names passed to Record/Stage/Observe at
+// worker call sites as of #244. `stage` is a metric label, so it must stay a
+// closed set. This list pins it: if you add a Record/Stage/Observe call with a
+// new stage name, add it here — and never build a stage from request data.
+// (A test cannot see the call sites directly, so this is a documented census,
+// not a mechanical guard; keep it in sync when touching worker timing.)
+var knownStages = []string{
+	"execute_pipeline_total",
+	"fetch_messages",
+	"persist_personal_result",
+	"personal_pipeline_total",
+	"resolve_user_names",
+	"llm_map_summary",
+	"llm_reduce_summary",
+	"build_citations",
+}
+
+// TestRecord_StageCensusRenders pins the stage vocabulary: every known stage
+// renders a clean summary_stage_duration_seconds series under its literal name.
+func TestRecord_StageCensusRenders(t *testing.T) {
+	for _, s := range knownStages {
+		Record("ST-census", s, 100*time.Millisecond)
+	}
+	out := scrapeDefault()
+	for _, s := range knownStages {
+		want := `summary_stage_duration_seconds_count{stage="` + s + `"}`
+		if !strings.Contains(out, want) {
+			t.Errorf("stage %q did not render its metric series (%s)", s, want)
+		}
+	}
+}
