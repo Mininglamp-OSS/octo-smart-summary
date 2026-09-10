@@ -712,17 +712,23 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 	}
 	history = agent.TruncateHistory(history, h.window)
 	// Trace the agent run so its latency lands in the always-on agent_* metrics
-	// (#242 S3-b), matching the two chat entry points. Scoped to the runner call
-	// itself — the run's wall clock (planning + tools) — not the handler
-	// post-processing below. StartTrace only adds a value to ctx, preserving the
-	// context configured above.
+	// (#242 S3-b), matching the two chat entry points. The deferred Report with a
+	// mutating outcome covers every exit — the runner error, the acceptance gates
+	// below (nil terminal, payload unmarshal, result-type validation, persistence
+	// …) and a panic in the run — so a turn rejected after the run is recorded as
+	// "error", not a false "ok", and a panicked run is not dropped. StartTrace
+	// only adds a value to ctx, preserving the context configured above.
 	ctx, trace := agent.StartTrace(ctx, agentSessionID)
+	traceOutcome := "panic"
+	defer func() { trace.Report(traceOutcome) }()
 	result, messages, err := runner.RunWithHistoryOutcome(ctx, system, history, req.Message)
 	if err != nil {
-		trace.Report("error")
+		traceOutcome = "error"
 		return WorkspaceSnapshot{}, err
 	}
-	trace.Report("ok")
+	// The run produced a terminal result; from here any failure return is a
+	// failed turn until the successful completion at the end sets "ok".
+	traceOutcome = "error"
 	if result.Terminal == nil {
 		return WorkspaceSnapshot{}, errors.New("summary workspace Agent did not emit a terminal result")
 	}
@@ -854,6 +860,7 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 			log.Printf("[summary-workspace] finish Agent run failed session=%s run=%s: %v", key.SessionID, resolvedRunID, err)
 		}
 	}
+	traceOutcome = "ok"
 	return snapshot, nil
 }
 

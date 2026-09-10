@@ -117,3 +117,31 @@ func TestRegistry_RendersInRegistrationOrder(t *testing.T) {
 		t.Errorf("registry did not preserve registration order (zzz should precede aaa):\n%s", a.String())
 	}
 }
+
+// TestHistogram_EmptyLabelSetRenders covers a label-free histogram (as used by
+// agent_steps / agent_prompt_chars): the le dimension must still render as a
+// well-formed {le="…"} with no leading comma, and _sum/_count carry no braces
+// content.
+func TestHistogram_EmptyLabelSetRenders(t *testing.T) {
+	h := NewHistogramVec("things", "no labels", []float64{1, 5})
+	h.Observe(Labels(), 3) // Labels() → empty LabelSet
+	var buf bytes.Buffer
+	h.WriteProm(&buf)
+	out := buf.String()
+
+	for _, want := range []string{
+		`things_bucket{le="1"} 0`,
+		`things_bucket{le="5"} 1`,
+		`things_bucket{le="+Inf"} 1`,
+		"things_sum{} 3",
+		"things_count{} 1",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+	// A leading comma would mean withLE glued le onto an empty set wrong.
+	if strings.Contains(out, `{,le=`) {
+		t.Errorf("empty label set produced a leading comma:\n%s", out)
+	}
+}
