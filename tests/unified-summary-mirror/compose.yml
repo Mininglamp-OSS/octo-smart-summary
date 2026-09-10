@@ -1,0 +1,48 @@
+name: summary-versioning-unified
+services:
+  # The shared external network also carries the sibling mirrors, and Compose
+  # publishes every service name as a network alias — a service named `fixture`
+  # here would collide with theirs and silently resolve to the wrong stub.
+  notifyfixture:
+    image: node:22.16.0-bookworm
+    command: ["node", "/fixtures/provider.mjs"]
+    volumes: ["./provider.mjs:/fixtures/provider.mjs:ro"]
+    networks: [isolated]
+  api:
+    image: octo-summary-unified:continue-optimize-20260910
+    ports: ["127.0.0.1:28371:8080"]
+    environment: &environment
+      MYSQL_DSN: "root@tcp(octo-summary-versioning-test-mysql:3306)/summary_versioning_unified?parseTime=true&loc=Asia%2FShanghai"
+      IM_MYSQL_DSN: "root@tcp(octo-summary-versioning-test-mysql:3306)/summary_versioning_unified?parseTime=true&loc=Asia%2FShanghai"
+      OCTO_API_URL: "http://notifyfixture:8089"
+      WORKER_TRIGGER_URL: "http://worker:8082/internal/trigger"
+      WORKER_API_CALLBACK_URL: "http://api:8081"
+      LLM_API_URL: "http://notifyfixture:8089/v1"
+      LLM_API_KEY: "local-synthetic-fixture"
+      LLM_MODEL: "fixture"
+      SUMMARY_CONTENT_EXECUTION_SPACES: "unified-fixture"
+      SUMMARY_WORKBENCH_ENABLED: "true"
+      # The reason this mirror exists: the existing harnesses run with
+      # notifications disabled, so the continue-optimize notification gate is a
+      # no-op there and cannot be accepted either way.
+      SUMMARY_NOTIFY_ENABLED: "true"
+      SUMMARY_NOTIFY_TOKEN: "local-synthetic-notify-token"
+      SUMMARY_WEB_BASE_URL: "http://127.0.0.1:28371"
+      APP_ENV: "fixture"
+      MESSAGE_FETCH_BACKEND: "mysql"
+      MSG_TABLE_COUNT: "1"
+      WORKER_POLL_INTERVAL_SECONDS: "1"
+      TIMING_LOG_PATH: "/tmp/summary-timing.log"
+      SUMMARY_REPORT_PATH: "/tmp/summary-report.log"
+    networks: [isolated]
+    depends_on: [notifyfixture]
+  worker:
+    image: octo-summary-unified:continue-optimize-20260910
+    entrypoint: ["/bin/summary-worker"]
+    environment: *environment
+    networks: [isolated]
+    profiles: [worker]
+networks:
+  isolated:
+    external: true
+    name: octo-summary-versioning-test

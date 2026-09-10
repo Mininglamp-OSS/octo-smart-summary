@@ -49,7 +49,7 @@ func (s *ContentService) QueueRefine(ctx context.Context, space string, taskID i
 	}
 	var result *model.SummaryGenerationRun
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		writer := NewContentService(tx)
+		writer := s.withDB(tx)
 		l, err := writer.lockContent(ctx, space, taskID, actor, contentID)
 		if err != nil {
 			return err
@@ -182,7 +182,7 @@ func (s *ContentService) withRun(ctx context.Context, id string, fn func(*Conten
 		if run.ID != id || task.SpaceID != run.SpaceID {
 			return contentError("generation_not_found", 404)
 		}
-		return fn(NewContentService(tx), &run)
+		return fn(s.withDB(tx), &run)
 	})
 }
 
@@ -200,8 +200,12 @@ func (s *ContentService) RecoverableGenerations(ctx context.Context, spaces []st
 	if s.db.Dialector.Name() == "mysql" {
 		spaceColumn = "BINARY space_id"
 	}
-	err := s.db.WithContext(ctx).Where(spaceColumn+" IN ? AND executor = ? AND cancel_requested = ? AND active_slot IS NOT NULL",
-		spaces, "refine", false).
+	executors := []string{"refine"}
+	if s.sourceAuthorizer != nil {
+		executors = append(executors, "workflow")
+	}
+	err := s.db.WithContext(ctx).Where(spaceColumn+" IN ? AND executor IN ? AND cancel_requested = ? AND active_slot IS NOT NULL",
+		spaces, executors, false).
 		Where("status = ? OR (status = ? AND lease_until <= ?)", "pending", "running", timezone.Now()).
 		Order("created_at ASC").Limit(limit).Find(&runs).Error
 	return runs, err
@@ -230,6 +234,12 @@ func (s *ContentService) ClaimGeneration(ctx context.Context, id string, lease t
 		until := now.Add(lease)
 		run.ExecutionToken++
 		run.LeaseUntil, run.Status, run.Stage = &until, "running", "refining"
+		if run.Executor == "workflow" {
+			if err := writer.requireSingleGeneration(l.access, l.target, run.ActorID); err != nil {
+				return writer.rejectUnauthorizedRun(run, contentError("content_forbidden", 403), &rejected)
+			}
+			run.Stage = "generating"
+		}
 		if err := writer.db.Save(run).Error; err != nil {
 			return err
 		}
@@ -353,7 +363,7 @@ func (l *lockedContent) appendRefinement(run *model.SummaryGenerationRun, input 
 			return nil, contentError("generation_input_invalid", 409)
 		}
 	}
-	snapshot["executor"], snapshot["model"], snapshot["generation_id"] = "refine", usedModel, run.ID
+	snapshot["executor"], snapshot["model"], snapshot["generation_id"] = run.Executor, usedModel, run.ID
 	snapshotJSON, err := json.Marshal(snapshot)
 	if err != nil {
 		return nil, err

@@ -131,6 +131,24 @@ func (r personalContentRepository) current() (*FormalContentVersion, int64, stri
 		Where("task_id = ? AND user_id = ?", r.target.TaskID, r.target.UserID).Count(&count).Error; err != nil {
 		return nil, 0, "", err
 	}
+	var versions []model.PersonalResultVersion
+	if pr.CurrentVersionID != nil {
+		if err := r.db.Where("id = ? AND task_id = ? AND user_id = ?", *pr.CurrentVersionID, r.target.TaskID, r.target.UserID).Find(&versions).Error; err != nil {
+			return nil, 0, "", err
+		}
+	} else if count > 0 {
+		if err := r.db.Where("task_id = ? AND user_id = ? AND content = ? AND COALESCE(citations_json, '') = ?",
+			r.target.TaskID, r.target.UserID, pr.Content, pr.CitationsJSON).Limit(2).Find(&versions).Error; err != nil {
+			return nil, 0, "", err
+		}
+	}
+	return r.currentFromLoaded(pr, count, versions)
+}
+
+// versions contains the pointed row, or at most two canonical-body matches.
+// Reused by batched metadata reads so damaged/legacy pointers have exactly the
+// same interpretation as the full catalog, without loading all history.
+func (r personalContentRepository) currentFromLoaded(pr model.PersonalResult, count int64, versions []model.PersonalResultVersion) (*FormalContentVersion, int64, string, error) {
 	revision := pr.ContentRevision
 	if revision == 0 {
 		revision = count
@@ -141,14 +159,12 @@ func (r personalContentRepository) current() (*FormalContentVersion, int64, stri
 	var current *FormalContentVersion
 	integrity := "consistent"
 	if pr.CurrentVersionID != nil {
-		var err error
-		current, err = r.version(*pr.CurrentVersionID)
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+		if len(versions) != 1 || versions[0].ID != *pr.CurrentVersionID ||
+			versions[0].TaskID != r.target.TaskID || versions[0].UserID != r.target.UserID {
 			return nil, revision, "repair_required", nil
 		}
-		if err != nil {
-			return nil, 0, "", err
-		}
+		v := r.dto(versions[0])
+		current = &v
 	} else if count == 0 {
 		if strings.TrimSpace(pr.Content) == "" {
 			return nil, revision, integrity, nil
@@ -173,16 +189,10 @@ func (r personalContentRepository) current() (*FormalContentVersion, int64, stri
 		// A missing pointer is safe to project only when exactly one retained
 		// version matches the canonical body and evidence. MAX(version) is not
 		// evidence of which version a previous restore selected.
-		var candidates []model.PersonalResultVersion
-		if err := r.db.Where("task_id = ? AND user_id = ? AND content = ? AND COALESCE(citations_json, '') = ?",
-			r.target.TaskID, r.target.UserID, pr.Content, pr.CitationsJSON).
-			Limit(2).Find(&candidates).Error; err != nil {
-			return nil, 0, "", err
-		}
-		if len(candidates) != 1 {
+		if len(versions) != 1 {
 			return nil, revision, "repair_required", nil
 		}
-		v := r.dto(candidates[0])
+		v := r.dto(versions[0])
 		current = &v
 		integrity = "normalization_required"
 	}

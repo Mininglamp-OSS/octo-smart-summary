@@ -111,7 +111,7 @@ type octoSearchClient interface {
 // fetchConcurrency preserves the existing configurable concurrency behavior.
 // This function creates the total timeout because the upstream context has no
 // deadline.
-func fetchViaBatch(ctx context.Context, client octoSearchClient, candidates []ChannelInfo, creatorUID string, startTS, endTS int64, fetchConcurrency int, pollInterval time.Duration) ([]Message, error) {
+func fetchViaBatch(ctx context.Context, client octoSearchClient, candidates []ChannelInfo, creatorUID string, startTS, endTS int64, fetchConcurrency int, pollInterval time.Duration, strict ...bool) ([]Message, error) {
 	if len(candidates) == 0 {
 		return nil, nil // Do not submit an empty channel list.
 	}
@@ -156,9 +156,9 @@ func fetchViaBatch(ctx context.Context, client octoSearchClient, candidates []Ch
 			}
 			defer func() { <-sem }()
 
-			msgs, err := runBatchWithSplit(ctx, client, chs, startTS, endTS, infoByID, pollInterval)
+			msgs, err := runBatchWithSplit(ctx, client, chs, startTS, endTS, infoByID, pollInterval, strict...)
 			if err != nil {
-				if isFatalBatchErr(err) {
+				if isFatalBatchErr(err) || (len(strict) > 0 && strict[0]) {
 					// Aborting errors stop the whole fetch.
 					mu.Lock()
 					if fatalErr == nil {
@@ -215,8 +215,8 @@ func isFatalBatchErr(err error) bool {
 // runBatchWithSplit submits one batch. On 413 it first bisects by channel; when
 // a single channel is still too large, it switches to time-window splitting.
 // Other errors are returned for the caller to classify.
-func runBatchWithSplit(ctx context.Context, client octoSearchClient, chs []string, startTS, endTS int64, infoByID map[string]ChannelInfo, pollInterval time.Duration) ([]Message, error) {
-	msgs, err := runOneBatch(ctx, client, chs, startTS, endTS, infoByID, pollInterval)
+func runBatchWithSplit(ctx context.Context, client octoSearchClient, chs []string, startTS, endTS int64, infoByID map[string]ChannelInfo, pollInterval time.Duration, strict ...bool) ([]Message, error) {
+	msgs, err := runOneBatch(ctx, client, chs, startTS, endTS, infoByID, pollInterval, strict...)
 	if err == nil {
 		return msgs, nil
 	}
@@ -229,9 +229,9 @@ func runBatchWithSplit(ctx context.Context, client octoSearchClient, chs []strin
 	if splittable {
 		var out []Message
 		for _, p := range parts {
-			sub, subErr := runBatchWithSplit(ctx, client, p, startTS, endTS, infoByID, pollInterval)
+			sub, subErr := runBatchWithSplit(ctx, client, p, startTS, endTS, infoByID, pollInterval, strict...)
 			if subErr != nil {
-				if isFatalBatchErr(subErr) {
+				if isFatalBatchErr(subErr) || (len(strict) > 0 && strict[0]) {
 					return nil, subErr
 				}
 				// Isolate this sub-batch and keep successful siblings.
@@ -244,14 +244,17 @@ func runBatchWithSplit(ctx context.Context, client octoSearchClient, chs []strin
 	}
 
 	// A single channel is still too large; shrink the time window.
-	return runWithTimeWindowSplit(ctx, client, chs, startTS, endTS, infoByID, pollInterval)
+	return runWithTimeWindowSplit(ctx, client, chs, startTS, endTS, infoByID, pollInterval, strict...)
 }
 
 // runWithTimeWindowSplit bisects the time window for a single channel after
 // 413. If the minimum window is still too large, the channel is skipped instead
 // of retrying forever.
-func runWithTimeWindowSplit(ctx context.Context, client octoSearchClient, chs []string, startTS, endTS int64, infoByID map[string]ChannelInfo, pollInterval time.Duration) ([]Message, error) {
+func runWithTimeWindowSplit(ctx context.Context, client octoSearchClient, chs []string, startTS, endTS int64, infoByID map[string]ChannelInfo, pollInterval time.Duration, strict ...bool) ([]Message, error) {
 	if endTS-startTS <= octoSearchMinWindowSec {
+		if len(strict) > 0 && strict[0] {
+			return nil, fmt.Errorf("confirmed source retrieval is incomplete: %w", service.ErrSingleTaskTooLarge)
+		}
 		log.Printf("[pipeline-personal] octo-search: channel %v still 413 at min window (%ds), skipping", chs, endTS-startTS)
 		return nil, nil
 	}
@@ -260,9 +263,9 @@ func runWithTimeWindowSplit(ctx context.Context, client octoSearchClient, chs []
 	// Recurse on both halves; aborting errors stop the fetch, isolatable errors skip only
 	// that half.
 	for _, w := range [2][2]int64{{startTS, mid}, {mid + 1, endTS}} {
-		sub, err := runBatchWithSplit(ctx, client, chs, w[0], w[1], infoByID, pollInterval)
+		sub, err := runBatchWithSplit(ctx, client, chs, w[0], w[1], infoByID, pollInterval, strict...)
 		if err != nil {
-			if isFatalBatchErr(err) {
+			if isFatalBatchErr(err) || (len(strict) > 0 && strict[0]) {
 				return nil, err
 			}
 			log.Printf("[pipeline-personal] octo-search time-window [%d,%d] for %v isolated: %v", w[0], w[1], chs, err)
@@ -275,7 +278,7 @@ func runWithTimeWindowSplit(ctx context.Context, client octoSearchClient, chs []
 
 // runOneBatch submits one batch, polls to a terminal status, downloads rows,
 // then maps rows back to pipeline messages.
-func runOneBatch(ctx context.Context, client octoSearchClient, chs []string, startTS, endTS int64, infoByID map[string]ChannelInfo, pollInterval time.Duration) ([]Message, error) {
+func runOneBatch(ctx context.Context, client octoSearchClient, chs []string, startTS, endTS int64, infoByID map[string]ChannelInfo, pollInterval time.Duration, strict ...bool) ([]Message, error) {
 	batchStart := time.Now()
 	taskID, err := client.Submit(ctx, chs, startTS, endTS)
 	if err != nil {
@@ -291,6 +294,9 @@ func runOneBatch(ctx context.Context, client octoSearchClient, chs []string, sta
 
 	switch status.Status {
 	case "completed", "partial":
+		if status.Status == "partial" && len(strict) > 0 && strict[0] {
+			return nil, fmt.Errorf("confirmed source retrieval is incomplete")
+		}
 		downloadMapStart := time.Now()
 		if status.Status == "partial" {
 			for _, w := range status.Warnings {

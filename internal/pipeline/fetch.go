@@ -702,7 +702,7 @@ func fetchMessagesByBackend(ctx context.Context, backend string, octoClient octo
 	}
 }
 
-func fetchViaMySQL(ctx context.Context, candidates []ChannelInfo, creatorUID string, startTS, endTS int64, imDB *gorm.DB, tableCount int, maxPerChannel int, fetchConcurrency int) ([]Message, error) {
+func fetchViaMySQL(ctx context.Context, candidates []ChannelInfo, creatorUID string, startTS, endTS int64, imDB *gorm.DB, tableCount int, maxPerChannel int, fetchConcurrency int, strict ...bool) ([]Message, error) {
 	if imDB == nil {
 		return nil, fmt.Errorf("IM database not available")
 	}
@@ -715,10 +715,11 @@ func fetchViaMySQL(ctx context.Context, candidates []ChannelInfo, creatorUID str
 	}
 
 	var (
-		mu  sync.Mutex
-		wg  sync.WaitGroup
-		all []Message
-		sem = make(chan struct{}, fetchConcurrency)
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		all      []Message
+		fetchErr error
+		sem      = make(chan struct{}, fetchConcurrency)
 	)
 	for _, id := range normIDs {
 		info := infoByID[id]
@@ -732,8 +733,18 @@ func fetchViaMySQL(ctx context.Context, candidates []ChannelInfo, creatorUID str
 			}
 			defer func() { <-sem }()
 
-			msgs, err := FetchMessagesFromChannel(ctx, ch.ChannelID, ch.ChannelType, startTS, endTS, imDB, tableCount, creatorUID, maxPerChannel)
+			msgs, coverage, err := FetchMessagesFromChannelWithCoverage(ctx, ch.ChannelID, ch.ChannelType, startTS, endTS, imDB, tableCount, creatorUID, maxPerChannel)
+			if err == nil && coverage.Truncated && len(strict) > 0 && strict[0] {
+				err = fmt.Errorf("confirmed source retrieval is incomplete")
+			}
 			if err != nil {
+				if len(strict) > 0 && strict[0] {
+					mu.Lock()
+					if fetchErr == nil {
+						fetchErr = err
+					}
+					mu.Unlock()
+				}
 				log.Printf("[pipeline-personal] mysql message fetch skipped channel=%s: %v", ch.ChannelID, err)
 				return
 			}
@@ -747,6 +758,9 @@ func fetchViaMySQL(ctx context.Context, candidates []ChannelInfo, creatorUID str
 		}(info)
 	}
 	wg.Wait()
+	if fetchErr != nil {
+		return nil, fetchErr
+	}
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}

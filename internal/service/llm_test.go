@@ -14,9 +14,10 @@ func TestChatTemplateKwargs_QwenWithThinkingDisabled(t *testing.T) {
 		Temperature: 0.3,
 		MaxTokens:   client.maxTokens,
 	}
-	thinking, kwargs := client.buildThinkingConfig(client.model)
-	reqBody.Thinking = thinking
-	reqBody.ChatTemplateKwargs = kwargs
+	policy := RequestPolicyForModel(client.model, client.enableThinking, reqBody.Temperature)
+	reqBody.Temperature = policy.Temperature
+	reqBody.Thinking = policy.Thinking
+	reqBody.ChatTemplateKwargs = policy.ChatTemplateKwargs
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -50,9 +51,10 @@ func TestChatTemplateKwargs_DeepseekV4WithThinkingDisabled(t *testing.T) {
 		Temperature: 0.3,
 		MaxTokens:   client.maxTokens,
 	}
-	thinking, kwargs := client.buildThinkingConfig(client.model)
-	reqBody.Thinking = thinking
-	reqBody.ChatTemplateKwargs = kwargs
+	policy := RequestPolicyForModel(client.model, client.enableThinking, reqBody.Temperature)
+	reqBody.Temperature = policy.Temperature
+	reqBody.Thinking = policy.Thinking
+	reqBody.ChatTemplateKwargs = policy.ChatTemplateKwargs
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -86,9 +88,10 @@ func TestChatTemplateKwargs_DeepseekV4WithThinkingEnabled(t *testing.T) {
 		Temperature: 0.3,
 		MaxTokens:   client.maxTokens,
 	}
-	thinking, kwargs := client.buildThinkingConfig(client.model)
-	reqBody.Thinking = thinking
-	reqBody.ChatTemplateKwargs = kwargs
+	policy := RequestPolicyForModel(client.model, client.enableThinking, reqBody.Temperature)
+	reqBody.Temperature = policy.Temperature
+	reqBody.Thinking = policy.Thinking
+	reqBody.ChatTemplateKwargs = policy.ChatTemplateKwargs
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -114,9 +117,10 @@ func TestChatTemplateKwargs_ClaudeModel(t *testing.T) {
 		Temperature: 0.3,
 		MaxTokens:   client.maxTokens,
 	}
-	thinking, kwargs := client.buildThinkingConfig(client.model)
-	reqBody.Thinking = thinking
-	reqBody.ChatTemplateKwargs = kwargs
+	policy := RequestPolicyForModel(client.model, client.enableThinking, reqBody.Temperature)
+	reqBody.Temperature = policy.Temperature
+	reqBody.Thinking = policy.Thinking
+	reqBody.ChatTemplateKwargs = policy.ChatTemplateKwargs
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -142,9 +146,10 @@ func TestChatTemplateKwargs_QwenWithThinkingEnabled(t *testing.T) {
 		Temperature: 0.3,
 		MaxTokens:   client.maxTokens,
 	}
-	thinking, kwargs := client.buildThinkingConfig(client.model)
-	reqBody.Thinking = thinking
-	reqBody.ChatTemplateKwargs = kwargs
+	policy := RequestPolicyForModel(client.model, client.enableThinking, reqBody.Temperature)
+	reqBody.Temperature = policy.Temperature
+	reqBody.Thinking = policy.Thinking
+	reqBody.ChatTemplateKwargs = policy.ChatTemplateKwargs
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -172,9 +177,10 @@ func TestChatTemplateKwargs_CallWithTools_Qwen(t *testing.T) {
 		Tools:       []Tool{{Type: "function", Function: ToolFunction{Name: "test", Description: "test", Parameters: nil}}},
 		ToolChoice:  ToolChoice{Type: "function", Function: ToolChoiceFunction{Name: "test"}},
 	}
-	thinking, kw := client.buildThinkingConfig(client.model)
-	reqBody.Thinking = thinking
-	reqBody.ChatTemplateKwargs = kw
+	policy := RequestPolicyForModel(client.model, client.enableThinking, reqBody.Temperature)
+	reqBody.Temperature = policy.Temperature
+	reqBody.Thinking = policy.Thinking
+	reqBody.ChatTemplateKwargs = policy.ChatTemplateKwargs
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {

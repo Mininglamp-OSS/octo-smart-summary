@@ -426,7 +426,7 @@ func TestContentMySQLExecutorKeepsTeamEvidencePrivate(t *testing.T) {
 			t.Fatalf("team rewrite received private message evidence: %+v", messages)
 		}
 		return "team rewrite [P7]", 2, "fixture-model", nil
-	}))
+	}), nil)
 	requireWriteOK(t, err)
 	v, err := s.Version(ctx, "s", 1, "owner", target.ID(), completed.OutputVersionID)
 	requireWriteOK(t, err)

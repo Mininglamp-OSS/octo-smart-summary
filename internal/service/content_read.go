@@ -14,9 +14,25 @@ import (
 // ContentService is the authenticated formal-content boundary. Transactional
 // command methods are tested independently; production still advertises read
 // capabilities only until API, worker and scheduler share the write protocol.
-type ContentService struct{ db *gorm.DB }
+type ContentService struct {
+	db               *gorm.DB
+	sourceAuthorizer GenerationSourceAuthorizer
+	maxWindowDays    int
+}
 
 func NewContentService(db *gorm.DB) *ContentService { return &ContentService{db: db} }
+
+func (s *ContentService) WithExecution(authorizer GenerationSourceAuthorizer, maxWindowDays int) *ContentService {
+	copy := *s
+	copy.sourceAuthorizer, copy.maxWindowDays = authorizer, maxWindowDays
+	return &copy
+}
+
+func (s *ContentService) withDB(db *gorm.DB) *ContentService {
+	copy := *s
+	copy.db = db
+	return &copy
+}
 
 func sameContentJSON(a, b any) bool { return reflect.DeepEqual(a, b) }
 
@@ -55,7 +71,24 @@ func (s *ContentService) access(ctx context.Context, spaceID string, taskID int6
 	if !authorized {
 		return a, contentError("content_forbidden", 403)
 	}
-	a.main = ContentTarget{SpaceID: spaceID, TaskID: taskID, Kind: ContentResult}
+	var schedule *model.SummarySchedule
+	if a.task.ScheduleID != nil && len(a.task.GenerationSpecJSON) == 0 {
+		var row model.SummarySchedule
+		err := db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", *a.task.ScheduleID, spaceID).First(&row).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return a, err
+		}
+		if err == nil && row.SpaceID == spaceID {
+			schedule = &row
+		}
+	}
+	return resolveMainContent(a, schedule)
+}
+
+// Shared by the catalog and batch action projection. Roster/configuration, not
+// the creating engine or number of successful submissions, defines the target.
+func resolveMainContent(a contentAccess, schedule *model.SummarySchedule) (contentAccess, error) {
+	a.main = ContentTarget{SpaceID: a.task.SpaceID, TaskID: a.task.ID, Kind: ContentResult}
 	if a.task.SummaryMode != model.ModeByPerson {
 		return a, nil
 	}
@@ -79,18 +112,11 @@ func (s *ContentService) access(ctx context.Context, spaceID string, taskID int6
 		}
 		return a, nil
 	}
-	if a.task.ScheduleID != nil {
-		var schedule model.SummarySchedule
-		err := db.Where("id = ? AND space_id = ? AND deleted_at IS NULL", *a.task.ScheduleID, spaceID).First(&schedule).Error
-		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-			return a, err
-		}
-		if err == nil {
-			config := model.ParseScheduleParticipantConfig(schedule.ParticipantConfig)
-			roster := config.EffectiveUserIDs(a.task.CreatorID)
-			if len(roster) > 1 {
-				return a, nil
-			}
+	if schedule != nil {
+		config := model.ParseScheduleParticipantConfig(schedule.ParticipantConfig)
+		roster := config.EffectiveUserIDs(a.task.CreatorID)
+		if len(roster) > 1 {
+			return a, nil
 		}
 	}
 	// Legacy Agent saves and single-person workflows have exactly the creator
@@ -184,12 +210,36 @@ func (s *ContentService) Catalog(ctx context.Context, spaceID string, taskID int
 			(active[0].ContentID == target.ID() || active[0].Scope == "task") {
 			activeRun = &active[0]
 		}
+		var latest []model.SummaryGenerationRun
+		if err := s.db.WithContext(ctx).Where("task_id = ? AND content_id = ?", taskID, target.ID()).
+			Order("created_at DESC, id DESC").Limit(1).Find(&latest).Error; err != nil {
+			return out, err
+		}
+		var latestRun *model.SummaryGenerationRun
+		if len(latest) == 1 && latest[0].SpaceID == spaceID && latest[0].ContentID == target.ID() {
+			latestRun = &latest[0]
+		}
+		capabilities, config := compatibilityContentCapabilities(), compatibilityGenerationConfig(a.task)
+		if s.sourceAuthorizer != nil && s.requireSingleGeneration(a, target, actorID) == nil {
+			configuration, err := s.configurationOf(ctx, a.task, actorID)
+			if err != nil {
+				return out, err
+			}
+			config = configuration.ContentGenerationConfig
+			// Do not offer mutations while a legacy writer still owns the task.
+			var rows []model.PersonalResult
+			if err := s.db.WithContext(ctx).Where("task_id = ? AND user_id = ?", taskID, actorID).Limit(2).Find(&rows).Error; err != nil {
+				return out, err
+			}
+			capabilities = singleContentCapabilities(a.task, current != nil, integrity, rows, activeRun != nil, config)
+		}
 		out.Contents = append(out.Contents, FormalContent{
 			ContentID: target.ID(), Kind: target.Kind, OwnerID: target.UserID,
 			IsMain: target == a.main, ContentRevision: revision, CurrentVersion: current,
-			Capabilities: compatibilityContentCapabilities(), Integrity: integrity,
-			GenerationConfig: compatibilityGenerationConfig(a.task),
+			Capabilities: capabilities, Integrity: integrity,
+			GenerationConfig: config,
 			ActiveGeneration: activeRun,
+			LatestGeneration: latestRun,
 		})
 	}
 	return out, nil

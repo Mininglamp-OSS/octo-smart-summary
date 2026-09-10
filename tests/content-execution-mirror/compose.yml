@@ -1,0 +1,38 @@
+name: summary-versioning-execution
+services:
+  fixture:
+    image: node:22.16.0-bookworm
+    command: ["node", "/fixtures/provider.mjs"]
+    volumes: ["./provider.mjs:/fixtures/provider.mjs:ro"]
+    networks: [isolated]
+  api:
+    image: octo-summary-execution:configuration-20260908
+    ports: ["127.0.0.1:28351:8080"]
+    environment: &environment
+      MYSQL_DSN: "root@tcp(octo-summary-versioning-test-mysql:3306)/summary_versioning_execution?parseTime=true&loc=Asia%2FShanghai"
+      IM_MYSQL_DSN: "root@tcp(octo-summary-versioning-test-mysql:3306)/summary_versioning_execution?parseTime=true&loc=Asia%2FShanghai"
+      OCTO_API_URL: "http://fixture:8089"
+      WORKER_TRIGGER_URL: "http://worker:8082/internal/trigger"
+      WORKER_API_CALLBACK_URL: "http://api:8081"
+      LLM_API_URL: "http://fixture:8089/v1"
+      LLM_API_KEY: "local-synthetic-fixture"
+      LLM_MODEL: "fixture"
+      SUMMARY_CONTENT_EXECUTION_SPACES: "execution-fixture"
+      SUMMARY_NOTIFY_ENABLED: "false"
+      MESSAGE_FETCH_BACKEND: "mysql"
+      MSG_TABLE_COUNT: "1"
+      WORKER_POLL_INTERVAL_SECONDS: "1"
+      TIMING_LOG_PATH: "/tmp/summary-timing.log"
+      SUMMARY_REPORT_PATH: "/tmp/summary-report.log"
+    networks: [isolated]
+    depends_on: [fixture]
+  worker:
+    image: octo-summary-execution:configuration-20260908
+    entrypoint: ["/bin/summary-worker"]
+    environment: *environment
+    networks: [isolated]
+    profiles: [worker]
+networks:
+  isolated:
+    external: true
+    name: octo-summary-versioning-test

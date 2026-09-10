@@ -673,6 +673,10 @@ func isFatalMapError(err error) bool {
 }
 
 func (p *Processor) executePersonalPipeline(ctx context.Context, task model.SummaryTask, userID string, reportStage func(string), streamDelta func(string) error) (string, []model.Citation, int, int, string, error) {
+	return p.executePersonalPipelineInput(ctx, task, userID, reportStage, streamDelta, nil)
+}
+
+func (p *Processor) executePersonalPipelineInput(ctx context.Context, task model.SummaryTask, userID string, reportStage func(string), streamDelta func(string) error, frozen *service.FrozenGenerationInput) (string, []model.Citation, int, int, string, error) {
 	totalStart := time.Now()
 	taskNo := task.TaskNo
 	defer func() {
@@ -684,7 +688,11 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 
 	// Load sources
 	var sources []model.SummarySource
-	if err := p.db.Where("task_id = ?", task.ID).Find(&sources).Error; err != nil {
+	if frozen != nil {
+		for _, source := range frozen.Spec.Sources {
+			sources = append(sources, model.SummarySource{SourceType: source.SourceType, SourceID: source.SourceID})
+		}
+	} else if err := p.db.Where("task_id = ?", task.ID).Find(&sources).Error; err != nil {
 		return "", nil, 0, 0, "", fmt.Errorf("load sources: %w", err)
 	}
 
@@ -716,13 +724,21 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	channelScopeOpts := channelScopeOptionsForTask(p.cfg.ChannelScopeEnabled, task.SpaceID, task.AgentSessionID, false, true)
 
 	fetchStart := time.Now()
-	messages, intentResult, err := pipeline.ResolveAndFetchMessagesForPersonal(
-		ctx, userID, nil, nil, specifiedSources, task.EffectiveTopic(),
-		task.TimeRangeStart, task.TimeRangeEnd,
-		p.imDB, p.octoClient, p.cfg.MessageFetchBackend, toolCallFn, llmFn,
-		p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency, p.cfg.OctoSearchPollSec,
-		channelScopeOpts, reportStage,
-	)
+	var messages []pipeline.Message
+	intentResult := &pipeline.IntentResult{Skipped: true, SkipReason: "confirmed_configuration"}
+	var err error
+	if frozen != nil {
+		messages, err = pipeline.FetchConfirmedGenerationMessages(ctx, task.SpaceID, userID, *frozen,
+			p.imDB, p.octoClient, p.cfg.MessageFetchBackend, p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency, p.cfg.OctoSearchPollSec)
+	} else {
+		messages, intentResult, err = pipeline.ResolveAndFetchMessagesForPersonal(
+			ctx, userID, nil, nil, specifiedSources, task.EffectiveTopic(),
+			task.TimeRangeStart, task.TimeRangeEnd,
+			p.imDB, p.octoClient, p.cfg.MessageFetchBackend, toolCallFn, llmFn,
+			p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency, p.cfg.OctoSearchPollSec,
+			channelScopeOpts, reportStage,
+		)
+	}
 	timing.Observe(taskNo, "fetch_messages", fetchStart)
 	if err != nil {
 		return "", nil, 0, 0, "", fmt.Errorf("fetch messages: %w", err)
@@ -784,7 +800,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	// summary would over-widen to ALL messages. So re-resolve against the actual
 	// post-fetch senders (nameMap, untruncated) whenever we have no target and the
 	// topic is not purely generic (pure_generic_topic by definition names no one).
-	if topic := task.EffectiveTopic(); len(targetUIDs) == 0 && intentResult.SkipReason != "pure_generic_topic" && topic != "" {
+	if topic := task.EffectiveTopic(); frozen == nil && len(targetUIDs) == 0 && intentResult != nil && intentResult.SkipReason != "pure_generic_topic" && topic != "" {
 		if fallback := pipeline.ResolveTopicTarget(ctx, topic, nameMap, userID, toolCallFn); len(fallback) > 0 {
 			targetUIDs = fallback
 			log.Printf("[personal-worker] target resolved via post-fetch fallback: %v (creator=%s)", targetUIDs, userID)
@@ -960,7 +976,15 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		userName = userID
 	}
 
-	generationTopic := p.generationTopic(task)
+	var generationTopic string
+	if frozen != nil {
+		generationTopic = *frozen.Spec.Requirement
+		if frozen.Spec.Template != nil {
+			generationTopic += "\n\n" + frozen.Spec.Template.Content
+		}
+	} else {
+		generationTopic = p.generationTopic(task)
+	}
 
 	var finalContent string
 	var totalTokens int

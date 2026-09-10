@@ -401,7 +401,7 @@ func (s *ContentService) Restore(ctx context.Context, space string, taskID int64
 func (s *ContentService) mutate(ctx context.Context, space string, taskID int64, actor, contentID string, base ContentBaseline, fn func(*lockedContent, time.Time) error) (*FormalContentVersion, error) {
 	var result *FormalContentVersion
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		writer := NewContentService(tx)
+		writer := s.withDB(tx)
 		l, err := writer.lockContent(ctx, space, taskID, actor, contentID)
 		if err != nil {
 			return err

@@ -72,6 +72,7 @@ type FormalContent struct {
 	Capabilities     ContentCapabilities         `json:"capabilities"`
 	GenerationConfig ContentGenerationConfig     `json:"generation_config"`
 	ActiveGeneration *model.SummaryGenerationRun `json:"active_generation"`
+	LatestGeneration *model.SummaryGenerationRun `json:"latest_generation"`
 	Integrity        string                      `json:"integrity"`
 }
 

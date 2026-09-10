@@ -24,7 +24,7 @@ func TestAgentLLMRejectsLengthTruncatedToolCall(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "key", "test-model", 5, 12000, nil)
+	client := NewClient(srv.URL, "key", "test-model", 5, 12000, nil, false)
 	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "summarize"}}, []Tool{{
 		Type: "function", Function: ToolFunction{Name: "merge_summaries"},
 	}})
@@ -46,7 +46,7 @@ func TestAgentLLMDisclosesLengthTruncatedContentAnswer(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewClient(srv.URL, "key", "test-model", 5, 12000, nil)
+	client := NewClient(srv.URL, "key", "test-model", 5, 12000, nil, false)
 	turn, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "summarize"}}, nil)
 	if err != nil {
 		t.Fatalf("content-only truncation should remain usable: %v", err)

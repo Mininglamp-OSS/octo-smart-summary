@@ -26,6 +26,19 @@ func ContentWriteSpaces() []string {
 	return spaces
 }
 
+// The single-person pilot does not enroll every task in a Space. Only an
+// explicit content/configuration command marks a task as managed; team tasks
+// and new legacy tasks keep their existing execution path.
+func ContentExecutionSpaces() []string {
+	parsed := ParseContentReadSpaces(os.Getenv("SUMMARY_CONTENT_EXECUTION_SPACES"))
+	spaces := make([]string, 0, len(parsed))
+	for space := range parsed {
+		spaces = append(spaces, space)
+	}
+	sort.Strings(spaces)
+	return spaces
+}
+
 func ContentProtocolRequired(task model.SummaryTask) bool {
 	if task.ContentProtocolVersion > 0 {
 		return true

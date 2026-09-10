@@ -17,6 +17,26 @@ type RefineModel interface {
 	CallWithModel(context.Context, []ChatMessage, float64) (string, int, string, error)
 }
 
+// RefineStreamModel is the optional streaming capability of a RefineModel. When
+// a model implements it and a live sink is present, the refine run streams its
+// output delta-by-delta over the same worker→ingest→SSE channel the full
+// generation uses; otherwise ExecuteRefine falls back to the buffered call.
+type RefineStreamModel interface {
+	CallStreamWithModel(context.Context, []ChatMessage, float64, func(string) error) (string, int, string, error)
+}
+
+// RefineStreamSink receives a live preview of a refine run. It is a view only:
+// the authoritative final state is the applied version written by CompleteRefine
+// and read back by the client's poll/refresh. The worker builds the concrete
+// sink (keyed to the claimed run) so the service never depends on transport.
+type RefineStreamSink interface {
+	Stage(stage string)
+	Delta(delta string) error
+	Done(status int)
+	Error(message string)
+	Close()
+}
+
 // RefineSystemPrompt is shared with the legacy endpoint during migration.
 func RefineSystemPrompt() string {
 	return `你是专业的工作总结编辑助手。请根据用户的修改意见，对“当前总结”做局部调整。
@@ -34,7 +54,11 @@ func RefineSystemPrompt() string {
 // ExecuteRefine is invoked by a durable-queue worker, never an HTTP goroutine.
 // Killing the worker leaves the run recoverable after lease expiry. A request
 // disconnect cannot cancel it. No IM notification is emitted for refinement.
-func (s *ContentService) ExecuteRefine(ctx context.Context, id string, llm RefineModel) (*model.SummaryGenerationRun, error) {
+//
+// newSink, when non-nil, is invoked once after a successful claim to build a
+// live SSE preview keyed to the claimed run; nil disables streaming (buffered
+// call only). The preview is a view: CompleteRefine remains authoritative.
+func (s *ContentService) ExecuteRefine(ctx context.Context, id string, llm RefineModel, newSink func(*model.SummaryGenerationRun) RefineStreamSink) (*model.SummaryGenerationRun, error) {
 	if llm == nil {
 		return nil, contentError("refine_executor_unavailable", 503)
 	}
@@ -42,8 +66,20 @@ func (s *ContentService) ExecuteRefine(ctx context.Context, id string, llm Refin
 	if err != nil {
 		return nil, err
 	}
+	// The sink is built only after the claim succeeds, so a run another worker
+	// won never emits a spurious preview to this run's channel.
+	var sink RefineStreamSink
+	if newSink != nil {
+		sink = newSink(run)
+	}
+	if sink != nil {
+		defer sink.Close()
+	}
 	var input FrozenRefineInput
 	if err := json.Unmarshal(run.InputJSON, &input); err != nil {
+		if sink != nil {
+			sink.Error("summary refinement failed")
+		}
 		if failure := s.FailGeneration(ctx, id, run.ExecutionToken, "invalid_output"); failure != nil {
 			return nil, failure
 		}
@@ -57,17 +93,32 @@ func (s *ContentService) ExecuteRefine(ctx context.Context, id string, llm Refin
 	}{input.Citations, input.TeamCitations})
 	modelCtx, cancel := context.WithTimeout(llmfallback.WithPath(ctx, llmfallback.PathAPIRefine), 90*time.Second)
 	defer cancel()
-	body, tokens, usedModel, err := llm.CallWithModel(modelCtx, []ChatMessage{
+	messages := []ChatMessage{
 		{Role: "system", Content: RefineSystemPrompt()},
 		{Role: "user", Content: fmt.Sprintf("当前总结：\n%s\n\n用户修改意见：\n%s\n\n本次可用证据（JSON）：\n%s",
 			input.Content, input.Feedback, evidence)},
-	}, 0.1)
+	}
+	var (
+		body      string
+		tokens    int
+		usedModel string
+	)
+	if streamModel, ok := llm.(RefineStreamModel); ok && sink != nil {
+		sink.Stage(model.WorkflowStageGenerateSummary)
+		body, tokens, usedModel, err = streamModel.CallStreamWithModel(modelCtx, messages, 0.1,
+			func(delta string) error { return sink.Delta(delta) })
+	} else {
+		body, tokens, usedModel, err = llm.CallWithModel(modelCtx, messages, 0.1)
+	}
 	if ctx.Err() != nil {
 		// Process shutdown: retain the durable run for recovery, not a fake
 		// permanent failure based on a transient worker lifetime.
 		return nil, ctx.Err()
 	}
 	if err != nil {
+		if sink != nil {
+			sink.Error("summary refinement failed")
+		}
 		code := "model_failed"
 		if errors.Is(err, context.DeadlineExceeded) {
 			code = "execution_timeout"
@@ -84,6 +135,13 @@ func (s *ContentService) ExecuteRefine(ctx context.Context, id string, llm Refin
 		ce.Code == "invalid_generation_output" || ce.Code == "generation_input_invalid") {
 		if failure := s.FailGeneration(ctx, id, run.ExecutionToken, "invalid_output"); failure != nil {
 			return nil, failure
+		}
+	}
+	if sink != nil {
+		if err != nil {
+			sink.Error("summary refinement failed")
+		} else {
+			sink.Done(model.StatusCompleted)
 		}
 	}
 	return completed, err

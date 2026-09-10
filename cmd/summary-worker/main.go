@@ -138,7 +138,10 @@ func main() {
 	// status. With an empty write allowlist this poller performs no DB scan.
 	contentCtx, stopContent := context.WithCancel(context.Background())
 	contentDone := make(chan struct{})
-	contentWorker := worker.NewContentGenerationWorker(summaryDB, pool, llm, time.Duration(cfg.WorkerPollInterval)*time.Second)
+	contentWorker := worker.NewContentGenerationWorker(summaryDB, pool, llm, time.Duration(cfg.WorkerPollInterval)*time.Second).
+		WithStreaming(cfg)
+	contentWorker.WithExecution(service.NewContentService(summaryDB).
+		WithExecution(pipeline.GenerationSourceAuthorizer{DB: imDB}, cfg.MaxTimeRangeDays), proc)
 	go func() {
 		defer close(contentDone)
 		contentWorker.Run(contentCtx)

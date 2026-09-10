@@ -7,19 +7,37 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/streaming"
 	"gorm.io/gorm"
 )
 
 // ContentGenerationWorker consumes committed runs independently of HTTP
 // wakeups and legacy task.status. Database claims, not this local map, are the
-// cross-process authority. No retrieval client or notifier is available here.
+// cross-process authority. Full retrieval is delegated to the frozen-input
+// executor; refinement never uses that executor.
 type ContentGenerationWorker struct {
 	content  *service.ContentService
 	model    service.RefineModel
+	executor service.FullGenerationExecutor
+	cfg      *config.Config
 	pool     *WorkerPool
 	interval time.Duration
 	inFlight sync.Map
+}
+
+func (w *ContentGenerationWorker) WithExecution(content *service.ContentService, executor service.FullGenerationExecutor) *ContentGenerationWorker {
+	w.content, w.executor = content, executor
+	return w
+}
+
+// WithStreaming enables the refine live-preview channel. Without it (cfg nil or
+// no callback URL configured) refinement still runs, buffered, exactly as before.
+func (w *ContentGenerationWorker) WithStreaming(cfg *config.Config) *ContentGenerationWorker {
+	w.cfg = cfg
+	return w
 }
 
 func NewContentGenerationWorker(db *gorm.DB, pool *WorkerPool, model service.RefineModel, interval time.Duration) *ContentGenerationWorker {
@@ -56,25 +74,42 @@ func (w *ContentGenerationWorker) poll(ctx context.Context) (int, error) {
 	if ctx.Err() != nil {
 		return 0, ctx.Err()
 	}
-	if w.model == nil || w.pool == nil {
+	if (w.model == nil && w.executor == nil) || w.pool == nil {
 		return 0, nil
 	}
-	runs, err := w.content.RecoverableGenerations(ctx, service.ContentWriteSpaces(), 100)
+	spaces := service.ContentWriteSpaces()
+	if w.executor != nil {
+		pilot := service.ContentExecutionSpaces()
+		if err := w.content.QueueDueGenerations(ctx, time.Now(), pilot); err != nil {
+			return 0, err
+		}
+		spaces = append(spaces, pilot...)
+	}
+	runs, err := w.content.RecoverableGenerations(ctx, spaces, 100)
 	if err != nil {
 		return 0, err
 	}
 	submitted := 0
 	for _, run := range runs {
+		if (run.Executor == "workflow" && w.executor == nil) || (run.Executor == "refine" && w.model == nil) {
+			continue
+		}
 		if ctx.Err() != nil {
 			break
 		}
 		id := run.ID
+		executor := run.Executor
 		if _, loaded := w.inFlight.LoadOrStore(id, struct{}{}); loaded {
 			continue
 		}
 		if !w.pool.TrySubmit(func() {
 			defer w.inFlight.Delete(id)
-			_, err := w.content.ExecuteRefine(ctx, id, w.model)
+			var err error
+			if executor == "workflow" {
+				_, err = w.content.ExecuteFullGeneration(ctx, id, w.executor)
+			} else {
+				_, err = w.content.ExecuteRefine(ctx, id, w.model, w.refineSink(ctx))
+			}
 			if err == nil || ctx.Err() != nil {
 				return
 			}
@@ -95,4 +130,16 @@ func (w *ContentGenerationWorker) poll(ctx context.Context) (int, error) {
 		submitted++
 	}
 	return submitted, nil
+}
+
+// refineSink returns a factory that builds the refine live-preview sink for a
+// claimed run, or nil when streaming is not configured (buffered refine only).
+// The sink is created after the claim so only the winning worker previews.
+func (w *ContentGenerationWorker) refineSink(ctx context.Context) func(*model.SummaryGenerationRun) service.RefineStreamSink {
+	if w.cfg == nil {
+		return nil
+	}
+	return func(run *model.SummaryGenerationRun) service.RefineStreamSink {
+		return newSummaryStreamSender(ctx, w.cfg, run.TaskID, run.ActorID, streaming.ScopePersonal, run.ID)
+	}
 }

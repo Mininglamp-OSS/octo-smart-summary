@@ -15,8 +15,19 @@ import (
 // ContentReadHandler is the additive, allowlisted compatibility endpoint.
 // It neither replaces legacy DTOs nor enables the new write protocol.
 type ContentReadHandler struct {
-	service *service.ContentService
-	spaces  map[string]bool
+	service          *service.ContentService
+	spaces           map[string]bool
+	executionService *service.ContentService
+	executionSpaces  map[string]bool
+}
+
+func (h *ContentReadHandler) WithExecution(spaces string, authorizer service.GenerationSourceAuthorizer, maxDays int) *ContentReadHandler {
+	h.executionSpaces = service.ParseContentReadSpaces(spaces)
+	h.executionService = h.service.WithExecution(authorizer, maxDays)
+	for space := range h.executionSpaces {
+		h.spaces[space] = true
+	}
+	return h
 }
 
 func NewContentReadHandler(db *gorm.DB, enabledSpaces string) *ContentReadHandler {
@@ -46,7 +57,11 @@ func (h *ContentReadHandler) Catalog(c *gin.Context) {
 	if !valid {
 		return
 	}
-	result, err := h.service.Catalog(c.Request.Context(), spaceID, taskID, actorID)
+	reader := h.service
+	if h.executionSpaces[spaceID] {
+		reader = h.executionService
+	}
+	result, err := reader.Catalog(c.Request.Context(), spaceID, taskID, actorID)
 	h.respond(c, result, err)
 }
 

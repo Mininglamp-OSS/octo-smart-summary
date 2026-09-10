@@ -20,8 +20,6 @@ import (
 
 const MapFailedMarker = "总结失败"
 
-const kimiRequiredTemperature = 0.6
-
 const maxLLMErrorBodyBytes = 4096
 
 // ErrReasoningBudgetExhausted marks a response whose reasoning consumed the
@@ -195,21 +193,6 @@ type chatResponse struct {
 	} `json:"usage"`
 }
 
-// buildThinkingConfig returns model-specific thinking parameters.
-// For Kimi: top-level thinking field. For Qwen/DeepSeek: chat_template_kwargs.
-func (c *LLMClient) buildThinkingConfig(model string) (*ThinkingParam, map[string]interface{}) {
-	if c.enableThinking {
-		return nil, nil
-	}
-	if config.IsKimiModel(model) {
-		return &ThinkingParam{Type: "disabled"}, nil
-	}
-	if config.IsQwenOrDeepSeekModel(model) {
-		return nil, map[string]interface{}{"enable_thinking": false}
-	}
-	return nil, nil
-}
-
 func readErrorBody(body io.Reader) string {
 	b, _ := io.ReadAll(io.LimitReader(body, maxLLMErrorBodyBytes))
 	return llmfallback.SafeTextForLog(string(b), 200)
@@ -270,10 +253,8 @@ func (c *LLMClient) callWithPolicyAndModel(ctx context.Context, messages []ChatM
 		Models:      c.models(),
 		MaxAttempts: 3,
 	}, func(ctx context.Context, model string) (result, llmfallback.Outcome, error) {
-		temp := temperature
-		if config.IsKimiModel(model) {
-			temp = kimiRequiredTemperature
-		}
+		modelPolicy := RequestPolicyForModel(model, c.enableThinking, temperature)
+		temp := modelPolicy.Temperature
 		log.Printf("[llm] calling model=%s temperature=%.2f max_tokens=%d", model, temp, c.maxTokens)
 		reqBody := chatRequest{
 			Model:       model,
@@ -281,9 +262,8 @@ func (c *LLMClient) callWithPolicyAndModel(ctx context.Context, messages []ChatM
 			Temperature: temp,
 			MaxTokens:   c.maxTokens,
 		}
-		thinking, kwargs := c.buildThinkingConfig(model)
-		reqBody.Thinking = thinking
-		reqBody.ChatTemplateKwargs = kwargs
+		reqBody.Thinking = modelPolicy.Thinking
+		reqBody.ChatTemplateKwargs = modelPolicy.ChatTemplateKwargs
 
 		body, err := json.Marshal(reqBody)
 		if err != nil {
@@ -394,10 +374,8 @@ func (c *LLMClient) callStreamWithModel(ctx context.Context, messages []ChatMess
 		Models:      c.models(),
 		MaxAttempts: 3,
 	}, func(ctx context.Context, model string) (result, llmfallback.Outcome, error) {
-		temp := temperature
-		if config.IsKimiModel(model) {
-			temp = kimiRequiredTemperature
-		}
+		modelPolicy := RequestPolicyForModel(model, c.enableThinking, temperature)
+		temp := modelPolicy.Temperature
 		log.Printf("[llm] streaming model=%s temperature=%.2f max_tokens=%d", model, temp, c.maxTokens)
 
 		reqBody := chatRequest{
@@ -408,9 +386,8 @@ func (c *LLMClient) callStreamWithModel(ctx context.Context, messages []ChatMess
 			Stream:        true,
 			StreamOptions: &streamOptions{IncludeUsage: true},
 		}
-		thinking, kwargs := c.buildThinkingConfig(model)
-		reqBody.Thinking = thinking
-		reqBody.ChatTemplateKwargs = kwargs
+		reqBody.Thinking = modelPolicy.Thinking
+		reqBody.ChatTemplateKwargs = modelPolicy.ChatTemplateKwargs
 
 		body, err := json.Marshal(reqBody)
 		if err != nil {
@@ -548,10 +525,8 @@ func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, t
 		MaxAttempts:     3,
 		Path:            llmfallback.PathToolCall,
 	}, func(ctx context.Context, model string) (result, llmfallback.Outcome, error) {
-		temp := temperature
-		if config.IsKimiModel(model) {
-			temp = kimiRequiredTemperature
-		}
+		modelPolicy := RequestPolicyForModel(model, c.enableThinking, temperature)
+		temp := modelPolicy.Temperature
 		log.Printf("[llm] CallWithTools: tool=%s temperature=%.2f model=%s", forceFn, temp, model)
 
 		var toolChoice interface{}
@@ -568,9 +543,8 @@ func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, t
 			Tools:       tools,
 			ToolChoice:  toolChoice,
 		}
-		thinking, kwargs := c.buildThinkingConfig(model)
-		reqBody.Thinking = thinking
-		reqBody.ChatTemplateKwargs = kwargs
+		reqBody.Thinking = modelPolicy.Thinking
+		reqBody.ChatTemplateKwargs = modelPolicy.ChatTemplateKwargs
 
 		body, err := json.Marshal(reqBody)
 		if err != nil {

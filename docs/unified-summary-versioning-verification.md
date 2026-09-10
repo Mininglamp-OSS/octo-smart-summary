@@ -1,5 +1,42 @@
 # Unified summary versioning verification
 
+## Native list/action slice — September 9, 2026
+
+This update supersedes earlier mirror/verification status, but not the remaining
+full-plan gates. `ListActions` projects exact-scope targets and capabilities
+using at most six queries for up to 100 tasks. Catalog/list share capability,
+configuration and current-pointer interpretation; list output excludes content,
+evidence, configuration inputs and private generation snapshots.
+
+Full `go test -race ./... -count=1` with real isolated MySQL and native tokenizer,
+CGO-disabled vet, SQLite and MySQL paired list-to-original V2 tests pass.
+Frontend after the native modal layout fix: 89 files / 1,282 tests, production
+Web build and i18n pass. Typecheck remains failing (6,062 vs previous 6,035;
+pristine main 6,025), so no PR is ready.
+
+The existing complete Octo preview was updated without reseeding:
+API/Worker `octo-summary-execution:native-actions-20260909`,
+Web `octo-web:native-actions-layout-20260909`, ports 28361/28360.
+Real local Octo login, original navigation and historical copied data are used;
+model responses remain synthetic, notifications disabled and tokenizer uses the
+CGO-disabled image fallback. It is not production-model quality acceptance.
+
+Browser tests used task 56 (historical Agent) and 52 (historical Workflow):
+identical menus → original detail → explicit refine → V2, with V1 retained.
+Task count stayed 58. Task 58 correctly failed `invalid_output` because the
+fixture model always returned `[1]`, absent from that task's evidence; current
+V1 remained intact and the native UI explained failure retention.
+Configuration/schedule UI opened in the same original detail, with no plan save.
+No restore overwrite was performed; generated V2 fixture content is retained.
+
+`tests/content-system-mirror/update.mjs` preflights exact existing targets and
+retains previous containers; the layout update used `--web-only`. Original
+28140 and diagnostic 28350 remain untouched. Reload the native page with
+`/summary?build=native-actions-layout-20260909` to bypass previously cached HTML.
+Logs: `.codex/native-actions-{mysql,backend-race,final-vet,mirror-update,layout-update}.log`.
+No push/PR, initial-V1/full-writer/team/event integration or complete two-account
+acceptance is claimed.
+
 Date: September 8, 2026. Backend base `391134c`; frontend base `2a41ee1d`.
 Local code commits: backend `c928ab6`, frontend `10d7ae85`. The frontend was
 rebased from the initial `9e33837a` baseline after upstream PR #1640 landed
@@ -7,13 +44,46 @@ during this implementation; the checks below were repeated on the new base.
 
 ## Delivery status
 
-The compatibility, transactional service, legacy-write fences and durable refine
-Worker slices are implemented and tested. The overall versioning plan is **not
-complete**. Production command routes remain unmounted and all user-facing write
-capabilities remain false. Old managed operations now fail safely; complete
-generation, collaboration and scheduling still need actual coordinated adapters.
-Keep `SUMMARY_CONTENT_WRITE_SPACES` unset outside isolated fixtures until those
-adapters and the UI are ready. No PR is ready.
+The compatibility, transactional service, legacy-write fences, durable Worker
+and **single-person configuration/execution/UI pilot** are implemented and
+tested. The overall versioning plan is **not complete**. Exact
+`SUMMARY_CONTENT_EXECUTION_SPACES` opt-in mounts human-only commands for
+completed creator-owned single-person content; it does not enroll an entire
+Space. Configuration or content writes enroll only their target task.
+Keep both execution and write Space flags unset outside isolated fixtures.
+Team/group execution, initial Agent save coordination, generation-event
+notifications and complete 28140 acceptance are still missing. No PR is ready.
+
+## Latest configuration/execution/UI slice (September 8, 2026)
+
+This section supersedes the historical slice-specific limitations below.
+Changes after backend `011ce5c` / frontend `6b3ed202` remain local and uncommitted.
+
+| Check | Result |
+|---|---|
+| Full backend `go test -race ./... -count=1` with real MySQL | Passed |
+| MySQL configuration CAS and atomic save-and-generate | Passed, including 12 simultaneous retries |
+| MySQL production poller → source authorization → retrieval → existing pipeline → local HTTP model → version | Passed explicitly, not skipped |
+| Schedule phase, unchanged legacy cron and busy/late slots | Passed |
+| Backend vet, final authenticated/gated route tests, diff check | Passed |
+| Final Summary Vitest | 86 files / 1,255 tests passed |
+| Production Web build, browser-fixture build and i18n | Passed |
+| Frontend typecheck | Not passing: baseline 6,025; current 6,035. Ten added diagnostics concern missing React/Storybook declarations and the inherited ChatSelectorModal JSX type |
+| Real API/Worker image smoke | Passed: configuration-only save, duplicate manual request, cited V2, edit CAS, refine, failure retention, actual scheduled V4, in-place restore |
+| Image resilience | Passed: conflict candidate/application, cancellation with late callback, Worker restart/expired-lease recovery, one output per run |
+| Real UI → API/Worker | Passed: chat picker, save-only, save-and-generate → V5, disabled overwrites while active, reload → V7, seven historical versions |
+| Visual/browser | Chinese/light and English/dark rendered; 28px buttons and no horizontal overflow at 1440/1024/720 |
+
+The API/Worker image runs production entry points with a CGO-disabled tokenizer
+fallback and synthetic auth/model services, not full production packaging or
+external-model quality evaluation. The Web image hosts the production entry and
+feature components in an isolated synthetic host, not the full signed-in shell.
+See `tests/content-execution-mirror/README.md` in both repositories.
+
+Current fixture: Web `127.0.0.1:28350`, API `127.0.0.1:28351`, separate disposable
+database `summary_versioning_execution`. Existing 28140 mirror and 28341
+compatibility fixture were not replaced. No external notification, branch push
+or PR was performed.
 
 ## Implemented
 
@@ -171,15 +241,14 @@ system-wide library path.
 
 ## Next implementation gates
 
-1. Replace compatibility rejection with actual unified adapters for legacy
-   commands, Agent formal V1, collaboration and full generation. Preserve
-   personal IDs/current content during requeue before enabling commands.
-2. Add coordinated full-generation commits while preserving task-level exclusion
-   and parallel team-member execution; refine polling is now connected.
-3. Authorized executable configuration, transactionally consistent Workflow
-   projections, common time resolution, schedules and notification semantics.
-4. Actual Workbench UI actions, operation confirmations, run refresh/cancel/
-   conflict behavior and user-visible revision/history rendering.
+1. Coordinate initial Agent formal V1 and remaining legacy creation/collaboration
+   writers rather than treating compatibility rejection as completed integration.
+2. Extend the tested single-person executor to group/team rounds and member
+   submissions, preserving authorization and member parallelism.
+3. Add durable generation-event notifications, with no notification for content
+   refinement, editing, restoring or candidate application.
+4. Complete non-pilot list/menus, delete/save-as-new and full signed-in host
+   navigation, plus frontend type/dependency validation.
 5. Full 28140 mirror acceptance using real historical samples and two accounts,
    including six-version retention and edit/refine/restore/schedule workflows;
    only then push to personal forks and create PRs.

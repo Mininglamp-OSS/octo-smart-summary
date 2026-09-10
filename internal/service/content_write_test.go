@@ -82,7 +82,7 @@ func TestContentRefineExecutorUsesFrozenInputAndPreservesFailure(t *testing.T) {
 			t.Fatalf("executor did not use frozen evidence: %+v", messages)
 		}
 		return "```markdown\nshort [7]\n```", 3, "fixture-model", nil
-	}))
+	}), nil)
 	requireWriteOK(t, err)
 	candidate, err := s.Version(ctx, "s", 1, "owner", target.ID(), completed.OutputVersionID)
 	requireWriteOK(t, err)
@@ -96,7 +96,7 @@ func TestContentRefineExecutorUsesFrozenInputAndPreservesFailure(t *testing.T) {
 	requireWriteOK(t, err)
 	_, err = s.ExecuteRefine(ctx, failed.ID, contentRefineModelFunc(func(context.Context, []ChatMessage, float64) (string, int, string, error) {
 		return "", 0, "", errors.New("provider error with sensitive details")
-	}))
+	}), nil)
 	requireContentCode(t, err, "model_failed")
 	status, err := s.Generation(ctx, "s", 1, "owner", target.ID(), failed.ID)
 	requireWriteOK(t, err)

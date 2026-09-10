@@ -1,0 +1,13 @@
+# Override for the 2026-09-10 request: rebind the unified mirror web to host
+# :28080 (after octo-alex-nginx-1 was stopped) and switch the model to
+# qwen3-max. The shared env file is left untouched; LLM_MODEL is overridden
+# here for api + worker only.
+services:
+  api:
+    environment:
+      LLM_MODEL: "qwen3-max"
+  worker:
+    environment:
+      LLM_MODEL: "qwen3-max"
+  web:
+    ports: !override ["0.0.0.0:28080:80"]
