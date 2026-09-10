@@ -2,11 +2,14 @@ package router
 
 import (
 	"net/http"
+	"os"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/handler"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/ws"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmobs"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/notify"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/streaming"
 	"github.com/gin-gonic/gin"
@@ -15,9 +18,9 @@ import (
 
 // SetupPublic configures the public API router on :8080.
 // 合并上游后统一签名：customTemplateLimit(上游模板) + streamHub(上游 SSE) + agent 原始 LLM 配置
-// (agent chat/summary handler 用) + 变参 llm(上游 refine/personal 用的 *service.LLMClient，
-// 可选，须置于末尾)。
-func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middleware.TokenResolver, botAuthResolver middleware.BotTokenResolver, workerTriggerURL string, candidateQueryLimit int, featureTeamSchedule, summaryWorkbenchEnabled bool, customTemplateLimit int, streamHub *streaming.Hub, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int, llmFallbackModels []string, llm ...*service.LLMClient) *gin.Engine {
+// (agent chat/summary handler 用) + agentNotifier(继续优化保存后的终态 IM 通知，可为 nil) +
+// 变参 llm(上游 refine/personal 用的 *service.LLMClient，可选，须置于末尾)。
+func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middleware.TokenResolver, botAuthResolver middleware.BotTokenResolver, workerTriggerURL string, candidateQueryLimit int, featureTeamSchedule, summaryWorkbenchEnabled bool, customTemplateLimit int, streamHub *streaming.Hub, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int, llmFallbackModels []string, agentNotifier *notify.Notifier, llm ...*service.LLMClient) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
 
@@ -60,6 +63,11 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	personalH.SetLLM(refineLLM)
 	streamH := handler.NewStreamHandler(db, streamHub)
 	shareH := handler.NewShareHandler(db, imDB)
+	contentReadH := handler.NewContentReadHandler(db, os.Getenv("SUMMARY_CONTENT_READ_SPACES"))
+	executionSpaces := os.Getenv("SUMMARY_CONTENT_EXECUTION_SPACES")
+	authorizer := pipeline.GenerationSourceAuthorizer{DB: imDB}
+	contentReadH.WithExecution(executionSpaces, authorizer, pipeline.MaxTimeRangeDays)
+	taskH.WithContentReader(contentReadH)
 
 	// Bot-facing mount (read plus owner-scoped create). Identity and space both come from
 	// verify-bot; this group deliberately does not use the human-token or space middleware.
@@ -91,6 +99,22 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		// response cache after a user action.
 		v1.GET("/summaries/attention", taskH.GetAttention)
 		v1.GET("/summaries/:id", taskH.GetSummary)
+		v1.GET("/summaries/:id/contents", contentReadH.Catalog)
+		v1.GET("/summaries/:id/contents/:content_id/versions", contentReadH.Versions)
+		v1.GET("/summaries/:id/contents/:content_id/versions/:version_id", contentReadH.Version)
+		v1.GET("/summaries/:id/contents/:content_id/generations/:generation_id", contentReadH.Generation)
+		if len(service.ContentExecutionSpaces()) > 0 {
+			command := handler.NewContentCommandHandler(db, executionSpaces).WithExecution(authorizer, pipeline.MaxTimeRangeDays)
+			base := "/summaries/:id/contents/:content_id"
+			v1.GET(base+"/configuration", command.Configuration)
+			v1.POST(base+"/configuration", command.SaveConfiguration)
+			v1.POST(base+"/edit", command.Edit)
+			v1.POST(base+"/restore", command.Restore)
+			v1.POST(base+"/generations/refine", command.Refine)
+			v1.POST(base+"/generations/regenerate", command.Regenerate)
+			v1.POST(base+"/generations/:generation_id/cancel", command.Cancel)
+			v1.POST(base+"/generations/:generation_id/apply", command.Apply)
+		}
 		v1.POST("/summaries/:id/shares", shareH.Create)
 		v1.GET("/summary-shares/:share_id", shareH.Get)
 		v1.DELETE("/summary-shares/:share_id", shareH.Revoke)
@@ -182,6 +206,9 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	// reference-based chat flow — see CHAT-REFERENCE-BASED-DESIGN-v1.)
 	agentSummaryH := handler.NewAgentSummaryHandler(db, imDB, llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
 	agentSummaryH.ConfigureSummaryWorkspace(summaryWorkbenchEnabled)
+	// Continue-optimize (继续优化) saves fire a terminal IM notification; a nil
+	// notifier keeps the emission a no-op (tests / notify disabled).
+	agentSummaryH.SetNotifier(agentNotifier)
 	v1.POST("/summaries/agent", agentSummaryH.CreateAgentSummary)
 	// Document "AI 速览": ephemeral streaming quick-glance, never persisted. See
 	// handler/document_preview.go.

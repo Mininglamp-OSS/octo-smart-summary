@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"log"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/router"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/ws"
@@ -132,6 +134,19 @@ func main() {
 	proc.SetNotifier(notifier)
 	go proc.Run()
 
+	// Durable content commands do not use the legacy trigger channel or task
+	// status. With an empty write allowlist this poller performs no DB scan.
+	contentCtx, stopContent := context.WithCancel(context.Background())
+	contentDone := make(chan struct{})
+	contentWorker := worker.NewContentGenerationWorker(summaryDB, pool, llm, time.Duration(cfg.WorkerPollInterval)*time.Second).
+		WithStreaming(cfg)
+	contentWorker.WithExecution(service.NewContentService(summaryDB).
+		WithExecution(pipeline.GenerationSourceAuthorizer{DB: imDB}, cfg.MaxTimeRangeDays), proc)
+	go func() {
+		defer close(contentDone)
+		contentWorker.Run(contentCtx)
+	}()
+
 	// Start scheduler (cron jobs)
 	cronSched := worker.StartScheduler(summaryDB, imDB, cfg.WorkerMaxRetry, cfg.WorkerTriggerURL, cfg.ScheduleMaxWindowDays, cfg.FeatureTeamSchedule, notifier)
 
@@ -157,6 +172,8 @@ func main() {
 	log.Println("[worker] shutting down...")
 
 	proc.Stop()
+	stopContent()
+	<-contentDone
 	pool.Drain()
 	cronSched.Stop()
 

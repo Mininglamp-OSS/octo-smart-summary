@@ -15,6 +15,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryspec"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/gin-gonic/gin"
@@ -199,7 +200,9 @@ func (h *AgentChatHandler) buildRunnerForProfile(profileName, uid, sessionID str
 		return nil, "", fmt.Errorf("build registry: %w", err)
 	}
 
-	client := agent.NewClient(h.llmApiURL, h.llmApiKey, h.llmModel, h.llmTimeout, h.llmMaxTokens, h.llmFallbackModels)
+	// LLM_ENABLE_THINKING is read here rather than stored on the handler so the
+	// agent client and the summary pipeline's client can never disagree about it.
+	client := agent.NewClient(h.llmApiURL, h.llmApiKey, h.llmModel, h.llmTimeout, h.llmMaxTokens, h.llmFallbackModels, config.LLMEnableThinking())
 	pool := agent.NewPool(4)
 	runner := agent.NewRunner(client, reg, pool, profile.Policy)
 	return runner, system, nil

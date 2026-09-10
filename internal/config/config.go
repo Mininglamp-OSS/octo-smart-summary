@@ -235,7 +235,7 @@ func Load() *Config {
 		LLMTimeout:         envInt("LLM_TIMEOUT", 180),
 		LLMMaxToken:        envInt("LLM_MAX_TOKENS", 4096),
 		LLMTemperature:     getEnvFloat("LLM_TEMPERATURE", 0.3),
-		LLMEnableThinking:  envBool("LLM_ENABLE_THINKING", false),
+		LLMEnableThinking:  LLMEnableThinking(),
 		APIPort:            envStr("API_PORT", "8080"),
 		APIInternalPort:    envStr("API_INTERNAL_PORT", "8081"),
 

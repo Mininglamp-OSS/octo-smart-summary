@@ -76,6 +76,9 @@ func (h *EditHandler) EditSummary(c *gin.Context) {
 		c.JSON(http.StatusForbidden, apiResponse{Code: 40003, Message: "仅创建者可编辑"})
 		return
 	}
+	if !allowLegacyContentCommand(c, task) {
+		return
+	}
 
 	if task.Status != model.StatusCompleted {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "仅已完成的任务可编辑"})
@@ -136,7 +139,7 @@ func (h *EditHandler) EditSummary(c *gin.Context) {
 
 	now := timezone.Now()
 
-	err = h.db.Transaction(func(tx *gorm.DB) error {
+	err = service.WithLegacyContentWrite(h.db, taskID, func(tx *gorm.DB) error {
 		result := tx.Model(&model.SummaryResult{}).
 			Where("id = ?", req.BaseResultID).
 			Updates(map[string]interface{}{
@@ -258,6 +261,9 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 		c.JSON(http.StatusForbidden, apiResponse{Code: 40003, Message: "仅创建者可调整"})
 		return
 	}
+	if !allowLegacyContentCommand(c, task) {
+		return
+	}
 	if task.Status != model.StatusCompleted {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "仅已完成的任务可调整"})
 		return
@@ -316,7 +322,7 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 	newResult.SetCitations(cleanedCitations)
 	newResult.SetTeamCitations(cleanedTeamCitations)
 
-	err = h.db.Transaction(func(tx *gorm.DB) error {
+	err = service.WithLegacyContentWrite(h.db, taskID, func(tx *gorm.DB) error {
 		var taskCheck model.SummaryTask
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", taskID).First(&taskCheck).Error; err != nil {
 			return err
@@ -410,6 +416,9 @@ func (h *EditHandler) RefineSummaryStream(c *gin.Context) {
 		c.JSON(http.StatusForbidden, apiResponse{Code: 40003, Message: "仅创建者可调整"})
 		return
 	}
+	if !allowLegacyContentCommand(c, task) {
+		return
+	}
 	if task.Status != model.StatusCompleted {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "仅已完成的任务可调整"})
 		return
@@ -492,7 +501,7 @@ func (h *EditHandler) RefineSummaryStream(c *gin.Context) {
 	newResult.SetCitations(cleanedCitations)
 	newResult.SetTeamCitations(cleanedTeamCitations)
 
-	err = h.db.Transaction(func(tx *gorm.DB) error {
+	err = service.WithLegacyContentWrite(h.db, taskID, func(tx *gorm.DB) error {
 		var taskCheck model.SummaryTask
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", taskID).First(&taskCheck).Error; err != nil {
 			return err
@@ -705,6 +714,9 @@ func (h *EditHandler) RestoreSummaryVersion(c *gin.Context) {
 		c.JSON(http.StatusForbidden, apiResponse{Code: 40003, Message: "仅创建者可恢复版本"})
 		return
 	}
+	if !allowLegacyContentCommand(c, task) {
+		return
+	}
 	if task.Status != model.StatusCompleted {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "仅已完成的任务可恢复版本"})
 		return
@@ -714,7 +726,7 @@ func (h *EditHandler) RestoreSummaryVersion(c *gin.Context) {
 		c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "版本不存在"})
 		return
 	}
-	err = h.db.Transaction(func(tx *gorm.DB) error {
+	err = service.WithLegacyContentWrite(h.db, taskID, func(tx *gorm.DB) error {
 		var taskCheck model.SummaryTask
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", taskID).First(&taskCheck).Error; err != nil {
 			return err
@@ -771,14 +783,7 @@ func cleanUnreferencedTeamCitations(content string, citations []model.TeamCitati
 }
 
 func buildRefineSystemPrompt() string {
-	return `你是专业的工作总结编辑助手。请根据用户的修改意见，对“当前总结”做局部调整。
-
-要求：
-- 尽量保留用户没有要求修改的内容、结构和引用编号。
-- 不要重新发散总结，不要补充当前总结里没有依据的新事实。
-- 如果只是语气、长短、结构调整，应保持事实含义不变。
-- 保留 Markdown 格式。
-- 只输出修改后的完整总结正文，不要输出解释、前后缀或代码块。`
+	return service.RefineSystemPrompt()
 }
 
 func stripMarkdownFence(s string) string {

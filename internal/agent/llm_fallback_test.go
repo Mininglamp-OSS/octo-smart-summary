@@ -59,7 +59,7 @@ func TestChatSeparatesTotalAndCompletionTokens(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "test-key", "primary", 5, 512, nil)
+	c := NewClient(srv.URL, "test-key", "primary", 5, 512, nil, false)
 	c.http = &http.Client{Timeout: 2 * time.Second}
 	turn, err := c.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil)
 	if err != nil {
@@ -86,7 +86,7 @@ func TestChat_FailoverToFallbackAfterRetriesExhausted(t *testing.T) {
 	srv := newFallbackTestServer(t, primary, http.StatusServiceUnavailable, &failFor, &seen)
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "test-key", primary, 5, 512, []string{fallback})
+	c := NewClient(srv.URL, "test-key", primary, 5, 512, []string{fallback}, false)
 	c.http = &http.Client{Timeout: 2 * time.Second}
 	// Force zero backoff would require reworking Chat; the exponential 1s+2s
 	// budget is short enough to keep the test under a few seconds.
@@ -136,7 +136,7 @@ func TestChat_NoFallbackOnTerminalError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "test-key", primary, 5, 512, []string{fallback})
+	c := NewClient(srv.URL, "test-key", primary, 5, 512, []string{fallback}, false)
 	c.http = &http.Client{Timeout: 2 * time.Second}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -165,7 +165,7 @@ func TestChat_NoFallbackConfiguredKeepsSingleModelBehavior(t *testing.T) {
 	srv := newFallbackTestServer(t, primary, http.StatusServiceUnavailable, &failFor, &seen)
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "test-key", primary, 5, 512, nil)
+	c := NewClient(srv.URL, "test-key", primary, 5, 512, nil, false)
 	c.http = &http.Client{Timeout: 2 * time.Second}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -192,7 +192,7 @@ func TestNewClient_DedupesFallbackList(t *testing.T) {
 	// empty strings and duplicates within the fallback list. Locking this in
 	// so future refactors don't re-introduce the wasted round-trip.
 	primary := "qwen3.6-max"
-	c := NewClient("http://x", "k", primary, 5, 512, []string{"", primary, "claude-sonnet-4-6", "claude-sonnet-4-6", "deepseek-v4-flash"})
+	c := NewClient("http://x", "k", primary, 5, 512, []string{"", primary, "claude-sonnet-4-6", "claude-sonnet-4-6", "deepseek-v4-flash"}, false)
 	if got, want := len(c.fallbackModels), 2; got != want {
 		t.Fatalf("fallbackModels length = %d, want %d (deduped): %v", got, want, c.fallbackModels)
 	}
@@ -244,7 +244,7 @@ func TestChat_HangingPrimaryEscalatesEarlyToFallback(t *testing.T) {
 	defer srv.Close()
 
 	// timeoutSec=2 -> per-attempt c.timeout = 2s.
-	c := NewClient(srv.URL, "test-key", primary, 2, 512, []string{fallback})
+	c := NewClient(srv.URL, "test-key", primary, 2, 512, []string{fallback}, false)
 	c.http = &http.Client{Timeout: 3 * time.Second} // let the ctx timeout drive, not the http client's
 
 	// Parent step deadline: 4s. Enough for exactly one full primary attempt
@@ -320,7 +320,7 @@ func TestChat_ParentContextCancelledIsNotMasqueradedAsFallback(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "test-key", primary, 5, 512, []string{fallback})
+	c := NewClient(srv.URL, "test-key", primary, 5, 512, []string{fallback}, false)
 	c.http = &http.Client{Timeout: 2 * time.Second}
 
 	// Cancel the parent after 500ms — enough time for the primary's first
@@ -380,7 +380,7 @@ func TestChat_403EscalatesToFallback(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "test-key", primary, 5, 512, []string{fallback})
+	c := NewClient(srv.URL, "test-key", primary, 5, 512, []string{fallback}, false)
 	c.http = &http.Client{Timeout: 2 * time.Second}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

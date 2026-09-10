@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/streaming"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timing"
@@ -80,6 +81,10 @@ func (m *MetaProcessor) TriggerMetaSummary(taskID int64) {
 }
 
 func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
+	var liveTask model.SummaryTask
+	if err := m.proc.db.First(&liveTask, taskID).Error; err != nil || service.ContentProtocolRequired(liveTask) || liveTask.DeletedAt != nil {
+		return
+	}
 	mu := m.getMetaLock(taskID)
 	if !mu.TryLock() {
 		m.markDirty(taskID)
@@ -135,7 +140,7 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 			// skip" semantics (scheduler.go uses StatusCancelled for a round that
 			// produced no result): no usable contribution, no meta result, round
 			// ends cleanly so subsequent rounds are not blocked.
-			res := m.proc.db.Model(&model.SummaryTask{}).
+			res := m.proc.db.Scopes(service.LegacyTaskScope).Model(&model.SummaryTask{}).
 				Where("id = ? AND status = ?", taskID, model.StatusProcessing).
 				Update("status", model.StatusCancelled)
 			if res.Error != nil {

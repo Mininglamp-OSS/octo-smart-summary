@@ -29,6 +29,9 @@ type scheduleParticipantConfig struct {
 }
 
 func syncScheduledTaskConfig(tx *gorm.DB, imDB *gorm.DB, sched model.SummarySchedule, task model.SummaryTask, now time.Time) error {
+	if err := service.LockLegacyContentTask(tx, task.ID); err != nil {
+		return err
+	}
 	if err := syncScheduledTaskSources(tx, imDB, task.ID, sched.SourceConfig); err != nil {
 		return err
 	}
@@ -258,6 +261,9 @@ func syncScheduledTaskSources(tx *gorm.DB, imDB *gorm.DB, taskID int64, raw mode
 }
 
 func syncScheduledTaskParticipants(tx *gorm.DB, task model.SummaryTask, raw model.JSON, now time.Time) error {
+	if err := service.LockLegacyContentTask(tx, task.ID); err != nil {
+		return err
+	}
 	if len(raw) == 0 {
 		return nil
 	}
@@ -322,7 +328,7 @@ func syncScheduledTaskParticipants(tx *gorm.DB, task model.SummaryTask, raw mode
 }
 
 func markTaskCompleted(tx *gorm.DB, taskID int64) error {
-	casResult := tx.Model(&model.SummaryTask{}).
+	casResult := tx.Scopes(service.LegacyTaskScope).Model(&model.SummaryTask{}).
 		Where("id = ? AND status = ?", taskID, model.StatusProcessing).
 		Updates(map[string]interface{}{
 			"status":              model.StatusCompleted,
@@ -361,7 +367,7 @@ func sameInt64Set(a, b []int64) bool {
 }
 
 func completeTaskWithoutNewResult(db *gorm.DB, taskID int64) error {
-	return db.Transaction(func(tx *gorm.DB) error {
+	return service.WithLegacyContentWrite(db, taskID, func(tx *gorm.DB) error {
 		return markTaskCompleted(tx, taskID)
 	})
 }
@@ -378,7 +384,7 @@ func completeTaskWithoutNewResult(db *gorm.DB, taskID int64) error {
 // disable the check (single-person/personal path: one freshly-produced result, no
 // cross-contributor merge to invalidate).
 func saveLatestResultAndCompleteTask(db *gorm.DB, taskID int64, result *model.SummaryResult, isScheduled bool, snapshotContributorIDs []int64) error {
-	return db.Transaction(func(tx *gorm.DB) error {
+	return service.WithLegacyContentWrite(db, taskID, func(tx *gorm.DB) error {
 		// Serialize against concurrent Leave/RemoveMember on this task: lock the task
 		// row FOR UPDATE so the roster re-check below and the Create/markTaskCompleted
 		// that follow are atomic w.r.t. roster mutations. Closes the residual TOCTOU

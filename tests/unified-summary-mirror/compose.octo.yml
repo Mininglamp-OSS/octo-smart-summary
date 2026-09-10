@@ -1,0 +1,96 @@
+# The full-Octo mirror: our summary API/worker wired into the real dev stack
+# (octo-alex) and fronted by the REAL octo-web bundle, so the browser gets the
+# whole product — app shell, nav rail, chat page, theme — with the summary
+# feature as it actually ships, not a fixture host around a few components.
+#
+# Sibling of compose.yml, and deliberately different from it:
+#
+#   compose.yml (hermetic, :28371 + :28372)   compose.octo.yml (this file, :28370)
+#   ----------------------------------------  -------------------------------------
+#   synthetic auth/model/notify stub          real octo-server, real LLM gateway
+#   own seeded IM tables                      the dev stack's IM DB, read-only
+#   notifications asserted against a sink     notifications OFF (see below)
+#   the automated acceptance (browser.mjs)    hands-on full-flow testing
+#
+# Secrets are never written here. Bring it up through the stack's own env file,
+# which supplies OCTO_SUMMARY_READER_PASSWORD / LLM_API_KEY / LLM_MODEL:
+#
+#   docker compose -p summary-unified-octo \
+#     --env-file /home/mlamp/octo-deployment/docker/.env \
+#     -f tests/unified-summary-mirror/compose.octo.yml up -d
+#
+# `-p` is explicit because that env file also sets COMPOSE_PROJECT_NAME, which
+# would otherwise win over a `name:` key here and fold this into another stack.
+services:
+  api:
+    image: octo-summary-unified:continue-optimize-20260910
+    container_name: octo-summary-unified-full-api
+    ports: ["127.0.0.1:28373:8080"]
+    environment: &environment
+      # Our own database on the throwaway test MySQL — never the dev stack's.
+      MYSQL_DSN: "root@tcp(octo-summary-versioning-test-mysql:3306)/summary_unified_octo?parseTime=true&loc=Asia%2FShanghai"
+      # The dev stack's IM data, through the read-only `summary_reader` grant.
+      IM_MYSQL_DSN: "summary_reader:${OCTO_SUMMARY_READER_PASSWORD}@tcp(mysql:3306)/${MYSQL_DATABASE:-octo}?charset=utf8mb4&parseTime=true"
+      OCTO_API_URL: "http://octo-server:8090"
+      DMWORK_API_URL: "http://octo-server:8090"
+      # Container names, not `summary-api`/`summary-worker`: those aliases are
+      # already taken on octo-net by the dev stack's own summary services, and a
+      # collision would have our callbacks land in theirs.
+      WORKER_TRIGGER_URL: "http://octo-summary-unified-full-worker:8082/internal/worker-trigger"
+      WORKER_API_CALLBACK_URL: "http://octo-summary-unified-full-api:8081/internal/task-event"
+      LLM_API_URL: "${LLM_API_URL}"
+      LLM_API_KEY: "${LLM_API_KEY}"
+      LLM_MODEL: "${LLM_MODEL}"
+      API_PORT: "8080"
+      API_INTERNAL_PORT: "8081"
+      # The execution/content pilot is an explicit allowlist (no wildcard), so a
+      # space that is not listed keeps the legacy path and the workbench looks
+      # reduced. The hex id is inherited from the sibling native mirror; `1,2`
+      # cover the dev stack's own spaces. Unlisted ids are inert, so listing all
+      # three is the cheapest way to avoid a silently reduced UI — add yours here
+      # and restart the api/worker if a space is still on the legacy path.
+      SUMMARY_CONTENT_EXECUTION_SPACES: "2d31bf15db6643ec9c0e13ba9e14e692,1,2"
+      SUMMARY_WORKBENCH_ENABLED: "true"
+      AGENT_SUMMARY_V2_MODE: "on"
+      BOT_SUMMARY_CREATE_ENABLED: "true"
+      AGENT_TRACE: "true"
+      AGENT_MAP_CONCURRENCY: "5"
+      SUMMARY_REPAIR_MAX_ROUNDS: "2"
+      # OFF on purpose. Enabling it here would push real IM cards to real
+      # accounts in the shared dev stack; the continue-optimize notification
+      # gate is accepted in the hermetic mirror instead, where the sink is
+      # synthetic and the delivery count is asserted.
+      SUMMARY_NOTIFY_ENABLED: "false"
+      MESSAGE_FETCH_BACKEND: "mysql"
+      WORKER_POLL_INTERVAL_SECONDS: "2"
+      TIMING_LOG_PATH: "/tmp/summary-timing.log"
+      SUMMARY_REPORT_PATH: "/tmp/summary-report.log"
+    networks: [octonet, isolated]
+  worker:
+    image: octo-summary-unified:continue-optimize-20260910
+    container_name: octo-summary-unified-full-worker
+    entrypoint: ["/bin/summary-worker"]
+    environment:
+      <<: *environment
+      WORKER_INTERNAL_PORT: "8082"
+    networks: [octonet, isolated]
+    depends_on: [api]
+  web:
+    # Built from the frontend worktree's tests/unified-summary-mirror/Dockerfile.octo
+    # — the production `apps/web` bundle on the production nginx template.
+    image: octo-web:unified-continue-optimize-20260910
+    container_name: octo-summary-unified-full-web
+    ports: ["127.0.0.1:28370:80"]
+    environment:
+      API_URL: "http://octo-server:8090"
+      SUMMARY_API_URL: "http://octo-summary-unified-full-api:8080"
+      NGINX_RESOLVER: "127.0.0.11"
+    networks: [octonet]
+    depends_on: [api]
+networks:
+  octonet:
+    external: true
+    name: octo-alex_octo-net
+  isolated:
+    external: true
+    name: octo-summary-versioning-test

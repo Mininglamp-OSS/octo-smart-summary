@@ -13,6 +13,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/finishgate"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/notify"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 
@@ -62,6 +63,21 @@ type AgentSummaryHandler struct {
 	// nil preserves legacy/test construction. Production sets this explicitly;
 	// false rejects workspace preview saves while leaving legacy saves intact.
 	workspaceEnabled *bool
+	// notifier delivers the terminal-state IM-bot notification for a 继续优化
+	// (continue-optimize) save — a brand-new summary that references an existing
+	// one. Optional: nil (or a disabled notifier) makes the emission a no-op, so
+	// it is always safe to leave unset in tests. Wired in SetupPublic.
+	notifier *notify.Notifier
+}
+
+// SetNotifier wires the terminal-state IM-bot notifier used by the
+// continue-optimize (继续优化) save path. Mirrors worker.Processor.SetNotifier;
+// optional, and nil-safe at the call site (OnTaskTerminal no-ops on a nil
+// receiver / disabled config).
+func (h *AgentSummaryHandler) SetNotifier(n *notify.Notifier) {
+	if h != nil {
+		h.notifier = n
+	}
 }
 
 func (h *AgentSummaryHandler) ConfigureSummaryWorkspace(enabled bool) {
@@ -889,6 +905,18 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 
 	log.Printf("[handler] CreateAgentSummary ok space=%s user=%s task_id=%d session=%s content_len=%d origin_channel=%s/%d",
 		spaceID, userID, createdTaskID, req.SessionID, len(content), finalChannelID, finalChannelType)
+
+	// 继续优化 (continue-optimize) notification. A save carrying referenced_task_ids
+	// is a derived summary produced by referencing an existing one — the product
+	// requires the user be told, via IM, that the new summary is ready. A plain
+	// from-scratch agent creation carries no references and stays silent. The task
+	// was born status=Completed and committed above, so this fires the same
+	// terminal card the worker path fires for scheduled/manual full generations.
+	// Best-effort: OnTaskTerminal is nil-safe and never blocks or fails the save;
+	// its UNIQUE(task_id, notify_kind, recipient_uid) dedup keeps it idempotent.
+	if len(req.ReferencedTaskIDs) > 0 {
+		h.notifier.OnTaskTerminal(task, model.StatusCompleted, "")
+	}
 
 	// Response shape is intentionally isomorphic to POST /summaries so the
 	// front-end can consume both endpoints with the same success handler.

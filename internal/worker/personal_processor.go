@@ -87,7 +87,7 @@ func (p *Processor) updatePersonalWorkflowStage(personalResultID int64, stage st
 func (p *Processor) persistCompletedPersonalResult(task model.SummaryTask, pr model.PersonalResult, content string, citations []model.Citation, msgCount, totalTokens int, modelVer string, genAt time.Time, skipContent bool) error {
 	updates := completedPersonalResultUpdates(pr, content, citations, msgCount, totalTokens, modelVer, genAt, skipContent)
 	if skipContent {
-		return p.db.Transaction(func(tx *gorm.DB) error {
+		return service.WithLegacyContentWrite(p.db, task.ID, func(tx *gorm.DB) error {
 			var lockedPR model.PersonalResult
 			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 				Where("id = ? AND task_id = ? AND user_id = ?", pr.ID, pr.TaskID, pr.UserID).
@@ -111,7 +111,7 @@ func (p *Processor) persistCompletedPersonalResult(task model.SummaryTask, pr mo
 		})
 	}
 
-	return p.db.Transaction(func(tx *gorm.DB) error {
+	return service.WithLegacyContentWrite(p.db, task.ID, func(tx *gorm.DB) error {
 		var lockedPR model.PersonalResult
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ? AND task_id = ? AND user_id = ?", pr.ID, pr.TaskID, pr.UserID).
@@ -182,55 +182,43 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 		return
 	}
 
-	// CAS: only proceed if worker_status is still Pending (prevents duplicate runs)
+	// Claim under the shared task lock. A late legacy trigger must not mutate
+	// personal/member status after coordinated enrollment.
 	now := timezone.Now()
-	cas := p.db.Model(&pr).
-		Where("worker_status = ?", model.PersonalStatusPending).
-		Update("worker_status", model.PersonalStatusProcessing)
-	if cas.RowsAffected == 0 {
-		log.Printf("[personal-worker] task=%d participant=%d already processing/completed, skipping", taskID, participantRefID)
-		return
-	}
-	p.db.Model(&participant).Updates(map[string]interface{}{
-		"status":            model.ParticipantProcessing,
-		"worker_started_at": now,
-	})
-
-	// CAS update task status to PROCESSING (from any earlier state).
-	// personal_regenerate is allowed to run against an already-Completed task
-	// without flipping the whole task back to Processing; the user will explicitly
-	// submit the regenerated personal result later, and Submit revives the task for
-	// meta recompute at that point.
 	deadline := timezone.Now().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute)
-	taskCAS := p.db.Model(&model.SummaryTask{}).
-		Where("id = ? AND status IN (?, ?)", taskID, model.StatusPending, model.StatusWaitingConfirm).
-		Updates(map[string]interface{}{
-			"status":              model.StatusProcessing,
-			"processing_deadline": deadline,
-		})
-	if taskCAS.Error != nil {
-		log.Printf("[personal-worker] task=%d CAS update failed: %v", taskID, taskCAS.Error)
-		return
-	}
-	if taskCAS.RowsAffected == 0 {
-		var currentTask model.SummaryTask
-		if err := p.db.Select("status").First(&currentTask, taskID).Error; err != nil ||
-			(currentTask.Status != model.StatusProcessing && !(allowCompletedTask && currentTask.Status == model.StatusCompleted)) {
-			log.Printf("[personal-worker] task=%d not in runnable state, aborting", taskID)
-			return
-		}
-		if currentTask.Status == model.StatusProcessing {
-			// Refresh deadline for already-processing task (prevents scheduler false-positive)
-			p.db.Model(&model.SummaryTask{}).Where("id = ?", taskID).
-				Update("processing_deadline", deadline)
-		}
-	}
-
-	// Load task
 	var task model.SummaryTask
-	if err := p.db.First(&task, taskID).Error; err != nil {
-		log.Printf("[personal-worker] task %d not found: %v", taskID, err)
-		p.markPersonalFailed(&pr, &participant, "task not found")
+	claimErr := service.WithLegacyContentWrite(p.db, taskID, func(tx *gorm.DB) error {
+		if err := tx.First(&task, taskID).Error; err != nil {
+			return err
+		}
+		if task.Status != model.StatusPending && task.Status != model.StatusWaitingConfirm &&
+			task.Status != model.StatusProcessing && !(allowCompletedTask && task.Status == model.StatusCompleted) {
+			return errTaskNoLongerProcessing
+		}
+		cas := tx.Model(&pr).
+			Where("worker_status = ?", model.PersonalStatusPending).
+			Update("worker_status", model.PersonalStatusProcessing)
+		if cas.Error != nil {
+			return cas.Error
+		}
+		if cas.RowsAffected == 0 || participant.TaskID != taskID {
+			return errTaskNoLongerProcessing
+		}
+		if err := tx.Model(&participant).Updates(map[string]interface{}{
+			"status": model.ParticipantProcessing, "worker_started_at": now,
+		}).Error; err != nil {
+			return err
+		}
+		// Personal-only regenerate does not revive an already completed team.
+		if task.Status == model.StatusCompleted {
+			return nil
+		}
+		return tx.Model(&task).Updates(map[string]interface{}{
+			"status": model.StatusProcessing, "processing_deadline": deadline,
+		}).Error
+	})
+	if claimErr != nil {
+		log.Printf("[personal-worker] task=%d participant=%d claim skipped: %v", taskID, participantRefID, claimErr)
 		return
 	}
 
@@ -343,9 +331,13 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 		finishStreamError("summary persistence failed")
 		return
 	}
-	p.db.Model(&participant).Updates(map[string]interface{}{
-		"status": model.ParticipantCompleted,
-	})
+	if err := service.WithLegacyContentWrite(p.db, taskID, func(tx *gorm.DB) error {
+		return tx.Model(&participant).Updates(map[string]interface{}{
+			"status": model.ParticipantCompleted,
+		}).Error
+	}); err != nil {
+		return
+	}
 	timing.Observe(task.TaskNo, "persist_personal_result", persistStart)
 
 	// Send directed WS notification to the specific user
@@ -454,7 +446,7 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 // the multi-person path), so it is not re-checked here.
 func (p *Processor) backfillSystemSubmittedAt(taskID int64, pr *model.PersonalResult) {
 	now := timezone.Now()
-	err := p.db.Transaction(func(tx *gorm.DB) error {
+	err := service.WithLegacyContentWrite(p.db, taskID, func(tx *gorm.DB) error {
 		var status int
 		if err := tx.Model(&model.SummaryParticipant{}).
 			Select("status").
@@ -518,7 +510,7 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 	var shouldNotify bool
 	var willRetry bool
 	var permanentMultiDeclined bool
-	txErr := p.db.Transaction(func(tx *gorm.DB) error {
+	txErr := service.WithLegacyContentWrite(p.db, pr.TaskID, func(tx *gorm.DB) error {
 		// 🟠 Atomic retry_count increment (no lost updates).
 		//
 		// The old code did a plain Select(retry_count) -> newRetry=current+1 -> write-back
@@ -682,6 +674,10 @@ func isFatalMapError(err error) bool {
 }
 
 func (p *Processor) executePersonalPipeline(ctx context.Context, task model.SummaryTask, userID string, reportStage func(string), streamDelta func(string) error) (string, []model.Citation, int, int, string, error) {
+	return p.executePersonalPipelineInput(ctx, task, userID, reportStage, streamDelta, nil)
+}
+
+func (p *Processor) executePersonalPipelineInput(ctx context.Context, task model.SummaryTask, userID string, reportStage func(string), streamDelta func(string) error, frozen *service.FrozenGenerationInput) (string, []model.Citation, int, int, string, error) {
 	totalStart := time.Now()
 	taskNo := task.TaskNo
 	defer func() {
@@ -693,7 +689,11 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 
 	// Load sources
 	var sources []model.SummarySource
-	if err := p.db.Where("task_id = ?", task.ID).Find(&sources).Error; err != nil {
+	if frozen != nil {
+		for _, source := range frozen.Spec.Sources {
+			sources = append(sources, model.SummarySource{SourceType: source.SourceType, SourceID: source.SourceID})
+		}
+	} else if err := p.db.Where("task_id = ?", task.ID).Find(&sources).Error; err != nil {
 		return "", nil, 0, 0, "", fmt.Errorf("load sources: %w", err)
 	}
 
@@ -727,13 +727,21 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	channelScopeOpts := channelScopeOptionsForTask(p.cfg.ChannelScopeEnabled, task.SpaceID, task.AgentSessionID, false, true)
 
 	fetchStart := time.Now()
-	messages, intentResult, err := pipeline.ResolveAndFetchMessagesForPersonal(
-		ctx, userID, nil, nil, specifiedSources, task.EffectiveTopic(),
-		task.TimeRangeStart, task.TimeRangeEnd,
-		p.imDB, p.octoClient, p.cfg.MessageFetchBackend, toolCallFn, llmFn,
-		p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency, p.cfg.OctoSearchPollSec,
-		channelScopeOpts, reportStage,
-	)
+	var messages []pipeline.Message
+	intentResult := &pipeline.IntentResult{Skipped: true, SkipReason: "confirmed_configuration"}
+	var err error
+	if frozen != nil {
+		messages, err = pipeline.FetchConfirmedGenerationMessages(ctx, task.SpaceID, userID, *frozen,
+			p.imDB, p.octoClient, p.cfg.MessageFetchBackend, p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency, p.cfg.OctoSearchPollSec)
+	} else {
+		messages, intentResult, err = pipeline.ResolveAndFetchMessagesForPersonal(
+			ctx, userID, nil, nil, specifiedSources, task.EffectiveTopic(),
+			task.TimeRangeStart, task.TimeRangeEnd,
+			p.imDB, p.octoClient, p.cfg.MessageFetchBackend, toolCallFn, llmFn,
+			p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency, p.cfg.OctoSearchPollSec,
+			channelScopeOpts, reportStage,
+		)
+	}
 	timing.Observe(taskNo, "fetch_messages", fetchStart)
 	if err != nil {
 		return "", nil, 0, 0, "", fmt.Errorf("fetch messages: %w", err)
@@ -795,7 +803,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	// summary would over-widen to ALL messages. So re-resolve against the actual
 	// post-fetch senders (nameMap, untruncated) whenever we have no target and the
 	// topic is not purely generic (pure_generic_topic by definition names no one).
-	if topic := task.EffectiveTopic(); len(targetUIDs) == 0 && intentResult.SkipReason != "pure_generic_topic" && topic != "" {
+	if topic := task.EffectiveTopic(); frozen == nil && len(targetUIDs) == 0 && intentResult != nil && intentResult.SkipReason != "pure_generic_topic" && topic != "" {
 		if fallback := pipeline.ResolveTopicTarget(ctx, topic, nameMap, userID, toolCallFn); len(fallback) > 0 {
 			targetUIDs = fallback
 			log.Printf("[personal-worker] target resolved via post-fetch fallback: %v (creator=%s)", targetUIDs, userID)
@@ -983,7 +991,15 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		userName = userID
 	}
 
-	generationTopic := p.generationTopic(task)
+	var generationTopic string
+	if frozen != nil {
+		generationTopic = *frozen.Spec.Requirement
+		if frozen.Spec.Template != nil {
+			generationTopic += "\n\n" + frozen.Spec.Template.Content
+		}
+	} else {
+		generationTopic = p.generationTopic(task)
+	}
 
 	var finalContent string
 	var totalTokens int

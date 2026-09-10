@@ -145,6 +145,9 @@ func (p *Processor) notifyTaskTerminal(taskID int64, status int) {
 		log.Printf("[processor] notifyTaskTerminal: reload task %d failed: %v", taskID, err)
 		return
 	}
+	if service.ContentProtocolRequired(task) {
+		return
+	}
 	errMsg := ""
 	if task.ErrorMessage != nil {
 		errMsg = *task.ErrorMessage
@@ -207,14 +210,14 @@ func (p *Processor) poll() {
 	for i := 0; i < 10; i++ {
 		// Step 1: find a candidate pending task
 		var candidate model.SummaryTask
-		if err := p.db.Where("status = ? AND retry_count < ? AND (processing_deadline IS NULL OR processing_deadline < ?) AND deleted_at IS NULL",
+		if err := p.db.Scopes(service.LegacyTaskScope).Where("status = ? AND retry_count < ? AND (processing_deadline IS NULL OR processing_deadline < ?) AND deleted_at IS NULL",
 			model.StatusPending, p.cfg.WorkerMaxRetry, now).
 			Order("id ASC").Limit(1).First(&candidate).Error; err != nil {
 			return // no pending tasks
 		}
 
 		// Step 2: atomically claim it by ID (prevents race with other workers)
-		result := p.db.Model(&model.SummaryTask{}).
+		result := p.db.Scopes(service.LegacyTaskScope).Model(&model.SummaryTask{}).
 			Where("id = ? AND status = ?", candidate.ID, model.StatusPending).
 			Updates(map[string]interface{}{
 				"status":              model.StatusProcessing,
@@ -256,6 +259,10 @@ func (p *Processor) dispatchPersonal(taskID, participantRefID int64) {
 }
 
 func (p *Processor) processTask(task model.SummaryTask) {
+	var liveTask model.SummaryTask
+	if err := p.db.First(&liveTask, task.ID).Error; err != nil || service.ContentProtocolRequired(liveTask) || liveTask.DeletedAt != nil {
+		return
+	}
 	log.Printf("[processor] processing task %d (%s)", task.ID, task.TaskNo)
 
 	// Send progress callback
@@ -279,7 +286,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 		if newRetry >= p.cfg.WorkerMaxRetry {
 			newStatus = model.StatusFailed
 		}
-		casResult := p.db.Model(&model.SummaryTask{}).
+		casResult := p.db.Scopes(service.LegacyTaskScope).Model(&model.SummaryTask{}).
 			Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
 			Updates(map[string]interface{}{
 				"status":              newStatus,
@@ -316,7 +323,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 		if newRetry >= p.cfg.WorkerMaxRetry {
 			newStatus = model.StatusFailed
 		}
-		casResult := p.db.Model(&model.SummaryTask{}).
+		casResult := p.db.Scopes(service.LegacyTaskScope).Model(&model.SummaryTask{}).
 			Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
 			Updates(map[string]interface{}{
 				"status":              newStatus,
@@ -358,7 +365,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 			if newRetry >= p.cfg.WorkerMaxRetry {
 				newStatus = model.StatusFailed
 			}
-			casResult := p.db.Model(&model.SummaryTask{}).
+			casResult := p.db.Scopes(service.LegacyTaskScope).Model(&model.SummaryTask{}).
 				Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
 				Updates(map[string]interface{}{
 					"status":              newStatus,
@@ -406,7 +413,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 				p.dispatchPersonal(task.ID, ptID)
 			}
 
-			casResult := p.db.Model(&model.SummaryTask{}).
+			casResult := p.db.Scopes(service.LegacyTaskScope).Model(&model.SummaryTask{}).
 				Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
 				Updates(map[string]interface{}{
 					"processing_deadline": timezone.Now().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute),
@@ -429,7 +436,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 			return
 		}
 
-		casResult := p.db.Model(&model.SummaryTask{}).
+		casResult := p.db.Scopes(service.LegacyTaskScope).Model(&model.SummaryTask{}).
 			Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
 			Updates(map[string]interface{}{
 				"processing_deadline": timezone.Now().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute),
@@ -527,7 +534,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 			// personal workers run. A miss here is acceptable: dispatch already happened,
 			// and re-claim is idempotent. We only need to ensure we do not stay in Processing
 			// with nothing in flight, so on a miss we re-read the real status.
-			casResult := p.db.Model(&model.SummaryTask{}).
+			casResult := p.db.Scopes(service.LegacyTaskScope).Model(&model.SummaryTask{}).
 				Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
 				Updates(map[string]interface{}{
 					"processing_deadline": timezone.Now().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute),
@@ -560,7 +567,7 @@ func (p *Processor) processTask(task model.SummaryTask) {
 		// deadline-refresh CAS, but make a miss recoverable and never leave the task pinned
 		// in Processing. (Scheduled CONFIRM rounds never reach this branch -- they take
 		// the active-dispatch path above, because their roster is already confirmed.)
-		casResult := p.db.Model(&model.SummaryTask{}).
+		casResult := p.db.Scopes(service.LegacyTaskScope).Model(&model.SummaryTask{}).
 			Where("id = ? AND status = ?", task.ID, model.StatusProcessing).
 			Updates(map[string]interface{}{
 				"processing_deadline": timezone.Now().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute),
@@ -653,7 +660,7 @@ func (p *Processor) bootstrapCreatorParticipant(task model.SummaryTask) (int64, 
 	creatorName := service.ResolveUserName(task.CreatorID)
 	var participant model.SummaryParticipant
 
-	err := p.db.Transaction(func(tx *gorm.DB) error {
+	err := service.WithLegacyContentWrite(p.db, task.ID, func(tx *gorm.DB) error {
 		participant = model.SummaryParticipant{
 			TaskID:      task.ID,
 			UserID:      task.CreatorID,

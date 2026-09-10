@@ -76,6 +76,9 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "该任务不支持个人调整"})
 		return
 	}
+	if !allowLegacyContentCommand(c, *task) {
+		return
+	}
 	if task.Status != model.StatusCompleted {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "仅已完成的任务可调整"})
 		return
@@ -136,7 +139,7 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 	now := timezone.Now()
 	var newVersion model.PersonalResultVersion
 	shouldTriggerMeta := false
-	err = h.db.Transaction(func(tx *gorm.DB) error {
+	err = service.WithLegacyContentWrite(h.db, taskID, func(tx *gorm.DB) error {
 		var latestPR model.PersonalResult
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ? AND task_id = ? AND user_id = ?", pr.ID, taskID, userID).
@@ -287,6 +290,9 @@ func (h *PersonalHandler) RefinePersonalSummaryStream(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "该任务不支持个人调整"})
 		return
 	}
+	if !allowLegacyContentCommand(c, *task) {
+		return
+	}
 	if task.Status != model.StatusCompleted {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "仅已完成的任务可调整"})
 		return
@@ -371,7 +377,7 @@ func (h *PersonalHandler) RefinePersonalSummaryStream(c *gin.Context) {
 	now := timezone.Now()
 	var newVersion model.PersonalResultVersion
 	shouldTriggerMeta := false
-	err = h.db.Transaction(func(tx *gorm.DB) error {
+	err = service.WithLegacyContentWrite(h.db, taskID, func(tx *gorm.DB) error {
 		var latestPR model.PersonalResult
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ? AND task_id = ? AND user_id = ?", pr.ID, taskID, userID).
@@ -597,6 +603,9 @@ func (h *PersonalHandler) RestorePersonalVersion(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "该任务不支持个人版本"})
 		return
 	}
+	if !allowLegacyContentCommand(c, *task) {
+		return
+	}
 	if task.Status != model.StatusCompleted {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "仅已完成的任务可恢复版本"})
 		return
@@ -614,7 +623,7 @@ func (h *PersonalHandler) RestorePersonalVersion(c *gin.Context) {
 
 	now := timezone.Now()
 	shouldTriggerMeta := false
-	err = h.db.Transaction(func(tx *gorm.DB) error {
+	err = service.WithLegacyContentWrite(h.db, taskID, func(tx *gorm.DB) error {
 		var latestPR model.PersonalResult
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ? AND task_id = ? AND user_id = ?", pr.ID, taskID, userID).
@@ -663,6 +672,10 @@ func (h *PersonalHandler) RestorePersonalVersion(c *gin.Context) {
 			c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "个人总结不存在"})
 			return
 		}
+		if bizError, isBiz := err.(*service.BizError); isBiz {
+			bizErr(c, bizError)
+			return
+		}
 		log.Printf("[personal-restore] transaction error task=%d user=%s version=%d: %v", taskID, userID, versionID, err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
 		return
@@ -692,6 +705,9 @@ func (h *PersonalHandler) RegeneratePersonalSummary(c *gin.Context) {
 	}
 	if task.SummaryMode != model.ModeByPerson {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "该任务不支持个人重新生成"})
+		return
+	}
+	if !allowLegacyContentCommand(c, *task) {
 		return
 	}
 	if task.Status != model.StatusCompleted {
@@ -733,7 +749,7 @@ func (h *PersonalHandler) RegeneratePersonalSummary(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "topic 不能超过 2300 字符"})
 		return
 	}
-	err := h.db.Transaction(func(tx *gorm.DB) error {
+	err := service.WithLegacyContentWrite(h.db, taskID, func(tx *gorm.DB) error {
 		var latestPR model.PersonalResult
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ? AND task_id = ? AND user_id = ?", pr.ID, taskID, userID).

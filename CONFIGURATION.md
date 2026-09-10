@@ -2,6 +2,23 @@
 
 All configuration is done via environment variables.
 
+## Formal-content compatibility reads (development phase)
+
+`SUMMARY_CONTENT_READ_SPACES` is an exact, comma-separated Space allowlist for
+the additive `/api/v1/summaries/:id/contents` and content-scoped version GET APIs.
+It defaults to empty; `*` does not enable all Spaces. Restart the API after
+changing it. It is independent of `SUMMARY_WORKBENCH_ENABLED`.
+
+This first migration phase does **not** enable new edits, restores, generation,
+schedule writes or history retention. The response explicitly returns disabled
+write capabilities and `write_protocol_not_enabled`. Keep the current UI and
+legacy writer behavior until all API/worker/scheduler paths use the shared
+protocol. GET never creates a personal V1 or repairs history.
+
+Apply the forward-compatible schema before serving these reads. Retain the
+new schema on rollback. Do not activate new write semantics or disable legacy
+cleanup using the read flag alone.
+
 ## Environment Variables
 
 | Variable | Description | Required | Default |
@@ -25,8 +42,8 @@ All configuration is done via environment variables.
 | `SUMMARY_WORKBENCH_ENABLED` | Environment-level rollout and rollback switch for the unified smart-summary workbench. `true` advertises and serves the v2 workspace APIs; unset, `false`, or invalid values fail closed to the legacy entry and reject workspace chat, history, confirmation, and workspace-preview save operations. Changing the value requires restarting the API deployment, but does not require rebuilding the Web image. | No | `false` |
 | `SUMMARY_REPAIR_MAX_ROUNDS` | Maximum number of distinct pre-freeze coverage gaps the agent may block for repair in one run. Calls fanned out by the same planner step share one decision; an unchanged gap on a later step is allowed through. Before each block, the gate reserves four downstream steps for Map, Reduce, a possible runner nudge, and the final answer, plus two steps for every still-available repair round; with the default of `2`, the first block therefore requires eight remaining steps. `0` disables the gate. | No | `2` |
 | `LLM_MAX_TOKENS` | Maximum tokens for LLM response | No | `4096` |
-| `LLM_TEMPERATURE` | Sampling temperature for LLM | No | `0.3` |
-| `LLM_ENABLE_THINKING` | Enable extended thinking mode | No | `false` |
+| `LLM_TEMPERATURE` | Sampling temperature for LLM. Some providers accept only one temperature per model and reject anything else with HTTP 400 rather than clamping, so the value is overridden per model where required — Kimi K2 is sent `0.6` with thinking disabled and `1.0` with thinking on. The override is applied in one place (`service.RequestPolicyForModel`) for both the summary pipeline and agent chat. | No | `0.3` |
+| `LLM_ENABLE_THINKING` | Enable extended thinking mode. `false` (default) asks the provider to skip reasoning, expressed per model family: Kimi gets `thinking:{"type":"disabled"}`, Qwen/DeepSeek get `chat_template_kwargs.enable_thinking=false`. Because the accepted temperature depends on this switch (see `LLM_TEMPERATURE`), it is read from one place for every LLM path. | No | `false` |
 | `API_PORT` | Port for the public API server | No | `8080` |
 | `API_INTERNAL_PORT` | Port for the API internal server. **Must not be published outside the cluster/container network** — see the warning below. | No | `8081` |
 | `WORKER_INTERNAL_PORT` | Port for the worker internal server. **Must not be published outside the cluster/container network** — see the warning below. | No | `8082` |

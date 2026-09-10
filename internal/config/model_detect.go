@@ -14,3 +14,12 @@ func IsQwenOrDeepSeekModel(model string) bool {
 	m := strings.ToLower(model)
 	return strings.Contains(m, "qwen3.6") || strings.Contains(m, "deepseek-v4")
 }
+
+// LLMEnableThinking reads LLM_ENABLE_THINKING. Exported because the per-model
+// request policy needs it on paths that build an LLM client directly instead of
+// receiving a loaded Config (internal/api/handler's agent chat), and both paths
+// must read the same switch — a mismatch changes the temperature the provider
+// requires, not just the answer's style.
+func LLMEnableThinking() bool {
+	return envBool("LLM_ENABLE_THINKING", false)
+}

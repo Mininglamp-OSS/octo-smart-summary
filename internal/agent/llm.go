@@ -22,6 +22,10 @@ type Client struct {
 	fallbackModels []string
 	timeout        time.Duration
 	maxTokens      int
+	// enableThinking mirrors LLM_ENABLE_THINKING and, together with the model
+	// name, decides the request's temperature and thinking switch — see
+	// service.RequestPolicyForModel.
+	enableThinking bool
 	http           *http.Client
 }
 
@@ -30,7 +34,11 @@ type Client struct {
 // model's per-model retry budget before switching to each fallback in order.
 // Passing a nil / empty slice preserves the single-model behavior. See
 // issue #179 for motivation.
-func NewClient(apiURL, apiKey, model string, timeoutSec, maxTokens int, fallbackModels []string) *Client {
+//
+// enableThinking comes from LLM_ENABLE_THINKING (config.LLMEnableThinking) and
+// must match what the summary pipeline's client is given: it is an input to the
+// per-model request policy, not a local preference.
+func NewClient(apiURL, apiKey, model string, timeoutSec, maxTokens int, fallbackModels []string, enableThinking bool) *Client {
 	// Copy to isolate the caller's slice from mutation; also drop empty
 	// entries and any entry that duplicates the primary model (would waste
 	// the retry budget without gaining coverage).
@@ -50,18 +58,29 @@ func NewClient(apiURL, apiKey, model string, timeoutSec, maxTokens int, fallback
 		fallbackModels: fallbacks,
 		timeout:        time.Duration(timeoutSec) * time.Second,
 		maxTokens:      maxTokens,
+		enableThinking: enableThinking,
 		http:           &http.Client{},
 	}
 }
 
+// agentBaseTemperature is what the agent loop asks for; a model whose provider
+// only accepts a specific value overrides it through the shared policy.
+const agentBaseTemperature = 0.3
+
 // chatRequest / chatResponse 只描述我们真正会用到的字段。
 type chatRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Tools       []Tool    `json:"tools,omitempty"`
-	ToolChoice  string    `json:"tool_choice,omitempty"`
-	MaxTokens   int       `json:"max_tokens"`
-	Temperature float64   `json:"temperature"`
+	Model      string    `json:"model"`
+	Messages   []Message `json:"messages"`
+	Tools      []Tool    `json:"tools,omitempty"`
+	ToolChoice string    `json:"tool_choice,omitempty"`
+	MaxTokens  int       `json:"max_tokens"`
+	// Temperature and the two thinking fields below are set from
+	// service.RequestPolicyForModel, never independently: on Kimi the gateway
+	// accepts exactly one temperature per thinking mode and rejects the request
+	// otherwise.
+	Temperature        float64                `json:"temperature"`
+	Thinking           *service.ThinkingParam `json:"thinking,omitempty"`
+	ChatTemplateKwargs map[string]interface{} `json:"chat_template_kwargs,omitempty"`
 }
 
 type chatResponse struct {
@@ -119,12 +138,19 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, tools []Tool) (Assist
 //     the next model — the Bedrock SCP-deny case, #211; other 4xx terminal)
 //   - decode error / empty choices -> Terminal
 func (c *Client) attemptChat(ctx context.Context, model string, msgs []Message, tools []Tool) (AssistantTurn, llmfallback.Outcome, error) {
+	// The gateway's per-model requirements (temperature + thinking switch) are
+	// shared with the summary pipeline's client. Deciding them here instead
+	// meant every agent turn on a Kimi deployment came back as a terminal
+	// HTTP 400 — no retry, no fallback, `50000 summary workspace failed`.
+	modelPolicy := service.RequestPolicyForModel(model, c.enableThinking, agentBaseTemperature)
 	reqBody := chatRequest{
-		Model:       model,
-		Messages:    msgs,
-		Tools:       tools,
-		MaxTokens:   c.maxTokens,
-		Temperature: 0.3,
+		Model:              model,
+		Messages:           msgs,
+		Tools:              tools,
+		MaxTokens:          c.maxTokens,
+		Temperature:        modelPolicy.Temperature,
+		Thinking:           modelPolicy.Thinking,
+		ChatTemplateKwargs: modelPolicy.ChatTemplateKwargs,
 	}
 	if len(tools) > 0 {
 		reqBody.ToolChoice = "auto"

@@ -44,6 +44,7 @@ type PersonalResult struct {
 	TotalTokenUsed   int        `gorm:"column:total_token_used;not null;default:0" json:"total_token_used"`
 	ModelVersion     string     `gorm:"column:model_version;type:varchar(50);not null;default:''" json:"model_version"`
 	CurrentVersionID *int64     `gorm:"column:current_version_id" json:"current_version_id"`
+	ContentRevision  int64      `gorm:"column:content_revision;not null;default:0" json:"content_revision"`
 	WorkerStatus     int        `gorm:"column:worker_status;type:tinyint;not null;default:0" json:"worker_status"`
 	WorkflowStage    string     `gorm:"column:workflow_stage;type:varchar(32);not null;default:''" json:"workflow_stage"`
 	RetryCount       int        `gorm:"column:retry_count;type:tinyint;not null;default:0" json:"retry_count"`
@@ -62,23 +63,31 @@ func (PersonalResult) TableName() string { return "summary_personal_result" }
 // PersonalResult. summary_personal_result remains the current materialized row
 // used by read paths; this table is only version history.
 type PersonalResultVersion struct {
-	ID               int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	TaskID           int64     `gorm:"column:task_id;not null;uniqueIndex:uk_personal_result_version_task_user_version" json:"task_id"`
-	ParticipantRefID int64     `gorm:"column:participant_ref_id;not null" json:"participant_ref_id"`
-	UserID           string    `gorm:"column:user_id;type:varchar(64);not null;uniqueIndex:uk_personal_result_version_task_user_version" json:"user_id"`
-	Content          string    `gorm:"column:content;type:mediumtext;not null" json:"content"`
-	CitationsJSON    string    `gorm:"column:citations_json;type:mediumtext" json:"-"`
-	MsgCount         int       `gorm:"column:msg_count;not null;default:0" json:"msg_count"`
-	TotalTokenUsed   int       `gorm:"column:total_token_used;not null;default:0" json:"total_token_used"`
-	ModelVersion     string    `gorm:"column:model_version;type:varchar(50);not null;default:''" json:"model_version"`
-	Version          int       `gorm:"column:version;not null;default:1;uniqueIndex:uk_personal_result_version_task_user_version" json:"version"`
-	OperationType    string    `gorm:"column:operation_type;type:varchar(32);not null;default:'generate'" json:"operation_type"`
-	OperationNote    string    `gorm:"column:operation_note;type:text" json:"operation_note"`
-	ParentVersionID  *int64    `gorm:"column:parent_version_id" json:"parent_version_id,omitempty"`
-	CreatedBy        string    `gorm:"column:created_by;type:varchar(64);not null;default:''" json:"created_by"`
-	GeneratedAt      time.Time `gorm:"column:generated_at;not null" json:"generated_at"`
-	CreatedAt        time.Time `gorm:"column:created_at;not null" json:"created_at"`
-	UpdatedAt        time.Time `gorm:"column:updated_at;not null" json:"updated_at"`
+	ID                     int64      `gorm:"primaryKey;autoIncrement" json:"id"`
+	TaskID                 int64      `gorm:"column:task_id;not null;uniqueIndex:uk_personal_result_version_task_user_version" json:"task_id"`
+	ParticipantRefID       int64      `gorm:"column:participant_ref_id;not null" json:"participant_ref_id"`
+	UserID                 string     `gorm:"column:user_id;type:varchar(64);not null;uniqueIndex:uk_personal_result_version_task_user_version;uniqueIndex:uk_personal_generation_user" json:"user_id"`
+	Content                string     `gorm:"column:content;type:mediumtext;not null" json:"content"`
+	CitationsJSON          string     `gorm:"column:citations_json;type:mediumtext" json:"-"`
+	MsgCount               int        `gorm:"column:msg_count;not null;default:0" json:"msg_count"`
+	TotalTokenUsed         int        `gorm:"column:total_token_used;not null;default:0" json:"total_token_used"`
+	ModelVersion           string     `gorm:"column:model_version;type:varchar(50);not null;default:''" json:"model_version"`
+	Version                int        `gorm:"column:version;not null;default:1;uniqueIndex:uk_personal_result_version_task_user_version" json:"version"`
+	OperationType          string     `gorm:"column:operation_type;type:varchar(32);not null;default:'generate'" json:"operation_type"`
+	OperationNote          string     `gorm:"column:operation_note;type:text" json:"operation_note"`
+	ParentVersionID        *int64     `gorm:"column:parent_version_id" json:"parent_version_id,omitempty"`
+	CreatedBy              string     `gorm:"column:created_by;type:varchar(64);not null;default:''" json:"created_by"`
+	GeneratedAt            time.Time  `gorm:"column:generated_at;not null" json:"generated_at"`
+	CreatedAt              time.Time  `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt              time.Time  `gorm:"column:updated_at;not null" json:"updated_at"`
+	ContentRevision        int64      `gorm:"column:content_revision;not null;default:0" json:"content_revision"`
+	BaseContentRevision    int64      `gorm:"column:base_content_revision;not null;default:0" json:"base_content_revision"`
+	GenerationSpecSnapshot JSON       `gorm:"column:generation_spec_snapshot;type:json" json:"-"`
+	GenerationID           *string    `gorm:"column:generation_id;type:varchar(36);uniqueIndex:uk_personal_generation_user" json:"generation_id,omitempty"`
+	EditedAt               *time.Time `gorm:"column:edited_at" json:"edited_at,omitempty"`
+	EditedBy               string     `gorm:"column:edited_by;type:varchar(64);not null;default:''" json:"edited_by,omitempty"`
+	RestoredFromVersionID  *int64     `gorm:"column:restored_from_version_id" json:"-"`
+	RestoredAt             *time.Time `gorm:"column:restored_at" json:"restored_at,omitempty"`
 }
 
 func (PersonalResultVersion) TableName() string { return "summary_personal_result_version" }

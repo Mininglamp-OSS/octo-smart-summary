@@ -18,6 +18,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/db"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmobs"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/notify"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/streaming"
@@ -124,9 +125,32 @@ func main() {
 	if cfg.LLMApiURL != "" && cfg.LLMApiKey != "" && cfg.LLMModel != "" {
 		refineLLM = service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, cfg.ToolCallTimeout, cfg.LLMFallbackModels)
 	}
+	// 继续优化 (continue-optimize) 保存后要发终态 IM 通知。API 进程同步创建这条派生
+	// 总结、worker 不经手，所以通知必须在 API 侧投递。仅在 SUMMARY_NOTIFY_ENABLED 且
+	// OCTO_API_URL 配好时启用；nil notifier 使 CreateAgentSummary 的通知成为 no-op。
+	// 只发 completed（errMsg 恒为空），故不接错误脱敏器（notify 对空原因本就安全降级）。
+	var agentNotifier *notify.Notifier
+	if cfg.NotifyEnabled {
+		if cfg.OctoAPIURL == "" {
+			log.Printf("[api] SUMMARY_NOTIFY_ENABLED=true but OCTO_API_URL missing; continue-optimize notifications disabled")
+		} else {
+			if cfg.NotifyInternalToken == "" {
+				if cfg.AppEnv == "prod" {
+					log.Fatalf("[api] SUMMARY_NOTIFY_ENABLED=true but SUMMARY_NOTIFY_TOKEN missing (APP_ENV=prod)")
+				}
+				log.Printf("[api] WARNING: SUMMARY_NOTIFY_ENABLED=true but SUMMARY_NOTIFY_TOKEN missing (APP_ENV=%s); /v1/internal/notify will 401", cfg.AppEnv)
+			}
+			deliverer := notify.NewInternalNotifyDeliverer(cfg.OctoAPIURL, cfg.NotifyInternalToken, cfg.SummaryWebBaseURL)
+			agentNotifier = notify.New(summaryDB, imDB, deliverer, notify.Config{
+				Enabled:     true,
+				MaxAttempts: cfg.MaxNotifyAttempts,
+			})
+			log.Printf("[api] continue-optimize terminal notifications ENABLED (internal-notify transport)")
+		}
+	}
 	// 合并上游后统一签名：上游 streamHub(SSE)+ 上游模板参数 + agent handler 所需的原始 LLM 配置
-	// + 变参 refineLLM(上游 refine/personal 用)。
-	publicRouter := router.SetupPublic(summaryDB, imDB, hub, authResolver, httpResolver, cfg.WorkerTriggerURL, cfg.CandidateQueryLimit, cfg.FeatureTeamSchedule, cfg.SummaryWorkbenchEnabled, cfg.SummaryCustomTemplateLimit, streamHub, cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMFallbackModels, refineLLM)
+	// + agentNotifier(继续优化通知，可为 nil)+ 变参 refineLLM(上游 refine/personal 用)。
+	publicRouter := router.SetupPublic(summaryDB, imDB, hub, authResolver, httpResolver, cfg.WorkerTriggerURL, cfg.CandidateQueryLimit, cfg.FeatureTeamSchedule, cfg.SummaryWorkbenchEnabled, cfg.SummaryCustomTemplateLimit, streamHub, cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMFallbackModels, agentNotifier, refineLLM)
 	publicSrv := &http.Server{
 		Addr:    ":" + cfg.APIPort,
 		Handler: publicRouter,
