@@ -241,7 +241,7 @@ func sanitizeToolProtocolHistory(history []Message) []Message {
 			results[history[j].ToolCallID] = struct{}{}
 			j++
 		}
-		complete := true
+		complete := validToolArguments(message.ToolCalls)
 		for _, call := range message.ToolCalls {
 			if call.ID == "" {
 				complete = false
@@ -265,6 +265,24 @@ func sanitizeToolProtocolHistory(history []Message) []Message {
 			}
 		}
 		i = j
+	}
+	return out
+}
+
+// Drop malformed legacy assistant/tool batches before the client's strict
+// outgoing-protocol guard. Never invent executable arguments or mutate stored
+// history; keep the user's request and any later user-visible answer.
+func stripInvalidToolHistory(history []Message) []Message {
+	out := make([]Message, 0, len(history))
+	for i := 0; i < len(history); i++ {
+		message := history[i]
+		if !validToolArguments(message.ToolCalls) {
+			for i+1 < len(history) && history[i+1].Role == "tool" {
+				i++
+			}
+			continue
+		}
+		out = append(out, message)
 	}
 	return out
 }

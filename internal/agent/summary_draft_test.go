@@ -39,6 +39,83 @@ func draftSubmission(handle string) string {
 	return string(data)
 }
 
+func TestPreparedDraftToollessResponseIsNudgedWithoutRegeneration(t *testing.T) {
+	for _, text := range []string{"", "Here is your summary"} {
+		t.Run(text, func(t *testing.T) {
+			plannerCalls, drafts := 0, 0
+			client := draftTestClient(func(ctx context.Context, messages []Message, tools []Tool) (AssistantTurn, error) {
+				if len(tools) == 0 {
+					drafts++
+					return AssistantTurn{Content: "Complete draft"}, nil
+				}
+				plannerCalls++
+				switch plannerCalls {
+				case 1:
+					return AssistantTurn{ToolCalls: []ToolCall{mkToolCall("prepare", prepareSummaryDraftTool, "{}")}}, nil
+				case 2:
+					return AssistantTurn{Content: text}, nil
+				default:
+					if len(tools) != 1 || tools[0].Function.Name != "emit_summary_response" {
+						t.Fatal("nudge reopened evidence tools")
+					}
+					return AssistantTurn{ToolCalls: []ToolCall{mkToolCall("submit", "emit_summary_response", draftSubmission(draftState(ctx).handle))}}, nil
+				}
+			})
+			runner := NewRunner(client, draftTestRegistry(), NewPool(1), terminalPolicy(1))
+			out, _, err := runner.RunWithHistoryOutcome(context.Background(), "system", nil, "request")
+			if err != nil || out.Terminal == nil || drafts != 1 || plannerCalls != 3 {
+				t.Fatalf("nudge lost draft: err=%v drafts=%d calls=%d", err, drafts, plannerCalls)
+			}
+		})
+	}
+}
+
+func TestPreparedDraftToollessNudgeIsBounded(t *testing.T) {
+	calls := 0
+	client := draftTestClient(func(ctx context.Context, _ []Message, tools []Tool) (AssistantTurn, error) {
+		if len(tools) == 0 {
+			return AssistantTurn{Content: "Draft"}, nil
+		}
+		calls++
+		if calls == 1 {
+			return AssistantTurn{ToolCalls: []ToolCall{mkToolCall("prepare", prepareSummaryDraftTool, "{}")}}, nil
+		}
+		return AssistantTurn{}, nil
+	})
+	runner := NewRunner(client, draftTestRegistry(), NewPool(1), terminalPolicy(1))
+	_, _, err := runner.RunWithHistoryOutcome(context.Background(), "", nil, "request")
+	var draftErr *SummaryDraftError
+	if !errors.As(err, &draftErr) || draftErr.Reason != "terminal_submission_missing" || calls != 4 {
+		t.Fatalf("unbounded nudge: calls=%d err=%v", calls, err)
+	}
+}
+
+func TestDraftPreparationArgumentRepairAtTokenBudget(t *testing.T) {
+	calls, drafts := 0, 0
+	client := draftTestClient(func(ctx context.Context, _ []Message, tools []Tool) (AssistantTurn, error) {
+		if len(tools) == 0 {
+			drafts++
+			return AssistantTurn{Content: "Draft"}, nil
+		}
+		calls++
+		switch calls {
+		case 1:
+			return AssistantTurn{Tokens: 2, ToolCalls: []ToolCall{mkToolCall("bad", prepareSummaryDraftTool, "{")}}, nil
+		case 2:
+			return AssistantTurn{ToolCalls: []ToolCall{mkToolCall("fixed", prepareSummaryDraftTool, "{}")}}, nil
+		default:
+			return AssistantTurn{ToolCalls: []ToolCall{mkToolCall("submit", "emit_summary_response", draftSubmission(draftState(ctx).handle))}}, nil
+		}
+	})
+	policy := terminalPolicy(1)
+	policy.MaxTokens = 1
+	runner := NewRunner(client, draftTestRegistry(), NewPool(1), policy)
+	out, _, err := runner.RunWithHistoryOutcome(context.Background(), "", nil, "request")
+	if err != nil || out.Terminal == nil || drafts != 1 || calls != 3 {
+		t.Fatalf("preparation repair failed: %v drafts=%d calls=%d", err, drafts, calls)
+	}
+}
+
 func TestPreparedDraftHTTPKeepsBodyOutOfArgumentsAndRepairsOnlyControl(t *testing.T) {
 	body := "# 项目进展\n引用跟在事实之后。[1]\n\n|列|\n|---|\n|\"双引号\"|\n路径 C:\\资料\\x；制表\t🙂\n```go\nfmt.Println(\"test\")\n```"
 	requests, drafts, fetched := 0, 0, 0

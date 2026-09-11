@@ -1363,9 +1363,15 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 		return
 	}
 	topic := strings.TrimSpace(req.Topic)
-	if utf8.RuneCountInString(topic) > maxSummaryTopicRunes {
+	if task.TriggerType != model.TriggerAgent && utf8.RuneCountInString(topic) > maxSummaryTopicRunes {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "topic 不能超过 2300 字符"})
 		return
+	}
+	// Resolve legacy Agent instructions once. Validation and persistence must
+	// use the same value, even if a later database read would fail.
+	if task.TriggerType == model.TriggerAgent {
+		requirement := generationRequirement(h.db, task)
+		task.GenerationRequirement = &requirement
 	}
 	if err := h.validateRegenerationConfig(c, task, req); err != nil {
 		var be *service.BizError
@@ -1390,6 +1396,7 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 
 	nextVer, _ := service.GetNextVersion(h.db, taskID)
 	now := timezone.Now()
+	var triggerParticipants []model.SummaryParticipant
 
 	err = h.db.Transaction(func(tx *gorm.DB) error {
 		// Atomic status transition: only proceed if the task is still in a
@@ -1405,7 +1412,7 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 				"error_message":          nil,
 				"processing_deadline":    nil,
 				"title":                  newTitle,
-				"topic":                  newTopic,
+				"topic":                  truncateRunes(newTopic, maxSummaryTopicRunes),
 				"generation_requirement": newTopic,
 			})
 		if res.Error != nil {
@@ -1452,20 +1459,19 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 		if err := tx.Model(&model.PersonalResult{}).
 			Where("task_id = ? AND participant_ref_id IN (?)", taskID, acceptedParticipantIDs).
 			Updates(map[string]interface{}{
-				"worker_status":      model.PersonalStatusPending,
-				"retry_count":        0,
-				"workflow_stage":     "",
-				"content":            "",
-				"citations_json":     "",
-				"msg_count":          0,
-				"total_token_used":   0,
-				"model_version":      "",
-				"current_version_id": nil,
-				"error_message":      nil,
-				"submitted_at":       nil,
-				"submit_source":      model.SubmitSourceSystem,
-				"generated_at":       nil,
-				"edited_at":          nil,
+				"worker_status":    model.PersonalStatusPending,
+				"retry_count":      0,
+				"workflow_stage":   "",
+				"content":          "",
+				"citations_json":   "",
+				"msg_count":        0,
+				"total_token_used": 0,
+				"model_version":    "",
+				"error_message":    nil,
+				"submitted_at":     nil,
+				"submit_source":    model.SubmitSourceSystem,
+				"generated_at":     nil,
+				"edited_at":        nil,
 			}).Error; err != nil {
 			return err
 		}
@@ -1479,6 +1485,21 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 				return err
 			}
 		}
+		triggerQuery := tx.Where("task_id = ? AND status NOT IN (?, ?)", taskID, model.ParticipantPending, model.ParticipantDeclined)
+		if task.SummaryMode != model.ModeByPerson {
+			triggerQuery = triggerQuery.Where("user_id = ?", task.CreatorID)
+		}
+		if err := triggerQuery.Find(&triggerParticipants).Error; err != nil {
+			return err
+		}
+		// Prepare before Pending becomes visible to the worker poller at commit.
+		// There are no further database writes after resetting the stream.
+		if h.streamHub != nil {
+			h.streamHub.Prepare(taskID, streaming.ScopeTeam, "")
+			for _, participant := range triggerParticipants {
+				h.streamHub.Prepare(taskID, streaming.ScopePersonal, participant.UserID)
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -1488,30 +1509,17 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 			return
 		}
 		log.Printf("[handler] Regenerate tx error: %v", err)
-		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: err.Error()})
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
 		return
 	}
 
-	var triggerParticipants []model.SummaryParticipant
-	triggerQuery := h.db.Where("task_id = ? AND status NOT IN (?, ?)", taskID, model.ParticipantPending, model.ParticipantDeclined)
-	if task.SummaryMode != model.ModeByPerson {
-		triggerQuery = triggerQuery.Where("user_id = ?", task.CreatorID)
-	}
-	if err := triggerQuery.Find(&triggerParticipants).Error; err == nil {
-		if h.streamHub != nil {
-			h.streamHub.Prepare(taskID, streaming.ScopeTeam, "")
-			for _, participant := range triggerParticipants {
-				h.streamHub.Prepare(taskID, streaming.ScopePersonal, participant.UserID)
-			}
-		}
-		for _, participant := range triggerParticipants {
-			ptID := participant.ID
-			go h.triggerWorker(model.WorkerTriggerRequest{
-				Type:             "personal_summary",
-				TaskID:           taskID,
-				ParticipantRefID: ptID,
-			})
-		}
+	for _, participant := range triggerParticipants {
+		ptID := participant.ID
+		go h.triggerWorker(model.WorkerTriggerRequest{
+			Type:             "personal_summary",
+			TaskID:           taskID,
+			ParticipantRefID: ptID,
+		})
 	}
 
 	ok(c, gin.H{

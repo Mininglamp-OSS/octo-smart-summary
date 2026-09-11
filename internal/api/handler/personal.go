@@ -659,7 +659,7 @@ func (h *PersonalHandler) PersonalEdit(c *gin.Context) {
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&lockedTask, taskID).Error; err != nil {
 			return err
 		}
-		if lockedTask.Status != model.StatusCompleted {
+		if lockedTask.Status != model.StatusCompleted && lockedTask.Status != model.StatusFailed && lockedTask.Status != model.StatusCancelled {
 			return service.NewBizError(40005, "任务处理中，暂不能编辑", http.StatusConflict)
 		}
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&pr, pr.ID).Error; err != nil {
@@ -691,6 +691,9 @@ func (h *PersonalHandler) PersonalEdit(c *gin.Context) {
 		pr.Content = req.Content
 		pr.EditedAt = &now
 		if _, err := createPersonalVersionSnapshot(tx, pr, &baseline, "edit"); err != nil {
+			return err
+		}
+		if err := service.PrunePersonalResultVersions(tx, taskID, userID, service.PersonalResultVersionKeepLimit); err != nil {
 			return err
 		}
 		//续修1: only revive when there is more than one participant. A single-person

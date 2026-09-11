@@ -18,6 +18,7 @@ const maxSnapshotBytes = 512 * 1024
 
 type streamState struct {
 	activeRunID   string
+	retiredRunID  string
 	awaitingStart bool
 	snapshot      string
 	done          bool
@@ -52,13 +53,21 @@ func Key(taskID int64, scope, targetUserID string) string {
 func (h *Hub) Prepare(taskID int64, scope, targetUserID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	st := h.ensureLocked(Key(taskID, scope, targetUserID))
+	key := Key(taskID, scope, targetUserID)
+	st := h.ensureLocked(key)
 	if st.cleanup != nil {
 		st.cleanup.Stop()
 		st.cleanup = nil
 	}
-	st.snapshot, st.done, st.awaitingStart = "", false, true
-	st.lastEventAt = time.Now()
+	retired := st.activeRunID
+	if retired == "" {
+		retired = st.retiredRunID
+	}
+	// A fresh identity invalidates callbacks already waiting on h.mu. Preserve
+	// subscribers, but never let a stale cleanup delete their new generation.
+	st = &streamState{clients: st.clients, retiredRunID: retired, awaitingStart: true, lastEventAt: time.Now()}
+	h.m[key] = st
+	h.scheduleIdleCleanupLocked(key, st)
 }
 
 func (h *Hub) Subscribe(taskID int64, scope, targetUserID string) (<-chan Event, string, bool, func()) {
@@ -107,6 +116,10 @@ func (h *Hub) Publish(ev Event) {
 	st := h.ensureLocked(key)
 
 	if ev.Type == EventStart {
+		if ev.RunID != "" && ev.RunID == st.retiredRunID {
+			h.mu.Unlock()
+			return
+		}
 		if st.cleanup != nil {
 			st.cleanup.Stop()
 			st.cleanup = nil

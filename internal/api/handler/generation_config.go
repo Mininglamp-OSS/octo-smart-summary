@@ -55,8 +55,12 @@ func agentMessageRequirement(db *gorm.DB, msg model.AgentMessage, userID string)
 // Only new/replaced source selections require validation here. Saved source
 // scope is still re-authorized by the existing Workflow when reading messages.
 func (h *TaskHandler) validateRegenerationConfig(c *gin.Context, task model.SummaryTask, req regenerateReq) error {
-	if utf8.RuneCountInString(req.Topic) > maxSummaryTopicRunes {
-		return service.NewBizError(40001, "topic 不能超过 2300 字符", http.StatusBadRequest)
+	limit := maxSummaryTopicRunes
+	if task.TriggerType == model.TriggerAgent {
+		limit = maxMessageLen
+	}
+	if utf8.RuneCountInString(strings.TrimSpace(req.Topic)) > limit {
+		return service.NewBizError(40001, fmt.Sprintf("topic 不能超过 %d 字符", limit), http.StatusBadRequest)
 	}
 	if req.TimeRange != nil {
 		r := req.TimeRange
@@ -141,7 +145,7 @@ func (h *TaskHandler) SaveGenerationConfig(c *gin.Context) {
 				return service.NewBizError(40005, "任务处理中，暂不能修改配置", http.StatusConflict)
 			}
 			if topic := strings.TrimSpace(req.Topic); topic != "" {
-				if err := tx.Model(&locked).Updates(map[string]interface{}{"topic": topic, "generation_requirement": topic}).Error; err != nil {
+				if err := tx.Model(&locked).Updates(map[string]interface{}{"topic": truncateRunes(topic, maxSummaryTopicRunes), "generation_requirement": topic}).Error; err != nil {
 					return err
 				}
 			}

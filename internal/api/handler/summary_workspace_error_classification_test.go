@@ -15,6 +15,8 @@ func TestWorkspaceModelRejectionDoesNotRestartRequest(t *testing.T) {
 		&agent.InvalidToolArgumentsError{},
 		&agent.SummaryDraftError{Reason: "invalid_citations"},
 		&agent.SummaryDraftError{Reason: "model_call", Cause: errors.New("network unavailable")},
+		&agent.SummaryDraftError{Reason: "model_call", Cause: &llmfallback.HTTPError{StatusCode: 429, Err: errors.New("rate limited")}},
+		&agent.SummaryDraftError{Reason: "model_call", Cause: &llmfallback.HTTPError{StatusCode: 503, Err: errors.New("unavailable")}},
 		fmt.Errorf("wrapped: %w", &agent.InvalidToolArgumentsError{}),
 		&llmfallback.HTTPError{StatusCode: 400, Err: errors.New("private provider details")},
 		fmt.Errorf("wrapped: %w", &llmfallback.HTTPError{StatusCode: 401, Err: errors.New("private provider details")}),
