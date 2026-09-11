@@ -655,6 +655,23 @@ func (h *PersonalHandler) PersonalEdit(c *gin.Context) {
 	// it into the team summary. reviveCompletedForRecompute is race-safe + a strict
 	// no-op for any task not Completed / not BY_PERSON.
 	if err := h.db.Transaction(func(tx *gorm.DB) error {
+		var lockedTask model.SummaryTask
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&lockedTask, taskID).Error; err != nil {
+			return err
+		}
+		if lockedTask.Status != model.StatusCompleted && lockedTask.Status != model.StatusFailed && lockedTask.Status != model.StatusCancelled {
+			return service.NewBizError(40005, "任务处理中，暂不能编辑", http.StatusConflict)
+		}
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&pr, pr.ID).Error; err != nil {
+			return err
+		}
+		baseline, err := ensurePersonalVersionBaseline(tx, pr)
+		if err != nil {
+			return err
+		}
+		cleaned := service.CleanUnreferencedCitations(req.Content, pr.GetCitations())
+		pr.SetCitations(cleaned)
+		citationsJSON = pr.CitationsJSON
 		result := tx.Model(&model.PersonalResult{}).
 			Where("id = ?", pr.ID).
 			Updates(map[string]interface{}{
@@ -671,6 +688,14 @@ func (h *PersonalHandler) PersonalEdit(c *gin.Context) {
 		if result.RowsAffected == 0 {
 			return errPersonalResultGone
 		}
+		pr.Content = req.Content
+		pr.EditedAt = &now
+		if _, err := createPersonalVersionSnapshot(tx, pr, &baseline, "edit"); err != nil {
+			return err
+		}
+		if err := service.PrunePersonalResultVersions(tx, taskID, userID, service.PersonalResultVersionKeepLimit); err != nil {
+			return err
+		}
 		//续修1: only revive when there is more than one participant. A single-person
 		// Completed BY_PERSON task has no other members' content to re-aggregate, so
 		// reviving it would be a pointless Completed->Processing flip (noise, and out
@@ -684,8 +709,13 @@ func (h *PersonalHandler) PersonalEdit(c *gin.Context) {
 		if participantCount > 1 {
 			return h.reviveCompletedForRecompute(tx, taskID)
 		}
-		return nil
+		return syncSinglePersonalDisplay(tx, lockedTask, req.Content, citationsJSON, now)
 	}); err != nil {
+		var be *service.BizError
+		if errors.As(err, &be) {
+			bizErr(c, be)
+			return
+		}
 		if errors.Is(err, errPersonalResultGone) {
 			c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "个人总结不存在"})
 			return

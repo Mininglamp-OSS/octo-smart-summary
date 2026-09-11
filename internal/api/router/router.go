@@ -49,6 +49,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 
 	// API routes
 	taskH := handler.NewTaskHandler(db, imDB, workerTriggerURL)
+	taskH.SetStreamHub(streamHub)
 	taskH.SetCustomTemplateLimit(customTemplateLimit)
 	schedH := handler.NewScheduleHandlerWithFlag(db, featureTeamSchedule)
 	personalH := handler.NewPersonalHandler(db, workerTriggerURL, hub)
@@ -98,6 +99,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		v1.POST("/summaries/:id/read", taskH.MarkSummaryRead)
 		v1.GET("/summaries/:id/result", taskH.GetResult)
 		v1.POST("/summaries/:id/regenerate", taskH.Regenerate)
+		v1.PUT("/summaries/:id/generation-config", taskH.SaveGenerationConfig)
 		v1.POST("/summaries/:id/refine", editH.RefineSummary)
 		v1.POST("/summaries/:id/refine/stream", editH.RefineSummaryStream)
 		v1.GET("/summaries/:id/versions", editH.ListSummaryVersions)

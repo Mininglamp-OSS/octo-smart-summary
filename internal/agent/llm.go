@@ -119,6 +119,12 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, tools []Tool) (Assist
 //     the next model — the Bedrock SCP-deny case, #211; other 4xx terminal)
 //   - decode error / empty choices -> Terminal
 func (c *Client) attemptChat(ctx context.Context, model string, msgs []Message, tools []Tool) (AssistantTurn, llmfallback.Outcome, error) {
+	// Defense in depth for legacy histories and callers outside Runner.
+	for _, message := range msgs {
+		if invalid := invalidToolArguments(message.ToolCalls); invalid != nil {
+			return AssistantTurn{}, llmfallback.Terminal, invalid
+		}
+	}
 	reqBody := chatRequest{
 		Model:       model,
 		Messages:    msgs,
@@ -133,6 +139,7 @@ func (c *Client) attemptChat(ctx context.Context, model string, msgs []Message, 
 	if err != nil {
 		return AssistantTurn{}, llmfallback.Terminal, fmt.Errorf("marshal request: %w", err)
 	}
+	diagnostics := beginToolDiagnostics(ctx, msgs, tools)
 
 	reqCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
@@ -151,11 +158,13 @@ func (c *Client) attemptChat(ctx context.Context, model string, msgs []Message, 
 		return AssistantTurn{}, llmfallback.RetrySameModel, fmt.Errorf("http do: %w", err)
 	}
 	defer resp.Body.Close()
+	diagnostics.httpStatus(resp.StatusCode)
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return AssistantTurn{}, llmfallback.ClassifyNonOKStatus(resp.StatusCode),
-			fmt.Errorf("http status %d: %s", resp.StatusCode, llmfallback.SafeTextForLog(string(body), 200))
+			&llmfallback.HTTPError{StatusCode: resp.StatusCode,
+				Err: fmt.Errorf("http status %d: %s", resp.StatusCode, llmfallback.SafeTextForLog(string(body), 200))}
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -174,6 +183,7 @@ func (c *Client) attemptChat(ctx context.Context, model string, msgs []Message, 
 	}
 	choice := cr.Choices[0]
 	msg := choice.Message
+	diagnostics.response(msg.Content, msg.ToolCalls, choice.FinishReason, cr.Usage.CompletionTokens)
 	// Set alongside the prose notice below, never instead of it: the notice tells
 	// the reader where the text stops, the flag lets the runner record a fact the
 	// model cannot edit away. See AssistantTurn.Truncated.

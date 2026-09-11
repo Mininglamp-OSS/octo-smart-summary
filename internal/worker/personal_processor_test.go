@@ -404,6 +404,27 @@ func TestMarkPersonalFailed_UnderMaxRetry_ResetsToPending(t *testing.T) {
 	}
 }
 
+func TestMarkPersonalFailedRestoresSelectedBaselineNotNewestVersion(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	p, pr, part := seedFailFixture(t, db, "restore-baseline", 1, 2)
+	old := model.PersonalResultVersion{TaskID: pr.TaskID, ParticipantRefID: part.ID, UserID: pr.UserID, Version: 1, Content: "selected older body"}
+	newer := model.PersonalResultVersion{TaskID: pr.TaskID, ParticipantRefID: part.ID, UserID: pr.UserID, Version: 2, Content: "newest historical body"}
+	if err := db.Create(&old).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&newer).Error; err != nil {
+		t.Fatal(err)
+	}
+	pr.CurrentVersionID = &old.ID
+	db.Model(pr).Update("current_version_id", old.ID)
+	p.markPersonalFailed(pr, part, "LLM API error: boom")
+	var got model.PersonalResult
+	db.First(&got, pr.ID)
+	if got.Content != old.Content || got.CurrentVersionID == nil || *got.CurrentVersionID != old.ID {
+		t.Fatal("failure restored newest history instead of active baseline")
+	}
+}
+
 func TestUpdatePersonalWorkflowStage_GuardsProcessingStatus(t *testing.T) {
 	db := newSchedulerTestDB(t)
 	now := time.Now()

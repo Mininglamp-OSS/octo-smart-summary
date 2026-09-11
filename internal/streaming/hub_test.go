@@ -42,6 +42,61 @@ func TestHubDeltaCarriesSnapshotAndLateSubscribe(t *testing.T) {
 	}
 }
 
+func TestHubPrepareDoesNotReplayCompletedGeneration(t *testing.T) {
+	h := NewHub(time.Second)
+	h.Publish(Event{Type: EventStart, TaskID: 1, Scope: ScopePersonal, TargetUserID: "u", RunID: "old"})
+	h.Publish(Event{Type: EventDelta, TaskID: 1, Scope: ScopePersonal, TargetUserID: "u", RunID: "old", Delta: "old body"})
+	h.Publish(Event{Type: EventDone, TaskID: 1, Scope: ScopePersonal, TargetUserID: "u", RunID: "old"})
+	h.Publish(Event{Type: EventStart, TaskID: 1, Scope: ScopePersonal, TargetUserID: "u", RunID: "old"})
+	h.Prepare(1, ScopePersonal, "u")
+	ch, snapshot, done, cancel := h.Subscribe(1, ScopePersonal, "u")
+	defer cancel()
+	if done || snapshot != "" {
+		t.Fatalf("stale generation replayed: %q %v", snapshot, done)
+	}
+	h.Publish(Event{Type: EventDone, TaskID: 1, Scope: ScopePersonal, TargetUserID: "u", RunID: "old"})
+	h.Publish(Event{Type: EventStart, TaskID: 1, Scope: ScopePersonal, TargetUserID: "u", RunID: "new"})
+	if event := readEvent(t, ch); event.Type != EventStart {
+		t.Fatalf("late old frame leaked: %+v", event)
+	}
+	h.Publish(Event{Type: EventDelta, TaskID: 1, Scope: ScopePersonal, TargetUserID: "u", RunID: "new", Delta: "new body"})
+	if event := readEvent(t, ch); event.Content != "new body" {
+		t.Fatalf("new stream not delivered: %+v", event)
+	}
+}
+
+func TestHubPrepareInvalidatesAlreadyFiredCleanup(t *testing.T) {
+	h := NewHub(time.Second)
+	key := Key(1, ScopePersonal, "u")
+	h.Publish(Event{Type: EventStart, TaskID: 1, Scope: ScopePersonal, TargetUserID: "u", RunID: "old"})
+	h.Publish(Event{Type: EventDone, TaskID: 1, Scope: ScopePersonal, TargetUserID: "u", RunID: "old"})
+	ch, _, _, cancel := h.Subscribe(1, ScopePersonal, "u")
+	defer cancel()
+	old := h.m[key]
+	oldEventAt := old.lastEventAt
+	h.Prepare(1, ScopePersonal, "u")
+	// Deterministically invoke the old callbacks after Prepare, as if they had
+	// fired before Stop and then waited for the mutex.
+	h.deleteKeyIfState(key, old, "old")
+	h.deleteKeyIfIdle(key, old, oldEventAt)
+	h.Publish(Event{Type: EventStart, TaskID: 1, Scope: ScopePersonal, TargetUserID: "u", RunID: "new"})
+	if ev := readEvent(t, ch); ev.RunID != "new" {
+		t.Fatal("stale cleanup orphaned subscriber")
+	}
+}
+
+func TestHubPrepareWithoutWorkerExpires(t *testing.T) {
+	h := NewHub(time.Second)
+	h.idleTTL = 10 * time.Millisecond
+	h.Prepare(1, ScopeTeam, "")
+	time.Sleep(50 * time.Millisecond)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.m) != 0 {
+		t.Fatal("prepared stream without a worker leaked")
+	}
+}
+
 func TestHubDropsOldRunEvents(t *testing.T) {
 	h := NewHub(time.Second)
 	h.Publish(Event{Type: EventStart, TaskID: 1, RunID: "old", Scope: ScopePersonal, TargetUserID: "u1"})
