@@ -210,7 +210,7 @@ func EmitSummaryResponseTool() (Tool, TerminalHandler) {
 		Type: "function",
 		Function: ToolFunction{
 			Name:        "emit_summary_response",
-			Description: "提交本轮智能总结的结构化结果并结束回合。必须单独调用；reply 是对话气泡，预览正文只能放在 preview.content。",
+			Description: "提交本轮智能总结结果并结束回合，必须单独调用。预览正文先由prepare_summary_draft生成，这里只传preview.content_handle，不要复制正文；reply只写一句简短说明。",
 			Parameters: map[string]interface{}{
 				"type":                 "object",
 				"additionalProperties": false,
@@ -250,7 +250,7 @@ func EmitSummaryResponseTool() (Tool, TerminalHandler) {
 						"type":                 "object",
 						"additionalProperties": false,
 						"properties": map[string]interface{}{
-							"content":           map[string]interface{}{"type": "string"},
+							"content_handle":    map[string]interface{}{"type": "string", "description": "prepare_summary_draft返回的本次请求终稿编号，原样传入。"},
 							"version":           map[string]interface{}{"type": "integer"},
 							"parent_message_id": map[string]interface{}{"type": "integer"},
 							"assumptions": map[string]interface{}{
@@ -258,7 +258,7 @@ func EmitSummaryResponseTool() (Tool, TerminalHandler) {
 								"items": map[string]interface{}{"type": "string"},
 							},
 						},
-						"required": []string{"content", "version"},
+						"required": []string{"content_handle", "version"},
 					},
 					"confirmation": map[string]interface{}{
 						"type":        "object",
@@ -275,6 +275,10 @@ func EmitSummaryResponseTool() (Tool, TerminalHandler) {
 	}
 
 	handler := func(ctx context.Context, args json.RawMessage) (TerminalOutcome, error) {
+		args, err := resolveSummaryDraftArguments(ctx, args)
+		if err != nil {
+			return TerminalOutcome{}, err
+		}
 		payload, canonical, err := parseSummaryResponsePayload(args)
 		if err != nil {
 			return TerminalOutcome{}, err

@@ -628,6 +628,11 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			task.TimeRangeStart = lockedRange.Start
 			task.TimeRangeEnd = lockedRange.End
 		}
+		requirement := agentMessageRequirement(tx, draftMsg, userID)
+		if requirement != "" {
+			task.GenerationRequirement = &requirement
+			task.Topic = requirement
+		}
 		if err := tx.Create(&task).Error; err != nil {
 			return fmt.Errorf("create summary_task: %w", err)
 		}

@@ -324,7 +324,8 @@ func (c *LLMClient) callWithPolicyAndModel(ctx context.Context, messages []ChatM
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
 			return result{}, llmfallback.ClassifyNonOKStatus(resp.StatusCode),
-				fmt.Errorf("LLM API error: status=%d body=%s", resp.StatusCode, readErrorBody(resp.Body))
+				&llmfallback.HTTPError{StatusCode: resp.StatusCode,
+					Err: fmt.Errorf("LLM API error: status=%d body=%s", resp.StatusCode, readErrorBody(resp.Body))}
 		}
 		respBody, err := io.ReadAll(resp.Body)
 		if err != nil {
@@ -456,7 +457,8 @@ func (c *LLMClient) callStreamWithModel(ctx context.Context, messages []ChatMess
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
 			return result{}, llmfallback.ClassifyNonOKStatus(resp.StatusCode),
-				fmt.Errorf("LLM stream API error: status=%d body=%s", resp.StatusCode, readErrorBody(resp.Body))
+				&llmfallback.HTTPError{StatusCode: resp.StatusCode,
+					Err: fmt.Errorf("LLM stream API error: status=%d body=%s", resp.StatusCode, readErrorBody(resp.Body))}
 		}
 
 		var sb strings.Builder
@@ -619,7 +621,8 @@ func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, t
 			errBody := readErrorBody(resp.Body)
 			resp.Body.Close()
 			return result{}, llmfallback.ClassifyNonOKStatus(resp.StatusCode),
-				fmt.Errorf("LLM API error: status=%d body=%s", resp.StatusCode, errBody)
+				&llmfallback.HTTPError{StatusCode: resp.StatusCode,
+					Err: fmt.Errorf("LLM API error: status=%d body=%s", resp.StatusCode, errBody)}
 		}
 		respBody, rerr := io.ReadAll(resp.Body)
 		resp.Body.Close()

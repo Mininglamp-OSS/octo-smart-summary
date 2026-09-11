@@ -17,12 +17,13 @@ const defaultIdleTTLMul = 10
 const maxSnapshotBytes = 512 * 1024
 
 type streamState struct {
-	activeRunID string
-	snapshot    string
-	done        bool
-	lastEventAt time.Time
-	clients     map[chan Event]struct{}
-	cleanup     *time.Timer
+	activeRunID   string
+	awaitingStart bool
+	snapshot      string
+	done          bool
+	lastEventAt   time.Time
+	clients       map[chan Event]struct{}
+	cleanup       *time.Timer
 }
 
 // Hub is an in-memory, single-api-instance bridge from worker NDJSON streams to
@@ -44,6 +45,20 @@ func NewHub(ttl time.Duration) *Hub {
 
 func Key(taskID int64, scope, targetUserID string) string {
 	return fmt.Sprintf("%d:%s:%s", taskID, NormalizeScope(scope), targetUserID)
+}
+
+// Prepare discards a completed run before the response to a requeue reaches
+// the browser. Keep subscribers and reject late frames until the next start.
+func (h *Hub) Prepare(taskID int64, scope, targetUserID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	st := h.ensureLocked(Key(taskID, scope, targetUserID))
+	if st.cleanup != nil {
+		st.cleanup.Stop()
+		st.cleanup = nil
+	}
+	st.snapshot, st.done, st.awaitingStart = "", false, true
+	st.lastEventAt = time.Now()
 }
 
 func (h *Hub) Subscribe(taskID int64, scope, targetUserID string) (<-chan Event, string, bool, func()) {
@@ -99,6 +114,10 @@ func (h *Hub) Publish(ev Event) {
 		st.activeRunID = ev.RunID
 		st.snapshot = ""
 		st.done = false
+		st.awaitingStart = false
+	} else if st.awaitingStart {
+		h.mu.Unlock()
+		return
 	} else if st.activeRunID != "" && ev.RunID != "" && ev.RunID != st.activeRunID {
 		// Old worker run arrived late after a newer run started; discard to avoid
 		// mixing regenerated content with a previous run.

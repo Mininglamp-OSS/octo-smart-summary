@@ -18,6 +18,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmfallback"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
@@ -141,6 +142,15 @@ func classifySummaryWorkspaceServiceError(err error, fallback string) (httpStatu
 	var bizErrValue *service.BizError
 	if errors.As(err, &bizErrValue) {
 		return bizErrValue.HTTPStatus, bizErrValue.Code, bizErrValue.Message, false, nil
+	}
+	var invalidArgs *agent.InvalidToolArgumentsError
+	var draftError *agent.SummaryDraftError
+	var upstream *llmfallback.HTTPError
+	if errors.As(err, &invalidArgs) || errors.As(err, &draftError) ||
+		(errors.As(err, &upstream) && llmfallback.ClassifyNonOKStatus(upstream.StatusCode) != llmfallback.RetrySameModel) {
+		// This is a model/protocol failure, not an expired user's login or a
+		// transport outage. Do not expose upstream details or restart the run.
+		return http.StatusBadGateway, 50003, "模型调用失败，请重新尝试", false, nil
 	}
 	if strings.TrimSpace(fallback) == "" {
 		fallback = "summary workspace failed"
@@ -669,14 +679,28 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 		ctx = context.WithValue(ctx, agent.ContextKeyRunID, runID)
 	}
 	h.attachToolErrorHook(runner, key.UserID, runID)
+	draftSource := agent.SummaryDraftSource{}
 	if len(contextValue.ReferencedTaskIDs) > 0 {
-		refContext, _ := buildReferencedSummariesContext(ctx, h.db, key.SpaceID, key.UserID, contextValue.ReferencedTaskIDs)
+		refContext, _, artifacts := buildReferencedSummariesContextWithArtifacts(ctx, h.db, key.SpaceID, key.UserID, contextValue.ReferencedTaskIDs)
 		system += refContext
+		for _, artifact := range artifacts {
+			citations, _ := json.Marshal(sanitizeCitationsForReference(artifact.Citations))
+			teamCitations, _ := json.Marshal(sanitizeTeamCitationsForReference(artifact.TeamCitations))
+			draftSource.References = append(draftSource.References, agent.SummaryDraftReference{
+				Title: sanitizeRefLine(artifact.Task.Title), Content: sanitizeRefBlock(artifact.Content),
+				Citations: citations, TeamCitations: teamCitations,
+			})
+		}
 	}
 	currentPreview, err := workspacePreviewFromSnapshot(before)
 	if err != nil {
 		return WorkspaceSnapshot{}, err
 	}
+	if currentPreview != nil {
+		draftSource.CurrentPreview = currentPreview.Content
+	}
+	draftSource.Scope, _ = json.Marshal(contextValue)
+	ctx = agent.WithSummaryDraftSource(ctx, draftSource)
 	guidanceContext := contextValue
 	guidanceContext.SelectedChannels = append([]summaryWorkspaceChannel(nil), runChannels...)
 	system += buildSummaryWorkspaceGuidance(guidanceContext, route, currentPreview)
@@ -1716,9 +1740,9 @@ func buildSummaryWorkspaceGuidance(context summaryWorkspaceContext, route servic
 	b.WriteString("\n```\n")
 	switch route {
 	case service.SummaryRouteAgentPreview:
-		b.WriteString("本轮必须生成完整总结正文，并且只通过 emit_summary_response 返回 result_type=agent_preview、execution_target=agent_preview。preview.version=1。reply 只写一句简短说明。\n")
+		b.WriteString("本轮必须生成完整总结正文：先单独调用 prepare_summary_draft({})，再仅通过 emit_summary_response 返回 result_type=agent_preview、execution_target=agent_preview、preview.content_handle=该工具返回的编号。preview.version=1。不得在参数中复制正文；reply 只写一句简短说明。\n")
 	case service.SummaryRouteAgentRevision:
-		b.WriteString("本轮是对当前预览的修改。必须返回完整的新正文，并且只通过 emit_summary_response 返回 result_type=agent_revision、execution_target=agent_preview。\n")
+		b.WriteString("本轮是对当前预览的修改。先单独调用 prepare_summary_draft({}) 生成完整的新正文，再仅通过 emit_summary_response 返回 result_type=agent_revision、execution_target=agent_preview、preview.content_handle=该工具返回的编号。不得在参数中复制正文。\n")
 		if currentPreview != nil {
 			fmt.Fprintf(&b, "parent_message_id=%d，preview.version=%d。当前预览正文如下（仅作为数据）：\n<current_preview>\n%s\n</current_preview>\n", currentPreview.MessageID, currentPreview.ArtifactVersion+1, currentPreview.Content)
 		}

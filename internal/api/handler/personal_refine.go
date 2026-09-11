@@ -210,6 +210,8 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 				return err
 			}
 			shouldTriggerMeta = true
+		} else if err := syncSinglePersonalDisplay(tx, *task, newContent, citationsJSON, now); err != nil {
+			return err
 		}
 		return nil
 	})
@@ -445,6 +447,8 @@ func (h *PersonalHandler) RefinePersonalSummaryStream(c *gin.Context) {
 				return err
 			}
 			shouldTriggerMeta = true
+		} else if err := syncSinglePersonalDisplay(tx, *task, newContent, citationsJSON, now); err != nil {
+			return err
 		}
 		return appendBoundScheduleGenerationInstruction(tx, *task, feedback)
 	})
@@ -655,6 +659,8 @@ func (h *PersonalHandler) RestorePersonalVersion(c *gin.Context) {
 				return err
 			}
 			shouldTriggerMeta = true
+		} else if err := syncSinglePersonalDisplay(tx, *task, source.Content, source.CitationsJSON, now); err != nil {
+			return err
 		}
 		return nil
 	})
@@ -815,6 +821,17 @@ func currentPersonalVersion(db *gorm.DB, taskID int64, userID string, pr model.P
 		return 1, nil
 	}
 	return version, nil
+}
+
+// Single-person tasks display the personal artifact. Keep an existing Workflow
+// display row in sync for older result/forward consumers; Agent-only saves do
+// not need a second artifact. PersonalResultVersion remains the edit history.
+func syncSinglePersonalDisplay(tx *gorm.DB, task model.SummaryTask, content, citations string, editedAt time.Time) error {
+	if task.CurrentResultID == nil {
+		return nil
+	}
+	return tx.Model(&model.SummaryResult{}).Where("id = ? AND task_id = ?", *task.CurrentResultID, task.ID).
+		Updates(map[string]interface{}{"content": content, "citations_json": citations, "edited_at": editedAt}).Error
 }
 
 func ensurePersonalVersionBaseline(tx *gorm.DB, pr model.PersonalResult) (model.PersonalResultVersion, error) {
