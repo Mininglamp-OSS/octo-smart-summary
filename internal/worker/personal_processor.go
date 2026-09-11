@@ -577,6 +577,24 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 			return err
 		}
 		if participantCount <= 1 {
+			// A regeneration failure is not a replacement result. Re-expose the
+			// last committed body while keeping the failed status retryable.
+			var latest model.PersonalResultVersion
+			err := tx.Where("task_id = ? AND user_id = ?", pr.TaskID, pr.UserID).
+				Order("version DESC").First(&latest).Error
+			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+			if err == nil {
+				if err := tx.Model(pr).Updates(map[string]interface{}{
+					"content": latest.Content, "citations_json": latest.CitationsJSON,
+					"current_version_id": latest.ID, "generated_at": latest.GeneratedAt,
+					"msg_count": latest.MsgCount, "total_token_used": latest.TotalTokenUsed,
+					"model_version": latest.ModelVersion,
+				}).Error; err != nil {
+					return err
+				}
+			}
 			// Single-person: keep prior behavior -- reset participant to Accepted and propagate failure to the task.
 			if err := tx.Model(participant).Update("status", model.ParticipantAccepted).Error; err != nil {
 				return err

@@ -25,6 +25,7 @@ var ToolLabels = map[string]struct {
 	"filter_relevant":          {Phase: "filter", Label: "筛选相关消息"},
 	"summarize_chunk":          {Phase: "distill", Label: "分块总结"},
 	"merge_summaries":          {Phase: "compose", Label: "合并结果"},
+	prepareSummaryDraftTool:    {Phase: "compose", Label: "生成终稿"},
 	"emit_summary_response":    {Phase: "reply", Label: "整理结果"},
 }
 

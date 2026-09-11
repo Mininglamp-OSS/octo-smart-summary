@@ -185,8 +185,8 @@ func TestGetProfile_SummaryWorkspace(t *testing.T) {
 	if !reg.IsTerminal("emit_summary_response") {
 		t.Fatal("summary_workspace registry is missing its terminal tool")
 	}
-	if got := len(reg.Schemas()); got != 13 {
-		t.Fatalf("Schemas len = %d, want 13", got)
+	if got := len(reg.Schemas()); got != 14 {
+		t.Fatalf("Schemas len = %d, want 14", got)
 	}
 	for _, discoveryTool := range []string{"list_channels", "narrow_channels_by_topic", "find_shared_channels"} {
 		if !reg.Has(discoveryTool) {
@@ -198,7 +198,7 @@ func TestGetProfile_SummaryWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadPrompt: %v", err)
 	}
-	for _, phrase := range []string{"emit_summary_response", "set_summary_scope", "preview.content", "禁止直接输出自由文本", "不得完全没有引用标记"} {
+	for _, phrase := range []string{"prepare_summary_draft", "emit_summary_response", "set_summary_scope", "preview.content_handle", "禁止直接输出自由文本", "不得完全没有引用标记"} {
 		if !strings.Contains(prompt, phrase) {
 			t.Errorf("prompt missing %q", phrase)
 		}

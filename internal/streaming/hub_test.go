@@ -42,6 +42,28 @@ func TestHubDeltaCarriesSnapshotAndLateSubscribe(t *testing.T) {
 	}
 }
 
+func TestHubPrepareDoesNotReplayCompletedGeneration(t *testing.T) {
+	h := NewHub(time.Second)
+	h.Publish(Event{Type: EventStart, TaskID: 1, Scope: ScopePersonal, TargetUserID: "u", RunID: "old"})
+	h.Publish(Event{Type: EventDelta, TaskID: 1, Scope: ScopePersonal, TargetUserID: "u", RunID: "old", Delta: "old body"})
+	h.Publish(Event{Type: EventDone, TaskID: 1, Scope: ScopePersonal, TargetUserID: "u", RunID: "old"})
+	h.Prepare(1, ScopePersonal, "u")
+	ch, snapshot, done, cancel := h.Subscribe(1, ScopePersonal, "u")
+	defer cancel()
+	if done || snapshot != "" {
+		t.Fatalf("stale generation replayed: %q %v", snapshot, done)
+	}
+	h.Publish(Event{Type: EventDone, TaskID: 1, Scope: ScopePersonal, TargetUserID: "u", RunID: "old"})
+	h.Publish(Event{Type: EventStart, TaskID: 1, Scope: ScopePersonal, TargetUserID: "u", RunID: "new"})
+	if event := readEvent(t, ch); event.Type != EventStart {
+		t.Fatalf("late old frame leaked: %+v", event)
+	}
+	h.Publish(Event{Type: EventDelta, TaskID: 1, Scope: ScopePersonal, TargetUserID: "u", RunID: "new", Delta: "new body"})
+	if event := readEvent(t, ch); event.Content != "new body" {
+		t.Fatalf("new stream not delivered: %+v", event)
+	}
+}
+
 func TestHubDropsOldRunEvents(t *testing.T) {
 	h := NewHub(time.Second)
 	h.Publish(Event{Type: EventStart, TaskID: 1, RunID: "old", Scope: ScopePersonal, TargetUserID: "u1"})

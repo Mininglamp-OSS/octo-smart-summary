@@ -42,6 +42,7 @@ var toolFactories = map[string]ToolFactory{
 	"filter_relevant":          FilterRelevantTool,
 	"summarize_chunk":          SummarizeChunkTool,
 	"merge_summaries":          MergeSummariesTool,
+	prepareSummaryDraftTool:    PrepareSummaryDraftTool,
 }
 
 var toolPhases = map[string]ToolPhase{
@@ -106,6 +107,7 @@ var profiles = map[string]Profile{
 			"list_channels", "narrow_channels_by_topic", "find_shared_channels",
 			"peek_channel", "fetch_channel", "search_messages",
 			"filter_relevant", "summarize_chunk", "merge_summaries",
+			prepareSummaryDraftTool,
 			"emit_summary_response",
 		},
 		Policy: Policy{

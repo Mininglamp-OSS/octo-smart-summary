@@ -136,6 +136,9 @@ func (r *Runner) RunWithHistoryOutcome(ctx context.Context, system string, histo
 	// New turns avoid persisting them below; this filter makes the migration safe
 	// for already-written history as well.
 	historyForPlanner := stripTerminalToolHistory(history, r.policy.TerminalTool)
+	if r.reg.Has(prepareSummaryDraftTool) {
+		historyForPlanner = stripTerminalToolHistory(historyForPlanner, prepareSummaryDraftTool)
+	}
 	if r.policy.TerminalTool != "" {
 		historyForPlanner = sanitizeToolProtocolHistory(historyForPlanner)
 	}
@@ -145,6 +148,12 @@ func (r *Runner) RunWithHistoryOutcome(ctx context.Context, system string, histo
 	// newMsgs 只累积本回合新增（user + 各 assistant + 各 tool），供落库；不含 system/history。
 	newMsgs := []Message{userMsg}
 	totalTokens := 0
+	argumentRepairs := 0
+	// Live workspaces use request-local drafts; legacy profiles retain their
+	// existing inline/free-text behavior. Never reuse state from a parent run.
+	if r.reg.Has(prepareSummaryDraftTool) {
+		ctx = context.WithValue(ctx, summaryDraftKey{}, &summaryDraftState{})
+	}
 
 	for step := 0; step < r.policy.MaxSteps; step++ {
 		stepStart := time.Now()
@@ -172,31 +181,62 @@ func (r *Runner) RunWithHistoryOutcome(ctx context.Context, system string, histo
 		// wall-clock ceiling for tool execution. If a per-tool budget is
 		// ever needed, wrap it inside the tool handler itself — do NOT
 		// re-widen stepCtx here.
-		stepCtx, cancel := context.WithTimeout(ctx, r.policy.StepTimeout)
-		// Measure the planner turn and the size of what it was handed. The
-		// message list grows by every tool result, so a late hop can spend
-		// more wall clock re-reading accumulated output than the tools took
-		// to produce it; without both numbers that cost is invisible. The
-		// measurement itself is skipped when tracing is off.
 		trace := TraceFromContext(ctx)
-		var promptChars, promptMsgs int
-		if trace.Active() {
-			promptChars, promptMsgs = measurePrompt(msgs)
+		var turn AssistantTurn
+		repairFinalOnly := false
+		// Argument correction belongs to this logical step, including the final
+		// allowed step. The run-wide repair count and outer deadline still bound it.
+		for {
+			stepCtx, cancel := context.WithTimeout(ctx, r.policy.StepTimeout)
+			if toolDiagnosticsEnabled(ctx) {
+				stepCtx = context.WithValue(stepCtx, toolDiagnosticStepKey{}, step+1)
+			}
+			var promptChars, promptMsgs int
+			if trace.Active() {
+				promptChars, promptMsgs = measurePrompt(msgs)
+			}
+			planStart := time.Now()
+			var err error
+			schemas := r.reg.Schemas()
+			if state := draftState(ctx); state != nil && state.handle != "" {
+				schemas = terminalSchemas(schemas, r.policy.TerminalTool)
+			}
+			turn, err = r.client.Chat(stepCtx, msgs, schemas)
+			planMs := time.Since(planStart).Milliseconds()
+			cancel()
+			trace.AddStep(step+1, planMs, promptChars, promptMsgs, turnCompletionTokens(turn, err))
+			if err != nil {
+				return RunResult{}, nil, err
+			}
+			totalTokens += turn.Tokens
+			terminalOnly := r.isTerminalOnly(turn.ToolCalls)
+			if state := draftState(ctx); state != nil && state.handle != "" && !terminalOnly {
+				return RunResult{}, nil, &SummaryDraftError{Reason: "nonterminal_after_preparation"}
+			}
+			// Once the token budget requires finalization, a repair must not
+			// reopen evidence gathering or dispatch additional nonterminal tools.
+			if repairFinalOnly && !terminalOnly {
+				return RunResult{}, nil, &InvalidToolArgumentsError{Reason: "nonterminal_after_finalization"}
+			}
+			// Validate BEFORE recording the turn or dispatching any sibling tool.
+			invalidArgs := invalidToolArguments(turn.ToolCalls)
+			if invalidArgs == nil {
+				break
+			}
+			// MaxTokens is the existing soft finalization budget (see below).
+			// Permit bounded correction of the final submission after it, just
+			// as the existing runner permits that submission itself.
+			if argumentRepairs >= maxToolArgumentRepairs || (totalTokens >= r.policy.MaxTokens && !terminalOnly) {
+				return RunResult{}, nil, invalidArgs
+			}
+			repairFinalOnly = totalTokens >= r.policy.MaxTokens
+			argumentRepairs++
+			log.Printf("[agent] step %d/%d: invalid tool arguments; requesting repair %d/%d reason=%s syntax_offset=%d",
+				step+1, r.policy.MaxSteps, argumentRepairs, maxToolArgumentRepairs, invalidArgs.Reason, invalidArgs.SyntaxOffset)
+			msgs = append(msgs, Message{Role: "user", Content: toolArgumentRepairInstruction})
 		}
-		planStart := time.Now()
-		turn, err := r.client.Chat(stepCtx, msgs, r.reg.Schemas())
-		planMs := time.Since(planStart).Milliseconds()
-		cancel()
-		trace.AddStep(step+1, planMs, promptChars, promptMsgs, turnCompletionTokens(turn, err))
-		if err != nil {
-			return RunResult{}, nil, err
-		}
-		totalTokens += turn.Tokens
 
-		terminalOnly := len(turn.ToolCalls) == 1 &&
-			r.policy.TerminalTool != "" &&
-			turn.ToolCalls[0].Function.Name == r.policy.TerminalTool &&
-			r.reg.IsTerminal(r.policy.TerminalTool)
+		terminalOnly := r.isTerminalOnly(turn.ToolCalls)
 
 		// A final answer is not valid while this request still has Map outputs that
 		// have not passed through one successful Reduce covering every handle. The
@@ -372,6 +412,14 @@ func (r *Runner) RunWithHistoryOutcome(ctx context.Context, system string, histo
 			return RunResult{Reply: outcome.VisibleContent, Terminal: &outcome}, newMsgs, nil
 		}
 
+		// Capture valid planner context BEFORE appending the preparation call:
+		// the text-only request must not contain an unanswered tool call.
+		toolsCtx := ctx
+		if len(turn.ToolCalls) == 1 && turn.ToolCalls[0].Function.Name == prepareSummaryDraftTool {
+			toolsCtx = context.WithValue(ctx, summaryDraftInputKey{}, summaryDraftInput{
+				client: r.client, messages: append([]Message(nil), msgs...), history: historyForPlanner, request: userInput,
+			})
+		}
 		// 回喂 assistant 轮次（必须携带原始 tool_calls，否则下游 tool 消息无处挂靠）。
 		assistantMsg := Message{
 			Role:      "assistant",
@@ -380,7 +428,9 @@ func (r *Runner) RunWithHistoryOutcome(ctx context.Context, system string, histo
 		}
 		msgs = append(msgs, assistantMsg)
 		if durableAssistant, ok := withoutTerminalToolCalls(assistantMsg, r.policy.TerminalTool); ok {
-			newMsgs = append(newMsgs, durableAssistant)
+			if durableAssistant, ok = withoutTerminalToolCalls(durableAssistant, prepareSummaryDraftTool); ok {
+				newMsgs = append(newMsgs, durableAssistant)
+			}
 		}
 
 		// 单跳内多工具并发执行；结果按原索引回填以保证顺序稳定、无数据竞争。
@@ -389,7 +439,14 @@ func (r *Runner) RunWithHistoryOutcome(ctx context.Context, system string, histo
 		// summarize_chunk run their own bounded-concurrent LLM calls that legitimately
 		// exceed the 60s per-step planning budget.
 		toolsStart := time.Now()
-		results := r.runTools(ctx, turn.ToolCalls, step+1, r.policy.MaxSteps)
+		results := r.runTools(toolsCtx, turn.ToolCalls, step+1, r.policy.MaxSteps)
+		if state := draftState(ctx); state != nil {
+			totalTokens += state.tokens
+			state.tokens = 0
+			if state.err != nil {
+				return RunResult{}, nil, state.err
+			}
+		}
 		if trace.Active() {
 			toolNames := make([]string, 0, len(turn.ToolCalls))
 			for _, tc := range turn.ToolCalls {
@@ -407,7 +464,7 @@ func (r *Runner) RunWithHistoryOutcome(ctx context.Context, system string, histo
 				Content:    results[i],
 			}
 			msgs = append(msgs, toolMsg)
-			if !r.reg.IsTerminal(tc.Function.Name) {
+			if !r.reg.IsTerminal(tc.Function.Name) && tc.Function.Name != prepareSummaryDraftTool {
 				newMsgs = append(newMsgs, toolMsg)
 			}
 		}
@@ -421,6 +478,14 @@ func (r *Runner) RunWithHistoryOutcome(ctx context.Context, system string, histo
 				ElapsedMs:    stepElapsed,
 				StepHasTools: true, // Had tool calls
 			})
+		}
+		if len(turn.ToolCalls) == 1 && turn.ToolCalls[0].Function.Name == prepareSummaryDraftTool {
+			if state := draftState(ctx); state != nil && state.handle != "" {
+				// Preparing + submitting is one logical finalization step. Even
+				// at MaxSteps, allow the short control submission; ready state
+				// above forbids returning to ordinary tool execution.
+				step--
+			}
 		}
 
 		// 预算触顶：注入收尾指令，逼模型下一轮直接给答案。
@@ -436,6 +501,9 @@ func (r *Runner) RunWithHistoryOutcome(ctx context.Context, system string, histo
 				instruction = "已达token预算，但本次请求仍有未合并的 Map 结果。下一步只调用 merge_summaries，传入全部 summary_handle；Reduce 成功后再直接输出最终答案。"
 			} else if r.policy.TerminalTool != "" {
 				instruction = "已达token预算，请基于现有信息仅调用 " + r.policy.TerminalTool + " 提交最终结果；不要直接输出文本，也不要再调用其他工具。"
+				if state := draftState(ctx); state != nil && state.handle == "" {
+					instruction = "已达token预算，完成必要Map/Reduce后只调用prepare_summary_draft生成终稿，再用emit_summary_response提交content_handle。不要再读取消息，不要在工具参数中写正文。"
+				}
 			}
 			msgs = append(msgs, Message{
 				Role:    "user",
@@ -444,6 +512,21 @@ func (r *Runner) RunWithHistoryOutcome(ctx context.Context, system string, histo
 		}
 	}
 	return RunResult{}, nil, errors.New("max steps exceeded")
+}
+
+func (r *Runner) isTerminalOnly(calls []ToolCall) bool {
+	return len(calls) == 1 && r.policy.TerminalTool != "" &&
+		calls[0].Function.Name == r.policy.TerminalTool && r.reg.IsTerminal(r.policy.TerminalTool)
+}
+
+func terminalSchemas(schemas []Tool, terminal string) []Tool {
+	var result []Tool
+	for _, schema := range schemas {
+		if schema.Function.Name == terminal {
+			result = append(result, schema)
+		}
+	}
+	return result
 }
 
 func (r *Runner) emitToolEvent(eventType, toolName string, step, ofSteps int, elapsedMs int64) {
@@ -494,6 +577,14 @@ func terminalOutcomeToolResult(outcome TerminalOutcome) string {
 // remaining calls start. Results still occupy their original indexes.
 func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps int) []string {
 	results := make([]string, len(calls))
+	for _, call := range calls {
+		if call.Function.Name == prepareSummaryDraftTool && len(calls) != 1 {
+			for i := range results {
+				results[i] = "错误: prepare_summary_draft必须单独调用，本批次工具均未执行。先完成Map/Reduce，再生成终稿。"
+			}
+			return results
+		}
+	}
 	hookOutcomes := make([]toolHookOutcome, len(calls))
 	// Every tool call chosen by one planner turn shares the same immutable step
 	// metadata. The pre-freeze coverage gate uses this to make one decision for
