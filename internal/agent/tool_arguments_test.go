@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -154,6 +155,52 @@ func TestClientRejectsInvalidHistoryBeforeHTTP(t *testing.T) {
 	}
 	if requests != 0 {
 		t.Fatalf("invalid history reached provider %d times", requests)
+	}
+}
+
+func TestRunnerDiscardsMalformedLegacyBatchesBeforeHTTP(t *testing.T) {
+	for _, terminal := range []bool{false, true} {
+		for _, args := range []string{"", "{", "null", "[]", `"string"`, `{"x":"unclosed}`} {
+			t.Run(fmt.Sprintf("%t/%s", terminal, args), func(t *testing.T) {
+				history := []Message{
+					{Role: "user", Content: "old request"},
+					{Role: "assistant", ToolCalls: []ToolCall{mkToolCall("bad", "echo", args), mkToolCall("sibling", "echo", "{}")}},
+					{Role: "tool", ToolCallID: "bad", Name: "echo", Content: "old error"},
+					{Role: "tool", ToolCallID: "sibling", Name: "echo", Content: "old sibling"},
+					{Role: "assistant", Content: "old visible answer"},
+				}
+				requests := 0
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					requests++
+					var request chatRequest
+					_ = json.NewDecoder(r.Body).Decode(&request)
+					for _, message := range request.Messages {
+						if len(message.ToolCalls) > 0 || message.Role == "tool" {
+							t.Error("malformed historical batch reached provider")
+						}
+					}
+					response := map[string]interface{}{"content": "new answer"}
+					if terminal {
+						response["tool_calls"] = []ToolCall{mkToolCall("final", "emit_summary_response", validPreviewTerminalArgs)}
+					}
+					_ = json.NewEncoder(w).Encode(map[string]interface{}{"choices": []interface{}{map[string]interface{}{"message": response}}})
+				}))
+				defer srv.Close()
+				reg, policy := regWithEcho("echo"), terminalPolicy(2)
+				if terminal {
+					reg = terminalRegistry(defaultTerminalHandler())
+				} else {
+					policy.TerminalTool = ""
+				}
+				runner := NewRunner(NewClient(srv.URL, "test", "test", 5, 256, nil), reg, NewPool(1), policy)
+				if _, _, err := runner.RunWithHistoryOutcome(context.Background(), "system", history, "new request"); err != nil || requests != 1 {
+					t.Fatalf("legacy session did not recover: err=%v requests=%d", err, requests)
+				}
+				if history[1].ToolCalls[0].Function.Arguments != args || len(history) != 5 {
+					t.Fatal("persisted history was mutated")
+				}
+			})
+		}
 	}
 }
 

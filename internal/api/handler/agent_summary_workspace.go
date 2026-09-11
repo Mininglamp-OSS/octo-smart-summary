@@ -146,6 +146,10 @@ func classifySummaryWorkspaceServiceError(err error, fallback string) (httpStatu
 	var invalidArgs *agent.InvalidToolArgumentsError
 	var draftError *agent.SummaryDraftError
 	var upstream *llmfallback.HTTPError
+	// Draft model calls already retry eligible transport/429/5xx failures inside
+	// Client.Chat. Even if that cause is transient, marking the exhausted draft
+	// transient HERE makes the browser replay discovery/Map/Reduce, not resume
+	// the writer. Keep whole-request replay disabled until resumable drafts exist.
 	if errors.As(err, &invalidArgs) || errors.As(err, &draftError) ||
 		(errors.As(err, &upstream) && llmfallback.ClassifyNonOKStatus(upstream.StatusCode) != llmfallback.RetrySameModel) {
 		// This is a model/protocol failure, not an expired user's login or a

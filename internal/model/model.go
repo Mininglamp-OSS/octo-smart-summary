@@ -218,6 +218,9 @@ func (SummaryAgentSaveIdempotency) TableName() string { return "summary_agent_sa
 // EffectiveTopic keeps existing tasks compatible while new tasks persist the
 // complete summary instruction separately from the display title.
 func (t SummaryTask) EffectiveTopic() string {
+	if t.TriggerType == TriggerAgent && t.GenerationRequirement != nil && strings.TrimSpace(*t.GenerationRequirement) != "" {
+		return *t.GenerationRequirement
+	}
 	if strings.TrimSpace(t.Topic) != "" {
 		return t.Topic
 	}

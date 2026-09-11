@@ -69,3 +69,23 @@ Apply `migrations/sql/20260911-01-summary-generation-requirement.sql` through th
 existing migration mechanism before serving the paired frontend. Deploy the
 backend first. Back up existing data before migration; the down migration drops
 the new configuration column and therefore discards saved requirements.
+
+## CR follow-up
+
+- Agent requests up to the chat limit remain intact in `generation_requirement`.
+  Only the compatibility `topic` is rune-truncated to VARCHAR(2300); Agent
+  Workflow execution reads the full saved instruction. Tests enforce the sink
+  limit explicitly because SQLite does not enforce VARCHAR lengths.
+- Malformed legacy assistant/tool batches are removed from planner input without
+  modifying stored history. The strict outgoing/current-call guard remains.
+  Tool-less post-draft responses receive at most two nudges, even at the final
+  step; preparation argument repair is also allowed at the finalization budget.
+- Streams are prepared before requeue commit, with fresh cleanup identity, idle
+  expiry and rejection of the discarded run's start. Failure restores the exact
+  pre-regeneration version; editing terminal failed/cancelled tasks is allowed,
+  and manual edit snapshots obey the existing retention limit.
+- The suggestion to mark exhausted draft failures transient at the request
+  boundary is intentionally not adopted: `Client.Chat` already retries eligible
+  model calls, while the browser's transient recovery restarts the entire turn.
+  It cannot resume the request-local draft. Tests pin no full-run replay for
+  exhausted transport/429/503 failures as well as protocol errors.

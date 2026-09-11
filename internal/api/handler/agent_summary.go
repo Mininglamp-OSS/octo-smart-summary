@@ -631,7 +631,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		requirement := agentMessageRequirement(tx, draftMsg, userID)
 		if requirement != "" {
 			task.GenerationRequirement = &requirement
-			task.Topic = requirement
+			task.Topic = truncateRunes(requirement, maxSummaryTopicRunes)
 		}
 		if err := tx.Create(&task).Error; err != nil {
 			return fmt.Errorf("create summary_task: %w", err)

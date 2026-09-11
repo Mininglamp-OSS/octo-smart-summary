@@ -135,7 +135,7 @@ func (r *Runner) RunWithHistoryOutcome(ctx context.Context, system string, histo
 	// payload in their arguments. Never feed those arguments back to the model.
 	// New turns avoid persisting them below; this filter makes the migration safe
 	// for already-written history as well.
-	historyForPlanner := stripTerminalToolHistory(history, r.policy.TerminalTool)
+	historyForPlanner := stripTerminalToolHistory(stripInvalidToolHistory(history), r.policy.TerminalTool)
 	if r.reg.Has(prepareSummaryDraftTool) {
 		historyForPlanner = stripTerminalToolHistory(historyForPlanner, prepareSummaryDraftTool)
 	}
@@ -149,6 +149,7 @@ func (r *Runner) RunWithHistoryOutcome(ctx context.Context, system string, histo
 	newMsgs := []Message{userMsg}
 	totalTokens := 0
 	argumentRepairs := 0
+	draftSubmissionNudges := 0
 	// Live workspaces use request-local drafts; legacy profiles retain their
 	// existing inline/free-text behavior. Never reuse state from a parent run.
 	if r.reg.Has(prepareSummaryDraftTool) {
@@ -211,11 +212,24 @@ func (r *Runner) RunWithHistoryOutcome(ctx context.Context, system string, histo
 			totalTokens += turn.Tokens
 			terminalOnly := r.isTerminalOnly(turn.ToolCalls)
 			if state := draftState(ctx); state != nil && state.handle != "" && !terminalOnly {
-				return RunResult{}, nil, &SummaryDraftError{Reason: "nonterminal_after_preparation"}
+				if len(turn.ToolCalls) != 0 {
+					return RunResult{}, nil, &SummaryDraftError{Reason: "nonterminal_after_preparation"}
+				}
+				// A tool-less response is recoverable, even when preparation used
+				// the last logical step. Reuse the immutable draft, never rerun it.
+				if draftSubmissionNudges >= 2 {
+					return RunResult{}, nil, &SummaryDraftError{Reason: "terminal_submission_missing"}
+				}
+				draftSubmissionNudges++
+				msgs = append(msgs, Message{Role: "user", Content: "终稿已准备好。请仅调用 emit_summary_response，使用 prepare_summary_draft 已返回的 content_handle 提交，不要输出正文或重新生成。"})
+				continue
 			}
 			// Once the token budget requires finalization, a repair must not
 			// reopen evidence gathering or dispatch additional nonterminal tools.
-			if repairFinalOnly && !terminalOnly {
+			finalizationOnly := terminalOnly || (draftState(ctx) != nil &&
+				draftState(ctx).handle == "" && len(turn.ToolCalls) == 1 &&
+				turn.ToolCalls[0].Function.Name == prepareSummaryDraftTool)
+			if repairFinalOnly && !finalizationOnly {
 				return RunResult{}, nil, &InvalidToolArgumentsError{Reason: "nonterminal_after_finalization"}
 			}
 			// Validate BEFORE recording the turn or dispatching any sibling tool.
@@ -226,7 +240,7 @@ func (r *Runner) RunWithHistoryOutcome(ctx context.Context, system string, histo
 			// MaxTokens is the existing soft finalization budget (see below).
 			// Permit bounded correction of the final submission after it, just
 			// as the existing runner permits that submission itself.
-			if argumentRepairs >= maxToolArgumentRepairs || (totalTokens >= r.policy.MaxTokens && !terminalOnly) {
+			if argumentRepairs >= maxToolArgumentRepairs || (totalTokens >= r.policy.MaxTokens && !finalizationOnly) {
 				return RunResult{}, nil, invalidArgs
 			}
 			repairFinalOnly = totalTokens >= r.policy.MaxTokens

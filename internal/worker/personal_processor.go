@@ -580,8 +580,12 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 			// A regeneration failure is not a replacement result. Re-expose the
 			// last committed body while keeping the failed status retryable.
 			var latest model.PersonalResultVersion
-			err := tx.Where("task_id = ? AND user_id = ?", pr.TaskID, pr.UserID).
-				Order("version DESC").First(&latest).Error
+			query := tx.Where("task_id = ? AND user_id = ?", pr.TaskID, pr.UserID)
+			if pr.CurrentVersionID != nil {
+				// A restored older version is the actual pre-regeneration body.
+				query = query.Where("id = ?", *pr.CurrentVersionID)
+			}
+			err := query.Order("version DESC").First(&latest).Error
 			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 				return err
 			}
