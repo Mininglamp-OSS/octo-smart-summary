@@ -7,18 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
-
-// citationMarkerRE matches numbered citation markers ([1], [2], ...) in
-// preview content. Same shape as the handler-side authority
-// (internal/api/handler/agent_summary_citations.go citationMarkerRE).
-var citationMarkerRE = regexp.MustCompile(`\[(\d+)\]`)
 
 const (
 	SummaryResultClarification        = "clarification"
@@ -102,6 +96,7 @@ type summaryCitationTrackingState struct {
 	evidenceKeys        map[summaryCitationEvidenceKey]struct{}
 	citationWindowKnown bool
 	citationWindowMax   int64
+	citationIndices     map[int]bool
 }
 
 type summaryCitationEvidenceKey struct {
@@ -160,7 +155,11 @@ func setSummaryCitationWindow(ctx context.Context, messages []pipeline.Message) 
 		return
 	}
 	var maxIndex int64
+	indices := make(map[int]bool)
 	for _, message := range messages {
+		if message.CitationIndex > 0 {
+			indices[message.CitationIndex] = true
+		}
 		if int64(message.CitationIndex) > maxIndex {
 			maxIndex = int64(message.CitationIndex)
 		}
@@ -168,6 +167,7 @@ func setSummaryCitationWindow(ctx context.Context, messages []pipeline.Message) 
 	state.mu.Lock()
 	state.citationWindowKnown = true
 	state.citationWindowMax = maxIndex
+	state.citationIndices = indices
 	state.mu.Unlock()
 }
 
@@ -189,17 +189,18 @@ func summaryCitationEvidenceWindow(ctx context.Context) (bool, int64) {
 // at least one marker exists. Bounding by the evidence pool is what stops a
 // stray prose "[1]" from spoofing coverage (review 5087740714 blocker 4).
 func citationMarkersWithinEvidence(content string, evidenceCount int64) bool {
-	markers := citationMarkerRE.FindAllStringSubmatch(content, -1)
-	if len(markers) == 0 {
-		return false
-	}
-	for _, marker := range markers {
-		index, err := strconv.ParseInt(marker[1], 10, 64)
-		if err != nil || index < 1 || index > evidenceCount {
-			return false
+	return citationtext.Valid(content, func(n int) bool { return int64(n) <= evidenceCount }, true)
+}
+
+func summaryCitationIndexAllowed(ctx context.Context, n int, fallbackMax int64) bool {
+	if state, ok := ctx.Value(summaryCitationTrackingContextKey{}).(*summaryCitationTrackingState); ok && state != nil {
+		state.mu.RLock()
+		defer state.mu.RUnlock()
+		if state.citationWindowKnown {
+			return state.citationIndices[n]
 		}
 	}
-	return true
+	return n > 0 && int64(n) <= fallbackMax
 }
 
 // EmitSummaryResponseTool returns the only successful termination mechanism
@@ -291,13 +292,14 @@ func EmitSummaryResponseTool() (Tool, TerminalHandler) {
 		hasEvidence, evidenceCount := summaryCitationEvidenceWindow(ctx)
 		if hasEvidence &&
 			(payload.ResultType == SummaryResultAgentPreview || payload.ResultType == SummaryResultAgentRevision) &&
-			(payload.Preview == nil || !citationMarkersWithinEvidence(payload.Preview.Content, evidenceCount)) {
+			(payload.Preview == nil || !citationtext.Valid(payload.Preview.Content,
+				func(n int) bool { return summaryCitationIndexAllowed(ctx, n, evidenceCount) }, true)) {
 			// Evidence-bounded marker guard (review 5087740714 blocker 4):
 			// every [N] must refer to an index inside the persisted evidence
 			// window, and at least one marker must exist. This accepts a
 			// legitimate preview citing only [2]/[3] and rejects prose whose
-			// "[1]" is not citation syntax at all. Marker shape matches the
-			// handler-side authority citationMarkerRE.
+			// "[1]" is not citation syntax at all. Explicit groups must also
+			// resolve in full against the exact frozen evidence set.
 			return TerminalOutcome{}, errors.New("preview.content must include citation markers such as [1] for chat-backed summaries")
 		}
 		return TerminalOutcome{

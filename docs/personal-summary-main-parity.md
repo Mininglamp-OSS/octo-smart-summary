@@ -63,6 +63,27 @@ drafts and one complete fetch/Map/Reduce/draft/submission result. These checks a
 not CI tests or a guarantee of model success. Private replay scripts, logs and
 database snapshots are intentionally excluded from the repository.
 
+## Citation consistency follow-up
+
+Agent saves and Workflow reuse the same citation builder and generated-content
+normalizer. Explicit numeric lists and inclusive ranges become adjacent `[n]`
+markers only when every index resolves to authorized evidence; groups are capped
+at 128 entries and normalization growth is bounded. Missing, reversed, malformed
+or oversized groups fail closed rather than silently losing citation metadata.
+Message identity stays unchanged: reading-order numbering is a frontend concern.
+
+The Agent writer validates the exact frozen evidence set (including holes),
+uses the same multi-source output rule as Workflow, and can repair invalid output
+within the existing maximum of two writer-only retries. Personal feedback
+refinement applies the normalizer before writing either the result or a version.
+Invalid refinement output leaves the old result/history intact. No retrieval
+replay, new preview API, database migration or historical repair is introduced.
+
+Markdown code and link content are excluded from citation extraction.
+The frontend only expands a group backed by complete citation data and numbers
+resolved sources in first-appearance order. Historical rows missing metadata
+are not silently repaired by the display layer.
+
 ## Rollout
 
 Apply `migrations/sql/20260911-01-summary-generation-requirement.sql` through the

@@ -6,7 +6,38 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 )
+
+func TestWorkflowCompoundCitationFinalization(t *testing.T) {
+	messages := []pipeline.Message{
+		{CitationIndex: 9, SenderUID: "alice", Content: "Budget approved", ChannelID: "budget", MessageSeq: 101},
+		{CitationIndex: 73, SenderUID: "bob", Content: "Budget details", ChannelID: "budget", MessageSeq: 102},
+		{CitationIndex: 88, SenderUID: "carol", Content: "ROI forecast", ChannelID: "forecast", MessageSeq: 201},
+	}
+	content := "Budget [9,73]. ROI [88]."
+	citations := buildCitations(content, messages, messages, nil)
+	normalized, err := service.NormalizeGeneratedCitations(content, citations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalized, citations = dedupCitations(normalized, citations)
+	normalized = stripOrphanCitations(normalized, citations)
+	if normalized != "Budget [9][73]. ROI [88]." || len(citations) != 3 {
+		t.Fatalf("lost compound citations: %q, %+v", normalized, citations)
+	}
+	for i, citation := range citations {
+		if citation.Index != messages[i].CitationIndex ||
+			citation.ChannelID != messages[i].ChannelID ||
+			citation.MessageSeq != messages[i].MessageSeq {
+			t.Fatalf("source identity changed: %+v", citation)
+		}
+	}
+	broken := "Budget [9,74]. ROI [88]."
+	if _, err := service.NormalizeGeneratedCitations(broken, buildCitations(broken, messages, messages, nil)); err == nil {
+		t.Fatal("partially resolved group accepted")
+	}
+}
 
 func TestExtractCitationIndexes(t *testing.T) {
 	tests := []struct {
@@ -19,6 +50,10 @@ func TestExtractCitationIndexes(t *testing.T) {
 		{"none", "没有引用标记", nil},
 		{"dedup", "[3] 重复引用 [3]", []int{3}},
 		{"consecutive", "[74][83][91]", []int{74, 83, 91}},
+		{"compound", "[9,73] [93–95]", []int{9, 73, 93, 94, 95}},
+		{"compound code", "`[9,73]` [88]", []int{88}},
+		{"numeric link", "[9](https://example.com/[73]) [88]", []int{88}},
+		{"invalid range", "[95–93] [88]", []int{88}},
 		{"spaced", "[74] [83]", []int{74, 83}},
 		{"skip markdown link", "[点击这里](https://example.com)", nil},
 		{"mixed", "text [1] and [link](url) and [2][3]", []int{1, 2, 3}},

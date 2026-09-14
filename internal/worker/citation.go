@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
@@ -17,13 +18,14 @@ var emptyLineRe = regexp.MustCompile(`(?m)^[ \t]*$\n`)
 
 // extractCitationIndexes extracts all [n] citation indexes from text.
 func extractCitationIndexes(text string) []int {
-	matches := citationRe.FindAllStringSubmatch(text, -1)
 	var indexes []int
 	seen := make(map[int]bool)
-	for _, m := range matches {
-		if n, err := strconv.Atoi(m[1]); err == nil && !seen[n] {
-			indexes = append(indexes, n)
-			seen[n] = true
+	for _, m := range citationtext.Scan(text) {
+		for _, n := range m.Indices {
+			if !seen[n] {
+				indexes = append(indexes, n)
+				seen[n] = true
+			}
 		}
 	}
 	sort.Ints(indexes)
