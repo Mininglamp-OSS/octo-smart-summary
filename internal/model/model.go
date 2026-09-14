@@ -221,6 +221,12 @@ func (t SummaryTask) EffectiveTopic() string {
 	if t.TriggerType == TriggerAgent && t.GenerationRequirement != nil && strings.TrimSpace(*t.GenerationRequirement) != "" {
 		return *t.GenerationRequirement
 	}
+	return t.DisplayTopic()
+}
+
+// DisplayTopic preserves the bounded compatibility field for API projections.
+// Generation uses EffectiveTopic instead, retaining the complete instruction.
+func (t SummaryTask) DisplayTopic() string {
 	if strings.TrimSpace(t.Topic) != "" {
 		return t.Topic
 	}

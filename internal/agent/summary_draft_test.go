@@ -302,7 +302,7 @@ func TestPreparedDraftRejectsIncompleteEvidenceAndMixedBatches(t *testing.T) {
 	}
 }
 
-func TestPreparedDraftFailureNeverReopensTools(t *testing.T) {
+func TestPreparedDraftFailureHasBoundedWriterRepairsWithoutReopeningTools(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		turn AssistantTurn
@@ -336,10 +336,117 @@ func TestPreparedDraftFailureNeverReopensTools(t *testing.T) {
 			runner := NewRunner(client, reg, NewPool(2), terminalPolicy(5))
 			_, _, err := runner.RunWithHistoryOutcome(ctx, "system", nil, "request")
 			var draftErr *SummaryDraftError
-			if !errors.As(err, &draftErr) || requests != 3 {
+			wantRequests := 3 + maxSummaryDraftRepairs
+			if test.err != nil {
+				wantRequests = 3 // transport is already retried by the client
+			}
+			if !errors.As(err, &draftErr) || requests != wantRequests {
 				t.Fatalf("err=%v requests=%d", err, requests)
 			}
 		})
+	}
+}
+
+func TestPreparedDraftRepairsQualityUsingSameEvidenceAtFinalStep(t *testing.T) {
+	for _, rejected := range []AssistantTurn{
+		{Content: "Missing citations"},
+		{Content: "Unknown reference [2]"},
+		{},
+		{Content: "Partial [1]", Truncated: true},
+		{Content: "<tool_call>do something</tool_call>"},
+		{ToolCalls: []ToolCall{mkToolCall("bad", "fetch_channel", "{}")}},
+		{Content: strings.Repeat("x", maxSummaryHandleText+1)},
+	} {
+		t.Run(summaryDraftQualityFailure(context.Background(), rejected)+rejected.Content[:min(len(rejected.Content), 20)], func(t *testing.T) {
+			planners, writers, merges := 0, 0, 0
+			var originalData string
+			client := draftTestClient(func(ctx context.Context, messages []Message, tools []Tool) (AssistantTurn, error) {
+				if len(tools) == 0 {
+					writers++
+					if len(messages) != 2 {
+						t.Fatal("rejected writer output entered the transcript")
+					}
+					if writers == 1 {
+						originalData = messages[1].Content
+						rejected.Tokens = 7
+						return rejected, nil
+					}
+					if messages[1].Content != originalData || !strings.Contains(messages[0].Content, "上一次") {
+						t.Fatal("repair lost evidence or validation feedback")
+					}
+					return AssistantTurn{Content: "Corrected fact [1]", Tokens: 11}, nil
+				}
+				planners++
+				switch planners {
+				case 1:
+					return AssistantTurn{ToolCalls: []ToolCall{mkToolCall("merge", "merge_summaries", "{}")}}, nil
+				case 2:
+					return AssistantTurn{ToolCalls: []ToolCall{mkToolCall("prepare", prepareSummaryDraftTool, "{}")}}, nil
+				default:
+					if len(tools) != 1 || tools[0].Function.Name != "emit_summary_response" {
+						t.Fatal("evidence gathering reopened")
+					}
+					return AssistantTurn{ToolCalls: []ToolCall{mkToolCall("submit", "emit_summary_response", draftSubmission(draftState(ctx).handle))}}, nil
+				}
+			})
+			ctx := WithSummaryCitationTracking(context.Background())
+			markSummaryCitationEvidence(ctx, citationTestMessages("channel", 1, 1))
+			reg := draftTestRegistry()
+			reg.Register(Tool{Function: ToolFunction{Name: "merge_summaries"}}, func(context.Context, json.RawMessage) (string, error) {
+				merges++
+				return `{"merged_summary":"evidence [1]"}`, nil
+			})
+			policy := terminalPolicy(2)
+			policy.MaxTokens = 1 // finalization repairs must also work at the soft budget
+			runner := NewRunner(client, reg, NewPool(1), policy)
+			out, history, err := runner.RunWithHistoryOutcome(ctx, "system", nil, "request")
+			if err != nil || out.Terminal == nil || writers != 2 || planners != 3 || merges != 1 {
+				t.Fatalf("repair lost work: %v writer=%d planner=%d merge=%d", err, writers, planners, merges)
+			}
+			for _, message := range history {
+				if strings.Contains(message.Content, "上一次") {
+					t.Fatal("writer repair leaked to durable history")
+				}
+			}
+		})
+	}
+}
+
+func TestPreparedDraftRepairHonorsCancellationAndCountsTokens(t *testing.T) {
+	calls := 0
+	var stop context.CancelFunc
+	client := draftTestClient(func(context.Context, []Message, []Tool) (AssistantTurn, error) {
+		calls++
+		stop()
+		return AssistantTurn{Tokens: 9}, nil
+	})
+	runCtx, cancel := context.WithCancel(draftTestContext(client))
+	stop = cancel
+	defer stop()
+	_, handler := PrepareSummaryDraftTool()
+	_, err := handler(runCtx, json.RawMessage("{}"))
+	if !errors.Is(err, context.Canceled) || calls != 1 || draftState(runCtx).tokens != 9 || draftState(runCtx).handle != "" {
+		t.Fatalf("cancel/tokens: %v calls=%d state=%+v", err, calls, draftState(runCtx))
+	}
+}
+
+func TestPreparedDraftRepairCountsAllAttemptsAndReusesAcceptedHandle(t *testing.T) {
+	calls := 0
+	ctx := draftTestContext(draftTestClient(func(context.Context, []Message, []Tool) (AssistantTurn, error) {
+		calls++
+		if calls <= maxSummaryDraftRepairs {
+			return AssistantTurn{Tokens: 6}, nil
+		}
+		return AssistantTurn{Content: "accepted body", Tokens: 9}, nil
+	}))
+	_, prepare := PrepareSummaryDraftTool()
+	first, err := prepare(ctx, json.RawMessage("{}"))
+	if err != nil || calls != 3 || draftState(ctx).tokens != 21 {
+		t.Fatalf("repair/token accounting: %v calls=%d state=%+v", err, calls, draftState(ctx))
+	}
+	second, err := prepare(ctx, json.RawMessage("{}"))
+	if err != nil || first != second || calls != 3 {
+		t.Fatalf("accepted handle regenerated: %v calls=%d", err, calls)
 	}
 }
 
