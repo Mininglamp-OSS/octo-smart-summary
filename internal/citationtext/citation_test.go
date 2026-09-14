@@ -8,7 +8,7 @@ import (
 func TestCanonicalizeBoundsTotalGrowth(t *testing.T) {
 	// A long untouched tail must not hide the expansion of earlier groups.
 	content := strings.Repeat("[1-128]", 1000) + strings.Repeat("x", maxExpansionBytes)
-	got, err := Canonicalize(content, func(n int) bool { return n >= 1 && n <= 128 })
+	got, err := Canonicalize(content, func(n int) bool { return n >= 1 && n <= 128 }, 128)
 	if err == nil || got != content {
 		t.Fatal("oversized expansion must fail atomically")
 	}
@@ -44,7 +44,7 @@ func TestCanonicalize(t *testing.T) {
 		{"[9,73][ref]\n\n[ref]: https://example.test\n\nactual [9,73]", "[9,73][ref]\n\n[ref]: https://example.test\n\nactual [9][73]", false},
 	} {
 		t.Run(tc.in, func(t *testing.T) {
-			got, err := Canonicalize(tc.in, valid)
+			got, err := Canonicalize(tc.in, valid, 129)
 			if got != tc.out || (err != nil) != tc.invalid {
 				t.Fatalf("got %q err=%v; want %q invalid=%v", got, err, tc.out, tc.invalid)
 			}
@@ -54,12 +54,58 @@ func TestCanonicalize(t *testing.T) {
 
 func TestValidationCannotSkipCompoundReferences(t *testing.T) {
 	valid := func(n int) bool { return n == 9 || n == 73 || n == 88 }
-	if !Valid("[9,73] then [88]", valid, true) {
+	if !Valid("[9,73] then [88]", valid, 88, true) {
 		t.Fatal("valid group rejected")
 	}
 	for _, text := range []string{"[9,74] then [88]", "[73–88]", "[0]", "[9,]", "`[9]`", "```\n[9]"} {
-		if Valid(text, valid, true) {
+		if Valid(text, valid, 88, true) {
 			t.Fatalf("invalid evidence accepted: %q", text)
 		}
+	}
+}
+
+func TestNumericProseDoesNotBecomeCitationCorruption(t *testing.T) {
+	valid := func(n int) bool { return n == 1 || n == 3 }
+	for _, prose := range []string{"[2024-2025]", "[2024–2025]", "[2026-09-14]", "[100-120]"} {
+		t.Run(prose, func(t *testing.T) {
+			content := "Evidence [1]. Date/page " + prose + "."
+			got, err := Canonicalize(content, valid, 3)
+			if err != nil || got != content {
+				t.Fatalf("prose changed: %q %v", got, err)
+			}
+			if !Valid(content, valid, 3, true) || Valid(prose, valid, 3, true) {
+				t.Fatal("prose rejected or counted as supporting evidence")
+			}
+		})
+	}
+	// An in-window gap is corruption even when none of the group members is
+	// authorized. Testing only whether ANY member is authorized would miss it.
+	for _, content := range []string{"[2,2]", "[1,999]", "[1-3]", "[1;2]", "[1-2-3]", "[0,999]"} {
+		if _, err := Canonicalize(content, valid, 3); err == nil || Valid(content, valid, 3, false) {
+			t.Fatalf("accepted corrupt group %q", content)
+		}
+	}
+}
+
+func TestFullyAuthorizedGroupLimit(t *testing.T) {
+	valid := func(n int) bool { return n >= 1 && n <= 129 }
+	if _, err := Canonicalize("[1-129]", valid, 129); err == nil {
+		t.Fatal("group larger than 128 accepted")
+	}
+	if _, err := Canonicalize("[1-128]", valid, 129); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUnknownEvidenceCannotExcuseMissingGroups(t *testing.T) {
+	if _, err := Canonicalize("[1,2]", nil, -1); err == nil {
+		t.Fatal("unknown evidence accepted a group")
+	}
+	prose := "Planning [2024-2025]"
+	if got, err := Canonicalize(prose, nil, 0); err != nil || got != prose {
+		t.Fatalf("known citation-free prose rejected: %q %v", got, err)
+	}
+	if Valid(prose, nil, 0, true) {
+		t.Fatal("citation-free prose counted as supporting evidence")
 	}
 }

@@ -16,6 +16,7 @@ const OutputRule = "多来源必须逐个写成 [9][73]，不得写成 [9,73] �
 var ErrInvalid = errors.New("invalid or unresolved citation")
 var candidate = regexp.MustCompile(`\[[ \t]*[0-9][0-9 \t,，;；\-–—]*\]`)
 var item = regexp.MustCompile(`^([0-9]+)(?:[ \t]*[-–—][ \t]*([0-9]+))?$`)
+var dateShape = regexp.MustCompile(`^[0-9]{4}[-–—][0-9]{2}[-–—][0-9]{2}$`)
 var definition = regexp.MustCompile(`(?m)^ {0,3}\[([^\]\n]+)\]:`)
 var listStart = regexp.MustCompile(`^(?:[-+*]|[0-9]+[.)])[ \t]+`)
 
@@ -39,6 +40,9 @@ func Scan(content string) []Marker {
 			continue
 		}
 		body := content[start+1 : end-1]
+		if dateShape.MatchString(strings.TrimSpace(body)) {
+			continue // A bracketed ISO-shaped date is prose, never evidence.
+		}
 		m := Marker{Start: start, End: end, Compound: strings.ContainsAny(body, " \t,，;；-–—")}
 		for _, part := range strings.Split(strings.ReplaceAll(body, "，", ","), ",") {
 			match := item.FindStringSubmatch(strings.TrimSpace(part))
@@ -68,11 +72,15 @@ func Scan(content string) []Marker {
 // Canonicalize expands explicit lists/inclusive ranges only when every member
 // is backed by the caller's authorized evidence. It is atomic on error.
 // Single markers remain unchanged, allowing existing prose-number policies.
-func Canonicalize(content string, valid func(int) bool) (string, error) {
+// maxIndex is the known numeric evidence window; -1 means unknown (fail closed).
+func Canonicalize(content string, valid func(int) bool, maxIndex int) (string, error) {
 	var b strings.Builder
 	offset := 0
 	for _, m := range Scan(content) {
 		if !m.Compound {
+			continue
+		}
+		if outsideEvidenceWindow(m, maxIndex) {
 			continue
 		}
 		if len(m.Indices) == 0 {
@@ -103,12 +111,13 @@ func Canonicalize(content string, valid func(int) bool) (string, error) {
 	return b.String(), nil
 }
 
-func Valid(content string, valid func(int) bool, requireMarker bool) bool {
+func Valid(content string, valid func(int) bool, maxIndex int, requireMarker bool) bool {
 	markers := Scan(content)
-	if requireMarker && len(markers) == 0 {
-		return false
-	}
+	hasCitation := false
 	for _, m := range markers {
+		if outsideEvidenceWindow(m, maxIndex) {
+			continue
+		}
 		if len(m.Indices) == 0 {
 			return false
 		}
@@ -116,6 +125,23 @@ func Valid(content string, valid func(int) bool, requireMarker bool) bool {
 			if valid == nil || !valid(n) {
 				return false
 			}
+		}
+		hasCitation = true
+	}
+	return !requireMarker || hasCitation
+}
+
+// Only well-formed groups wholly above a KNOWN evidence window are prose.
+// Use the window, not membership: [2,2] with evidence {1,3} is corruption.
+// An unknown window cannot excuse a failed citation build. Malformed
+// groups and expansion-limit violations also remain fail-closed.
+func outsideEvidenceWindow(m Marker, maxIndex int) bool {
+	if !m.Compound || maxIndex < 0 || len(m.Indices) == 0 {
+		return false
+	}
+	for _, n := range m.Indices {
+		if n <= maxIndex {
+			return false
 		}
 	}
 	return true

@@ -145,3 +145,46 @@ Run with `SUMMARY_CR_MYSQL_TEST_DSN` pointing to a **disposable** `summary_cr_*`
 database; the test creates missing tables and inserts synthetic rows only.
 The normal unit suite skips it without that variable. It does not contact a real
 LLM. SQLite tests are not a substitute for this row-lock verification.
+
+## PR #246 remediation — approved scheduling boundary
+
+- A topic-less configuration save resolves a legacy Agent requirement from the
+  locked task exactly once, validates that value, and persists it independently
+  of the run/spec. Expiring the original session no longer loses a successfully
+  saved requirement. Configuration-only saves do not start generation.
+- `generation-config` returns HTTP 409 / code 40005 for schedule-bound tasks,
+  including paused bindings. Scheduling is configured only on the individual
+  summary's detail page; the legacy schedule list is read-only. The detail page
+  does not offer chat selection while setting a schedule.
+- Schedule creation inherits the task's source identifiers. Create/update may
+  resend the same set, but cannot add, drop, replace, or change source types.
+  Source names are server-owned. Re-generation cannot bypass the binding guard
+  to replace sources, and rejected operations leave task/schedule data unchanged.
+  Recurrence editing, enabling, and disabling remain on the detail page.
+- ISO-shaped bracketed dates are prose. Well-formed numeric groups wholly above
+  a known evidence window are also prose and remain unchanged; they never count
+  as the required supporting citation. In-window holes, mixed valid/invalid
+  groups, malformed syntax, and expansion-limit violations still fail closed.
+  Unknown evidence at the Agent-save boundary is not treated as a known empty
+  set. Citation-free personal/team refinement can preserve numeric prose.
+- Both personal and team refinement transports normalize before persistence.
+  Workflow normalizes against the full authorized message window before building
+  and deduplicating citations; orphan-single stripping remains unchanged.
+
+Local verification for this remediation:
+
+```sh
+CGO_LDFLAGS='-L/home/mlamp/.local/lib -lstdc++ -lm -ldl' \
+  go test -race ./internal/agent ./internal/api/handler ./internal/citationtext \
+  ./internal/service ./internal/worker ./internal/streaming ./internal/llmfallback
+CGO_ENABLED=0 go build -buildvcs=false ./...
+```
+
+The same seven packages pass without `-race`. The paired frontend passes 1,361
+summary tests across 85 files, locale checks, and its production build. Local
+synthetic browser checks cover the detail scheduling modal, source-less refusal,
+and the read-only legacy list in Chinese and English. The worker regression
+executes the real generation/finalization path with deterministic retrieval and
+model fixtures, not a live IM service or model. Real MySQL row-lock tests and
+deployment were not run in this remediation. `-buildvcs=false` is needed only for
+this local worktree's VCS discovery; it is not a source-code or Git-config change.

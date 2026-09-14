@@ -212,7 +212,7 @@ func summaryDraftQualityFailure(ctx context.Context, turn AssistantTurn) string 
 		reason = "too_large"
 	}
 	if hasEvidence, count := summaryCitationEvidenceWindow(ctx); hasEvidence && reason == "" &&
-		!citationtext.Valid(turn.Content, func(n int) bool { return summaryCitationIndexAllowed(ctx, n, count) }, true) {
+		!citationtext.Valid(turn.Content, func(n int) bool { return summaryCitationIndexAllowed(ctx, n, count) }, int(count), true) {
 		reason = "invalid_citations"
 	}
 	return reason
@@ -234,11 +234,12 @@ func summaryDraftRepairInstruction(reason string) string {
 func canonicalizeDraftCitations(ctx context.Context, content string) (string, error) {
 	hasEvidence, count := summaryCitationEvidenceWindow(ctx)
 	if hasEvidence {
-		return citationtext.Canonicalize(content, func(n int) bool { return summaryCitationIndexAllowed(ctx, n, count) })
+		return citationtext.Canonicalize(content, func(n int) bool { return summaryCitationIndexAllowed(ctx, n, count) }, int(count))
 	}
 	// No-fetch rewrites may use only the already-authorized reference entries.
 	source, _ := ctx.Value(summaryDraftSourceKey{}).(SummaryDraftSource)
 	indices := make(map[int]bool)
+	maxIndex := -1 // No reference metadata is unknown, not a known empty window.
 	for _, ref := range source.References {
 		var cits []struct {
 			Index int `json:"index"`
@@ -246,10 +247,13 @@ func canonicalizeDraftCitations(ctx context.Context, content string) (string, er
 		if json.Unmarshal(ref.Citations, &cits) == nil {
 			for _, c := range cits {
 				indices[c.Index] = true
+				if c.Index > maxIndex {
+					maxIndex = c.Index
+				}
 			}
 		}
 	}
-	return citationtext.Canonicalize(content, func(n int) bool { return indices[n] })
+	return citationtext.Canonicalize(content, func(n int) bool { return indices[n] }, maxIndex)
 }
 
 func preparedDraftResult(state *summaryDraftState) string {
