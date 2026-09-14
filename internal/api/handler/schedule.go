@@ -642,6 +642,10 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		if !int64PtrEqual(task.ScheduleID, peekedExisting) {
 			return errRebindConcurrentModified
 		}
+		sched.SourceConfig, err = scheduleTaskSources(tx, task, req.Sources)
+		if err != nil {
+			return err
+		}
 
 		// Single-person guard: configured participants must be a subset of {creator}.
 		// Bypassed when team schedules are enabled.
@@ -1173,10 +1177,6 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		}
 		updates["time_range_type"] = *req.TimeRangeType
 	}
-	if req.Sources != nil {
-		b, _ := json.Marshal(req.Sources)
-		updates["source_config"] = model.JSON(b)
-	}
 	// participant_config / confirm_policy reset+merge is done INSIDE the tx where the
 	// FOR UPDATE-locked stored config is available (so we can preserve existing
 	// confirm state under Q3). See the confirm-state block below.
@@ -1269,9 +1269,17 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 
 			// 1->N: a schedule may own many tasks (history); no "already bound" rejection.
 		} else {
-			if _, err := loadBoundTaskForScheduleUpdate(tx, lockedSched, userID); err != nil {
+			task, err = loadBoundTaskForScheduleUpdate(tx, lockedSched, userID)
+			if err != nil {
 				return err
 			}
+		}
+		if req.Sources != nil || req.Scope == "task" {
+			sources, err := scheduleTaskSources(tx, task, req.Sources)
+			if err != nil {
+				return err
+			}
+			updates["source_config"] = sources
 		}
 
 		if req.Scope == "task" && (task.ScheduleID == nil || *task.ScheduleID != sched.ID) {

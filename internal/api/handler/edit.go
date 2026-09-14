@@ -299,6 +299,15 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 	if !callerPlainCitationsVisible(h.db, &task, userID, &baseResult) {
 		basePlainCitations = []model.Citation{}
 	}
+	newContent, err = service.NormalizeGeneratedCitations(newContent, basePlainCitations)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "调整结果包含无效引用，请修改要求后重试"})
+		return
+	}
+	if len(newContent) > maxContentBytes {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "调整结果超过 500KB 限制"})
+		return
+	}
 	cleanedCitations := service.CleanUnreferencedCitations(newContent, basePlainCitations)
 	cleanedTeamCitations := cleanUnreferencedTeamCitations(newContent, baseResult.GetTeamCitations())
 	newResult := model.SummaryResult{
@@ -474,6 +483,15 @@ func (h *EditHandler) RefineSummaryStream(c *gin.Context) {
 	basePlainCitations := baseResult.GetCitations()
 	if !callerPlainCitationsVisible(h.db, &task, userID, &baseResult) {
 		basePlainCitations = []model.Citation{}
+	}
+	newContent, err = service.NormalizeGeneratedCitations(newContent, basePlainCitations)
+	if err != nil {
+		writeStreamError("调整结果包含无效引用，请修改要求后重试")
+		return
+	}
+	if len(newContent) > maxContentBytes {
+		writeStreamError("调整结果超过 500KB 限制")
+		return
 	}
 	cleanedCitations := service.CleanUnreferencedCitations(newContent, basePlainCitations)
 	cleanedTeamCitations := cleanUnreferencedTeamCitations(newContent, baseResult.GetTeamCitations())

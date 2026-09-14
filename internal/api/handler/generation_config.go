@@ -55,6 +55,13 @@ func agentMessageRequirement(db *gorm.DB, msg model.AgentMessage, userID string)
 // Only new/replaced source selections require validation here. Saved source
 // scope is still re-authorized by the existing Workflow when reading messages.
 func (h *TaskHandler) validateRegenerationConfig(c *gin.Context, task model.SummaryTask, req regenerateReq) error {
+	return h.validateRegenerationConfigDB(c, h.db, task, req)
+}
+
+func (h *TaskHandler) validateRegenerationConfigDB(c *gin.Context, db *gorm.DB, task model.SummaryTask, req regenerateReq) error {
+	if task.ScheduleID != nil && req.Sources != nil {
+		return service.NewBizError(40005, "定时更新沿用当前总结来源，不能更换群聊", http.StatusConflict)
+	}
 	limit := maxSummaryTopicRunes
 	if task.TriggerType == model.TriggerAgent {
 		limit = maxMessageLen
@@ -99,10 +106,10 @@ func (h *TaskHandler) validateRegenerationConfig(c *gin.Context, task model.Summ
 	if task.TriggerType == model.TriggerAgent {
 		requirement := strings.TrimSpace(req.Topic)
 		if requirement == "" {
-			requirement = generationRequirement(h.db, task)
+			requirement = generationRequirement(db, task)
 		}
 		var sources int64
-		if err := h.db.Model(&model.SummarySource{}).Where("task_id = ?", task.ID).Count(&sources).Error; err != nil {
+		if err := db.Model(&model.SummarySource{}).Where("task_id = ?", task.ID).Count(&sources).Error; err != nil {
 			return err
 		}
 		if requirement == "" || (req.TimeRange == nil && !task.TimeRangeEnd.After(task.TimeRangeStart)) ||
@@ -113,8 +120,8 @@ func (h *TaskHandler) validateRegenerationConfig(c *gin.Context, task model.Summ
 	return nil
 }
 
-// SaveGenerationConfig is the same configuration transaction used by full
-// regeneration, without starting a run or creating/enabling a schedule.
+// SaveGenerationConfig completes an unscheduled task's generation configuration,
+// without starting a run. Bound schedules are configured only from task details.
 func (h *TaskHandler) SaveGenerationConfig(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -134,24 +141,36 @@ func (h *TaskHandler) SaveGenerationConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid request body"})
 		return
 	}
-	err = h.validateRegenerationConfig(c, *task, req)
-	if err == nil {
-		err = h.db.Transaction(func(tx *gorm.DB) error {
-			var locked model.SummaryTask
-			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&locked, id).Error; err != nil {
+	err = h.db.Transaction(func(tx *gorm.DB) error {
+		var locked model.SummaryTask
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&locked, id).Error; err != nil {
+			return err
+		}
+		if locked.DeletedAt != nil || (locked.Status != model.StatusCompleted && locked.Status != model.StatusFailed && locked.Status != model.StatusCancelled) {
+			return service.NewBizError(40005, "任务处理中，暂不能修改配置", http.StatusConflict)
+		}
+		if locked.ScheduleID != nil || locked.TriggerType == model.TriggerScheduled {
+			return service.NewBizError(40005, "请在总结详情页设置定时更新；定时更新不能更换群聊来源", http.StatusConflict)
+		}
+		// Resolve exactly once from the locked task. Keep the recovered value
+		// through validation and persistence, before its run/spec can expire.
+		topic := strings.TrimSpace(req.Topic)
+		if locked.TriggerType == model.TriggerAgent {
+			if topic == "" {
+				topic = generationRequirement(tx, locked)
+			}
+			locked.GenerationRequirement = &topic
+		}
+		if err := h.validateRegenerationConfigDB(c, tx, locked, req); err != nil {
+			return err
+		}
+		if topic != "" {
+			if err := tx.Model(&locked).Updates(map[string]interface{}{"topic": truncateRunes(topic, maxSummaryTopicRunes), "generation_requirement": topic}).Error; err != nil {
 				return err
 			}
-			if locked.DeletedAt != nil || (locked.Status != model.StatusCompleted && locked.Status != model.StatusFailed && locked.Status != model.StatusCancelled) {
-				return service.NewBizError(40005, "任务处理中，暂不能修改配置", http.StatusConflict)
-			}
-			if topic := strings.TrimSpace(req.Topic); topic != "" {
-				if err := tx.Model(&locked).Updates(map[string]interface{}{"topic": truncateRunes(topic, maxSummaryTopicRunes), "generation_requirement": topic}).Error; err != nil {
-					return err
-				}
-			}
-			return h.saveGenerationScope(tx, locked, req)
-		})
-	}
+		}
+		return h.saveGenerationScope(tx, locked, req)
+	})
 	if err != nil {
 		var be *service.BizError
 		if errors.As(err, &be) {
@@ -165,6 +184,17 @@ func (h *TaskHandler) SaveGenerationConfig(c *gin.Context) {
 }
 
 func (h *TaskHandler) saveGenerationScope(tx *gorm.DB, task model.SummaryTask, req regenerateReq) error {
+	if req.Sources != nil {
+		// Regenerate acquired the task lock with its status transition. Re-read
+		// the binding there as scheduling could have raced the pre-validation.
+		var current model.SummaryTask
+		if err := tx.First(&current, task.ID).Error; err != nil {
+			return err
+		}
+		if current.ScheduleID != nil || current.TriggerType == model.TriggerScheduled {
+			return service.NewBizError(40005, "定时更新沿用当前总结来源，不能更换群聊", http.StatusConflict)
+		}
+	}
 	if req.TimeRange != nil {
 		if err := tx.Model(&model.SummaryTask{}).Where("id = ?", task.ID).Updates(map[string]interface{}{
 			"time_range_start": req.TimeRange.Start, "time_range_end": req.TimeRange.End,

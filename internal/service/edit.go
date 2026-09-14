@@ -20,10 +20,14 @@ func CleanUnreferencedCitations(content string, citations []model.Citation) []mo
 // Only already-authorized citations may back a group; no source is fabricated.
 func NormalizeGeneratedCitations(content string, citations []model.Citation) (string, error) {
 	indices := make(map[int]bool, len(citations))
+	maxIndex := 0
 	for _, c := range citations {
 		indices[c.Index] = true
+		if c.Index > maxIndex {
+			maxIndex = c.Index
+		}
 	}
-	return citationtext.Canonicalize(content, func(n int) bool { return indices[n] })
+	return citationtext.Canonicalize(content, func(n int) bool { return indices[n] }, maxIndex)
 }
 
 func extractReferencedIndices(content string) map[int]bool {

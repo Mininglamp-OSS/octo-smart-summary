@@ -184,14 +184,6 @@ func summaryCitationEvidenceWindow(ctx context.Context) (bool, int64) {
 	return len(state.evidenceKeys) > 0, int64(len(state.evidenceKeys))
 }
 
-// citationMarkersWithinEvidence reports whether every [N] marker in content
-// refers to an index in [1, evidenceCount] (the persisted evidence window) and
-// at least one marker exists. Bounding by the evidence pool is what stops a
-// stray prose "[1]" from spoofing coverage (review 5087740714 blocker 4).
-func citationMarkersWithinEvidence(content string, evidenceCount int64) bool {
-	return citationtext.Valid(content, func(n int) bool { return int64(n) <= evidenceCount }, true)
-}
-
 func summaryCitationIndexAllowed(ctx context.Context, n int, fallbackMax int64) bool {
 	if state, ok := ctx.Value(summaryCitationTrackingContextKey{}).(*summaryCitationTrackingState); ok && state != nil {
 		state.mu.RLock()
@@ -293,7 +285,7 @@ func EmitSummaryResponseTool() (Tool, TerminalHandler) {
 		if hasEvidence &&
 			(payload.ResultType == SummaryResultAgentPreview || payload.ResultType == SummaryResultAgentRevision) &&
 			(payload.Preview == nil || !citationtext.Valid(payload.Preview.Content,
-				func(n int) bool { return summaryCitationIndexAllowed(ctx, n, evidenceCount) }, true)) {
+				func(n int) bool { return summaryCitationIndexAllowed(ctx, n, evidenceCount) }, int(evidenceCount), true)) {
 			// Evidence-bounded marker guard (review 5087740714 blocker 4):
 			// every [N] must refer to an index inside the persisted evidence
 			// window, and at least one marker must exist. This accepts a

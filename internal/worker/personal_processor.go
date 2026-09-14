@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmfallback"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
@@ -749,13 +750,20 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	channelScopeOpts := channelScopeOptionsForTask(p.cfg.ChannelScopeEnabled, task.SpaceID, task.AgentSessionID, false, true)
 
 	fetchStart := time.Now()
-	messages, intentResult, err := pipeline.ResolveAndFetchMessagesForPersonal(
-		ctx, userID, nil, nil, specifiedSources, task.EffectiveTopic(),
-		task.TimeRangeStart, task.TimeRangeEnd,
-		p.imDB, p.octoClient, p.cfg.MessageFetchBackend, toolCallFn, llmFn,
-		p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency, p.cfg.OctoSearchPollSec,
-		channelScopeOpts, reportStage,
-	)
+	var messages []pipeline.Message
+	var intentResult *pipeline.IntentResult
+	var err error
+	if p.fetchPersonalMessagesFn != nil {
+		messages, intentResult, err = p.fetchPersonalMessagesFn(ctx, task, userID)
+	} else {
+		messages, intentResult, err = pipeline.ResolveAndFetchMessagesForPersonal(
+			ctx, userID, nil, nil, specifiedSources, task.EffectiveTopic(),
+			task.TimeRangeStart, task.TimeRangeEnd,
+			p.imDB, p.octoClient, p.cfg.MessageFetchBackend, toolCallFn, llmFn,
+			p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency, p.cfg.OctoSearchPollSec,
+			channelScopeOpts, reportStage,
+		)
+	}
 	timing.Observe(taskNo, "fetch_messages", fetchStart)
 	if err != nil {
 		return "", nil, 0, 0, "", fmt.Errorf("fetch messages: %w", err)
@@ -1179,12 +1187,23 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 
 	// Build citations from final content
 	citationStart := time.Now()
-	citations := buildCitations(finalContent, userMessages, messages, nameMap)
-	normalizedContent, citationErr := service.NormalizeGeneratedCitations(finalContent, citations)
+	// Validate against the full authorized evidence window, not just the
+	// citations successfully built from this output. Otherwise a group made
+	// entirely of missing in-window indices could be mistaken for prose.
+	indices := make(map[int]bool, len(userMessages))
+	maxIndex := 0
+	for _, message := range userMessages {
+		indices[message.CitationIndex] = true
+		if message.CitationIndex > maxIndex {
+			maxIndex = message.CitationIndex
+		}
+	}
+	normalizedContent, citationErr := citationtext.Canonicalize(finalContent, func(n int) bool { return indices[n] }, maxIndex)
 	if citationErr != nil {
 		return "", nil, 0, 0, "", fmt.Errorf("citation normalization: %w", citationErr)
 	}
 	finalContent = normalizedContent
+	citations := buildCitations(finalContent, userMessages, messages, nameMap)
 	finalContent, citations = dedupCitations(finalContent, citations)
 	finalContent = stripOrphanCitations(finalContent, citations)
 	timing.Observe(taskNo, "build_citations", citationStart)

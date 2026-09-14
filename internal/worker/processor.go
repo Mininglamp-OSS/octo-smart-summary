@@ -46,6 +46,9 @@ type Processor struct {
 	// get dispatched) is observable without running the LLM personal pipeline.
 	// Production leaves it nil and the real pool/processPersonalSummary is used.
 	dispatchPersonalFn func(taskID, participantRefID int64)
+	// Test-only retrieval seam: execute the real generation/finalization pipeline
+	// with deterministic already-authorized messages, without an external IM DB.
+	fetchPersonalMessagesFn func(context.Context, model.SummaryTask, string) ([]pipeline.Message, *pipeline.IntentResult, error)
 	// notifier delivers the terminal-state (Completed/Failed) IM-bot notification
 	// after a task's status is durably committed. nil = disabled (OnTaskTerminal
 	// is a no-op), so it is safe to call unconditionally.
