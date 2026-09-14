@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/artifact"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/finishgate"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/worker"
@@ -275,6 +276,15 @@ func contentHasCitationMarker(content string) bool {
 //     run with 2 citations cannot have meant `[2024]`. Only an in-range miss —
 //     e.g. [3] when 1, 2 and 4 exist — indicates real citation corruption.
 func citationsValid(content string, cits []model.Citation, runFetchedAnything bool) bool {
+	// Unlike incidental single prose numbers, an explicit numeric group must
+	// resolve in full; the old single-marker regex silently skipped groups.
+	indices := make(map[int]bool, len(cits))
+	for _, cit := range cits {
+		indices[cit.Index] = true
+	}
+	if _, err := citationtext.Canonicalize(content, func(n int) bool { return indices[n] }); err != nil {
+		return false
+	}
 	if len(cits) == 0 {
 		if runFetchedAnything && contentHasCitationSequence(content) {
 			return false

@@ -128,6 +128,11 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 		return
 	}
 
+	newContent, err = service.NormalizeGeneratedCitations(newContent, pr.GetCitations())
+	if err != nil || len(newContent) > maxContentBytes {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "调整失败，请稍后重试"})
+		return
+	}
 	cleanedCitations := service.CleanUnreferencedCitations(newContent, pr.GetCitations())
 	tmp := &model.PersonalResult{}
 	tmp.SetCitations(cleanedCitations)
@@ -369,6 +374,11 @@ func (h *PersonalHandler) RefinePersonalSummaryStream(c *gin.Context) {
 		return
 	}
 
+	newContent, err = service.NormalizeGeneratedCitations(newContent, pr.GetCitations())
+	if err != nil || len(newContent) > maxContentBytes {
+		writeStreamError("调整失败，请稍后重试")
+		return
+	}
 	cleanedCitations := service.CleanUnreferencedCitations(newContent, pr.GetCitations())
 	tmp := &model.PersonalResult{}
 	tmp.SetCitations(cleanedCitations)

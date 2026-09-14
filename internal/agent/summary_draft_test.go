@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
 
 type draftTestClient func(context.Context, []Message, []Tool) (AssistantTurn, error)
@@ -351,6 +353,9 @@ func TestPreparedDraftRepairsQualityUsingSameEvidenceAtFinalStep(t *testing.T) {
 	for _, rejected := range []AssistantTurn{
 		{Content: "Missing citations"},
 		{Content: "Unknown reference [2]"},
+		{Content: "Unresolved group [1,2] and valid single [1]"},
+		{Content: "Unresolved range [1–3] and valid single [1]"},
+		{Content: "Malformed group [1,] and valid single [1]"},
 		{},
 		{Content: "Partial [1]", Truncated: true},
 		{Content: "<tool_call>do something</tool_call>"},
@@ -409,6 +414,39 @@ func TestPreparedDraftRepairsQualityUsingSameEvidenceAtFinalStep(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPreparedDraftCanonicalizesGroupsWithoutAnotherModelCall(t *testing.T) {
+	calls := 0
+	ctx := draftTestContext(draftTestClient(func(context.Context, []Message, []Tool) (AssistantTurn, error) {
+		calls++
+		return AssistantTurn{Content: "Budget [9,73]. ROI [88]. Repeated [9]. Range [93–95]."}, nil
+	}))
+	ctx = WithSummaryCitationTracking(ctx)
+	pool := []pipeline.Message{
+		{ChannelID: "a", MessageSeq: 1, CitationIndex: 9},
+		{ChannelID: "b", MessageSeq: 2, CitationIndex: 73},
+		{ChannelID: "b", MessageSeq: 3, CitationIndex: 88},
+		{ChannelID: "b", MessageSeq: 4, CitationIndex: 93},
+		{ChannelID: "b", MessageSeq: 5, CitationIndex: 94},
+		{ChannelID: "b", MessageSeq: 6, CitationIndex: 95},
+	}
+	markSummaryCitationEvidence(ctx, pool)
+	setSummaryCitationWindow(ctx, pool)
+	input := ctx.Value(summaryDraftInputKey{}).(summaryDraftInput)
+	input.messages = []Message{{Role: "tool", Name: "merge_summaries", Content: `{"merged_summary":"Budget [9][73]. ROI [88]. Range [93][94][95]."}`}}
+	ctx = context.WithValue(ctx, summaryDraftInputKey{}, input)
+	_, prepare := PrepareSummaryDraftTool()
+	if _, err := prepare(ctx, json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if got := draftState(ctx).text; got != "Budget [9][73]. ROI [88]. Repeated [9]. Range [93][94][95]." || calls != 1 {
+		t.Fatalf("got %q calls=%d", got, calls)
+	}
+	// Count/max cannot stand in for actual membership of a sparse manifest.
+	if summaryDraftQualityFailure(ctx, AssistantTurn{Content: "Missing [10] but valid [9]"}) != "invalid_citations" {
+		t.Fatal("accepted a gap in frozen evidence")
 	}
 }
 

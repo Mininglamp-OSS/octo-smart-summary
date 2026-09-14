@@ -1180,6 +1180,11 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	// Build citations from final content
 	citationStart := time.Now()
 	citations := buildCitations(finalContent, userMessages, messages, nameMap)
+	normalizedContent, citationErr := service.NormalizeGeneratedCitations(finalContent, citations)
+	if citationErr != nil {
+		return "", nil, 0, 0, "", fmt.Errorf("citation normalization: %w", citationErr)
+	}
+	finalContent = normalizedContent
 	finalContent, citations = dedupCitations(finalContent, citations)
 	finalContent = stripOrphanCitations(finalContent, citations)
 	timing.Observe(taskNo, "build_citations", citationStart)

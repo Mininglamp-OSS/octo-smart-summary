@@ -752,6 +752,12 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 					req.SessionID, req.ReferencedTaskIDs[0])
 			}
 		}
+		normalizedContent, citationErr := service.NormalizeGeneratedCitations(content, cits)
+		if citationErr != nil {
+			return fmt.Errorf("%w: compound references do not resolve", errWorkspacePreviewCitationUnresolved)
+		}
+		content = normalizedContent
+		creatorPR.Content = content
 		if workspaceSave && len(cits) > 0 && contentHasCitationMarker(content) && !citationsValid(content, cits, true) {
 			return fmt.Errorf("%w: fallback citations do not resolve preview markers", errWorkspacePreviewCitationUnresolved)
 		}

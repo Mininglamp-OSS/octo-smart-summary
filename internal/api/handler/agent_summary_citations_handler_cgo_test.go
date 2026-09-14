@@ -5,6 +5,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -16,6 +17,63 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"gorm.io/gorm"
 )
+
+func TestCreateAgentSummary_WorkspaceCompoundCitationSave(t *testing.T) {
+	for _, tc := range []struct {
+		name, content, want string
+		status              int
+	}{
+		{"complete", "Budget [9,73]. ROI [88]. Range [93–95].", "Budget [9][73]. ROI [88]. Range [93][94][95].", http.StatusOK},
+		{"out-of-range", "Budget [9,130]. ROI [88].", "", http.StatusConflict},
+		{"malformed", "Budget [9,]. ROI [88].", "", http.StatusConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+			db := setupAgentSummaryTestDB(t)
+			if err := db.AutoMigrate(&model.AgentSummaryRun{}, &model.AgentSummaryTurn{}, &model.AgentSummarySpec{}, &model.AgentEvidenceArtifact{}, &model.AgentCitationManifest{}); err != nil {
+				t.Fatal(err)
+			}
+			fixture := seedWorkspaceSaveFixture(t, db, "compound-"+tc.name)
+			message := fixture.Message
+			sessionID := bindWorkspacePreviewRun(t, db, fixture, &message, "compound-request", agent.SummaryResultAgentPreview, 0, 3, tc.content)
+			messages := make([]pipeline.Message, 129)
+			for i := range messages {
+				messages[i] = pipeline.Message{ChannelID: "channel-workspace", ChannelType: 2,
+					MessageSeq: int64(i + 1000), Timestamp: int64(i + 1), SenderUID: "alice",
+					Content: fmt.Sprintf("Evidence %d", i+1)}
+			}
+			seedEvidenceRow(t, db, fixture.Session.UserID, sessionID, "compound-evidence", messages)
+			fixture.Body["request_id"] = "compound-request"
+			h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+			w := doAgentSave(t, setupAgentSummaryRouter(h), fixture.Body, map[string]string{"Idempotency-Key": "compound-save"})
+			if w.Code != tc.status {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+			var count int64
+			if err := db.Model(&model.SummaryTask{}).Count(&count).Error; err != nil {
+				t.Fatal(err)
+			}
+			if tc.status != http.StatusOK {
+				if count != 0 {
+					t.Fatal("failed citation save leaked a task")
+				}
+				return
+			}
+			var saved model.PersonalResult
+			if err := db.First(&saved).Error; err != nil {
+				t.Fatal(err)
+			}
+			if saved.Content != tc.want || len(saved.GetCitations()) != 6 {
+				t.Fatalf("content=%q citations=%d", saved.Content, len(saved.GetCitations()))
+			}
+			for _, cit := range saved.GetCitations() {
+				if cit.MessageSeq != int64(cit.Index+999) {
+					t.Fatal("citation source changed")
+				}
+			}
+		})
+	}
+}
 
 func bindWorkspacePreviewRun(
 	t *testing.T,

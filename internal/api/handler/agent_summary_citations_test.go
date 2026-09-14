@@ -35,6 +35,34 @@ func seedEvidenceRow(t *testing.T, db *gorm.DB, uid, sessionID, handle string, m
 	}
 }
 
+func TestBuildAgentCompoundCitationsUsesWorkflowBuilder(t *testing.T) {
+	agent.ResetForTest()
+	db, skip := setupTestDB(t)
+	if skip {
+		return
+	}
+	messages := []pipeline.Message{
+		{ChannelID: "a", MessageSeq: 10, Timestamp: 1, Content: "first"},
+		{ChannelID: "b", MessageSeq: 20, Timestamp: 2, Content: "second"},
+		{ChannelID: "b", MessageSeq: 30, Timestamp: 3, Content: "third"},
+	}
+	seedEvidenceRow(t, db, "user", "compound", "compound-handle", messages)
+	h := &AgentSummaryHandler{db: db}
+	cits, err := h.buildCitationsForSession(context.Background(), "compound", "Group [1,3]. Range [2–3].", "user", "")
+	if err != nil || len(cits) != 3 {
+		t.Fatalf("cits=%v err=%v", cits, err)
+	}
+	if cits[0].MessageSeq != 10 || cits[1].MessageSeq != 20 || cits[2].MessageSeq != 30 {
+		t.Fatal("source identity changed")
+	}
+	if citationsValid("Bad group [1,4] and good single [2]", cits, true) {
+		t.Fatal("finish gate skipped unresolved compound")
+	}
+	if !citationsValid("Good group [1,3] and single [2]", cits, true) {
+		t.Fatal("valid compound rejected")
+	}
+}
+
 // Test 1: 有 [n] 标记 + 有完整 tool 轨迹 → citations 非空、结构正确
 func TestBuildCitationsForSession_WithMarkersAndMessages(t *testing.T) {
 	agent.ResetForTest()

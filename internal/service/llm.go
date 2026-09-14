@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmfallback"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
@@ -737,6 +738,7 @@ func buildMapSystemPrompt(userName, topic string) string {
 - 用显示名称指代人（如"张三"），绝对不要输出 UID 或用户 ID
 - 输出语言与聊天记录的语言保持一致
 `)
+	sb.WriteString("\n" + citationtext.OutputRule + "\n")
 	return sb.String()
 }
 
@@ -766,6 +768,7 @@ func buildReduceSystemPrompt(topic string) string {
 - 绝对不要引用或复制正文内出现的任何 [数字] 标记
 - 超出有效范围的标记一律不得出现在输出中
 `)
+	sb.WriteString("\n" + citationtext.OutputRule + "\n")
 	if topic != "" {
 		sb.WriteString(fmt.Sprintf("\n重要：总结主题是「%s」，请只保留与该主题相关的条目，移除不相关内容。\n", topic))
 	}
