@@ -19,14 +19,20 @@ useDefault = true
 # is a *_test.go fixture, the values are model identifiers, and no real
 # credential is present (the apiKey arg is the literal "test-fake-api-key").
 #
-# We scope the exemption to this single test file and the generic-api-key rule
-# so real-secret detection elsewhere is unaffected. Using a path-based rule
-# (not a commit-fingerprint) keeps it stable across rebases / line shifts.
+# docs/auth-optimization-frontend.md also contains the internal service URL
+# "summary-api:8080/api/v1/summaries". The generic-api-key rule treats the
+# service name before the colon as a key, but the value is only a documented
+# cluster-local endpoint and contains no credential.
+#
+# We scope both exemptions to the exact files and the generic-api-key rule so
+# real-secret detection elsewhere is unaffected. Using path-based rules (not
+# commit fingerprints) keeps them stable across rebases / line shifts.
 # ---------------------------------------------------------------------------
 [[rules]]
 id = "generic-api-key"
 [rules.allowlist]
-description = "LLM model-name literals in llm_test.go are not secrets"
+description = "Documented generic-api-key false positives"
 paths = [
   '''internal/service/llm_test\.go''',
+  '''docs/auth-optimization-frontend\.md''',
 ]
