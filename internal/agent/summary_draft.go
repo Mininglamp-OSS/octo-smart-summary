@@ -10,6 +10,7 @@ import (
 )
 
 const prepareSummaryDraftTool = "prepare_summary_draft"
+const maxSummaryDraftRepairs = 2
 
 // SummaryDraftError is a bounded finalization failure, never a reason to
 // replay the completed discovery/Map/Reduce work. Reason contains fixed codes.
@@ -150,36 +151,70 @@ func PrepareSummaryDraftTool() (Tool, Handler) {
 			{Role: "system", Content: summaryDraftInstruction},
 			{Role: "user", Content: string(data)},
 		}
-		turn, err := input.client.Chat(ctx, messages, nil)
-		state.tokens += turn.Tokens
-		if err != nil {
-			state.err = &SummaryDraftError{Reason: "model_call", Cause: err}
-			return "", state.err
+		// Keep quality repair inside this tool: the authorized evidence and
+		// completed Reduce stay fixed, and no planner/evidence tool is reopened.
+		// Transport retries already belong to Client.Chat. Do not multiply them
+		// here or mark an exhausted draft retryable at the HTTP boundary.
+		for attempt := 0; ; attempt++ {
+			if err := ctx.Err(); err != nil {
+				state.err = &SummaryDraftError{Reason: "model_call", Cause: err}
+				return "", state.err
+			}
+			turn, err := input.client.Chat(ctx, messages, nil)
+			state.tokens += turn.Tokens
+			if err != nil {
+				state.err = &SummaryDraftError{Reason: "model_call", Cause: err}
+				return "", state.err
+			}
+			reason := summaryDraftQualityFailure(ctx, turn)
+			if reason == "" {
+				state.handle = "draft_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+				state.text = turn.Content
+				return preparedDraftResult(state), nil
+			}
+			if attempt >= maxSummaryDraftRepairs {
+				state.err = &SummaryDraftError{Reason: reason}
+				return "", state.err
+			}
+			// Only fixed validation feedback is added to the writer instruction.
+			// Rejected text/tool calls stay out of both planner and durable history;
+			// replaying them could introduce invalid protocol or inflate the input.
+			messages[0].Content = summaryDraftInstruction + "\n" + summaryDraftRepairInstruction(reason)
 		}
-		reason := ""
-		switch {
-		case len(turn.ToolCalls) != 0:
-			reason = "unexpected_tool_call"
-		case turn.Truncated:
-			reason = "truncated"
-		case strings.TrimSpace(turn.Content) == "":
-			reason = "empty"
-		case strings.Contains(turn.Content, "```tool_code") || strings.Contains(turn.Content, "<tool_call>"):
-			reason = "protocol_instead_of_content"
-		case len(turn.Content) > maxSummaryHandleText:
-			reason = "too_large"
-		}
-		if hasEvidence, count := summaryCitationEvidenceWindow(ctx); hasEvidence && reason == "" &&
-			!citationMarkersWithinEvidence(turn.Content, count) {
-			reason = "invalid_citations"
-		}
-		if reason != "" {
-			state.err = &SummaryDraftError{Reason: reason}
-			return "", state.err
-		}
-		state.handle = "draft_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-		state.text = turn.Content
-		return preparedDraftResult(state), nil
+	}
+}
+
+func summaryDraftQualityFailure(ctx context.Context, turn AssistantTurn) string {
+	reason := ""
+	switch {
+	case len(turn.ToolCalls) != 0:
+		reason = "unexpected_tool_call"
+	case turn.Truncated:
+		reason = "truncated"
+	case strings.TrimSpace(turn.Content) == "":
+		reason = "empty"
+	case strings.Contains(turn.Content, "```tool_code") || strings.Contains(turn.Content, "<tool_call>"):
+		reason = "protocol_instead_of_content"
+	case len(turn.Content) > maxSummaryHandleText:
+		reason = "too_large"
+	}
+	if hasEvidence, count := summaryCitationEvidenceWindow(ctx); hasEvidence && reason == "" &&
+		!citationMarkersWithinEvidence(turn.Content, count) {
+		reason = "invalid_citations"
+	}
+	return reason
+}
+
+func summaryDraftRepairInstruction(reason string) string {
+	switch reason {
+	case "invalid_citations":
+		return "上一次终稿未通过引用校验。请基于相同证据重新撰写，至少保留一处已有的 [n] 标记，每个编号必须来自提供的证据，不编造引用。"
+	case "truncated", "too_large":
+		return "上一次终稿过长或被截断。请压缩重复叙述，基于相同证据输出完整、精炼且保留引用标记的终稿。"
+	case "empty":
+		return "上一次终稿为空。请根据已提供的资料直接输出完整 Markdown 正文及对应引用标记。"
+	default:
+		return "上一次输出包含工具协议而非正文。当前没有工具；请直接输出完整 Markdown 终稿及对应引用，不输出工具调用或协议。"
 	}
 }
 

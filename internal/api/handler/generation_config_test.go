@@ -15,6 +15,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/streaming"
 	"gorm.io/gorm"
 )
 
@@ -229,5 +230,59 @@ func TestSaveGenerationConfigDoesNotStartWorkflow(t *testing.T) {
 	db.First(&pr, prID)
 	if task.Status != model.StatusCompleted || task.ScheduleID != nil || pr.Content != "old personal content" {
 		t.Fatal("saving configuration changed task, result or schedule")
+	}
+}
+
+func TestSaveLongGenerationConfigKeepsBoundedDisplayTopic(t *testing.T) {
+	db, id, _ := seedAgentRegeneration(t)
+	if err := db.Exec(`CREATE TRIGGER bounded_config_topic BEFORE UPDATE OF topic ON summary_task
+		WHEN length(NEW.topic) > 2300 BEGIN SELECT RAISE(ABORT, 'topic too long'); END`).Error; err != nil {
+		t.Fatal(err)
+	}
+	h := NewTaskHandler(db, nil, "")
+	r := setupRegenerateRouter(h)
+	r.PUT("/api/v1/summaries/:id/generation-config", h.SaveGenerationConfig)
+	requirement := strings.Repeat("需🙂", 4096)
+	w := doJSONRequest(r, "PUT", fmt.Sprintf("/api/v1/summaries/%d/generation-config", id), "creator1",
+		map[string]interface{}{"topic": requirement, "time_range": map[string]string{
+			"start": "2026-09-01T00:00:00Z", "end": "2026-09-07T23:59:59Z",
+		}})
+	if w.Code != 200 {
+		t.Fatalf("config save: %d %s", w.Code, w.Body)
+	}
+	var task model.SummaryTask
+	db.First(&task, id)
+	assertStoredLongRequirement(t, task, requirement)
+	if utf8.RuneCountInString(task.DisplayTopic()) != maxSummaryTopicRunes {
+		t.Fatal("list/display projection must not return the full execution instruction")
+	}
+}
+
+func TestRegenerateResetsEveryClearedPersonalStream(t *testing.T) {
+	db := setupRegenerateDB(t)
+	id, _, _ := seedCompletedTask(t, db)
+	db.Model(&model.SummaryTask{}).Where("id = ?", id).Update("summary_mode", 1) // BY_GROUP
+	member := model.SummaryParticipant{TaskID: id, UserID: "other", Status: model.ParticipantCompleted}
+	if err := db.Create(&member).Error; err != nil {
+		t.Fatal(err)
+	}
+	pr := model.PersonalResult{TaskID: id, UserID: member.UserID, ParticipantRefID: member.ID,
+		Content: "discarded content", WorkerStatus: model.PersonalStatusCompleted}
+	db.Create(&pr)
+	hub := streaming.NewHub(time.Minute)
+	hub.Publish(streaming.Event{Type: streaming.EventStart, TaskID: id, TargetUserID: "other", RunID: "old"})
+	hub.Publish(streaming.Event{Type: streaming.EventDelta, TaskID: id, TargetUserID: "other", RunID: "old", Delta: pr.Content})
+	hub.Publish(streaming.Event{Type: streaming.EventDone, TaskID: id, TargetUserID: "other", RunID: "old"})
+	h := NewTaskHandler(db, nil, "")
+	h.SetStreamHub(hub)
+	w := doJSONRequest(setupRegenerateRouter(h), "POST", fmt.Sprintf("/api/v1/summaries/%d/regenerate", id), "creator1", nil)
+	if w.Code != 200 {
+		t.Fatalf("regenerate: %d %s", w.Code, w.Body)
+	}
+	db.First(&pr, pr.ID)
+	_, snapshot, done, cancel := hub.Subscribe(id, streaming.ScopePersonal, "other")
+	defer cancel()
+	if pr.Content != "" || snapshot != "" || done {
+		t.Fatalf("reset mismatch: persisted=%q stream=%q done=%v", pr.Content, snapshot, done)
 	}
 }

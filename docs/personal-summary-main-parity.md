@@ -70,6 +70,11 @@ existing migration mechanism before serving the paired frontend. Deploy the
 backend first. Back up existing data before migration; the down migration drops
 the new configuration column and therefore discards saved requirements.
 
+If `AGENT_PROMPT_DIR` overrides `summary_workspace.md`, remove the obsolete copy
+or update it to the paired `prepare_summary_draft` / `content_handle` protocol
+before rollout. External prompts take precedence over the embedded prompt;
+deploying the binary alone does not update those overrides.
+
 ## CR follow-up
 
 - Agent requests up to the chat limit remain intact in `generation_requirement`.
@@ -89,3 +94,33 @@ the new configuration column and therefore discards saved requirements.
   model calls, while the browser's transient recovery restarts the entire turn.
   It cannot resume the request-local draft. Tests pin no full-run replay for
   exhausted transport/429/503 failures as well as protocol errors.
+
+## CR follow-up — 2026-09-14
+
+- Draft content-quality failures (missing/invalid citations, empty/truncated or
+  oversized output, unexpected tool protocol) now retry only the tool-less writer,
+  at most twice after the first attempt. Each attempt uses identical authorized
+  data plus fixed validation feedback; no rejected tool call/body enters planner
+  history, no discovery/Map/Reduce work is repeated, and no handle is issued until
+  validation succeeds. The outer deadline and cancellation still bound the work.
+  Exhausted transport calls remain terminal; there is no browser whole-run replay.
+- Edit, both personal refinement transports and version restore lock task first,
+  then the personal result, in short persistence transactions after any model
+  call. They recheck state/version and sync the current locked display target.
+  Conflicts return 409 (or an SSE error on an already-open stream), not success.
+- Stream preparation now covers every accepted participant whose result was
+  cleared, independently of the narrower immediate-worker trigger roster.
+  Prepare stays before commit to prevent worker/poller races. A rare failed commit
+  may invalidate only the in-memory stream; the DB result remains authoritative
+  and the idle TTL bounds the entry. Generation-fencing redesign is separate work.
+- List/detail `topic` uses the bounded compatibility value. Full instructions
+  remain in detail `generation_requirement` and execution `EffectiveTopic()`.
+  Tests enforce the VARCHAR sink on configuration save as well as initial save
+  and regeneration. Requeue also resets each personal result's retry count.
+
+The opt-in `TestPersonalWritesMySQLConcurrency` covers four write handlers against
+concurrent task-status, current-display-target and personal-version changes.
+Run with `SUMMARY_CR_MYSQL_TEST_DSN` pointing to a **disposable** `summary_cr_*`
+database; the test creates missing tables and inserts synthetic rows only.
+The normal unit suite skips it without that variable. It does not contact a real
+LLM. SQLite tests are not a substitute for this row-lock verification.

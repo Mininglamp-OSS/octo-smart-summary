@@ -655,15 +655,19 @@ func (h *PersonalHandler) PersonalEdit(c *gin.Context) {
 	// it into the team summary. reviveCompletedForRecompute is race-safe + a strict
 	// no-op for any task not Completed / not BY_PERSON.
 	if err := h.db.Transaction(func(tx *gorm.DB) error {
-		var lockedTask model.SummaryTask
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&lockedTask, taskID).Error; err != nil {
+		lockedTask, err := lockPersonalWriteTask(tx, taskID, true)
+		if err != nil {
 			return err
 		}
-		if lockedTask.Status != model.StatusCompleted && lockedTask.Status != model.StatusFailed && lockedTask.Status != model.StatusCancelled {
-			return service.NewBizError(40005, "任务处理中，暂不能编辑", http.StatusConflict)
-		}
+		before := pr
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&pr, pr.ID).Error; err != nil {
 			return err
+		}
+		if err := checkPersonalWriteBaseline(before, pr); err != nil {
+			return err
+		}
+		if pr.WorkerStatus == model.PersonalStatusPending || pr.WorkerStatus == model.PersonalStatusProcessing {
+			return service.NewBizError(40005, "个人总结正在生成中", http.StatusConflict)
 		}
 		baseline, err := ensurePersonalVersionBaseline(tx, pr)
 		if err != nil {

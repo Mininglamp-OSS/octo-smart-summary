@@ -779,7 +779,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			"task_id":          t.ID,
 			"task_no":          t.TaskNo,
 			"title":            t.Title,
-			"topic":            t.EffectiveTopic(),
+			"topic":            t.DisplayTopic(),
 			"summary_mode":     t.SummaryMode,
 			"status":           t.Status,
 			"trigger_type":     t.TriggerType,
@@ -1033,7 +1033,7 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		"task_id":                task.ID,
 		"task_no":                task.TaskNo,
 		"title":                  task.Title,
-		"topic":                  task.EffectiveTopic(),
+		"topic":                  task.DisplayTopic(),
 		"generation_requirement": generationRequirement(h.db, task),
 		"summary_mode":           task.SummaryMode,
 		"status":                 task.Status,
@@ -1495,8 +1495,15 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 		// Prepare before Pending becomes visible to the worker poller at commit.
 		// There are no further database writes after resetting the stream.
 		if h.streamHub != nil {
+			// Reset every personal stream whose persisted result was cleared,
+			// not just the narrower roster eligible for an immediate trigger.
+			var resetParticipants []model.SummaryParticipant
+			if err := tx.Where("task_id = ? AND status NOT IN ?", taskID,
+				[]int{model.ParticipantPending, model.ParticipantDeclined}).Find(&resetParticipants).Error; err != nil {
+				return err
+			}
 			h.streamHub.Prepare(taskID, streaming.ScopeTeam, "")
-			for _, participant := range triggerParticipants {
+			for _, participant := range resetParticipants {
 				h.streamHub.Prepare(taskID, streaming.ScopePersonal, participant.UserID)
 			}
 		}
