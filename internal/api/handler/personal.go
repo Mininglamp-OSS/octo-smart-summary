@@ -655,7 +655,7 @@ func (h *PersonalHandler) PersonalEdit(c *gin.Context) {
 	// it into the team summary. reviveCompletedForRecompute is race-safe + a strict
 	// no-op for any task not Completed / not BY_PERSON.
 	if err := h.db.Transaction(func(tx *gorm.DB) error {
-		lockedTask, err := lockPersonalWriteTask(tx, taskID, true)
+		lockedTask, err := lockPersonalWriteTask(tx, taskID, true, true)
 		if err != nil {
 			return err
 		}
@@ -712,6 +712,9 @@ func (h *PersonalHandler) PersonalEdit(c *gin.Context) {
 		}
 		if participantCount > 1 {
 			return h.reviveCompletedForRecompute(tx, taskID)
+		}
+		if lockedTask.Status == model.StatusProcessing {
+			return service.NewBizError(40005, "任务状态已变更，请刷新后重试", http.StatusConflict)
 		}
 		return syncSinglePersonalDisplay(tx, lockedTask, req.Content, citationsJSON, now)
 	}); err != nil {

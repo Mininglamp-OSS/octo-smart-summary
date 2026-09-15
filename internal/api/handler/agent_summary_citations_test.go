@@ -55,11 +55,17 @@ func TestBuildAgentCompoundCitationsUsesWorkflowBuilder(t *testing.T) {
 	if cits[0].MessageSeq != 10 || cits[1].MessageSeq != 20 || cits[2].MessageSeq != 30 {
 		t.Fatal("source identity changed")
 	}
-	if citationsValid("Bad group [1,4] and good single [2]", cits, true) {
-		t.Fatal("finish gate skipped unresolved compound")
+	if !citationsValid("Numeric prose [1,4] and good single [2]", cits, true) {
+		t.Fatal("isolated numeric prose was rejected")
 	}
 	if !citationsValid("Good group [1,3] and single [2]", cits, true) {
 		t.Fatal("valid compound rejected")
+	}
+	if citationsValid("Valid [1], dangling [2], valid [3]", []model.Citation{{Index: 1}, {Index: 3}}, true) {
+		t.Fatal("finish gate accepted an unresolved single inside the evidence window")
+	}
+	if !citationsValid("规划 [2024-2025]，页码 [100-120]。", nil, false) {
+		t.Fatal("citation-free numeric prose was rejected")
 	}
 }
 

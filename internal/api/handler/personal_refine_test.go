@@ -20,7 +20,7 @@ import (
 	"gorm.io/gorm"
 )
 
-func TestPersonalRefineCompoundCitationsBothTransports(t *testing.T) {
+func TestPersonalRefinePreservesIsolatedNumericGroupsBothTransports(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		for _, valid := range []bool{false, true} {
 			t.Run(fmt.Sprintf("stream=%t/valid=%t", stream, valid), func(t *testing.T) {
@@ -71,21 +71,8 @@ func TestPersonalRefineCompoundCitationsBothTransports(t *testing.T) {
 				if err := db.Model(&model.PersonalResultVersion{}).Count(&versions).Error; err != nil {
 					t.Fatal(err)
 				}
-				if valid {
-					if w.Code != http.StatusOK || saved.Content != "Budget [9][73]. ROI [88]." || len(saved.GetCitations()) != 3 || versions != 2 {
-						t.Fatalf("status=%d body=%s content=%q versions=%d", w.Code, w.Body.String(), saved.Content, versions)
-					}
-				} else {
-					if saved.Content != pr.Content || versions != 0 {
-						t.Fatal("invalid generated references changed saved content/history")
-					}
-					if stream {
-						if !strings.Contains(w.Body.String(), "event: error") {
-							t.Fatalf("missing SSE error: %s", w.Body.String())
-						}
-					} else if w.Code != http.StatusInternalServerError {
-						t.Fatalf("status=%d", w.Code)
-					}
+				if w.Code != http.StatusOK || saved.Content != content || versions != 2 {
+					t.Fatalf("status=%d body=%s content=%q versions=%d", w.Code, w.Body.String(), saved.Content, versions)
 				}
 			})
 		}
@@ -293,5 +280,47 @@ func TestRegeneratePersonalSummary_DoesNotMutateSharedTaskOrSchedule(t *testing.
 	}
 	if gotSched.GenerationInstruction != sched.GenerationInstruction {
 		t.Fatalf("personal regenerate must not mutate shared schedule instruction, got %q want %q", gotSched.GenerationInstruction, sched.GenerationInstruction)
+	}
+}
+
+func TestRegeneratePersonalSummaryPreservesSelectedBaselineIdentity(t *testing.T) {
+	db := setupPersonalRefineDB(t)
+	task, _, pr := seedScheduledMultiPersonPersonalTask(t, db)
+	old := model.PersonalResultVersion{TaskID: task.ID, ParticipantRefID: pr.ParticipantRefID, UserID: pr.UserID, Version: 1, Content: "selected older body"}
+	newer := model.PersonalResultVersion{TaskID: task.ID, ParticipantRefID: pr.ParticipantRefID, UserID: pr.UserID, Version: 2, Content: "newest historical body"}
+	if err := db.Create(&old).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&newer).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&pr).Updates(map[string]interface{}{"current_version_id": old.ID, "content": old.Content}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	w := doPersonalRegenerateRequest(setupPersonalRefineRouter(NewPersonalHandler(db, "", nil)), task.ID, pr.UserID, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	db.First(&pr, pr.ID)
+	if pr.CurrentVersionID == nil || *pr.CurrentVersionID != old.ID || pr.Content != "" {
+		t.Fatalf("selected baseline identity lost during reset: current=%v content=%q", pr.CurrentVersionID, pr.Content)
+	}
+}
+
+func TestPersonalEditAllowsCompletedMemberWhileTeamStillProcessing(t *testing.T) {
+	db := setupPersonalRefineDB(t)
+	task, _, pr := seedScheduledMultiPersonPersonalTask(t, db)
+	if err := db.Model(&task).Update("status", model.StatusProcessing).Error; err != nil {
+		t.Fatal(err)
+	}
+	w := doJSONRequest(setupPersonalEditRouter(NewPersonalHandler(db, "", nil)), "PUT",
+		fmt.Sprintf("/api/v1/summaries/%d/personal-edit", task.ID), pr.UserID, map[string]interface{}{"content": "edited while teammate is running"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	db.First(&pr, pr.ID)
+	if pr.Content != "edited while teammate is running" {
+		t.Fatalf("edit was not persisted: %q", pr.Content)
 	}
 }

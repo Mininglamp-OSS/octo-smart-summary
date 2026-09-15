@@ -15,7 +15,7 @@ func TestWorkflowCompoundCitationFinalization(t *testing.T) {
 		{CitationIndex: 73, SenderUID: "bob", Content: "Budget details", ChannelID: "budget", MessageSeq: 102},
 		{CitationIndex: 88, SenderUID: "carol", Content: "ROI forecast", ChannelID: "forecast", MessageSeq: 201},
 	}
-	content := "Budget [9,73]. ROI [88]."
+	content := "Budget [88][9,73]."
 	citations := buildCitations(content, messages, messages, nil)
 	normalized, err := service.NormalizeGeneratedCitations(content, citations)
 	if err != nil {
@@ -23,7 +23,7 @@ func TestWorkflowCompoundCitationFinalization(t *testing.T) {
 	}
 	normalized, citations = dedupCitations(normalized, citations)
 	normalized = stripOrphanCitations(normalized, citations)
-	if normalized != "Budget [9][73]. ROI [88]." || len(citations) != 3 {
+	if normalized != "Budget [88][9][73]." || len(citations) != 3 {
 		t.Fatalf("lost compound citations: %q, %+v", normalized, citations)
 	}
 	for i, citation := range citations {
@@ -33,9 +33,9 @@ func TestWorkflowCompoundCitationFinalization(t *testing.T) {
 			t.Fatalf("source identity changed: %+v", citation)
 		}
 	}
-	broken := "Budget [9,74]. ROI [88]."
-	if _, err := service.NormalizeGeneratedCitations(broken, buildCitations(broken, messages, messages, nil)); err == nil {
-		t.Fatal("partially resolved group accepted")
+	prose := "Budget range [9,74]. ROI [88]."
+	if got, err := service.NormalizeGeneratedCitations(prose, buildCitations(prose, messages, messages, nil)); err != nil || got != prose {
+		t.Fatalf("numeric prose changed: %q %v", got, err)
 	}
 }
 

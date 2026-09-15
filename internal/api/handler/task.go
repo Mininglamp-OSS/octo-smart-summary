@@ -1397,6 +1397,7 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 	nextVer, _ := service.GetNextVersion(h.db, taskID)
 	now := timezone.Now()
 	var triggerParticipants []model.SummaryParticipant
+	var resetParticipants []model.SummaryParticipant
 
 	err = h.db.Transaction(func(tx *gorm.DB) error {
 		// Atomic status transition: only proceed if the task is still in a
@@ -1492,19 +1493,12 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 		if err := triggerQuery.Find(&triggerParticipants).Error; err != nil {
 			return err
 		}
-		// Prepare before Pending becomes visible to the worker poller at commit.
-		// There are no further database writes after resetting the stream.
 		if h.streamHub != nil {
 			// Reset every personal stream whose persisted result was cleared,
 			// not just the narrower roster eligible for an immediate trigger.
-			var resetParticipants []model.SummaryParticipant
 			if err := tx.Where("task_id = ? AND status NOT IN ?", taskID,
 				[]int{model.ParticipantPending, model.ParticipantDeclined}).Find(&resetParticipants).Error; err != nil {
 				return err
-			}
-			h.streamHub.Prepare(taskID, streaming.ScopeTeam, "")
-			for _, participant := range resetParticipants {
-				h.streamHub.Prepare(taskID, streaming.ScopePersonal, participant.UserID)
 			}
 		}
 		return nil
@@ -1518,6 +1512,14 @@ func (h *TaskHandler) Regenerate(c *gin.Context) {
 		log.Printf("[handler] Regenerate tx error: %v", err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
 		return
+	}
+	// Do not mutate in-memory stream state until the database transition is
+	// committed. A failed commit must leave subscribers on the persisted run.
+	if h.streamHub != nil {
+		h.streamHub.Prepare(taskID, streaming.ScopeTeam, "")
+		for _, participant := range resetParticipants {
+			h.streamHub.Prepare(taskID, streaming.ScopePersonal, participant.UserID)
+		}
 	}
 
 	for _, participant := range triggerParticipants {

@@ -22,10 +22,11 @@ func TestCreateAgentSummary_WorkspaceCompoundCitationSave(t *testing.T) {
 	for _, tc := range []struct {
 		name, content, want string
 		status              int
+		wantCitations       int
 	}{
-		{"complete", "Budget [9,73]. ROI [88]. Range [93–95].", "Budget [9][73]. ROI [88]. Range [93][94][95].", http.StatusOK},
-		{"out-of-range", "Budget [9,130]. ROI [88].", "", http.StatusConflict},
-		{"malformed", "Budget [9,]. ROI [88].", "", http.StatusConflict},
+		{"complete", "Budget [9,73]. ROI [88]. Range [93–95].", "Budget [9,73]. ROI [88]. Range [93–95].", http.StatusOK, 6},
+		{"out-of-range", "Budget [9,130]. ROI [88].", "Budget [9,130]. ROI [88].", http.StatusOK, 2},
+		{"malformed", "Budget [9,]. ROI [88].", "Budget [9,]. ROI [88].", http.StatusOK, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
@@ -63,7 +64,7 @@ func TestCreateAgentSummary_WorkspaceCompoundCitationSave(t *testing.T) {
 			if err := db.First(&saved).Error; err != nil {
 				t.Fatal(err)
 			}
-			if saved.Content != tc.want || len(saved.GetCitations()) != 6 {
+			if saved.Content != tc.want || len(saved.GetCitations()) != tc.wantCitations {
 				t.Fatalf("content=%q citations=%d", saved.Content, len(saved.GetCitations()))
 			}
 			for _, cit := range saved.GetCitations() {

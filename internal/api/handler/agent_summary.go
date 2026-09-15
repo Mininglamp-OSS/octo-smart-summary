@@ -11,7 +11,6 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/finishgate"
-	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
@@ -751,13 +750,6 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 				workspaceCitationFallback = contentHasCitationSequence(content)
 				log.Printf("[handler] CreateAgentSummary stripped dangling citation markers (borrow returned empty) session=%s ref_task_id=%d",
 					req.SessionID, req.ReferencedTaskIDs[0])
-			}
-		}
-		// No built metadata is not proof of an empty evidence window here:
-		// fetch/build/borrow may have failed. Keep this save boundary strict.
-		if len(cits) == 0 {
-			if _, err := citationtext.Canonicalize(content, nil, -1); err != nil {
-				return fmt.Errorf("%w: compound references have no evidence", errWorkspacePreviewCitationUnresolved)
 			}
 		}
 		normalizedContent, citationErr := service.NormalizeGeneratedCitations(content, cits)

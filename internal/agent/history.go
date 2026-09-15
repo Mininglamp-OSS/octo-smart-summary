@@ -277,6 +277,10 @@ func stripInvalidToolHistory(history []Message) []Message {
 	for i := 0; i < len(history); i++ {
 		message := history[i]
 		if !validToolArguments(message.ToolCalls) {
+			if strings.TrimSpace(message.Content) != "" {
+				message.ToolCalls = nil
+				out = append(out, message)
+			}
 			for i+1 < len(history) && history[i+1].Role == "tool" {
 				i++
 			}
