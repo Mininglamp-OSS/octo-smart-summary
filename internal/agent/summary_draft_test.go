@@ -330,9 +330,15 @@ func TestPreparedDraftFailureHasBoundedWriterRepairsWithoutReopeningTools(t *tes
 				return test.turn, test.err
 			})
 			ctx := WithSummaryCitationTracking(context.Background())
-			markSummaryCitationEvidence(ctx, citationTestMessages("channel", 1, 1))
+			pool := citationTestMessages("channel", 1, 1)
+			pool[0].CitationIndex = 1
+			markSummaryCitationEvidence(ctx, pool)
+			setSummaryCitationWindow(ctx, pool)
 			reg := draftTestRegistry()
 			reg.Register(Tool{Function: ToolFunction{Name: "merge_summaries"}}, func(context.Context, json.RawMessage) (string, error) {
+				if test.name == "citations" {
+					return `{"merged_summary":"invalid merged evidence [2]"}`, nil
+				}
 				return `{"merged_summary":"evidence [1]"}`, nil
 			})
 			runner := NewRunner(client, reg, NewPool(2), terminalPolicy(5))
@@ -447,6 +453,60 @@ func TestPreparedDraftCanonicalizesGroupsWithoutAnotherModelCall(t *testing.T) {
 	// Count/max cannot stand in for actual membership of a sparse manifest.
 	if summaryDraftQualityFailure(ctx, AssistantTurn{Content: "Missing [10] but valid [9]"}) != "invalid_citations" {
 		t.Fatal("accepted a gap in frozen evidence")
+	}
+}
+
+func TestPreparedDraftFallsBackToValidatedMergedAnalysisAfterCitationRepairs(t *testing.T) {
+	calls := 0
+	ctx := WithSummaryCitationTracking(draftTestContext(draftTestClient(func(context.Context, []Message, []Tool) (AssistantTurn, error) {
+		calls++
+		return AssistantTurn{Content: "unknown citation [2]", Tokens: 5}, nil
+	})))
+	pool := citationTestMessages("channel", 1, 1)
+	pool[0].CitationIndex = 1
+	markSummaryCitationEvidence(ctx, pool)
+	setSummaryCitationWindow(ctx, pool)
+	input := ctx.Value(summaryDraftInputKey{}).(summaryDraftInput)
+	input.messages = []Message{{
+		Role:    "tool",
+		Name:    "merge_summaries",
+		Content: `{"merged_summary":"validated merged evidence [1]"}`,
+	}}
+	ctx = context.WithValue(ctx, summaryDraftInputKey{}, input)
+
+	_, prepare := PrepareSummaryDraftTool()
+	if _, err := prepare(ctx, json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1+maxSummaryDraftRepairs {
+		t.Fatalf("writer calls = %d, want %d", calls, 1+maxSummaryDraftRepairs)
+	}
+	if got := draftState(ctx).text; got != "validated merged evidence [1]" {
+		t.Fatalf("fallback draft = %q", got)
+	}
+}
+
+func TestPreparedDraftRejectsInvalidMergedAnalysisFallback(t *testing.T) {
+	ctx := WithSummaryCitationTracking(draftTestContext(draftTestClient(func(context.Context, []Message, []Tool) (AssistantTurn, error) {
+		return AssistantTurn{Content: "unknown citation [2]"}, nil
+	})))
+	pool := citationTestMessages("channel", 1, 1)
+	pool[0].CitationIndex = 1
+	markSummaryCitationEvidence(ctx, pool)
+	setSummaryCitationWindow(ctx, pool)
+	input := ctx.Value(summaryDraftInputKey{}).(summaryDraftInput)
+	input.messages = []Message{{
+		Role:    "tool",
+		Name:    "merge_summaries",
+		Content: `{"merged_summary":"also unknown [2]"}`,
+	}}
+	ctx = context.WithValue(ctx, summaryDraftInputKey{}, input)
+
+	_, prepare := PrepareSummaryDraftTool()
+	_, err := prepare(ctx, json.RawMessage(`{}`))
+	var draftErr *SummaryDraftError
+	if !errors.As(err, &draftErr) || draftErr.Reason != "invalid_citations" {
+		t.Fatalf("err = %v, want invalid_citations", err)
 	}
 }
 
