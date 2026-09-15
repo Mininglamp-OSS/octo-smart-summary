@@ -26,17 +26,42 @@ func escapeCitationMarkers(content string) string {
 }
 
 // personalStuckLease is how long a personal summary may hold
-// ParticipantProcessing before scanStuckPersonalTasks (which runs every 60s)
-// treats it as stuck and re-dispatches it. It is the single source of truth for
-// that window: both the scanner and the per-run deadline below derive from it,
-// so they cannot drift apart.
+// ParticipantProcessing without renewing worker_started_at before
+// scanStuckPersonalTasks (which runs every 60s) treats it as stuck and
+// re-dispatches it. It is the single source of truth for that window: both the
+// scanner and the lease heartbeat below derive from it, so they cannot drift.
 const personalStuckLease = 10 * time.Minute
 
-// personalRunGrace is the slack reserved under personalStuckLease for a run's
-// own post-LLM work (persistence, status writes) plus the scanner's 60s tick,
-// so a run bounded by personalStuckLease-personalRunGrace cancels and clears its
-// Processing state before the earliest moment it could be re-dispatched.
-const personalRunGrace = 60 * time.Second
+// personalLeaseHeartbeat is how often a live run renews worker_started_at. At a
+// third of the lease, a live run's timestamp is never older than ~200s, so even
+// a couple of missed ticks cannot push it past the stuck window — only an
+// actually-dead worker (no more renewals) can.
+const personalLeaseHeartbeat = personalStuckLease / 3
+
+// startLeaseHeartbeat renews the participant's worker_started_at every
+// personalLeaseHeartbeat until the returned stop func is called (defer it at the
+// run's top). It writes on p.db (never the run's ctx) so it survives whatever
+// the run's context does, and is guarded by status=Processing so it can never
+// resurrect the timestamp on a row the terminal/retry path has already cleared.
+func (p *Processor) startLeaseHeartbeat(participantRefID int64) func() {
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(personalLeaseHeartbeat)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				p.db.Model(&model.SummaryParticipant{}).
+					Where("id = ? AND status = ?", participantRefID, model.ParticipantProcessing).
+					Update("worker_started_at", timezone.Now())
+			}
+		}
+	}()
+	var once sync.Once
+	return func() { once.Do(func() { close(done) }) }
+}
 
 const noRelevantContentMessage = pipeline.NoRelevantContentMessage
 
@@ -181,20 +206,6 @@ func (p *Processor) processPersonalSummaryAllowCompleted(ctx context.Context, ta
 func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskID, participantRefID int64, allowCompletedTask bool) {
 	log.Printf("[personal-worker] start task=%d participant=%d allow_completed=%t", taskID, participantRefID, allowCompletedTask)
 
-	// Bound the whole run so it cancels and fails cleanly BEFORE the stuck
-	// scanner (scanStuckPersonalTasks, every 60s) would re-dispatch it (#220).
-	// Worker LLM work roots at context.Background() with no deadline, so a
-	// degraded run doing a full retry+fallback sequence (~727s at LLM_TIMEOUT=180s,
-	// 3 attempts + a fallback) outlives the 600s personal lease and gets a
-	// SECOND concurrent dispatch — the same summary computed twice. The deadline
-	// propagates through ctx into every p.llm.Call* below (requests are built on
-	// ctx), so expiry cancels the in-flight attempt; the error is retry-count
-	// classified (markPersonalFailed), turning a would-be duplicate into a clean
-	// retry. personalRunGrace reserves room under the lease for the scanner's 60s
-	// tick and this run's own persistence.
-	ctx, cancel := context.WithTimeout(ctx, personalStuckLease-personalRunGrace)
-	defer cancel()
-
 	// Load participant
 	var participant model.SummaryParticipant
 	if err := p.db.First(&participant, participantRefID).Error; err != nil {
@@ -222,6 +233,17 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 		"status":            model.ParticipantProcessing,
 		"worker_started_at": now,
 	})
+
+	// Renew the participant's lease while this run is alive so the stuck scanner
+	// only re-dispatches a run whose worker has actually died, never a slow but
+	// live one (#220 §2). A degraded run's full retry+fallback sequence (~727s at
+	// LLM_TIMEOUT=180s) legitimately outlives the 600s stuck window; without a
+	// heartbeat it looks identical to a crashed worker and gets a second
+	// concurrent dispatch — the same summary computed twice. Bounding the run
+	// instead would starve the configured fallback and truncate the SSE stream,
+	// so we keep the run unbounded and refresh worker_started_at.
+	stopHeartbeat := p.startLeaseHeartbeat(participantRefID)
+	defer stopHeartbeat()
 
 	// CAS update task status to PROCESSING (from any earlier state).
 	// personal_regenerate is allowed to run against an already-Completed task

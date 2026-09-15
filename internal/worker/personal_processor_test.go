@@ -621,25 +621,20 @@ func TestMarkPersonalFailed_SequentialRetry_AccumulatesThenTerminal(t *testing.T
 	}
 }
 
-// TestPersonalRunBudgetCancelsBeforeReDispatch pins the #220 invariant: the
-// per-run deadline (personalStuckLease-personalRunGrace, applied in
-// processPersonalSummaryWithOptions) must fire strictly before the stuck
-// scanner would re-dispatch the run, with at least one 60s scanner tick of
-// slack for the run's own persistence. Otherwise a slow run and its
-// re-dispatch race and the same summary is computed twice.
-func TestPersonalRunBudgetCancelsBeforeReDispatch(t *testing.T) {
-	if personalRunGrace <= 0 {
-		t.Fatalf("personalRunGrace must be positive, got %v", personalRunGrace)
+// TestPersonalLeaseHeartbeatRenewsBeforeStuck pins the #220 invariant: a live
+// run must renew worker_started_at often enough that the stuck scanner never
+// mistakes it for a dead worker. Requiring at least two heartbeats to fit inside
+// the lease means a single missed tick still cannot push a live run past the
+// stuck window.
+func TestPersonalLeaseHeartbeatRenewsBeforeStuck(t *testing.T) {
+	if personalLeaseHeartbeat <= 0 {
+		t.Fatalf("personalLeaseHeartbeat must be positive, got %v", personalLeaseHeartbeat)
 	}
-	budget := personalStuckLease - personalRunGrace
-	if budget <= 0 {
-		t.Fatalf("run budget non-positive: lease=%v grace=%v", personalStuckLease, personalRunGrace)
+	if personalLeaseHeartbeat >= personalStuckLease {
+		t.Fatalf("heartbeat %v must be shorter than the stuck lease %v", personalLeaseHeartbeat, personalStuckLease)
 	}
-	if budget >= personalStuckLease {
-		t.Fatalf("run budget %v must be strictly under the stuck lease %v", budget, personalStuckLease)
-	}
-	if personalStuckLease-budget < 60*time.Second {
-		t.Errorf("only %v slack under the %v lease; want >= 60s for the scanner tick + persistence",
-			personalStuckLease-budget, personalStuckLease)
+	if personalLeaseHeartbeat*2 >= personalStuckLease {
+		t.Errorf("heartbeat %v leaves no room for a missed tick under the %v lease; want at least two heartbeats to fit",
+			personalLeaseHeartbeat, personalStuckLease)
 	}
 }
