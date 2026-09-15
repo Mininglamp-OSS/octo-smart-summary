@@ -462,7 +462,7 @@ func scanStuckTasks(db *gorm.DB, maxRetry int, notifier *notify.Notifier) {
 // and detects accepted participants with PENDING personal_result that were never triggered.
 func scanStuckPersonalTasks(db *gorm.DB, workerTriggerURL string) {
 	now := timezone.Now()
-	leaseTimeout := now.Add(-10 * time.Minute)
+	leaseTimeout := now.Add(-personalStuckLease)
 
 	// Find participants stuck in processing
 	var stuck []model.SummaryParticipant

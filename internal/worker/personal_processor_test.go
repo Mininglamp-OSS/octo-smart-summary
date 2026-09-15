@@ -620,3 +620,26 @@ func TestMarkPersonalFailed_SequentialRetry_AccumulatesThenTerminal(t *testing.T
 		t.Fatalf("after reaching maxRetry: worker_status=%d, want Failed(terminal) -- no infinite re-run", g3.WorkerStatus)
 	}
 }
+
+// TestPersonalRunBudgetCancelsBeforeReDispatch pins the #220 invariant: the
+// per-run deadline (personalStuckLease-personalRunGrace, applied in
+// processPersonalSummaryWithOptions) must fire strictly before the stuck
+// scanner would re-dispatch the run, with at least one 60s scanner tick of
+// slack for the run's own persistence. Otherwise a slow run and its
+// re-dispatch race and the same summary is computed twice.
+func TestPersonalRunBudgetCancelsBeforeReDispatch(t *testing.T) {
+	if personalRunGrace <= 0 {
+		t.Fatalf("personalRunGrace must be positive, got %v", personalRunGrace)
+	}
+	budget := personalStuckLease - personalRunGrace
+	if budget <= 0 {
+		t.Fatalf("run budget non-positive: lease=%v grace=%v", personalStuckLease, personalRunGrace)
+	}
+	if budget >= personalStuckLease {
+		t.Fatalf("run budget %v must be strictly under the stuck lease %v", budget, personalStuckLease)
+	}
+	if personalStuckLease-budget < 60*time.Second {
+		t.Errorf("only %v slack under the %v lease; want >= 60s for the scanner tick + persistence",
+			personalStuckLease-budget, personalStuckLease)
+	}
+}

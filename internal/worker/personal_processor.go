@@ -25,6 +25,19 @@ func escapeCitationMarkers(content string) string {
 	return citationRe.ReplaceAllString(content, "($1)")
 }
 
+// personalStuckLease is how long a personal summary may hold
+// ParticipantProcessing before scanStuckPersonalTasks (which runs every 60s)
+// treats it as stuck and re-dispatches it. It is the single source of truth for
+// that window: both the scanner and the per-run deadline below derive from it,
+// so they cannot drift apart.
+const personalStuckLease = 10 * time.Minute
+
+// personalRunGrace is the slack reserved under personalStuckLease for a run's
+// own post-LLM work (persistence, status writes) plus the scanner's 60s tick,
+// so a run bounded by personalStuckLease-personalRunGrace cancels and clears its
+// Processing state before the earliest moment it could be re-dispatched.
+const personalRunGrace = 60 * time.Second
+
 const noRelevantContentMessage = pipeline.NoRelevantContentMessage
 
 const noSelfMessagesMessage = pipeline.NoSelfMessagesMessage
@@ -167,6 +180,20 @@ func (p *Processor) processPersonalSummaryAllowCompleted(ctx context.Context, ta
 
 func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskID, participantRefID int64, allowCompletedTask bool) {
 	log.Printf("[personal-worker] start task=%d participant=%d allow_completed=%t", taskID, participantRefID, allowCompletedTask)
+
+	// Bound the whole run so it cancels and fails cleanly BEFORE the stuck
+	// scanner (scanStuckPersonalTasks, every 60s) would re-dispatch it (#220).
+	// Worker LLM work roots at context.Background() with no deadline, so a
+	// degraded run doing a full retry+fallback sequence (~727s at LLM_TIMEOUT=180s,
+	// 3 attempts + a fallback) outlives the 600s personal lease and gets a
+	// SECOND concurrent dispatch — the same summary computed twice. The deadline
+	// propagates through ctx into every p.llm.Call* below (requests are built on
+	// ctx), so expiry cancels the in-flight attempt; the error is retry-count
+	// classified (markPersonalFailed), turning a would-be duplicate into a clean
+	// retry. personalRunGrace reserves room under the lease for the scanner's 60s
+	// tick and this run's own persistence.
+	ctx, cancel := context.WithTimeout(ctx, personalStuckLease-personalRunGrace)
+	defer cancel()
 
 	// Load participant
 	var participant model.SummaryParticipant
