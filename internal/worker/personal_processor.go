@@ -32,30 +32,72 @@ func escapeCitationMarkers(content string) string {
 // scanner and the lease heartbeat below derive from it, so they cannot drift.
 const personalStuckLease = 10 * time.Minute
 
-// personalLeaseHeartbeat is how often a live run renews worker_started_at. At a
-// third of the lease, a live run's timestamp is never older than ~200s, so even
-// a couple of missed ticks cannot push it past the stuck window — only an
-// actually-dead worker (no more renewals) can.
+// personalLeaseHeartbeat is how often a live run renews its leases. At a third
+// of the participant lease, a live run's timestamp is never older than ~200s,
+// so even a couple of missed ticks cannot push it past the stuck window — only
+// an actually-dead worker (no more renewals) can.
 const personalLeaseHeartbeat = personalStuckLease / 3
 
-// startLeaseHeartbeat renews the participant's worker_started_at every
-// personalLeaseHeartbeat until the returned stop func is called (defer it at the
-// run's top). It writes on p.db (never the run's ctx) so it survives whatever
-// the run's context does, and is guarded by status=Processing so it can never
-// resurrect the timestamp on a row the terminal/retry path has already cleared.
-func (p *Processor) startLeaseHeartbeat(participantRefID int64) func() {
+// personalRunCeiling caps how long a run keeps renewing its leases. Fetch alone
+// carries a ~20m client budget and the LLM retry+fallback path ~12m, so a
+// legitimate personal run finishes well under this; a run still alive past it is
+// almost certainly wedged (e.g. a dropped MySQL connection on a ctx-less query,
+// which nothing else bounds). At the ceiling we stop renewing so the stuck
+// scanner regains its recovery path rather than pinning the participant forever.
+const personalRunCeiling = 40 * time.Minute
+
+// startLeaseHeartbeat renews both leases a live personal run holds — the
+// participant's worker_started_at (scanStuckPersonalTasks) and the task's
+// processing_deadline (scanStuckTasks) — until the returned stop func is called
+// (defer it). Renewing keeps the scanners from mistaking a slow-but-alive run
+// for a dead worker and double-dispatching it (#220 §2), while the ceiling and
+// the RowsAffected==0 fence keep a wedged or lease-lost run from renewing
+// forever.
+func (p *Processor) startLeaseHeartbeat(taskID, participantRefID int64) func() {
+	return p.startLeaseHeartbeatEvery(taskID, participantRefID, personalLeaseHeartbeat, personalRunCeiling)
+}
+
+// startLeaseHeartbeatEvery is startLeaseHeartbeat with injectable timings for
+// tests. All writes are on p.db (never the run ctx) so they survive whatever the
+// run's context does, and are guarded by status=Processing so they can never
+// resurrect a row the terminal/retry path has already cleared.
+func (p *Processor) startLeaseHeartbeatEvery(taskID, participantRefID int64, interval, ceiling time.Duration) func() {
 	done := make(chan struct{})
 	go func() {
-		t := time.NewTicker(personalLeaseHeartbeat)
+		t := time.NewTicker(interval)
 		defer t.Stop()
+		expiry := timezone.Now().Add(ceiling)
 		for {
 			select {
 			case <-done:
 				return
 			case <-t.C:
-				p.db.Model(&model.SummaryParticipant{}).
+				if !timezone.Now().Before(expiry) {
+					log.Printf("[personal-worker] participant=%d lease heartbeat hit the %v ceiling; stopping renewal so the stuck scanner can reclaim a wedged run", participantRefID, ceiling)
+					return
+				}
+				// Participant lease. RowsAffected==0 is the fence: the row is no
+				// longer Processing (the scanner reset it, or a re-dispatch owns it),
+				// so this run has lost its lease — stop renewing rather than keep a
+				// lost lease alive.
+				res := p.db.Model(&model.SummaryParticipant{}).
 					Where("id = ? AND status = ?", participantRefID, model.ParticipantProcessing).
 					Update("worker_started_at", timezone.Now())
+				if res.Error != nil {
+					log.Printf("[personal-worker] participant=%d lease heartbeat error: %v", participantRefID, res.Error)
+					continue
+				}
+				if res.RowsAffected == 0 {
+					log.Printf("[personal-worker] participant=%d no longer Processing; stopping lease heartbeat (lease lost)", participantRefID)
+					return
+				}
+				// Sibling task lease (scanStuckTasks, WorkerLeaseMinutes). Guarded by
+				// task status=Processing so it never resurrects a finished task.
+				if err := p.db.Model(&model.SummaryTask{}).
+					Where("id = ? AND status = ?", taskID, model.StatusProcessing).
+					Update("processing_deadline", timezone.Now().Add(time.Duration(p.cfg.WorkerLeaseMinutes)*time.Minute)).Error; err != nil {
+					log.Printf("[personal-worker] task=%d task-lease heartbeat error: %v", taskID, err)
+				}
 			}
 		}
 	}()
@@ -234,17 +276,6 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 		"worker_started_at": now,
 	})
 
-	// Renew the participant's lease while this run is alive so the stuck scanner
-	// only re-dispatches a run whose worker has actually died, never a slow but
-	// live one (#220 §2). A degraded run's full retry+fallback sequence (~727s at
-	// LLM_TIMEOUT=180s) legitimately outlives the 600s stuck window; without a
-	// heartbeat it looks identical to a crashed worker and gets a second
-	// concurrent dispatch — the same summary computed twice. Bounding the run
-	// instead would starve the configured fallback and truncate the SSE stream,
-	// so we keep the run unbounded and refresh worker_started_at.
-	stopHeartbeat := p.startLeaseHeartbeat(participantRefID)
-	defer stopHeartbeat()
-
 	// CAS update task status to PROCESSING (from any earlier state).
 	// personal_regenerate is allowed to run against an already-Completed task
 	// without flipping the whole task back to Processing; the user will explicitly
@@ -282,6 +313,18 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 		p.markPersonalFailed(&pr, &participant, "task not found")
 		return
 	}
+
+	// Both leases are established (participant Processing above, task
+	// Processing/deadline in the CAS) — renew them while this run is alive so the
+	// stuck scanners only reclaim a run whose worker actually died, never a
+	// slow-but-live one (#220 §2). A degraded run's retry+fallback sequence
+	// (~727s) plus the fetch stage's ~20m budget legitimately exceed both the
+	// 600s participant window and the 20m task lease; without renewal each scanner
+	// re-dispatches or fails the task mid-run. The heartbeat carries its own
+	// absolute ceiling (personalRunCeiling) and a lease-lost fence, and stops at
+	// the run's exit.
+	stopHeartbeat := p.startLeaseHeartbeat(taskID, participantRefID)
+	defer stopHeartbeat()
 
 	nonNegativeMs := func(start time.Time) int64 {
 		if start.IsZero() {
