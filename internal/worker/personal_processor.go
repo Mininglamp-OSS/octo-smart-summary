@@ -820,6 +820,14 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	if err := p.db.Where("task_id = ?", task.ID).Find(&sources).Error; err != nil {
 		return "", nil, 0, 0, "", fmt.Errorf("load sources: %w", err)
 	}
+	documentMode := documentSourcesOnly(sources)
+	if !documentMode {
+		for _, source := range sources {
+			if source.SourceType == model.SourceDocument {
+				return "", nil, 0, 0, "", fmt.Errorf("document sources cannot be mixed with chat sources")
+			}
+		}
+	}
 
 	specifiedSources := explicitSpecifiedSources(sources)
 
@@ -854,7 +862,9 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	var messages []pipeline.Message
 	var intentResult *pipeline.IntentResult
 	var err error
-	if p.fetchPersonalMessagesFn != nil {
+	if documentMode {
+		messages, err = loadDocumentEvidence(p.db, sources)
+	} else if p.fetchPersonalMessagesFn != nil {
 		messages, intentResult, err = p.fetchPersonalMessagesFn(ctx, task, userID)
 	} else {
 		messages, intentResult, err = pipeline.ResolveAndFetchMessagesForPersonal(
@@ -883,7 +893,15 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 
 	// Resolve sender names (for display in summary)
 	resolveStart := time.Now()
-	nameMap, botSet := p.batchResolveUserNames(messages)
+	nameMap := make(map[string]string)
+	botSet := make(map[string]bool)
+	if documentMode {
+		for _, message := range messages {
+			nameMap[message.SenderUID] = message.SourceName
+		}
+	} else {
+		nameMap, botSet = p.batchResolveUserNames(messages)
+	}
 	timing.Observe(taskNo, "resolve_user_names", resolveStart)
 	log.Printf("[personal-worker] batchResolveUserNames took %dms (%d names, %d bots)",
 		time.Since(resolveStart).Milliseconds(), len(nameMap), len(botSet))
@@ -926,7 +944,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	// summary would over-widen to ALL messages. So re-resolve against the actual
 	// post-fetch senders (nameMap, untruncated) whenever we have no target and the
 	// topic is not purely generic (pure_generic_topic by definition names no one).
-	if topic := task.EffectiveTopic(); len(targetUIDs) == 0 && intentResult.SkipReason != "pure_generic_topic" && topic != "" {
+	if topic := task.EffectiveTopic(); !documentMode && len(targetUIDs) == 0 && intentResult != nil && intentResult.SkipReason != "pure_generic_topic" && topic != "" {
 		if fallback := pipeline.ResolveTopicTarget(ctx, topic, nameMap, userID, toolCallFn); len(fallback) > 0 {
 			targetUIDs = fallback
 			log.Printf("[personal-worker] target resolved via post-fetch fallback: %v (creator=%s)", targetUIDs, userID)
@@ -1011,6 +1029,9 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	// and are unaffected.
 	if targetMsgCount == 0 {
 		targetMsgCount = len(userMessages)
+	}
+	if documentMode {
+		targetMsgCount = len(sources)
 	}
 
 	if reportStage != nil {
@@ -1100,6 +1121,10 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 
 	startTime := task.TimeRangeStart.Format("2006-01-02 15:04")
 	endTime := task.TimeRangeEnd.Format("2006-01-02 15:04")
+	if documentMode {
+		startTime = ""
+		endTime = ""
+	}
 	sourceName := sourceNameForGeneration(sources)
 
 	// Determine userName: use target's name when topic points to someone else
@@ -1124,9 +1149,13 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		// Skip Map-Reduce: call Map once with all messages (single chunk)
 		var formatted []string
 		for _, m := range userMessages {
-			formatted = append(formatted, fmt.Sprintf("[%d][%s] %s: %s",
-				m.CitationIndex, m.SendTime, m.SenderName,
-				escapeCitationMarkers(m.Content)))
+			if documentMode {
+				formatted = append(formatted, formatDocumentEvidence(m))
+			} else {
+				formatted = append(formatted, fmt.Sprintf("[%d][%s] %s: %s",
+					m.CitationIndex, m.SendTime, m.SenderName,
+					escapeCitationMarkers(m.Content)))
+			}
 		}
 
 		if reportStage != nil {
@@ -1136,10 +1165,15 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		mapStart := time.Now()
 		mapCallStart := time.Now()
 		var err error
-		finalContent, totalTokens, modelVer, err = p.llm.CallMapStreamWithModel(ctx,
-			joinStrings(formatted), sourceName, 0, len(userMessages),
-			startTime, endTime, generationTopic, userName, streamDelta,
-		)
+		if documentMode {
+			finalContent, totalTokens, modelVer, err = p.llm.CallDocumentMapStreamWithModel(ctx,
+				joinStrings(formatted), sourceName, 0, len(userMessages), generationTopic, streamDelta)
+		} else {
+			finalContent, totalTokens, modelVer, err = p.llm.CallMapStreamWithModel(ctx,
+				joinStrings(formatted), sourceName, 0, len(userMessages),
+				startTime, endTime, generationTopic, userName, streamDelta,
+			)
+		}
 		timing.RecordLLMSince(taskNo, "Map: 单次总结(跳过Map-Reduce)", mapCallStart, totalTokens)
 		timing.Observe(taskNo, "llm_map_summary", mapStart)
 		if err != nil {
@@ -1192,9 +1226,13 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 
 				var formatted []string
 				for _, m := range c {
-					formatted = append(formatted, fmt.Sprintf("[%d][%s] %s: %s",
-						m.CitationIndex, m.SendTime, m.SenderName,
-						escapeCitationMarkers(m.Content)))
+					if documentMode {
+						formatted = append(formatted, formatDocumentEvidence(m))
+					} else {
+						formatted = append(formatted, fmt.Sprintf("[%d][%s] %s: %s",
+							m.CitationIndex, m.SendTime, m.SenderName,
+							escapeCitationMarkers(m.Content)))
+					}
 				}
 
 				callStart := time.Now()
@@ -1202,11 +1240,17 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 				var tokens int
 				var usedModel string
 				var err error
-				if len(chunks) == 1 {
+				if len(chunks) == 1 && documentMode {
+					summary, tokens, usedModel, err = p.llm.CallDocumentMapStreamWithModel(ctx,
+						joinStrings(formatted), sourceName, idx, len(c), generationTopic, streamDelta)
+				} else if len(chunks) == 1 {
 					summary, tokens, usedModel, err = p.llm.CallMapStreamWithModel(ctx,
 						joinStrings(formatted), sourceName, idx, len(c),
 						startTime, endTime, generationTopic, userName, streamDelta,
 					)
+				} else if documentMode {
+					summary, tokens, usedModel, err = p.llm.CallDocumentMapWithModel(ctx,
+						joinStrings(formatted), sourceName, idx, len(c), generationTopic)
 				} else {
 					summary, tokens, usedModel, err = p.llm.CallMapWithModel(ctx,
 						joinStrings(formatted), sourceName, idx, len(c),
@@ -1273,9 +1317,14 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 			// Multiple chunks: execute Reduce to merge
 			var err error
 			reduceCallStart := time.Now()
-			finalContent, reduceTokens, modelVer, err = p.llm.CallReduceStreamWithModel(ctx,
-				chunkSummaries, sourceName, startTime, endTime, targetMsgCount, generationTopic, streamDelta,
-			)
+			if documentMode {
+				finalContent, reduceTokens, modelVer, err = p.llm.CallDocumentReduceStreamWithModel(ctx,
+					chunkSummaries, sourceName, len(userMessages), generationTopic, streamDelta)
+			} else {
+				finalContent, reduceTokens, modelVer, err = p.llm.CallReduceStreamWithModel(ctx,
+					chunkSummaries, sourceName, startTime, endTime, targetMsgCount, generationTopic, streamDelta,
+				)
+			}
 			timing.RecordLLMSince(taskNo, "Reduce: 合并分块总结", reduceCallStart, reduceTokens)
 			if err != nil {
 				return "", nil, 0, 0, "", fmt.Errorf("reduce: %w", err)

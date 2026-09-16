@@ -52,9 +52,9 @@ type ChannelInfo struct {
 
 // Message represents a fetched chat message.
 type Message struct {
-	MessageSeq    int64  `json:"message_seq"`
-	SenderUID     string `json:"sender_uid"`
-	SenderName    string `json:"sender_name"`
+	MessageSeq int64  `json:"message_seq"`
+	SenderUID  string `json:"sender_uid"`
+	SenderName string `json:"sender_name"`
 	// SenderIsBot marks whether the sender is a bot (IM user.robot=1 OR
 	// uid present in the robot table). Filled alongside SenderName by the
 	// same batch resolver — see worker.batchResolveUserNames and
@@ -68,6 +68,7 @@ type Message struct {
 	SendTime      string `json:"send_time"`
 	Content       string `json:"content"`
 	SourceName    string `json:"source_name"`
+	SourceVersion string `json:"source_version,omitempty"`
 	CitationIndex int    `json:"citation_index"`
 	IsTargetUser  bool   `json:"is_target_user"`
 }

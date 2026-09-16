@@ -95,7 +95,7 @@ func buildCitations(text string, messages []pipeline.Message, allMessages []pipe
 
 			before, after := findContextFast(msg, channelMsgMap, seqIndexMap, nameMap, 3)
 
-			citations = append(citations, model.Citation{
+			citation := model.Citation{
 				Index:         msg.CitationIndex,
 				Sender:        sender,
 				SenderIsBot:   msg.SenderIsBot,
@@ -107,7 +107,13 @@ func buildCitations(text string, messages []pipeline.Message, allMessages []pipe
 				MessageSeq:    msg.MessageSeq,
 				ContextBefore: before,
 				ContextAfter:  after,
-			})
+			}
+			if msg.ChannelType == model.SourceDocument {
+				citation.DocumentID = msg.ChannelID
+				citation.DocumentVersion = msg.SourceVersion
+				citation.DocumentChunk = int(msg.MessageSeq)
+			}
+			citations = append(citations, citation)
 		}
 	}
 	if citations == nil {

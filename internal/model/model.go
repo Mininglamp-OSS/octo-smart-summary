@@ -319,15 +319,18 @@ type Citation struct {
 	// frontend sees a consistent bot flag across endpoints. Included in
 	// JSON unconditionally so the frontend can filter by it — a `false`
 	// value is meaningful (this sender is confirmed not a bot).
-	SenderIsBot   bool         `json:"sender_is_bot"`
-	Content       string       `json:"content"`
-	SentAt        string       `json:"sent_at"`
-	Source        string       `json:"source"`
-	ChannelID     string       `json:"channel_id"`
-	ChannelType   int          `json:"channel_type"`
-	MessageSeq    int64        `json:"message_seq"`
-	ContextBefore []ContextMsg `json:"context_before,omitempty"`
-	ContextAfter  []ContextMsg `json:"context_after,omitempty"`
+	SenderIsBot     bool         `json:"sender_is_bot"`
+	Content         string       `json:"content"`
+	SentAt          string       `json:"sent_at"`
+	Source          string       `json:"source"`
+	ChannelID       string       `json:"channel_id"`
+	ChannelType     int          `json:"channel_type"`
+	MessageSeq      int64        `json:"message_seq"`
+	DocumentID      string       `json:"document_id,omitempty"`
+	DocumentVersion string       `json:"document_version,omitempty"`
+	DocumentChunk   int          `json:"document_chunk,omitempty"`
+	ContextBefore   []ContextMsg `json:"context_before,omitempty"`
+	ContextAfter    []ContextMsg `json:"context_after,omitempty"`
 }
 
 // ContextMsg represents a surrounding message used as context for a citation.
