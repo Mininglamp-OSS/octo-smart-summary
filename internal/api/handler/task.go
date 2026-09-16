@@ -374,23 +374,18 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		}
 	}
 	workflowInput.Sources = make([]service.SummaryWorkflowSource, 0, len(req.Sources))
-	documentSources, documentMode, documentErr := h.prepareDocumentSummarySources(c.Request.Context(), c.Request.Header, spaceID, userID, req)
-	if documentErr != nil {
-		if documentErr.retryAfter != "" {
-			c.Header("Retry-After", documentErr.retryAfter)
+	for _, source := range req.Sources {
+		// The snapshot schema lands before the worker consumer. Keep the public
+		// create path closed in this independently deployable change so a document
+		// id can never be dispatched to the chat-only worker by an older release.
+		if source.SourceType == model.SourceDocument {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "文档总结功能尚未开放"})
+			return
 		}
-		c.JSON(documentErr.status, apiResponse{Code: documentErr.code, Message: documentErr.message})
-		return
-	}
-	if documentMode {
-		workflowInput.Sources = documentSources
-	} else {
-		for _, source := range req.Sources {
-			workflowInput.Sources = append(workflowInput.Sources, service.SummaryWorkflowSource{
-				SourceType: source.SourceType,
-				SourceID:   source.SourceID,
-			})
-		}
+		workflowInput.Sources = append(workflowInput.Sources, service.SummaryWorkflowSource{
+			SourceType: source.SourceType,
+			SourceID:   source.SourceID,
+		})
 	}
 	workflowInput.Participants = make([]service.SummaryWorkflowParticipant, 0, len(req.Participants))
 	for _, participant := range req.Participants {
@@ -2021,6 +2016,9 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 					Update("deleted_at", &now).Error; err != nil {
 					return err
 				}
+				if err := deleteSummarySourceSnapshotsForSchedule(tx, lockedSched.ID); err != nil {
+					return err
+				}
 				// Soft-delete EVERY live task in the group in one batch UPDATE (never
 				// loop per-row; a long-lived schedule may own thousands of tasks).
 				// schedule_id is preserved (no unbind) so deleted history stays
@@ -2046,6 +2044,9 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 			}
 		}
 
+		if err := deleteSummarySourceSnapshotsForTask(tx, liveTask.ID); err != nil {
+			return err
+		}
 		return tx.Model(&liveTask).Updates(map[string]interface{}{
 			"status":     -1,
 			"deleted_at": now,
@@ -2068,6 +2069,17 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok"})
+}
+
+func deleteSummarySourceSnapshotsForTask(tx *gorm.DB, taskID int64) error {
+	sourceIDs := tx.Model(&model.SummarySource{}).Select("id").Where("task_id = ?", taskID)
+	return tx.Where("summary_source_id IN (?)", sourceIDs).Delete(&model.SummarySourceSnapshot{}).Error
+}
+
+func deleteSummarySourceSnapshotsForSchedule(tx *gorm.DB, scheduleID int64) error {
+	taskIDs := tx.Model(&model.SummaryTask{}).Select("id").Where("schedule_id = ?", scheduleID)
+	sourceIDs := tx.Model(&model.SummarySource{}).Select("id").Where("task_id IN (?)", taskIDs)
+	return tx.Where("summary_source_id IN (?)", sourceIDs).Delete(&model.SummarySourceSnapshot{}).Error
 }
 
 // CancelSummary handles POST /api/v1/summaries/:id/cancel

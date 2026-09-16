@@ -81,12 +81,13 @@ type SummaryWorkflowTimeRange struct {
 // SummaryWorkflowSource is one normalized input source. SnapshotContent is set
 // only for document sources and is persisted atomically with the task.
 type SummaryWorkflowSource struct {
-	SourceType      int
-	SourceID        string
-	SourceName      string
-	SourceVersion   string
-	SourceHash      string
-	SnapshotContent string
+	SourceType        int
+	SourceID          string
+	SourceName        string
+	SourceVersion     string
+	SourceHash        string
+	SnapshotContent   string
+	SnapshotTruncated bool
 }
 
 // SummaryWorkflowParticipant is one requested workflow participant. The
@@ -492,6 +493,7 @@ func (s *SummaryWorkflowService) persist(ctx context.Context, in normalizedSumma
 					Content:         source.SnapshotContent,
 					ContentBytes:    len([]byte(source.SnapshotContent)),
 					ContentHash:     source.SourceHash,
+					Truncated:       source.SnapshotTruncated,
 				}
 				if err := tx.Create(&snapshot).Error; err != nil {
 					return err

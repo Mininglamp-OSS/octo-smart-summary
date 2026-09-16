@@ -109,6 +109,26 @@ func TestCreateSummary_SourceCountExceedsLimit(t *testing.T) {
 	}
 }
 
+func TestCreateSummary_DocumentSourceRemainsClosedUntilWorkerShips(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	h := NewTaskHandler(db, imDB, "")
+	w := doCreateSummary(setupCreateRouter(h), map[string]interface{}{
+		"title": "document",
+		"sources": []map[string]interface{}{{
+			"source_type": model.SourceDocument,
+			"source_id":   "d_1",
+		}},
+	}, "creator1")
+
+	if w.Code != http.StatusBadRequest || respCode(t, w) != 40001 {
+		t.Fatalf("document create response = %d %s, want closed entry point", w.Code, w.Body.String())
+	}
+	var taskCount int64
+	if err := db.Model(&model.SummaryTask{}).Count(&taskCount).Error; err != nil || taskCount != 0 {
+		t.Fatalf("task count=%d err=%v, want zero", taskCount, err)
+	}
+}
+
 func TestCreateSummary_SourceCountExceedsLimitBeforeDedup(t *testing.T) {
 	db, imDB := setupTestDBs(t)
 	h := NewTaskHandler(db, imDB, "")
