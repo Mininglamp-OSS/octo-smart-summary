@@ -314,25 +314,30 @@ func TestSplitClosesChunkSize201to500Route(t *testing.T) {
 // (MAP_MAX_TOKENS=1500 → 700 usable) must be preserved: round-3's cliff
 // finding takes precedence, and the fallback is logged, not silent.
 func TestChunkTokenBudgetCliffGuard(t *testing.T) {
-	defaultBudget := fallbackMapMaxTokens - mapSystemPromptReserve
+	// Both the system prompt AND the completion (LLMMaxToken) share the window,
+	// so the usable input budget is window - MapSystemPromptReserve - LLMMaxToken
+	// (#241 item 3).
+	const llmMax = 4096
+	reserve := config.MapSystemPromptReserve + llmMax
 	cases := []struct {
-		name       string
-		mapMax     int
-		wantBudget int
+		name   string
+		mapMax int
+		base   int // effective window after the cliff guard
 	}{
-		{"zero config -> global default", 0, defaultBudget},
-		{"cliff 801 -> loud fallback", 801, defaultBudget},
-		{"low positive 1500 -> loud fallback", 1500, defaultBudget},
-		{"sub-reserve 500 -> loud fallback", 500, defaultBudget},
-		{"just below floor -> loud fallback", minSaneMapMaxTokens - 1, defaultBudget},
-		{"at floor preserved", minSaneMapMaxTokens, minSaneMapMaxTokens - mapSystemPromptReserve},
-		{"healthy explicit preserved", 50000, 50000 - mapSystemPromptReserve},
+		{"zero config -> global default", 0, fallbackMapMaxTokens},
+		{"cliff 801 -> loud fallback", 801, fallbackMapMaxTokens},
+		{"low positive 1500 -> loud fallback", 1500, fallbackMapMaxTokens},
+		{"sub-reserve 500 -> loud fallback", 500, fallbackMapMaxTokens},
+		{"just below floor -> loud fallback", minSaneMapMaxTokens - 1, fallbackMapMaxTokens},
+		{"at floor preserved", minSaneMapMaxTokens, minSaneMapMaxTokens},
+		{"healthy explicit preserved", 50000, 50000},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			cfg := config.Config{MapMaxTokens: c.mapMax}
-			if got := chunkTokenBudget(cfg); got != c.wantBudget {
-				t.Fatalf("chunkTokenBudget(MapMaxTokens=%d) = %d, want %d", c.mapMax, got, c.wantBudget)
+			cfg := config.Config{MapMaxTokens: c.mapMax, LLMMaxToken: llmMax}
+			want := c.base - reserve
+			if got := chunkTokenBudget(cfg); got != want {
+				t.Fatalf("chunkTokenBudget(MapMaxTokens=%d) = %d, want %d", c.mapMax, got, want)
 			}
 		})
 	}

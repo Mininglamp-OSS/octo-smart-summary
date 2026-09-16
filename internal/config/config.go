@@ -423,6 +423,24 @@ var modelMapThresholds = []modelThreshold{
 
 const defaultMapMaxTokens = 100000
 
+// MapSystemPromptReserve is the tokens held back from the Map context-window
+// budget (ResolveMapMaxTokens) for the fixed Map/summarize system prompt. It is
+// shared by BOTH Map paths — the agent's summarize_chunk (internal/agent
+// chunkTokenBudget) and the worker's Map chunking (internal/worker) — so they
+// budget identically. Before #241 the two paths used different values (agent
+// 800, worker 3000); unified here at the more conservative of the two.
+const MapSystemPromptReserve = 3000
+
+// MapWindowReserve is the total budget to subtract from ResolveMapMaxTokens
+// (which is treated as the model's context window) so a chunk's INPUT leaves
+// room for both the system prompt AND the completion the same call produces:
+// LLMMaxToken output shares the one context window (#241 item 3). Both Map
+// paths must reserve this, or an input packed to nearly the whole window leaves
+// no room for the up-to-LLMMaxToken response and the call is rejected/truncated.
+func (c *Config) MapWindowReserve() int {
+	return MapSystemPromptReserve + c.LLMMaxToken
+}
+
 const (
 	// defaultAgentMapConcurrency is the agent Map-phase fan-out default.
 	//

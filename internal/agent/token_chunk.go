@@ -15,13 +15,11 @@ import (
 // message-count backstop (P0-2) so no estimator bug can produce an unbounded
 // chunk.
 const (
-	// mapSystemPromptReserve is subtracted from the Map token budget to leave
-	// room for the fixed summarize system prompt.
-	mapSystemPromptReserve = 800
 	// minChunkTokenBudget is the fallback budget used ONLY when the configured
-	// Map budget minus the system-prompt reserve leaves nothing usable
-	// (config <= reserve). A deliberately low MAP_MAX_TOKENS is never silently
-	// enlarged (PR #196 review P2-2).
+	// Map budget minus the window reserve (config.MapWindowReserve: system
+	// prompt + completion) leaves nothing usable (config <= reserve). A
+	// deliberately low MAP_MAX_TOKENS is never silently enlarged (PR #196 review
+	// P2-2).
 	minChunkTokenBudget = 2000
 	// hardMessageBackstop caps messages per chunk regardless of the token
 	// budget and the chunk_size hint, so degenerate estimates (e.g. empty
@@ -123,7 +121,7 @@ func chunkTokenBudget(cfg config.Config) int {
 		log.Printf("[config] resolved MapMaxTokens=%d below sane floor %d, using default %d (agent Map path)", mapMax, minSaneMapMaxTokens, fallbackMapMaxTokens)
 		mapMax = fallbackMapMaxTokens
 	}
-	budget := mapMax - mapSystemPromptReserve
+	budget := mapMax - cfg.MapWindowReserve()
 	if budget < 1 {
 		budget = minChunkTokenBudget
 	}

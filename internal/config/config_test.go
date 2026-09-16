@@ -112,3 +112,22 @@ func TestLoad_SummaryWorkbenchEnabledFromEnvironment(t *testing.T) {
 		t.Fatal("SummaryWorkbenchEnabled=false, want true")
 	}
 }
+
+// TestMapWindowReserve is the #241 item-3 contract: the Map window reserve is
+// the shared system-prompt reserve PLUS the completion budget (LLMMaxToken)
+// that shares the same context window, so both Map paths hold back room for the
+// response. A single source keeps the agent and worker paths from drifting
+// apart (they used 800 vs 3000 before).
+func TestMapWindowReserve(t *testing.T) {
+	c := &Config{LLMMaxToken: 4096}
+	if got, want := c.MapWindowReserve(), MapSystemPromptReserve+4096; got != want {
+		t.Errorf("MapWindowReserve() = %d, want %d (system prompt %d + completion %d)",
+			got, want, MapSystemPromptReserve, 4096)
+	}
+	// The completion term tracks LLMMaxToken, so changing LLM_MAX_TOKENS keeps
+	// the reserve correct rather than hard-coding 4096.
+	c2 := &Config{LLMMaxToken: 8192}
+	if got, want := c2.MapWindowReserve(), MapSystemPromptReserve+8192; got != want {
+		t.Errorf("MapWindowReserve() with LLMMaxToken=8192 = %d, want %d", got, want)
+	}
+}

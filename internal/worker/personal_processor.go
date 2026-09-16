@@ -1026,9 +1026,6 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	}
 	tok := tokenizer.New(p.cfg.LLMModel, tokCfg)
 
-	// System prompt overhead (same as used in chunking)
-	const systemPromptTokens = 3000
-
 	// Calculate total tokens for all messages
 	var allContent strings.Builder
 	for _, m := range userMessages {
@@ -1048,7 +1045,9 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	if mapMaxTokens > 0 && mapMaxTokens < skipThreshold {
 		skipThreshold = mapMaxTokens
 	}
-	effectiveSkipThreshold := skipThreshold - systemPromptTokens
+	// Reserve the shared system-prompt + completion budget from the window, so
+	// a single-shot summary's input leaves room for its own response (#241).
+	effectiveSkipThreshold := skipThreshold - p.cfg.MapWindowReserve()
 	skipMapReduce := tok.IsExact() && estimatedTotalTokens <= effectiveSkipThreshold
 	if skipMapReduce {
 		log.Printf("[personal-worker] skip Map-Reduce: totalTokens=%d <= threshold=%d (exact=%v)",
@@ -1061,7 +1060,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		log.Printf("[config] resolved MapMaxTokens=%d too small, using default 100000", maxTokens)
 		maxTokens = 100000
 	}
-	effectiveMax := maxTokens - systemPromptTokens
+	effectiveMax := maxTokens - p.cfg.MapWindowReserve()
 
 	var chunks [][]pipeline.Message
 	var currentChunk []pipeline.Message
