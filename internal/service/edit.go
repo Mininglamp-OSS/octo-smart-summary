@@ -1,14 +1,9 @@
 package service
 
 import (
-	"regexp"
-	"strconv"
-	"strings"
-
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 )
-
-var citationRefRe = regexp.MustCompile(`\[(\d{1,5})\]`)
 
 func CleanUnreferencedCitations(content string, citations []model.Citation) []model.Citation {
 	referenced := extractReferencedIndices(content)
@@ -21,90 +16,38 @@ func CleanUnreferencedCitations(content string, citations []model.Citation) []mo
 	return kept
 }
 
+// NormalizeGeneratedCitations is shared by Agent saves and refinement. Match the
+// generation path's prose-safe policy: only adjacent citation clusters are
+// expanded, while isolated bracketed ranges remain byte-identical prose. Single
+// markers inside the known evidence window must still resolve.
+func NormalizeGeneratedCitations(content string, citations []model.Citation) (string, error) {
+	indices := make(map[int]bool, len(citations))
+	maxIndex := 0
+	for _, c := range citations {
+		indices[c.Index] = true
+		if c.Index > maxIndex {
+			maxIndex = c.Index
+		}
+	}
+	normalized := citationtext.CanonicalizeAdjacent(content, func(n int) bool { return indices[n] })
+	for _, marker := range citationtext.Scan(normalized) {
+		if marker.Compound || len(marker.Indices) != 1 {
+			continue
+		}
+		n := marker.Indices[0]
+		if n <= maxIndex && !indices[n] {
+			return content, citationtext.ErrInvalid
+		}
+	}
+	return normalized, nil
+}
+
 func extractReferencedIndices(content string) map[int]bool {
 	result := make(map[int]bool)
-	fencedRanges := findFencedCodeRanges(content)
-	inlineRanges := findInlineCodeRanges(content)
-
-	matches := citationRefRe.FindAllStringSubmatchIndex(content, -1)
-	for _, m := range matches {
-		matchStart := m[0]
-		matchEnd := m[1]
-
-		if inRange(matchStart, fencedRanges) || inRange(matchStart, inlineRanges) {
-			continue
+	for _, marker := range citationtext.Scan(content) {
+		for _, n := range marker.Indices {
+			result[n] = true
 		}
-
-		if matchEnd < len(content) && content[matchEnd] == '(' {
-			continue
-		}
-
-		numStr := content[m[2]:m[3]]
-		idx, err := strconv.Atoi(numStr)
-		if err != nil {
-			continue
-		}
-		result[idx] = true
 	}
 	return result
-}
-
-type textRange struct {
-	start, end int
-}
-
-func findFencedCodeRanges(content string) []textRange {
-	var ranges []textRange
-	lines := strings.Split(content, "\n")
-	pos := 0
-	inFence := false
-	fenceStart := 0
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "```") {
-			if !inFence {
-				inFence = true
-				fenceStart = pos
-			} else {
-				ranges = append(ranges, textRange{fenceStart, pos + len(line)})
-				inFence = false
-			}
-		}
-		pos += len(line) + 1
-	}
-	if inFence {
-		ranges = append(ranges, textRange{fenceStart, len(content)})
-	}
-	return ranges
-}
-
-func findInlineCodeRanges(content string) []textRange {
-	var ranges []textRange
-	i := 0
-	for i < len(content) {
-		if content[i] == '`' {
-			if i+2 < len(content) && content[i:i+3] == "```" {
-				i++
-				continue
-			}
-			end := strings.Index(content[i+1:], "`")
-			if end == -1 {
-				break
-			}
-			ranges = append(ranges, textRange{i, i + 1 + end + 1})
-			i = i + 1 + end + 1
-		} else {
-			i++
-		}
-	}
-	return ranges
-}
-
-func inRange(pos int, ranges []textRange) bool {
-	for _, r := range ranges {
-		if pos >= r.start && pos < r.end {
-			return true
-		}
-	}
-	return false
 }

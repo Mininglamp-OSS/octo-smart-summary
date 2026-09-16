@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmfallback"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
@@ -576,6 +577,37 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 		if err := tx.Model(&model.SummaryParticipant{}).Where("task_id = ?", pr.TaskID).Count(&participantCount).Error; err != nil {
 			return err
 		}
+
+		// A regeneration failure is not a replacement result. Re-expose the last
+		// committed body so the summary does not vanish for the affected member.
+		// This must run for BOTH single- and multi-person tasks: RegeneratePersonalSummary
+		// rejects single-person tasks (40005 "单人任务请使用全部重新生成"), so gating the
+		// restore on participantCount<=1 made it dead code on exactly the per-person
+		// regenerate path it exists for (PR#248 review P1-1). First-generation failures
+		// have no prior version and hit ErrRecordNotFound, so they correctly skip it.
+		{
+			var latest model.PersonalResultVersion
+			query := tx.Where("task_id = ? AND user_id = ?", pr.TaskID, pr.UserID)
+			if pr.CurrentVersionID != nil {
+				// A restored older version is the actual pre-regeneration body.
+				query = query.Where("id = ?", *pr.CurrentVersionID)
+			}
+			err := query.Order("version DESC").First(&latest).Error
+			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+			if err == nil {
+				if err := tx.Model(pr).Updates(map[string]interface{}{
+					"content": latest.Content, "citations_json": latest.CitationsJSON,
+					"current_version_id": latest.ID, "generated_at": latest.GeneratedAt,
+					"msg_count": latest.MsgCount, "total_token_used": latest.TotalTokenUsed,
+					"model_version": latest.ModelVersion,
+				}).Error; err != nil {
+					return err
+				}
+			}
+		}
+
 		if participantCount <= 1 {
 			// Single-person: keep prior behavior -- reset participant to Accepted and propagate failure to the task.
 			if err := tx.Model(participant).Update("status", model.ParticipantAccepted).Error; err != nil {
@@ -727,13 +759,20 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	channelScopeOpts := channelScopeOptionsForTask(p.cfg.ChannelScopeEnabled, task.SpaceID, task.AgentSessionID, false, true)
 
 	fetchStart := time.Now()
-	messages, intentResult, err := pipeline.ResolveAndFetchMessagesForPersonal(
-		ctx, userID, nil, nil, specifiedSources, task.EffectiveTopic(),
-		task.TimeRangeStart, task.TimeRangeEnd,
-		p.imDB, p.octoClient, p.cfg.MessageFetchBackend, toolCallFn, llmFn,
-		p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency, p.cfg.OctoSearchPollSec,
-		channelScopeOpts, reportStage,
-	)
+	var messages []pipeline.Message
+	var intentResult *pipeline.IntentResult
+	var err error
+	if p.fetchPersonalMessagesFn != nil {
+		messages, intentResult, err = p.fetchPersonalMessagesFn(ctx, task, userID)
+	} else {
+		messages, intentResult, err = pipeline.ResolveAndFetchMessagesForPersonal(
+			ctx, userID, nil, nil, specifiedSources, task.EffectiveTopic(),
+			task.TimeRangeStart, task.TimeRangeEnd,
+			p.imDB, p.octoClient, p.cfg.MessageFetchBackend, toolCallFn, llmFn,
+			p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency, p.cfg.OctoSearchPollSec,
+			channelScopeOpts, reportStage,
+		)
+	}
 	timing.Observe(taskNo, "fetch_messages", fetchStart)
 	if err != nil {
 		return "", nil, 0, 0, "", fmt.Errorf("fetch messages: %w", err)
@@ -1157,6 +1196,22 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 
 	// Build citations from final content
 	citationStart := time.Now()
+	// Validate against the full authorized evidence window, not just the
+	// citations successfully built from this output. Otherwise a group made
+	// entirely of missing in-window indices could be mistaken for prose.
+	indices := make(map[int]bool, len(userMessages))
+	for _, message := range userMessages {
+		indices[message.CitationIndex] = true
+	}
+	// Normalize compound citation groups the model may have emitted despite the
+	// single-marker OutputRule, but never rewrite ordinary bracketed-number prose
+	// and never abort the whole summary on a group the normalizer cannot resolve.
+	// The evidence window here is a contiguous 1..N range, so every small number
+	// looks "valid": Canonicalize would silently corrupt prose like "[3-5]万元"
+	// into false citations, and hard-fail on shapes like "GB/T [50011-2010]" with
+	// no repair path (PR#248 review B-1/B-2). CanonicalizeAdjacent only expands
+	// real citation clusters and leaves everything else byte-identical.
+	finalContent = citationtext.CanonicalizeAdjacent(finalContent, func(n int) bool { return indices[n] })
 	citations := buildCitations(finalContent, userMessages, messages, nameMap)
 	finalContent, citations = dedupCitations(finalContent, citations)
 	finalContent = stripOrphanCitations(finalContent, citations)

@@ -404,6 +404,62 @@ func TestMarkPersonalFailed_UnderMaxRetry_ResetsToPending(t *testing.T) {
 	}
 }
 
+func TestMarkPersonalFailedRestoresSelectedBaselineNotNewestVersion(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	p, pr, part := seedFailFixture(t, db, "restore-baseline", 1, 2)
+	old := model.PersonalResultVersion{TaskID: pr.TaskID, ParticipantRefID: part.ID, UserID: pr.UserID, Version: 1, Content: "selected older body"}
+	newer := model.PersonalResultVersion{TaskID: pr.TaskID, ParticipantRefID: part.ID, UserID: pr.UserID, Version: 2, Content: "newest historical body"}
+	if err := db.Create(&old).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&newer).Error; err != nil {
+		t.Fatal(err)
+	}
+	pr.CurrentVersionID = &old.ID
+	db.Model(pr).Update("current_version_id", old.ID)
+	p.markPersonalFailed(pr, part, "LLM API error: boom")
+	var got model.PersonalResult
+	db.First(&got, pr.ID)
+	if got.Content != old.Content || got.CurrentVersionID == nil || *got.CurrentVersionID != old.ID {
+		t.Fatal("failure restored newest history instead of active baseline")
+	}
+}
+
+// A per-person regenerate only exists for multi-person tasks (single-person is
+// routed to full regeneration). So a permanent regenerate failure in a
+// multi-person task must still re-expose the pre-regeneration body — the restore
+// used to be gated behind participantCount<=1, making it dead code on exactly
+// the path it exists for (PR#248 review P1-1).
+func TestMarkPersonalFailed_MultiPerson_RestoresBaseline(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	p, pr, part := seedFailFixture(t, db, "restore-multi", 2, 2)
+	baseline := model.PersonalResultVersion{
+		TaskID: pr.TaskID, ParticipantRefID: part.ID, UserID: pr.UserID,
+		Version: 1, Content: "pre-regeneration body",
+	}
+	if err := db.Create(&baseline).Error; err != nil {
+		t.Fatal(err)
+	}
+	pr.CurrentVersionID = &baseline.ID
+	db.Model(pr).Update("current_version_id", baseline.ID)
+
+	p.markPersonalFailed(pr, part, "LLM API error: boom")
+
+	var got model.PersonalResult
+	db.First(&got, pr.ID)
+	if got.WorkerStatus != model.PersonalStatusFailed {
+		t.Fatalf("worker_status=%d, want Failed", got.WorkerStatus)
+	}
+	if got.Content != baseline.Content || got.CurrentVersionID == nil || *got.CurrentVersionID != baseline.ID {
+		t.Fatalf("multi-person failure did not restore prior body: content=%q current=%v", got.Content, got.CurrentVersionID)
+	}
+	var gotPart model.SummaryParticipant
+	db.First(&gotPart, part.ID)
+	if gotPart.Status != model.ParticipantDeclined {
+		t.Fatalf("participant status=%d, want Declined", gotPart.Status)
+	}
+}
+
 func TestUpdatePersonalWorkflowStage_GuardsProcessingStatus(t *testing.T) {
 	db := newSchedulerTestDB(t)
 	now := time.Now()

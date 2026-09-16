@@ -128,6 +128,15 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 		return
 	}
 
+	newContent, err = service.NormalizeGeneratedCitations(newContent, pr.GetCitations())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "调整结果包含无效引用，请修改要求后重试"})
+		return
+	}
+	if len(newContent) > maxContentBytes {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "调整结果超过 500KB 限制"})
+		return
+	}
 	cleanedCitations := service.CleanUnreferencedCitations(newContent, pr.GetCitations())
 	tmp := &model.PersonalResult{}
 	tmp.SetCitations(cleanedCitations)
@@ -137,6 +146,10 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 	var newVersion model.PersonalResultVersion
 	shouldTriggerMeta := false
 	err = h.db.Transaction(func(tx *gorm.DB) error {
+		lockedTask, err := lockPersonalWriteTask(tx, taskID, false, false)
+		if err != nil {
+			return err
+		}
 		var latestPR model.PersonalResult
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ? AND task_id = ? AND user_id = ?", pr.ID, taskID, userID).
@@ -210,6 +223,8 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 				return err
 			}
 			shouldTriggerMeta = true
+		} else if err := syncSinglePersonalDisplay(tx, lockedTask, newContent, citationsJSON, now); err != nil {
+			return err
 		}
 		return nil
 	})
@@ -363,6 +378,15 @@ func (h *PersonalHandler) RefinePersonalSummaryStream(c *gin.Context) {
 		return
 	}
 
+	newContent, err = service.NormalizeGeneratedCitations(newContent, pr.GetCitations())
+	if err != nil {
+		writeStreamError("调整结果包含无效引用，请修改要求后重试")
+		return
+	}
+	if len(newContent) > maxContentBytes {
+		writeStreamError("调整结果超过 500KB 限制")
+		return
+	}
 	cleanedCitations := service.CleanUnreferencedCitations(newContent, pr.GetCitations())
 	tmp := &model.PersonalResult{}
 	tmp.SetCitations(cleanedCitations)
@@ -372,6 +396,10 @@ func (h *PersonalHandler) RefinePersonalSummaryStream(c *gin.Context) {
 	var newVersion model.PersonalResultVersion
 	shouldTriggerMeta := false
 	err = h.db.Transaction(func(tx *gorm.DB) error {
+		lockedTask, err := lockPersonalWriteTask(tx, taskID, false, false)
+		if err != nil {
+			return err
+		}
 		var latestPR model.PersonalResult
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ? AND task_id = ? AND user_id = ?", pr.ID, taskID, userID).
@@ -445,8 +473,10 @@ func (h *PersonalHandler) RefinePersonalSummaryStream(c *gin.Context) {
 				return err
 			}
 			shouldTriggerMeta = true
+		} else if err := syncSinglePersonalDisplay(tx, lockedTask, newContent, citationsJSON, now); err != nil {
+			return err
 		}
-		return appendBoundScheduleGenerationInstruction(tx, *task, feedback)
+		return appendBoundScheduleGenerationInstruction(tx, lockedTask, feedback)
 	})
 	if err != nil {
 		if bizError, isBiz := err.(*service.BizError); isBiz {
@@ -615,10 +645,25 @@ func (h *PersonalHandler) RestorePersonalVersion(c *gin.Context) {
 	now := timezone.Now()
 	shouldTriggerMeta := false
 	err = h.db.Transaction(func(tx *gorm.DB) error {
+		lockedTask, err := lockPersonalWriteTask(tx, taskID, false, false)
+		if err != nil {
+			return err
+		}
 		var latestPR model.PersonalResult
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ? AND task_id = ? AND user_id = ?", pr.ID, taskID, userID).
 			First(&latestPR).Error; err != nil {
+			return err
+		}
+		if err := checkPersonalWriteBaseline(pr, latestPR); err != nil {
+			return err
+		}
+		if latestPR.WorkerStatus == model.PersonalStatusPending || latestPR.WorkerStatus == model.PersonalStatusProcessing {
+			return service.NewBizError(40005, "个人总结正在生成中", http.StatusConflict)
+		}
+		// The selected version may have been pruned while waiting for the task
+		// lock. Re-read it in the same transaction that will make it current.
+		if err := tx.Where("id = ? AND task_id = ? AND user_id = ?", versionID, taskID, userID).First(&source).Error; err != nil {
 			return err
 		}
 		if _, err := ensurePersonalVersionBaseline(tx, latestPR); err != nil {
@@ -655,10 +700,17 @@ func (h *PersonalHandler) RestorePersonalVersion(c *gin.Context) {
 				return err
 			}
 			shouldTriggerMeta = true
+		} else if err := syncSinglePersonalDisplay(tx, lockedTask, source.Content, source.CitationsJSON, now); err != nil {
+			return err
 		}
 		return nil
 	})
 	if err != nil {
+		var be *service.BizError
+		if errors.As(err, &be) {
+			bizErr(c, be)
+			return
+		}
 		if err == gorm.ErrRecordNotFound || err == errPersonalResultGone {
 			c.JSON(http.StatusNotFound, apiResponse{Code: 40008, Message: "个人总结不存在"})
 			return
@@ -734,6 +786,13 @@ func (h *PersonalHandler) RegeneratePersonalSummary(c *gin.Context) {
 		return
 	}
 	err := h.db.Transaction(func(tx *gorm.DB) error {
+		lockedTask, err := lockPersonalWriteTask(tx, taskID, false, false)
+		if err != nil {
+			return err
+		}
+		if lockedTask.SummaryMode != model.ModeByPerson {
+			return service.NewBizError(40005, "该任务不支持个人重新生成", http.StatusBadRequest)
+		}
 		var latestPR model.PersonalResult
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ? AND task_id = ? AND user_id = ?", pr.ID, taskID, userID).
@@ -746,20 +805,19 @@ func (h *PersonalHandler) RegeneratePersonalSummary(c *gin.Context) {
 		res := tx.Model(&model.PersonalResult{}).
 			Where("id = ? AND task_id = ? AND user_id = ? AND worker_status IN ?", latestPR.ID, taskID, userID, []int{model.PersonalStatusCompleted, model.PersonalStatusFailed}).
 			Updates(map[string]interface{}{
-				"worker_status":      model.PersonalStatusPending,
-				"workflow_stage":     "",
-				"retry_count":        0,
-				"content":            "",
-				"citations_json":     "",
-				"msg_count":          0,
-				"total_token_used":   0,
-				"model_version":      "",
-				"current_version_id": nil,
-				"error_message":      nil,
-				"submitted_at":       nil,
-				"submit_source":      model.SubmitSourceNone,
-				"generated_at":       nil,
-				"edited_at":          nil,
+				"worker_status":    model.PersonalStatusPending,
+				"workflow_stage":   "",
+				"retry_count":      0,
+				"content":          "",
+				"citations_json":   "",
+				"msg_count":        0,
+				"total_token_used": 0,
+				"model_version":    "",
+				"error_message":    nil,
+				"submitted_at":     nil,
+				"submit_source":    model.SubmitSourceNone,
+				"generated_at":     nil,
+				"edited_at":        nil,
 			})
 		if res.Error != nil {
 			return res.Error
@@ -796,6 +854,35 @@ func (h *PersonalHandler) RegeneratePersonalSummary(c *gin.Context) {
 	ok(c, gin.H{"task_id": taskID, "result_id": pr.ID, "status": model.PersonalStatusPending})
 }
 
+// Edit, feedback refinement and restore take the task lock before the personal-result
+// lock. Call only in the short persistence transaction, never around an LLM
+// call. Its fresh CurrentResultID is also the display-sync target.
+func lockPersonalWriteTask(tx *gorm.DB, taskID int64, allowFailed, allowProcessing bool) (model.SummaryTask, error) {
+	var task model.SummaryTask
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&task, taskID).Error; err != nil {
+		return task, err
+	}
+	if task.Status != model.StatusCompleted &&
+		!(allowFailed && (task.Status == model.StatusFailed || task.Status == model.StatusCancelled)) &&
+		!(allowProcessing && task.Status == model.StatusProcessing) {
+		return task, service.NewBizError(40005, "任务状态已变更，请刷新后重试", http.StatusConflict)
+	}
+	return task, nil
+}
+
+func checkPersonalWriteBaseline(before, current model.PersonalResult) error {
+	versionID := func(pr model.PersonalResult) int64 {
+		if pr.CurrentVersionID != nil {
+			return *pr.CurrentVersionID
+		}
+		return 0
+	}
+	if before.Content != current.Content || versionID(before) != versionID(current) {
+		return service.NewBizError(40009, "内容已更新，请刷新后重试", http.StatusConflict)
+	}
+	return nil
+}
+
 func currentPersonalVersion(db *gorm.DB, taskID int64, userID string, pr model.PersonalResult) (int, error) {
 	if pr.CurrentVersionID != nil {
 		var current model.PersonalResultVersion
@@ -815,6 +902,17 @@ func currentPersonalVersion(db *gorm.DB, taskID int64, userID string, pr model.P
 		return 1, nil
 	}
 	return version, nil
+}
+
+// Single-person tasks display the personal artifact. Keep an existing Workflow
+// display row in sync for older result/forward consumers; Agent-only saves do
+// not need a second artifact. PersonalResultVersion remains the edit history.
+func syncSinglePersonalDisplay(tx *gorm.DB, task model.SummaryTask, content, citations string, editedAt time.Time) error {
+	if task.CurrentResultID == nil {
+		return nil
+	}
+	return tx.Model(&model.SummaryResult{}).Where("id = ? AND task_id = ?", *task.CurrentResultID, task.ID).
+		Updates(map[string]interface{}{"content": content, "citations_json": citations, "edited_at": editedAt}).Error
 }
 
 func ensurePersonalVersionBaseline(tx *gorm.DB, pr model.PersonalResult) (model.PersonalResultVersion, error) {

@@ -8,15 +8,76 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/gin-gonic/gin"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
+
+func TestPersonalRefinePreservesIsolatedNumericGroupsBothTransports(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, valid := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stream=%t/valid=%t", stream, valid), func(t *testing.T) {
+				content := "Budget [9,73]. ROI [88]."
+				if !valid {
+					content = "Missing [9,74]. ROI [88]."
+				}
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						delta, _ := json.Marshal(map[string]interface{}{"choices": []interface{}{
+							map[string]interface{}{"delta": map[string]string{"content": content}},
+						}})
+						fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", delta)
+					} else {
+						_ = json.NewEncoder(w).Encode(map[string]interface{}{"choices": []interface{}{
+							map[string]interface{}{"message": map[string]string{"content": content}, "finish_reason": "stop"},
+						}})
+					}
+				}))
+				defer srv.Close()
+				db := setupPersonalRefineDB(t)
+				task, _, pr := seedScheduledMultiPersonPersonalTask(t, db)
+				pr.Content = "Before [9][73][88]"
+				pr.SetCitations([]model.Citation{{Index: 9}, {Index: 73}, {Index: 88}})
+				if err := db.Save(&pr).Error; err != nil {
+					t.Fatal(err)
+				}
+				h := NewPersonalHandler(db, "", nil)
+				h.SetLLM(service.NewLLMClient(srv.URL, "test", "test", 5, 256, false, 5, nil))
+				r := setupPersonalRefineRouter(h)
+				path := fmt.Sprintf("/api/v1/summaries/%d/personal-refine", task.ID)
+				if stream {
+					r.POST("/api/v1/summaries/:id/personal-refine-stream", h.RefinePersonalSummaryStream)
+					path += "-stream"
+				}
+				req := httptest.NewRequest("POST", path, strings.NewReader(`{"feedback":"adjust","base_version":1}`))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Token", "member_a")
+				req.Header.Set("X-Space-Id", "space1")
+				w := httptest.NewRecorder()
+				r.ServeHTTP(w, req)
+				var saved model.PersonalResult
+				if err := db.First(&saved, pr.ID).Error; err != nil {
+					t.Fatal(err)
+				}
+				var versions int64
+				if err := db.Model(&model.PersonalResultVersion{}).Count(&versions).Error; err != nil {
+					t.Fatal(err)
+				}
+				if w.Code != http.StatusOK || saved.Content != content || versions != 2 {
+					t.Fatalf("status=%d body=%s content=%q versions=%d", w.Code, w.Body.String(), saved.Content, versions)
+				}
+			})
+		}
+	}
+}
 
 func setupPersonalRefineDB(t *testing.T) *gorm.DB {
 	t.Helper()
@@ -219,5 +280,47 @@ func TestRegeneratePersonalSummary_DoesNotMutateSharedTaskOrSchedule(t *testing.
 	}
 	if gotSched.GenerationInstruction != sched.GenerationInstruction {
 		t.Fatalf("personal regenerate must not mutate shared schedule instruction, got %q want %q", gotSched.GenerationInstruction, sched.GenerationInstruction)
+	}
+}
+
+func TestRegeneratePersonalSummaryPreservesSelectedBaselineIdentity(t *testing.T) {
+	db := setupPersonalRefineDB(t)
+	task, _, pr := seedScheduledMultiPersonPersonalTask(t, db)
+	old := model.PersonalResultVersion{TaskID: task.ID, ParticipantRefID: pr.ParticipantRefID, UserID: pr.UserID, Version: 1, Content: "selected older body"}
+	newer := model.PersonalResultVersion{TaskID: task.ID, ParticipantRefID: pr.ParticipantRefID, UserID: pr.UserID, Version: 2, Content: "newest historical body"}
+	if err := db.Create(&old).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&newer).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&pr).Updates(map[string]interface{}{"current_version_id": old.ID, "content": old.Content}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	w := doPersonalRegenerateRequest(setupPersonalRefineRouter(NewPersonalHandler(db, "", nil)), task.ID, pr.UserID, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	db.First(&pr, pr.ID)
+	if pr.CurrentVersionID == nil || *pr.CurrentVersionID != old.ID || pr.Content != "" {
+		t.Fatalf("selected baseline identity lost during reset: current=%v content=%q", pr.CurrentVersionID, pr.Content)
+	}
+}
+
+func TestPersonalEditAllowsCompletedMemberWhileTeamStillProcessing(t *testing.T) {
+	db := setupPersonalRefineDB(t)
+	task, _, pr := seedScheduledMultiPersonPersonalTask(t, db)
+	if err := db.Model(&task).Update("status", model.StatusProcessing).Error; err != nil {
+		t.Fatal(err)
+	}
+	w := doJSONRequest(setupPersonalEditRouter(NewPersonalHandler(db, "", nil)), "PUT",
+		fmt.Sprintf("/api/v1/summaries/%d/personal-edit", task.ID), pr.UserID, map[string]interface{}{"content": "edited while teammate is running"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	db.First(&pr, pr.ID)
+	if pr.Content != "edited while teammate is running" {
+		t.Fatalf("edit was not persisted: %q", pr.Content)
 	}
 }

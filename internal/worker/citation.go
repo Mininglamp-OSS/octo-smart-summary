@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
@@ -15,15 +16,25 @@ var citationRe = regexp.MustCompile(`\[(\d{1,5})\]`)
 var multiSpaceRe = regexp.MustCompile(`[ \t]{2,}`)
 var emptyLineRe = regexp.MustCompile(`(?m)^[ \t]*$\n`)
 
-// extractCitationIndexes extracts all [n] citation indexes from text.
+// extractCitationIndexes extracts citation indexes from single [n] markers.
+// Compound groups are deliberately NOT harvested: an isolated bracketed range
+// in prose ("预算区间 [3-5] 万元") stays prose, matching the old single-marker
+// regex and stripOrphanCitations below, so no false model.Citation rows are
+// built from it (PR#251 review P1-3). Real compound clusters are already
+// expanded to single markers by the upstream normalizers before this runs.
+// Scan is kept over the raw regex for its code/escape/date/link protections.
 func extractCitationIndexes(text string) []int {
-	matches := citationRe.FindAllStringSubmatch(text, -1)
 	var indexes []int
 	seen := make(map[int]bool)
-	for _, m := range matches {
-		if n, err := strconv.Atoi(m[1]); err == nil && !seen[n] {
-			indexes = append(indexes, n)
-			seen[n] = true
+	for _, m := range citationtext.Scan(text) {
+		if m.Compound {
+			continue
+		}
+		for _, n := range m.Indices {
+			if !seen[n] {
+				indexes = append(indexes, n)
+				seen[n] = true
+			}
 		}
 	}
 	sort.Ints(indexes)

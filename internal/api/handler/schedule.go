@@ -642,6 +642,18 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		if !int64PtrEqual(task.ScheduleID, peekedExisting) {
 			return errRebindConcurrentModified
 		}
+		inherited, hadStored, err := scheduleTaskSources(tx, task, req.Sources)
+		if err != nil {
+			return err
+		}
+		// Inherit the task's own (non-derived) sources when it has them. An
+		// Agent-saved summary can legitimately have zero source rows until
+		// generation-config backfills them; there is nothing to inherit, so keep
+		// the caller-supplied sourceConfig rather than overwriting it with an
+		// empty set (PR#248 review P1-4).
+		if hadStored {
+			sched.SourceConfig = inherited
+		}
 
 		// Single-person guard: configured participants must be a subset of {creator}.
 		// Bypassed when team schedules are enabled.
@@ -1173,10 +1185,6 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		}
 		updates["time_range_type"] = *req.TimeRangeType
 	}
-	if req.Sources != nil {
-		b, _ := json.Marshal(req.Sources)
-		updates["source_config"] = model.JSON(b)
-	}
 	// participant_config / confirm_policy reset+merge is done INSIDE the tx where the
 	// FOR UPDATE-locked stored config is available (so we can preserve existing
 	// confirm state under Q3). See the confirm-state block below.
@@ -1269,8 +1277,26 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 
 			// 1->N: a schedule may own many tasks (history); no "already bound" rejection.
 		} else {
-			if _, err := loadBoundTaskForScheduleUpdate(tx, lockedSched, userID); err != nil {
+			task, err = loadBoundTaskForScheduleUpdate(tx, lockedSched, userID)
+			if err != nil {
 				return err
+			}
+		}
+		// Only rewrite source_config when the caller explicitly sends sources.
+		// A nil req.Sources on a task-scope edit (title/cadence) must not silently
+		// rewrite — or, for a zero-source Agent task, empty — an existing
+		// schedule's persisted config (PR#248 review P1-4).
+		if req.Sources != nil {
+			sources, hadStored, err := scheduleTaskSources(tx, task, req.Sources)
+			if err != nil {
+				return err
+			}
+			if hadStored {
+				updates["source_config"] = sources
+			} else {
+				// Task has no inheritable sources; persist the caller's explicit set.
+				b, _ := json.Marshal(req.Sources)
+				updates["source_config"] = model.JSON(b)
 			}
 		}
 

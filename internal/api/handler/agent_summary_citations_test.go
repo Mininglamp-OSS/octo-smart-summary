@@ -35,6 +35,46 @@ func seedEvidenceRow(t *testing.T, db *gorm.DB, uid, sessionID, handle string, m
 	}
 }
 
+func TestBuildAgentCompoundCitationsUsesWorkflowBuilder(t *testing.T) {
+	agent.ResetForTest()
+	db, skip := setupTestDB(t)
+	if skip {
+		return
+	}
+	messages := []pipeline.Message{
+		{ChannelID: "a", MessageSeq: 10, Timestamp: 1, Content: "first"},
+		{ChannelID: "b", MessageSeq: 20, Timestamp: 2, Content: "second"},
+		{ChannelID: "b", MessageSeq: 30, Timestamp: 3, Content: "third"},
+	}
+	seedEvidenceRow(t, db, "user", "compound", "compound-handle", messages)
+	h := &AgentSummaryHandler{db: db}
+	// PR#251 review P1-3 parity: single markers build rows; isolated
+	// compounds stay prose and must NOT become citation rows.
+	cits, err := h.buildCitationsForSession(context.Background(), "compound", "First [1] and group [2,3].", "user", "")
+	if err != nil || len(cits) != 1 {
+		t.Fatalf("cits=%v err=%v", cits, err)
+	}
+	if cits[0].MessageSeq != 10 {
+		t.Fatal("source identity changed")
+	}
+	proseOnly, err := h.buildCitationsForSession(context.Background(), "compound", "Group [1,3]. Range [2–3].", "user", "")
+	if err != nil || len(proseOnly) != 0 {
+		t.Fatalf("isolated compound built rows: %v err=%v", proseOnly, err)
+	}
+	if !citationsValid("Numeric prose [1,4] and good single [2]", cits, true) {
+		t.Fatal("isolated numeric prose was rejected")
+	}
+	if !citationsValid("Good group [1,3] and single [2]", cits, true) {
+		t.Fatal("valid compound rejected")
+	}
+	if citationsValid("Valid [1], dangling [2], valid [3]", []model.Citation{{Index: 1}, {Index: 3}}, true) {
+		t.Fatal("finish gate accepted an unresolved single inside the evidence window")
+	}
+	if !citationsValid("规划 [2024-2025]，页码 [100-120]。", nil, false) {
+		t.Fatal("citation-free numeric prose was rejected")
+	}
+}
+
 // Test 1: 有 [n] 标记 + 有完整 tool 轨迹 → citations 非空、结构正确
 func TestBuildCitationsForSession_WithMarkersAndMessages(t *testing.T) {
 	agent.ResetForTest()
