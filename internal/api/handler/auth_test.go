@@ -35,6 +35,7 @@ func setupTestDBs(t *testing.T) (db *gorm.DB, imDB *gorm.DB) {
 	if err := db.AutoMigrate(
 		&model.SummaryTask{},
 		&model.SummarySource{},
+		&model.SummarySourceSnapshot{},
 		&model.SummaryParticipant{},
 		&model.PersonalResult{},
 	); err != nil {
