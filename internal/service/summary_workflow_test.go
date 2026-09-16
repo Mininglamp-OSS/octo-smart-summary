@@ -80,6 +80,7 @@ func TestSummaryWorkflowPersistsDocumentSnapshotAtomically(t *testing.T) {
 	in.Sources = []SummaryWorkflowSource{{
 		SourceType: model.SourceDocument, SourceID: "d_1", SourceName: "Design",
 		SourceVersion: "v3", SourceHash: hex.EncodeToString(hash[:]), SnapshotContent: content,
+		SnapshotTruncated: true,
 	}}
 
 	if _, err := svc.CreateFromLegacyHTTP(context.Background(), in); err != nil {
@@ -93,7 +94,7 @@ func TestSummaryWorkflowPersistsDocumentSnapshotAtomically(t *testing.T) {
 	if err := db.First(&snapshot, "summary_source_id = ?", source.ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if source.SourceVersion != "v3" || source.SourceHash != snapshot.ContentHash || snapshot.Content != content || snapshot.ContentBytes != len([]byte(content)) {
+	if source.SourceVersion != "v3" || source.SourceHash != snapshot.ContentHash || snapshot.Content != content || snapshot.ContentBytes != len([]byte(content)) || !snapshot.Truncated {
 		t.Fatalf("source=%#v snapshot=%#v", source, snapshot)
 	}
 }

@@ -9,9 +9,12 @@ CREATE TABLE IF NOT EXISTS summary_source_snapshot (
   content MEDIUMTEXT NOT NULL,
   content_bytes INT NOT NULL,
   content_hash CHAR(64) NOT NULL,
+  truncated TINYINT(1) NOT NULL DEFAULT 0,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE KEY uk_summary_source_snapshot (summary_source_id),
-  KEY idx_summary_source_snapshot_created_at (created_at)
+  KEY idx_summary_source_snapshot_created_at (created_at),
+  CONSTRAINT fk_summary_source_snapshot_source
+    FOREIGN KEY (summary_source_id) REFERENCES summary_source(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- +migrate Down

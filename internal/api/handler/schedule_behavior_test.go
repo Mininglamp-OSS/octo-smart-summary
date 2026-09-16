@@ -40,6 +40,7 @@ func newScheduleTestDB(t *testing.T) *gorm.DB {
 		&model.SummarySchedule{},
 		&model.SummaryParticipant{},
 		&model.SummarySource{},
+		&model.SummarySourceSnapshot{},
 		&model.SummaryResult{},
 		&model.SummaryChunk{},
 		&model.PersonalResult{},
@@ -235,6 +236,13 @@ func TestDeleteSummary_CreatorCascadeDeletesOwnSchedule(t *testing.T) {
 	var task model.SummaryTask
 	db.First(&task, taskID)
 	schedID := *task.ScheduleID
+	source := model.SummarySource{TaskID: taskID, SourceType: model.SourceDocument, SourceID: "d_1"}
+	if err := db.Create(&source).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.SummarySourceSnapshot{SummarySourceID: source.ID, Content: "snapshot", ContentBytes: 8, ContentHash: "hash"}).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	// Creator deletes their own summary -> the schedule is cascade soft-deleted.
 	w = scheduleReq(t, r, "u1", "s1", http.MethodDelete, "/api/v1/summaries/"+sid(taskID), nil)
@@ -247,6 +255,10 @@ func TestDeleteSummary_CreatorCascadeDeletesOwnSchedule(t *testing.T) {
 	}
 	if sched.DeletedAt == nil {
 		t.Error("schedule should be cascade soft-deleted by its creator")
+	}
+	var snapshotCount int64
+	if err := db.Model(&model.SummarySourceSnapshot{}).Count(&snapshotCount).Error; err != nil || snapshotCount != 0 {
+		t.Fatalf("snapshot count=%d err=%v, want zero after schedule group deletion", snapshotCount, err)
 	}
 }
 
