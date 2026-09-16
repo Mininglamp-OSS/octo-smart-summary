@@ -14,6 +14,8 @@ import (
 
 const documentEvidenceChunkRunes = 40000
 
+const documentSnapshotTruncatedMarker = "\n[文档内容已按长度上限截断]"
+
 func documentSourcesOnly(sources []model.SummarySource) bool {
 	if len(sources) == 0 {
 		return false
@@ -48,6 +50,9 @@ func loadDocumentEvidence(db *gorm.DB, sources []model.SummarySource) ([]pipelin
 			return nil, fmt.Errorf("document snapshot hash mismatch source=%d", source.ID)
 		}
 		parts := splitDocumentEvidence(snapshot.Content, documentEvidenceChunkRunes)
+		if snapshot.Truncated && len(parts) > 0 {
+			parts[len(parts)-1] += documentSnapshotTruncatedMarker
+		}
 		for index, content := range parts {
 			messages = append(messages, pipeline.Message{
 				MessageSeq:    int64(index + 1),

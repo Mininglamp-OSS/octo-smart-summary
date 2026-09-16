@@ -261,7 +261,8 @@ func (SummarySource) TableName() string { return "summary_source" }
 // SummarySourceSnapshot is immutable authorization-time input captured for a
 // document source. The row is retained while its summary is live and is removed
 // when that summary is soft-deleted; deleting the source physically also cascades.
-// Worker consumption is introduced together with the document create entry point.
+// Workers consume this row instead of retaining a user's token or re-reading a
+// document that may have changed after task creation.
 type SummarySourceSnapshot struct {
 	ID              int64     `gorm:"primaryKey;autoIncrement" json:"id"`
 	SummarySourceID int64     `gorm:"column:summary_source_id;not null;uniqueIndex:uk_summary_source_snapshot" json:"summary_source_id"`

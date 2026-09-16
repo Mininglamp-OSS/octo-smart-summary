@@ -13,7 +13,7 @@ import (
 // TestDocumentPreviewLimiter covers the admission gate's own contract.
 func TestDocumentPreviewLimiter(t *testing.T) {
 	t.Run("caps concurrent slots per user", func(t *testing.T) {
-		l := newDocumentPreviewLimiter(2)
+		l := newDocumentSummaryLimiter(2)
 		r1, ok1 := l.acquire("u1")
 		_, ok2 := l.acquire("u1")
 		_, ok3 := l.acquire("u1")
@@ -31,7 +31,7 @@ func TestDocumentPreviewLimiter(t *testing.T) {
 	})
 
 	t.Run("users do not share a budget", func(t *testing.T) {
-		l := newDocumentPreviewLimiter(1)
+		l := newDocumentSummaryLimiter(1)
 		if _, ok := l.acquire("u1"); !ok {
 			t.Fatal("u1 should be admitted")
 		}
@@ -43,7 +43,7 @@ func TestDocumentPreviewLimiter(t *testing.T) {
 	t.Run("release is idempotent", func(t *testing.T) {
 		// A double release would hand out phantom capacity, which is worse than the
 		// unbounded case it replaces because it would look enforced.
-		l := newDocumentPreviewLimiter(1)
+		l := newDocumentSummaryLimiter(1)
 		rel, _ := l.acquire("u1")
 		rel()
 		rel()
@@ -57,7 +57,7 @@ func TestDocumentPreviewLimiter(t *testing.T) {
 	})
 
 	t.Run("does not leak map entries", func(t *testing.T) {
-		l := newDocumentPreviewLimiter(2)
+		l := newDocumentSummaryLimiter(2)
 		for i := 0; i < 100; i++ {
 			rel, _ := l.acquire(strings.Repeat("u", i+1))
 			rel()
@@ -72,7 +72,7 @@ func TestDocumentPreviewLimiter(t *testing.T) {
 	})
 
 	t.Run("is race free", func(t *testing.T) {
-		l := newDocumentPreviewLimiter(4)
+		l := newDocumentSummaryLimiter(4)
 		var wg sync.WaitGroup
 		for i := 0; i < 64; i++ {
 			wg.Add(1)
@@ -93,7 +93,7 @@ func TestDocumentPreviewLimiter(t *testing.T) {
 	})
 
 	t.Run("zero max disables the gate", func(t *testing.T) {
-		l := newDocumentPreviewLimiter(0)
+		l := newDocumentSummaryLimiter(0)
 		for i := 0; i < 10; i++ {
 			if _, ok := l.acquire("u1"); !ok {
 				t.Fatal("a zero limit must not reject")
@@ -107,12 +107,12 @@ func TestDocumentPreviewLimiter(t *testing.T) {
 // document_id against nothing, so this is the only server-side control standing
 // between one authenticated account and unbounded fan-out of LLM completions.
 func TestStreamDocumentPreview_InFlightCapRejects(t *testing.T) {
-	prev := documentPreviewLimiterInstance
-	documentPreviewLimiterInstance = newDocumentPreviewLimiter(1)
-	t.Cleanup(func() { documentPreviewLimiterInstance = prev })
+	prev := documentSummaryLimiterInstance
+	documentSummaryLimiterInstance = newDocumentSummaryLimiter(1)
+	t.Cleanup(func() { documentSummaryLimiterInstance = prev })
 
 	// Occupy the single slot for the user the test harness authenticates as.
-	release, ok := documentPreviewLimiterInstance.acquire("u")
+	release, ok := documentSummaryLimiterInstance.acquire("u")
 	if !ok {
 		t.Fatal("failed to occupy the slot")
 	}
@@ -135,9 +135,9 @@ func TestStreamDocumentPreview_InFlightCapRejects(t *testing.T) {
 // TestStreamDocumentPreview_SlotIsReleased pins the other direction: a completed
 // request must free its slot, or the endpoint bricks itself after N requests.
 func TestStreamDocumentPreview_SlotIsReleased(t *testing.T) {
-	prev := documentPreviewLimiterInstance
-	documentPreviewLimiterInstance = newDocumentPreviewLimiter(1)
-	t.Cleanup(func() { documentPreviewLimiterInstance = prev })
+	prev := documentSummaryLimiterInstance
+	documentSummaryLimiterInstance = newDocumentSummaryLimiter(1)
+	t.Cleanup(func() { documentSummaryLimiterInstance = prev })
 
 	h := &AgentSummaryHandler{llmApiURL: "http://127.0.0.1:1/v1", llmModel: "m", llmTimeout: 1}
 	for i := 0; i < 3; i++ {
@@ -152,10 +152,10 @@ func TestStreamDocumentPreview_SlotIsReleased(t *testing.T) {
 // placement: it is taken after validation, so a caller cannot exhaust another
 // request's capacity with malformed input that never reaches the model.
 func TestStreamDocumentPreview_InvalidRequestDoesNotConsumeSlot(t *testing.T) {
-	l := newDocumentPreviewLimiter(1)
-	prev := documentPreviewLimiterInstance
-	documentPreviewLimiterInstance = l
-	t.Cleanup(func() { documentPreviewLimiterInstance = prev })
+	l := newDocumentSummaryLimiter(1)
+	prev := documentSummaryLimiterInstance
+	documentSummaryLimiterInstance = l
+	t.Cleanup(func() { documentSummaryLimiterInstance = prev })
 
 	gin.SetMode(gin.TestMode)
 	h := &AgentSummaryHandler{llmApiURL: "http://llm.local", llmModel: "m"}

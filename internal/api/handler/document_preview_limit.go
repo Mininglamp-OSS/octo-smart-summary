@@ -1,6 +1,7 @@
 package handler
 
-// Per-user in-flight admission control for the ephemeral document preview.
+// Per-user in-flight admission control shared by ephemeral document previews
+// and persisted document-summary creation.
 //
 // Why this exists, stated plainly because the alternative was shipping on an
 // unresolved 「待人确认」:
@@ -26,7 +27,7 @@ package handler
 //     account into an amplifier, and it is the dimension a single-process counter
 //     can enforce honestly.
 //   - It is per-process, and this service runs multiple replicas, so the effective
-//     cluster limit is documentPreviewMaxInFlightPerUser × replicas. That is a real
+//     cluster limit is documentSummaryMaxInFlightPerUser × replicas. That is a real
 //     limitation, not a rounding error, and it is why this is described as an
 //     admission gate rather than a quota. A cluster-wide quota belongs in the
 //     gateway or a shared store; this closes the unbounded case without pretending
@@ -39,26 +40,25 @@ package handler
 
 import "sync"
 
-// documentPreviewMaxInFlightPerUser bounds concurrent previews for one user in one
-// process. 2 rather than 1: a user legitimately reopening a document while the
-// previous stream is still draining should not see a spurious rejection, and the
-// front end cancels via AbortController rather than waiting for the server.
-const documentPreviewMaxInFlightPerUser = 2
+// documentSummaryMaxInFlightPerUser bounds concurrent document operations for
+// one user in one process. 2 rather than 1 allows a persisted summary to start
+// while an earlier preview stream is still draining.
+const documentSummaryMaxInFlightPerUser = 2
 
-// documentPreviewLimiter tracks in-flight previews per user.
-type documentPreviewLimiter struct {
+// documentSummaryLimiter tracks in-flight document operations per user.
+type documentSummaryLimiter struct {
 	mu       sync.Mutex
 	max      int
 	inFlight map[string]int
 }
 
-func newDocumentPreviewLimiter(max int) *documentPreviewLimiter {
-	return &documentPreviewLimiter{max: max, inFlight: make(map[string]int)}
+func newDocumentSummaryLimiter(max int) *documentSummaryLimiter {
+	return &documentSummaryLimiter{max: max, inFlight: make(map[string]int)}
 }
 
 // acquire reserves a slot for userID. The release func is safe to call exactly
 // once; it is a no-op when ok is false, so callers can defer unconditionally.
-func (l *documentPreviewLimiter) acquire(userID string) (release func(), ok bool) {
+func (l *documentSummaryLimiter) acquire(userID string) (release func(), ok bool) {
 	if l == nil || l.max <= 0 {
 		return func() {}, true
 	}
@@ -85,7 +85,7 @@ func (l *documentPreviewLimiter) acquire(userID string) (release func(), ok bool
 	}, true
 }
 
-// documentPreviewLimiterInstance is process-global because the handler is
+// documentSummaryLimiterInstance is process-global because the handler is
 // constructed per router and the limit is a property of the process's capacity,
 // not of any one handler instance.
-var documentPreviewLimiterInstance = newDocumentPreviewLimiter(documentPreviewMaxInFlightPerUser)
+var documentSummaryLimiterInstance = newDocumentSummaryLimiter(documentSummaryMaxInFlightPerUser)

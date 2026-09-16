@@ -378,18 +378,32 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		}
 	}
 	workflowInput.Sources = make([]service.SummaryWorkflowSource, 0, len(req.Sources))
-	for _, source := range req.Sources {
-		// The snapshot schema lands before the worker consumer. Keep the public
-		// create path closed in this independently deployable change so a document
-		// id can never be dispatched to the chat-only worker by an older release.
-		if source.SourceType == model.SourceDocument {
-			c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "文档总结功能尚未开放"})
+	if createSummaryHasDocumentSource(req) {
+		releaseSlot, admitted := documentSummaryLimiterInstance.acquire(userID)
+		if !admitted {
+			c.Header("Retry-After", "1")
+			c.JSON(http.StatusTooManyRequests, apiResponse{Code: 42902, Message: "文档总结请求过于频繁，请稍后重试"})
 			return
 		}
-		workflowInput.Sources = append(workflowInput.Sources, service.SummaryWorkflowSource{
-			SourceType: source.SourceType,
-			SourceID:   source.SourceID,
-		})
+		defer releaseSlot()
+	}
+	documentSources, documentMode, documentErr := h.prepareDocumentSummarySources(c.Request.Context(), c.Request.Header, spaceID, userID, req)
+	if documentErr != nil {
+		if documentErr.retryAfter != "" {
+			c.Header("Retry-After", documentErr.retryAfter)
+		}
+		c.JSON(documentErr.status, apiResponse{Code: documentErr.code, Message: documentErr.message})
+		return
+	}
+	if documentMode {
+		workflowInput.Sources = documentSources
+	} else {
+		for _, source := range req.Sources {
+			workflowInput.Sources = append(workflowInput.Sources, service.SummaryWorkflowSource{
+				SourceType: source.SourceType,
+				SourceID:   source.SourceID,
+			})
+		}
 	}
 	workflowInput.Participants = make([]service.SummaryWorkflowParticipant, 0, len(req.Participants))
 	for _, participant := range req.Participants {

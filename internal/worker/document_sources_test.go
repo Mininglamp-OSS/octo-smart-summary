@@ -37,6 +37,37 @@ func TestLoadDocumentEvidenceUsesPersistedSnapshot(t *testing.T) {
 	}
 }
 
+func TestLoadDocumentEvidenceSurfacesSnapshotTruncation(t *testing.T) {
+	db := setupProcessorTestDB(t)
+	if err := db.AutoMigrate(&model.SummarySourceSnapshot{}); err != nil {
+		t.Fatal(err)
+	}
+	content := "retained body"
+	hash := sha256.Sum256([]byte(content))
+	hashText := hex.EncodeToString(hash[:])
+	source := model.SummarySource{TaskID: 1, SourceType: model.SourceDocument, SourceID: "d_1", SourceHash: hashText}
+	if err := db.Create(&source).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.SummarySourceSnapshot{
+		SummarySourceID: source.ID,
+		Content:         content,
+		ContentBytes:    len(content),
+		ContentHash:     hashText,
+		Truncated:       true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	messages, err := loadDocumentEvidence(db, []model.SummarySource{source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 || messages[0].Content != content+documentSnapshotTruncatedMarker {
+		t.Fatalf("messages = %#v, want retained content plus truncation marker", messages)
+	}
+}
+
 func TestLoadDocumentEvidenceRejectsChangedSnapshot(t *testing.T) {
 	db := setupProcessorTestDB(t)
 	if err := db.AutoMigrate(&model.SummarySourceSnapshot{}); err != nil {
