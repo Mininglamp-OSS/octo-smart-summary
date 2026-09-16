@@ -24,8 +24,10 @@ func TestCreateAgentSummary_WorkspaceCompoundCitationSave(t *testing.T) {
 		status              int
 		wantCitations       int
 	}{
-		{"complete", "Budget [9,73]. ROI [88]. Range [93–95].", "Budget [9,73]. ROI [88]. Range [93–95].", http.StatusOK, 6},
-		{"out-of-range", "Budget [9,130]. ROI [88].", "Budget [9,130]. ROI [88].", http.StatusOK, 2},
+		// PR#251 review P1-3: isolated compound groups stay prose — content is
+		// saved byte-identically and only single markers become citation rows.
+		{"complete", "Budget [9,73]. ROI [88]. Range [93–95].", "Budget [9,73]. ROI [88]. Range [93–95].", http.StatusOK, 1},
+		{"out-of-range", "Budget [9,130]. ROI [88].", "Budget [9,130]. ROI [88].", http.StatusOK, 1},
 		{"malformed", "Budget [9,]. ROI [88].", "Budget [9,]. ROI [88].", http.StatusOK, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

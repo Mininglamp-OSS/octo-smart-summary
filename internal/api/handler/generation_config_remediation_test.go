@@ -92,6 +92,28 @@ func TestSaveGenerationConfigRejectsBoundScheduleWithoutWrites(t *testing.T) {
 	}
 }
 
+// PR#251 review P2 pin: a scheduled task's caller-supplied (unchanged) source
+// set is validated-for-nothing in validateRegenerationConfigDB and DROPPED by
+// saveGenerationScope's writeSources=false guard — never persisted. The
+// stored server-owned set must survive byte-identically.
+func TestRegenerateScheduledTaskDropsCallerSources(t *testing.T) {
+	db := setupRegenerateDB(t)
+	id, _, _ := seedCompletedTask(t, db)
+	db.Model(&model.SummaryTask{}).Where("id = ?", id).Update("schedule_id", 42)
+	r := setupRegenerateRouter(NewTaskHandler(db, nil, ""))
+	// Sources mirror the stored set exactly (what an honest client resends).
+	w := doJSONRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/regenerate", id), "creator1",
+		map[string]interface{}{"sources": []sourceReq{{SourceType: model.SourceGroup, SourceID: "grp_abc"}}})
+	if w.Code != 200 {
+		t.Fatalf("unchanged stored set must pass validation, got %d: %s", w.Code, w.Body)
+	}
+	var sources []model.SummarySource
+	db.Where("task_id = ?", id).Find(&sources)
+	if len(sources) != 1 || sources[0].SourceID != "grp_abc" {
+		t.Fatalf("stored schedule sources altered: %+v", sources)
+	}
+}
+
 func TestRegenerateCannotReplaceBoundScheduleSources(t *testing.T) {
 	db := setupRegenerateDB(t)
 	id, _, _ := seedCompletedTask(t, db)

@@ -284,14 +284,18 @@ func EmitSummaryResponseTool() (Tool, TerminalHandler) {
 		hasEvidence, evidenceCount := summaryCitationEvidenceWindow(ctx)
 		if hasEvidence &&
 			(payload.ResultType == SummaryResultAgentPreview || payload.ResultType == SummaryResultAgentRevision) &&
-			(payload.Preview == nil || !citationtext.Valid(payload.Preview.Content,
-				func(n int) bool { return summaryCitationIndexAllowed(ctx, n, evidenceCount) }, int(evidenceCount), true)) {
+			(payload.Preview == nil || !citationtext.ValidAdjacent(payload.Preview.Content,
+				func(n int) bool { return summaryCitationIndexAllowed(ctx, n, evidenceCount) }, true)) {
 			// Evidence-bounded marker guard (review 5087740714 blocker 4):
 			// every [N] must refer to an index inside the persisted evidence
 			// window, and at least one marker must exist. This accepts a
 			// legitimate preview citing only [2]/[3] and rejects prose whose
-			// "[1]" is not citation syntax at all. Explicit groups must also
-			// resolve in full against the exact frozen evidence set.
+			// "[1]" is not citation syntax at all. Compound groups inside a
+			// real citation cluster must still resolve in full against the
+			// frozen evidence set. PR#251 review P1-1 adds one exemption with
+			// the CanonicalizeAdjacent adjacency rule: an ISOLATED compound
+			// group ("GB/T [50011-2010]", "预算区间 [3-5] 万元") is prose, not
+			// citation syntax, so it no longer discards the whole turn.
 			return TerminalOutcome{}, errors.New("preview.content must include citation markers such as [1] for chat-backed summaries")
 		}
 		return TerminalOutcome{

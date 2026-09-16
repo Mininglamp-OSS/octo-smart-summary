@@ -23,15 +23,17 @@ func TestWorkflowCompoundCitationFinalization(t *testing.T) {
 	}
 	normalized, citations = dedupCitations(normalized, citations)
 	normalized = stripOrphanCitations(normalized, citations)
-	if normalized != "Budget [88][9][73]." || len(citations) != 3 {
-		t.Fatalf("lost compound citations: %q, %+v", normalized, citations)
+	// PR#251 review P1-3: buildCitations harvests single markers only, so the
+	// compound group never becomes a phantom citation row. The real marker
+	// [88] is kept; the adjacent compound is NOT expanded to [9][73] here
+	// (expansion happens upstream in normalize only for authorized clusters,
+	// and rows now carry only single markers), so the group survives as
+	// bracketed prose rather than pretending to cite [9]/[73].
+	if normalized != "Budget [88][9,73]." || len(citations) != 1 {
+		t.Fatalf("cluster handling changed: %q, %+v", normalized, citations)
 	}
-	for i, citation := range citations {
-		if citation.Index != messages[i].CitationIndex ||
-			citation.ChannelID != messages[i].ChannelID ||
-			citation.MessageSeq != messages[i].MessageSeq {
-			t.Fatalf("source identity changed: %+v", citation)
-		}
+	if citations[0].Index != 88 || citations[0].ChannelID != "forecast" {
+		t.Fatalf("real citation lost: %+v", citations[0])
 	}
 	prose := "Budget range [9,74]. ROI [88]."
 	if got, err := service.NormalizeGeneratedCitations(prose, buildCitations(prose, messages, messages, nil)); err != nil || got != prose {
@@ -50,7 +52,10 @@ func TestExtractCitationIndexes(t *testing.T) {
 		{"none", "没有引用标记", nil},
 		{"dedup", "[3] 重复引用 [3]", []int{3}},
 		{"consecutive", "[74][83][91]", []int{74, 83, 91}},
-		{"compound", "[9,73] [93–95]", []int{9, 73, 93, 94, 95}},
+		// PR#251 review P1-3: compound groups are no longer harvested — an
+		// isolated group is prose ("预算区间 [3-5] 万元"), matching
+		// stripOrphanCitations' single-marker regex, so no phantom rows.
+		{"compound", "[9,73] [93–95]", nil},
 		{"compound code", "`[9,73]` [88]", []int{88}},
 		{"numeric link", "[9](https://example.com/[73]) [88]", []int{88}},
 		{"invalid range", "[95–93] [88]", []int{88}},

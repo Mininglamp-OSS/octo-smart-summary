@@ -48,12 +48,18 @@ func TestBuildAgentCompoundCitationsUsesWorkflowBuilder(t *testing.T) {
 	}
 	seedEvidenceRow(t, db, "user", "compound", "compound-handle", messages)
 	h := &AgentSummaryHandler{db: db}
-	cits, err := h.buildCitationsForSession(context.Background(), "compound", "Group [1,3]. Range [2–3].", "user", "")
-	if err != nil || len(cits) != 3 {
+	// PR#251 review P1-3 parity: single markers build rows; isolated
+	// compounds stay prose and must NOT become citation rows.
+	cits, err := h.buildCitationsForSession(context.Background(), "compound", "First [1] and group [2,3].", "user", "")
+	if err != nil || len(cits) != 1 {
 		t.Fatalf("cits=%v err=%v", cits, err)
 	}
-	if cits[0].MessageSeq != 10 || cits[1].MessageSeq != 20 || cits[2].MessageSeq != 30 {
+	if cits[0].MessageSeq != 10 {
 		t.Fatal("source identity changed")
+	}
+	proseOnly, err := h.buildCitationsForSession(context.Background(), "compound", "Group [1,3]. Range [2–3].", "user", "")
+	if err != nil || len(proseOnly) != 0 {
+		t.Fatalf("isolated compound built rows: %v err=%v", proseOnly, err)
 	}
 	if !citationsValid("Numeric prose [1,4] and good single [2]", cits, true) {
 		t.Fatal("isolated numeric prose was rejected")

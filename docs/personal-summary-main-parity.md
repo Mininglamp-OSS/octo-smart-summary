@@ -66,7 +66,9 @@ database snapshots are intentionally excluded from the repository.
 ## Citation consistency follow-up
 
 Agent saves, Workflow and refinement reuse the same prose-safe generated-content
-normalizer. Numeric lists and inclusive ranges become adjacent `[n]` markers only
+normalizer (`citationtext.CanonicalizeAdjacent`), and the Agent draft/emit gates
+validate with its companion `citationtext.ValidAdjacent` (PR#251 review P1-1).
+Numeric lists and inclusive ranges become adjacent `[n]` markers only
 inside an adjacent citation cluster and when every index resolves to authorized
 evidence. Isolated bracketed ranges stay byte-identical because they may be dates,
 standards, page ranges or counts. Single markers inside the known evidence window

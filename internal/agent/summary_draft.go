@@ -234,7 +234,12 @@ func summaryDraftQualityFailure(ctx context.Context, turn AssistantTurn) string 
 		reason = "too_large"
 	}
 	if hasEvidence, count := summaryCitationEvidenceWindow(ctx); hasEvidence && reason == "" &&
-		!citationtext.Valid(turn.Content, func(n int) bool { return summaryCitationIndexAllowed(ctx, n, count) }, int(count), true) {
+		!citationtext.ValidAdjacent(turn.Content, func(n int) bool { return summaryCitationIndexAllowed(ctx, n, count) }, true) {
+		// Prose-safe validation keeps blocker-4 guarantees (every single
+		// marker and every cluster member in the evidence window, at least
+		// one real marker) while isolated bracketed-number prose such as
+		// "GB/T [50011-2010]" or "预算区间 [3-5] 万元" no longer discards
+		// the whole draft (PR#251 review P1-1).
 		reason = "invalid_citations"
 	}
 	return reason
@@ -256,12 +261,15 @@ func summaryDraftRepairInstruction(reason string) string {
 func canonicalizeDraftCitations(ctx context.Context, content string) (string, error) {
 	hasEvidence, count := summaryCitationEvidenceWindow(ctx)
 	if hasEvidence {
-		return citationtext.Canonicalize(content, func(n int) bool { return summaryCitationIndexAllowed(ctx, n, count) }, int(count))
+		// Same prose-safe expander as the Workflow finalizer: only compound
+		// groups inside an adjacent citation cluster are expanded, so prose
+		// like "预算区间 [3-5] 万元" cannot be corrupted into [3][4][5]
+		// (PR#251 review P1-2). Single markers stay untouched.
+		return citationtext.CanonicalizeAdjacent(content, func(n int) bool { return summaryCitationIndexAllowed(ctx, n, count) }), nil
 	}
 	// No-fetch rewrites may use only the already-authorized reference entries.
 	source, _ := ctx.Value(summaryDraftSourceKey{}).(SummaryDraftSource)
 	indices := make(map[int]bool)
-	maxIndex := -1 // No reference metadata is unknown, not a known empty window.
 	for _, ref := range source.References {
 		var cits []struct {
 			Index int `json:"index"`
@@ -269,13 +277,10 @@ func canonicalizeDraftCitations(ctx context.Context, content string) (string, er
 		if json.Unmarshal(ref.Citations, &cits) == nil {
 			for _, c := range cits {
 				indices[c.Index] = true
-				if c.Index > maxIndex {
-					maxIndex = c.Index
-				}
 			}
 		}
 	}
-	return citationtext.Canonicalize(content, func(n int) bool { return indices[n] }, maxIndex)
+	return citationtext.CanonicalizeAdjacent(content, func(n int) bool { return indices[n] }), nil
 }
 
 func preparedDraftResult(state *summaryDraftState) string {

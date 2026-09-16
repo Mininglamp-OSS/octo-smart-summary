@@ -359,9 +359,13 @@ func TestPreparedDraftRepairsQualityUsingSameEvidenceAtFinalStep(t *testing.T) {
 	for _, rejected := range []AssistantTurn{
 		{Content: "Missing citations"},
 		{Content: "Unknown reference [2]"},
-		{Content: "Unresolved group [1,2] and valid single [1]"},
-		{Content: "Unresolved range [1–3] and valid single [1]"},
-		{Content: "Malformed group [1,] and valid single [1]"},
+		// PR#251 review P1-1: an ISOLATED compound is prose, so these shapes
+		// no longer fail the draft (ValidAdjacent adopts the adjacency rule).
+		// Corruption inside a real cluster must still fail closed — the
+		// cluster forms below by putting the bad group next to [1].
+		{Content: "Unresolved cluster [1][1,2]"},
+		{Content: "Unresolved cluster range [1][1–3]"},
+		{Content: "Malformed cluster [1][1,]"},
 		{},
 		{Content: "Partial [1]", Truncated: true},
 		{Content: "<tool_call>do something</tool_call>"},
@@ -447,7 +451,10 @@ func TestPreparedDraftCanonicalizesGroupsWithoutAnotherModelCall(t *testing.T) {
 	if _, err := prepare(ctx, json.RawMessage(`{}`)); err != nil {
 		t.Fatal(err)
 	}
-	if got := draftState(ctx).text; got != "Budget [9][73]. ROI [88]. Repeated [9]. Range [93][94][95]." || calls != 1 {
+	// PR#251 review P1-2: an isolated group is prose — it must NOT be
+	// rewritten into [9][73] (adjacency rule), unlike the old strict
+	// canonicalizer. Clustered compounds and plain singles still normalize.
+	if got := draftState(ctx).text; got != "Budget [9,73]. ROI [88]. Repeated [9]. Range [93–95]." || calls != 1 {
 		t.Fatalf("got %q calls=%d", got, calls)
 	}
 	// Count/max cannot stand in for actual membership of a sparse manifest.

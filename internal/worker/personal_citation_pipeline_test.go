@@ -33,16 +33,20 @@ func TestPersonalPipelineCitationFinalization(t *testing.T) {
 		// normalized to singles by CanonicalizeAdjacent.
 		{"cluster", "Budget [1][1,2].", "Budget [1][2].", false, 2},
 		// An isolated compound is treated as prose and left byte-identical — it
-		// must never be rewritten into [1][2] (PR#248 review B-2). Its indices
-		// are still harvested into the citation list.
-		{"isolated compound", "Budget [1,2].", "Budget [1,2].", false, 2},
+		// must never be rewritten into [1][2] (PR#248 review B-2), and per
+		// PR#251 review P1-3 its indices are NOT harvested into citation rows:
+		// extract and strip must agree that isolated groups are prose, so the
+		// content keeps zero citations and would be strip-cleaned if orphaned.
+		{"isolated compound", "Budget [1,2].", "Budget [1,2].", false, 0},
 		{"year range", "Budget [1]. Plan [2024-2025].", "Budget [1]. Plan [2024-2025].", false, 1},
 		{"date", "Budget [1]. Date [2026-09-14].", "Budget [1]. Date [2026-09-14].", false, 1},
 		{"pages", "Budget [1]. Pages [100-120].", "Budget [1]. Pages [100-120].", false, 1},
 		{"orphan single", "Budget [1]. Other [999].", "", false, 1},
 		// An unresolvable group must NOT abort the whole summary; it is left as
-		// prose rather than failing the task (PR#248 review B-1).
-		{"unresolved group", "Budget [1,3].", "Budget [1,3].", false, 1},
+		// prose rather than failing the task (PR#248 review B-1). No citation
+		// rows are built from its indices (PR#251 review P1-3: extract must
+		// not harvest compound groups — they stay prose end-to-end).
+		{"unresolved group", "Budget [1,3].", "Budget [1,3].", false, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var calls atomic.Int32
@@ -84,8 +88,14 @@ func TestPersonalPipelineCitationFinalization(t *testing.T) {
 				}
 				return
 			}
-			if err != nil || len(cits) == 0 {
+			if err != nil {
 				t.Fatalf("pipeline error=%v content=%q citations=%v", err, got, cits)
+			}
+			if tc.wantCits == 0 && len(cits) != 0 {
+				t.Fatalf("prose-only content built citation rows: %v", cits)
+			}
+			if tc.wantCits > 0 && len(cits) == 0 {
+				t.Fatalf("expected citation rows, content=%q citations=%v", got, cits)
 			}
 			if tc.want != "" && got != tc.want {
 				t.Fatalf("content=%q want=%q", got, tc.want)

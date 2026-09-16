@@ -63,8 +63,13 @@ func (h *TaskHandler) validateRegenerationConfigDB(c *gin.Context, db *gorm.DB, 
 		if _, _, err := scheduleTaskSources(db, task, *req.Sources); err != nil {
 			return err
 		}
-		// The immutable set was re-sent unchanged. It needs no permission
-		// re-validation or persistence; the server-owned names stay authoritative.
+		// The immutable set was re-sent unchanged, so it needs no permission
+		// re-validation. Clearing the LOCAL copy only skips validation here;
+		// req is a value, so the caller still sees Sources != nil. The
+		// persistence guarantee lives in saveGenerationScope: it re-reads the
+		// locked task and forces writeSources=false for any scheduled task,
+		// so a caller-supplied set on a scheduled task is validated-for-
+		// nothing here and DROPPED there, never written (PR#251 review P2).
 		req.Sources = nil
 	}
 	limit := maxSummaryTopicRunes
