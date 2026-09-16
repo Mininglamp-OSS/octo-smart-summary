@@ -642,9 +642,17 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		if !int64PtrEqual(task.ScheduleID, peekedExisting) {
 			return errRebindConcurrentModified
 		}
-		sched.SourceConfig, err = scheduleTaskSources(tx, task, req.Sources)
+		inherited, hadStored, err := scheduleTaskSources(tx, task, req.Sources)
 		if err != nil {
 			return err
+		}
+		// Inherit the task's own (non-derived) sources when it has them. An
+		// Agent-saved summary can legitimately have zero source rows until
+		// generation-config backfills them; there is nothing to inherit, so keep
+		// the caller-supplied sourceConfig rather than overwriting it with an
+		// empty set (PR#248 review P1-4).
+		if hadStored {
+			sched.SourceConfig = inherited
 		}
 
 		// Single-person guard: configured participants must be a subset of {creator}.
@@ -1274,12 +1282,22 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 				return err
 			}
 		}
-		if req.Sources != nil || req.Scope == "task" {
-			sources, err := scheduleTaskSources(tx, task, req.Sources)
+		// Only rewrite source_config when the caller explicitly sends sources.
+		// A nil req.Sources on a task-scope edit (title/cadence) must not silently
+		// rewrite — or, for a zero-source Agent task, empty — an existing
+		// schedule's persisted config (PR#248 review P1-4).
+		if req.Sources != nil {
+			sources, hadStored, err := scheduleTaskSources(tx, task, req.Sources)
 			if err != nil {
 				return err
 			}
-			updates["source_config"] = sources
+			if hadStored {
+				updates["source_config"] = sources
+			} else {
+				// Task has no inheritable sources; persist the caller's explicit set.
+				b, _ := json.Marshal(req.Sources)
+				updates["source_config"] = model.JSON(b)
+			}
 		}
 
 		if req.Scope == "task" && (task.ScheduleID == nil || *task.ScheduleID != sched.ID) {

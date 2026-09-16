@@ -7,18 +7,23 @@ import (
 )
 
 func TestNormalizeGeneratedCitations(t *testing.T) {
-	citations := []model.Citation{{Index: 9}, {Index: 73}, {Index: 88}}
-	got, err := NormalizeGeneratedCitations("Budget [9,73]. ROI [88].", citations)
-	if err != nil || got != "Budget [9][73]. ROI [88]." {
+	citations := []model.Citation{{Index: 1}, {Index: 3}, {Index: 9}, {Index: 73}, {Index: 88}}
+	got, err := NormalizeGeneratedCitations("Budget [88][9,73].", citations)
+	if err != nil || got != "Budget [88][9][73]." {
 		t.Fatalf("%q %v", got, err)
 	}
 	if len(CleanUnreferencedCitations(got, citations)) != 3 {
 		t.Fatal("lost group sources")
 	}
-	for _, text := range []string{"Missing [9,74] valid [88]", "Gap [9–73] valid [88]"} {
-		if _, err := NormalizeGeneratedCitations(text, citations); err == nil {
-			t.Fatalf("accepted %q", text)
+	for _, text := range []string{
+		"预算区间 [3-5] 万元。", "依据 GB/T [50011-2010]。", "排期 [2026-09]。", "编号 [7;9]。", "涉及 [1,3] 两类问题。",
+	} {
+		if got, err := NormalizeGeneratedCitations(text, citations); err != nil || got != text {
+			t.Fatalf("numeric prose changed: %q %v", got, err)
 		}
+	}
+	if _, err := NormalizeGeneratedCitations("Valid [1], dangling [2], valid [3].", citations); err == nil {
+		t.Fatal("accepted an unresolved single marker inside the evidence window")
 	}
 }
 

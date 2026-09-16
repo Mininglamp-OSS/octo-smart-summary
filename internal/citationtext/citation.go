@@ -111,6 +111,79 @@ func Canonicalize(content string, valid func(int) bool, maxIndex int) (string, e
 	return b.String(), nil
 }
 
+// CanonicalizeAdjacent normalizes compound citation groups like Canonicalize,
+// but is built for generation paths (Workflow Map/Reduce) whose evidence window
+// is a contiguous 1..N range. There, every small bracketed number "resolves",
+// so Canonicalize would (a) silently rewrite ordinary prose such as
+// "预算区间 [3-5] 万元" into false citations "[3][4][5]", and (b) hard-fail the
+// whole summary on an unresolvable group such as "GB/T [50011-2010]" or a
+// semicolon group, with no repair loop behind it (PR#248 review B-1/B-2).
+//
+// This variant therefore NEVER errors — any group it cannot safely resolve is
+// left byte-identical — and it only expands a group that is adjacent to another
+// citation marker, i.e. part of a real citation cluster like "[1][3-5]". An
+// isolated bracketed number is treated as prose and preserved. The single-marker
+// OutputRule already steers the model to emit "[9][73]" directly, so genuine
+// citations rarely need expansion here anyway.
+func CanonicalizeAdjacent(content string, valid func(int) bool) string {
+	markers := Scan(content)
+	var b strings.Builder
+	offset := 0
+	for i, m := range markers {
+		if !m.Compound || len(m.Indices) == 0 {
+			continue // single markers and unparseable groups stay as prose
+		}
+		resolved := valid != nil
+		for _, n := range m.Indices {
+			if valid == nil || !valid(n) {
+				resolved = false
+				break
+			}
+		}
+		if !resolved || !adjacentToMarker(content, markers, i) {
+			continue
+		}
+		b.WriteString(content[offset:m.Start])
+		seen := make(map[int]bool)
+		for _, n := range m.Indices {
+			if !seen[n] {
+				b.WriteString("[" + strconv.Itoa(n) + "]")
+				seen[n] = true
+			}
+		}
+		if b.Len() > len(content)+maxExpansionBytes {
+			return content // pathological growth: keep the model's output verbatim
+		}
+		offset = m.End
+	}
+	b.WriteString(content[offset:])
+	if b.Len() > len(content)+maxExpansionBytes {
+		return content
+	}
+	return b.String()
+}
+
+// adjacentToMarker reports whether markers[i] abuts another Scan marker with
+// only optional spaces/tabs between them — the shape of a citation cluster
+// ("[1][2]", "[1] [3-5]") as opposed to a bracketed number sitting in prose.
+func adjacentToMarker(content string, markers []Marker, i int) bool {
+	onlySpace := func(a, b int) bool {
+		for ; a < b; a++ {
+			if content[a] != ' ' && content[a] != '\t' {
+				return false
+			}
+		}
+		return true
+	}
+	if i > 0 && onlySpace(markers[i-1].End, markers[i].Start) {
+		return true
+	}
+	if i+1 < len(markers) && onlySpace(markers[i].End, markers[i+1].Start) {
+		return true
+	}
+	return false
+}
+
 func Valid(content string, valid func(int) bool, maxIndex int, requireMarker bool) bool {
 	markers := Scan(content)
 	hasCitation := false

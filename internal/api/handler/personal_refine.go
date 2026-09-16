@@ -146,7 +146,7 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 	var newVersion model.PersonalResultVersion
 	shouldTriggerMeta := false
 	err = h.db.Transaction(func(tx *gorm.DB) error {
-		lockedTask, err := lockPersonalWriteTask(tx, taskID, false)
+		lockedTask, err := lockPersonalWriteTask(tx, taskID, false, false)
 		if err != nil {
 			return err
 		}
@@ -396,7 +396,7 @@ func (h *PersonalHandler) RefinePersonalSummaryStream(c *gin.Context) {
 	var newVersion model.PersonalResultVersion
 	shouldTriggerMeta := false
 	err = h.db.Transaction(func(tx *gorm.DB) error {
-		lockedTask, err := lockPersonalWriteTask(tx, taskID, false)
+		lockedTask, err := lockPersonalWriteTask(tx, taskID, false, false)
 		if err != nil {
 			return err
 		}
@@ -645,7 +645,7 @@ func (h *PersonalHandler) RestorePersonalVersion(c *gin.Context) {
 	now := timezone.Now()
 	shouldTriggerMeta := false
 	err = h.db.Transaction(func(tx *gorm.DB) error {
-		lockedTask, err := lockPersonalWriteTask(tx, taskID, false)
+		lockedTask, err := lockPersonalWriteTask(tx, taskID, false, false)
 		if err != nil {
 			return err
 		}
@@ -786,6 +786,13 @@ func (h *PersonalHandler) RegeneratePersonalSummary(c *gin.Context) {
 		return
 	}
 	err := h.db.Transaction(func(tx *gorm.DB) error {
+		lockedTask, err := lockPersonalWriteTask(tx, taskID, false, false)
+		if err != nil {
+			return err
+		}
+		if lockedTask.SummaryMode != model.ModeByPerson {
+			return service.NewBizError(40005, "该任务不支持个人重新生成", http.StatusBadRequest)
+		}
 		var latestPR model.PersonalResult
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ? AND task_id = ? AND user_id = ?", pr.ID, taskID, userID).
@@ -798,20 +805,19 @@ func (h *PersonalHandler) RegeneratePersonalSummary(c *gin.Context) {
 		res := tx.Model(&model.PersonalResult{}).
 			Where("id = ? AND task_id = ? AND user_id = ? AND worker_status IN ?", latestPR.ID, taskID, userID, []int{model.PersonalStatusCompleted, model.PersonalStatusFailed}).
 			Updates(map[string]interface{}{
-				"worker_status":      model.PersonalStatusPending,
-				"workflow_stage":     "",
-				"retry_count":        0,
-				"content":            "",
-				"citations_json":     "",
-				"msg_count":          0,
-				"total_token_used":   0,
-				"model_version":      "",
-				"current_version_id": nil,
-				"error_message":      nil,
-				"submitted_at":       nil,
-				"submit_source":      model.SubmitSourceNone,
-				"generated_at":       nil,
-				"edited_at":          nil,
+				"worker_status":    model.PersonalStatusPending,
+				"workflow_stage":   "",
+				"retry_count":      0,
+				"content":          "",
+				"citations_json":   "",
+				"msg_count":        0,
+				"total_token_used": 0,
+				"model_version":    "",
+				"error_message":    nil,
+				"submitted_at":     nil,
+				"submit_source":    model.SubmitSourceNone,
+				"generated_at":     nil,
+				"edited_at":        nil,
 			})
 		if res.Error != nil {
 			return res.Error
@@ -851,13 +857,14 @@ func (h *PersonalHandler) RegeneratePersonalSummary(c *gin.Context) {
 // Edit, feedback refinement and restore take the task lock before the personal-result
 // lock. Call only in the short persistence transaction, never around an LLM
 // call. Its fresh CurrentResultID is also the display-sync target.
-func lockPersonalWriteTask(tx *gorm.DB, taskID int64, allowFailed bool) (model.SummaryTask, error) {
+func lockPersonalWriteTask(tx *gorm.DB, taskID int64, allowFailed, allowProcessing bool) (model.SummaryTask, error) {
 	var task model.SummaryTask
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&task, taskID).Error; err != nil {
 		return task, err
 	}
 	if task.Status != model.StatusCompleted &&
-		!(allowFailed && (task.Status == model.StatusFailed || task.Status == model.StatusCancelled)) {
+		!(allowFailed && (task.Status == model.StatusFailed || task.Status == model.StatusCancelled)) &&
+		!(allowProcessing && task.Status == model.StatusProcessing) {
 		return task, service.NewBizError(40005, "任务状态已变更，请刷新后重试", http.StatusConflict)
 	}
 	return task, nil

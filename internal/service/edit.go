@@ -16,8 +16,10 @@ func CleanUnreferencedCitations(content string, citations []model.Citation) []mo
 	return kept
 }
 
-// NormalizeGeneratedCitations is shared by Agent saves, Workflow and refinement.
-// Only already-authorized citations may back a group; no source is fabricated.
+// NormalizeGeneratedCitations is shared by Agent saves and refinement. Match the
+// generation path's prose-safe policy: only adjacent citation clusters are
+// expanded, while isolated bracketed ranges remain byte-identical prose. Single
+// markers inside the known evidence window must still resolve.
 func NormalizeGeneratedCitations(content string, citations []model.Citation) (string, error) {
 	indices := make(map[int]bool, len(citations))
 	maxIndex := 0
@@ -27,7 +29,17 @@ func NormalizeGeneratedCitations(content string, citations []model.Citation) (st
 			maxIndex = c.Index
 		}
 	}
-	return citationtext.Canonicalize(content, func(n int) bool { return indices[n] }, maxIndex)
+	normalized := citationtext.CanonicalizeAdjacent(content, func(n int) bool { return indices[n] })
+	for _, marker := range citationtext.Scan(normalized) {
+		if marker.Compound || len(marker.Indices) != 1 {
+			continue
+		}
+		n := marker.Indices[0]
+		if n <= maxIndex && !indices[n] {
+			return content, citationtext.ErrInvalid
+		}
+	}
+	return normalized, nil
 }
 
 func extractReferencedIndices(content string) map[int]bool {

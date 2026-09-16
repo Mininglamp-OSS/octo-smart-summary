@@ -65,12 +65,14 @@ database snapshots are intentionally excluded from the repository.
 
 ## Citation consistency follow-up
 
-Agent saves and Workflow reuse the same citation builder and generated-content
-normalizer. Explicit numeric lists and inclusive ranges become adjacent `[n]`
-markers only when every index resolves to authorized evidence; groups are capped
-at 128 entries and normalization growth is bounded. Missing, reversed, malformed
-or oversized groups fail closed rather than silently losing citation metadata.
-Message identity stays unchanged: reading-order numbering is a frontend concern.
+Agent saves, Workflow and refinement reuse the same prose-safe generated-content
+normalizer. Numeric lists and inclusive ranges become adjacent `[n]` markers only
+inside an adjacent citation cluster and when every index resolves to authorized
+evidence. Isolated bracketed ranges stay byte-identical because they may be dates,
+standards, page ranges or counts. Single markers inside the known evidence window
+must resolve; the Agent writer remains the strict fail-closed repair boundary.
+Groups are capped at 128 entries and normalization growth is bounded. Message
+identity stays unchanged: reading-order numbering is a frontend concern.
 
 The Agent writer validates the exact frozen evidence set (including holes),
 uses the same multi-source output rule as Workflow, and can repair invalid output
@@ -154,19 +156,19 @@ LLM. SQLite tests are not a substitute for this row-lock verification.
   saved requirement. Configuration-only saves do not start generation.
 - `generation-config` returns HTTP 409 / code 40005 for schedule-bound tasks,
   including paused bindings. Scheduling is configured only on the individual
-  summary's detail page; the legacy schedule list is read-only. The detail page
+  summary's detail page; the legacy schedule list remains an edit/recovery surface
+  for existing rows but cannot create standalone schedules. The detail page
   does not offer chat selection while setting a schedule.
-- Schedule creation inherits the task's source identifiers. Create/update may
-  resend the same set, but cannot add, drop, replace, or change source types.
+- Schedule creation inherits the task's source identifiers. Create/update and
+  regeneration may resend the same set, but cannot add, drop, replace, or change source types.
   Source names are server-owned. Re-generation cannot bypass the binding guard
   to replace sources, and rejected operations leave task/schedule data unchanged.
   Recurrence editing, enabling, and disabling remain on the detail page.
-- ISO-shaped bracketed dates are prose. Well-formed numeric groups wholly above
-  a known evidence window are also prose and remain unchanged; they never count
-  as the required supporting citation. In-window holes, mixed valid/invalid
-  groups, malformed syntax, and expansion-limit violations still fail closed.
-  Unknown evidence at the Agent-save boundary is not treated as a known empty
-  set. Citation-free personal/team refinement can preserve numeric prose.
+- ISO-shaped bracketed dates and isolated numeric groups are prose and remain
+  unchanged. Adjacent citation clusters expand only when every member resolves;
+  unresolved single markers inside the known evidence window fail closed. A
+  fetched run with no citation metadata still rejects a surviving `[1]` sequence.
+  Citation-free Agent saves and personal/team refinement preserve numeric prose.
 - Both personal and team refinement transports normalize before persistence.
   Workflow normalizes against the full authorized message window before building
   and deduplicating citations; orphan-single stripping remains unchanged.
@@ -183,7 +185,7 @@ CGO_ENABLED=0 go build -buildvcs=false ./...
 The same seven packages pass without `-race`. The paired frontend passes 1,361
 summary tests across 85 files, locale checks, and its production build. Local
 synthetic browser checks cover the detail scheduling modal, source-less refusal,
-and the read-only legacy list in Chinese and English. The worker regression
+and the legacy recovery list in Chinese and English. The worker regression
 executes the real generation/finalization path with deterministic retrieval and
 model fixtures, not a live IM service or model. Real MySQL row-lock tests and
 deployment were not run in this remediation. `-buildvcs=false` is needed only for

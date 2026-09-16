@@ -186,6 +186,13 @@ func PrepareSummaryDraftTool() (Tool, Handler) {
 				return preparedDraftResult(state), nil
 			}
 			if attempt >= maxSummaryDraftRepairs {
+				if reason == "invalid_citations" {
+					if fallback, ok := validatedMergedDraftFallback(ctx, analyses); ok {
+						state.handle = "draft_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+						state.text = fallback
+						return preparedDraftResult(state), nil
+					}
+				}
 				state.err = &SummaryDraftError{Reason: reason}
 				return "", state.err
 			}
@@ -195,6 +202,21 @@ func PrepareSummaryDraftTool() (Tool, Handler) {
 			messages[0].Content = summaryDraftInstruction + "\n" + summaryDraftRepairInstruction(reason)
 		}
 	}
+}
+
+// validatedMergedDraftFallback keeps a completed evidence pass usable when
+// the final writer repeatedly damages otherwise valid citation markers. The
+// merged analysis was produced from the same authorized evidence and must pass
+// the exact final-draft citation and size checks before it can be returned.
+func validatedMergedDraftFallback(ctx context.Context, analyses []string) (string, bool) {
+	for i := len(analyses) - 1; i >= 0; i-- {
+		normalized, err := canonicalizeDraftCitations(ctx, analyses[i])
+		if err != nil || summaryDraftQualityFailure(ctx, AssistantTurn{Content: normalized}) != "" {
+			continue
+		}
+		return normalized, true
+	}
+	return "", false
 }
 
 func summaryDraftQualityFailure(ctx context.Context, turn AssistantTurn) string {

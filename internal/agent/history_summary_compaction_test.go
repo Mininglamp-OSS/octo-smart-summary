@@ -51,6 +51,18 @@ func TestCompactSummaryToolHistoryRemovesLegacyBodiesAndKeepsPairs(t *testing.T)
 	}
 }
 
+func TestStripInvalidToolHistoryKeepsAssistantProse(t *testing.T) {
+	history := []Message{
+		{Role: "assistant", Content: "keep this explanation", ToolCalls: []ToolCall{mkToolCall("bad", "tool", "{")}},
+		{Role: "tool", ToolCallID: "bad", Name: "tool", Content: "failed"},
+		{Role: "user", Content: "continue"},
+	}
+	got := stripInvalidToolHistory(history)
+	if len(got) != 2 || got[0].Content != "keep this explanation" || len(got[0].ToolCalls) != 0 || got[1].Role != "user" {
+		t.Fatalf("assistant prose was lost with malformed tools: %+v", got)
+	}
+}
+
 // PR #208 round-5 P2-3. Compaction rewrites past merge_summaries arguments, and
 // the model is few-shot conditioned by its own transcript: a placeholder that
 // violates the LIVE tool schema is a worked example of a malformed call. The

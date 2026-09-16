@@ -24,7 +24,7 @@ func TestRefineNumericProseAcrossSurfaces(t *testing.T) {
 					var citations []model.Citation
 					if cited {
 						content += "依据[1,3]。"
-						want += "依据[1][3]。"
+						want += "依据[1,3]。"
 						citations = []model.Citation{{Index: 1}, {Index: 3}}
 					}
 					if !personal {

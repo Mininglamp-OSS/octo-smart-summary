@@ -60,7 +60,12 @@ func (h *TaskHandler) validateRegenerationConfig(c *gin.Context, task model.Summ
 
 func (h *TaskHandler) validateRegenerationConfigDB(c *gin.Context, db *gorm.DB, task model.SummaryTask, req regenerateReq) error {
 	if task.ScheduleID != nil && req.Sources != nil {
-		return service.NewBizError(40005, "定时更新沿用当前总结来源，不能更换群聊", http.StatusConflict)
+		if _, _, err := scheduleTaskSources(db, task, *req.Sources); err != nil {
+			return err
+		}
+		// The immutable set was re-sent unchanged. It needs no permission
+		// re-validation or persistence; the server-owned names stay authoritative.
+		req.Sources = nil
 	}
 	limit := maxSummaryTopicRunes
 	if task.TriggerType == model.TriggerAgent {
@@ -184,6 +189,7 @@ func (h *TaskHandler) SaveGenerationConfig(c *gin.Context) {
 }
 
 func (h *TaskHandler) saveGenerationScope(tx *gorm.DB, task model.SummaryTask, req regenerateReq) error {
+	writeSources := req.Sources != nil
 	if req.Sources != nil {
 		// Regenerate acquired the task lock with its status transition. Re-read
 		// the binding there as scheduling could have raced the pre-validation.
@@ -192,7 +198,10 @@ func (h *TaskHandler) saveGenerationScope(tx *gorm.DB, task model.SummaryTask, r
 			return err
 		}
 		if current.ScheduleID != nil || current.TriggerType == model.TriggerScheduled {
-			return service.NewBizError(40005, "定时更新沿用当前总结来源，不能更换群聊", http.StatusConflict)
+			if _, _, err := scheduleTaskSources(tx, current, *req.Sources); err != nil {
+				return err
+			}
+			writeSources = false
 		}
 	}
 	if req.TimeRange != nil {
@@ -202,7 +211,7 @@ func (h *TaskHandler) saveGenerationScope(tx *gorm.DB, task model.SummaryTask, r
 			return err
 		}
 	}
-	if req.Sources == nil {
+	if !writeSources {
 		return nil
 	}
 	if err := tx.Where("task_id = ?", task.ID).Delete(&model.SummarySource{}).Error; err != nil {

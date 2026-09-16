@@ -286,3 +286,47 @@ func TestRegenerateResetsEveryClearedPersonalStream(t *testing.T) {
 		t.Fatalf("reset mismatch: persisted=%q stream=%q done=%v", pr.Content, snapshot, done)
 	}
 }
+
+func TestScheduleBoundRegenerateAcceptsSameSourceSet(t *testing.T) {
+	db, id, _ := seedAgentRegeneration(t)
+	if err := db.AutoMigrate(&model.SummarySchedule{}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	requirement := "existing requirement"
+	sched := model.SummarySchedule{SpaceID: "space1", CreatorID: "creator1", Title: "Schedule", IsActive: 1}
+	if err := db.Create(&sched).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&model.SummaryTask{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"schedule_id": sched.ID, "generation_requirement": requirement,
+		"time_range_start": now.Add(-time.Hour), "time_range_end": now,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Where("task_id = ?", id).Delete(&model.SummarySource{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, src := range []model.SummarySource{
+		{TaskID: id, SourceType: model.SourceGroup, SourceID: "grp_a", SourceName: "Group A"},
+		{TaskID: id, SourceType: model.SourceGroup, SourceID: "grp_b", SourceName: "Group B"},
+	} {
+		if err := db.Create(&src).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	body := map[string]interface{}{"sources": []sourceReq{
+		{SourceType: model.SourceGroup, SourceID: "grp_b", SourceName: "spoof"},
+		{SourceType: model.SourceGroup, SourceID: "grp_a"},
+	}}
+	w := doJSONRequest(setupRegenerateRouter(NewTaskHandler(db, nil, "")), "POST",
+		fmt.Sprintf("/api/v1/summaries/%d/regenerate", id), "creator1", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("same-source regenerate rejected: %d %s", w.Code, w.Body)
+	}
+	var stored []model.SummarySource
+	db.Where("task_id = ?", id).Order("source_id").Find(&stored)
+	if len(stored) != 2 || stored[0].SourceName != "Group A" || stored[1].SourceName != "Group B" {
+		t.Fatalf("server-owned source labels changed: %+v", stored)
+	}
+}

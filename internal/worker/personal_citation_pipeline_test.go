@@ -25,13 +25,24 @@ func TestPersonalPipelineCitationFinalization(t *testing.T) {
 	for _, tc := range []struct {
 		name, content, want string
 		invalid             bool
+		wantCits            int
 	}{
-		{"compound", "Budget [1,2].", "Budget [1][2].", false},
-		{"year range", "Budget [1]. Plan [2024-2025].", "Budget [1]. Plan [2024-2025].", false},
-		{"date", "Budget [1]. Date [2026-09-14].", "Budget [1]. Date [2026-09-14].", false},
-		{"pages", "Budget [1]. Pages [100-120].", "Budget [1]. Pages [100-120].", false},
-		{"orphan single", "Budget [1]. Other [999].", "", false},
-		{"corrupt", "Budget [1,3].", "", true},
+		// The model emits singles directly per OutputRule — the happy path.
+		{"singles", "Budget [1][2].", "Budget [1][2].", false, 2},
+		// A genuine citation cluster (compound abutting another marker) is
+		// normalized to singles by CanonicalizeAdjacent.
+		{"cluster", "Budget [1][1,2].", "Budget [1][2].", false, 2},
+		// An isolated compound is treated as prose and left byte-identical — it
+		// must never be rewritten into [1][2] (PR#248 review B-2). Its indices
+		// are still harvested into the citation list.
+		{"isolated compound", "Budget [1,2].", "Budget [1,2].", false, 2},
+		{"year range", "Budget [1]. Plan [2024-2025].", "Budget [1]. Plan [2024-2025].", false, 1},
+		{"date", "Budget [1]. Date [2026-09-14].", "Budget [1]. Date [2026-09-14].", false, 1},
+		{"pages", "Budget [1]. Pages [100-120].", "Budget [1]. Pages [100-120].", false, 1},
+		{"orphan single", "Budget [1]. Other [999].", "", false, 1},
+		// An unresolvable group must NOT abort the whole summary; it is left as
+		// prose rather than failing the task (PR#248 review B-1).
+		{"unresolved group", "Budget [1,3].", "Budget [1,3].", false, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var calls atomic.Int32
@@ -82,8 +93,8 @@ func TestPersonalPipelineCitationFinalization(t *testing.T) {
 			if strings.Contains(got, "[999]") {
 				t.Fatal("orphan single no longer stripped")
 			}
-			if tc.name == "compound" && len(cits) != 2 {
-				t.Fatal("normalization lost sources")
+			if tc.wantCits != 0 && len(cits) != tc.wantCits {
+				t.Fatalf("citations=%d want %d", len(cits), tc.wantCits)
 			}
 		})
 	}

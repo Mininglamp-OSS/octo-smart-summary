@@ -577,9 +577,15 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 		if err := tx.Model(&model.SummaryParticipant{}).Where("task_id = ?", pr.TaskID).Count(&participantCount).Error; err != nil {
 			return err
 		}
-		if participantCount <= 1 {
-			// A regeneration failure is not a replacement result. Re-expose the
-			// last committed body while keeping the failed status retryable.
+
+		// A regeneration failure is not a replacement result. Re-expose the last
+		// committed body so the summary does not vanish for the affected member.
+		// This must run for BOTH single- and multi-person tasks: RegeneratePersonalSummary
+		// rejects single-person tasks (40005 "单人任务请使用全部重新生成"), so gating the
+		// restore on participantCount<=1 made it dead code on exactly the per-person
+		// regenerate path it exists for (PR#248 review P1-1). First-generation failures
+		// have no prior version and hit ErrRecordNotFound, so they correctly skip it.
+		{
 			var latest model.PersonalResultVersion
 			query := tx.Where("task_id = ? AND user_id = ?", pr.TaskID, pr.UserID)
 			if pr.CurrentVersionID != nil {
@@ -600,6 +606,9 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 					return err
 				}
 			}
+		}
+
+		if participantCount <= 1 {
 			// Single-person: keep prior behavior -- reset participant to Accepted and propagate failure to the task.
 			if err := tx.Model(participant).Update("status", model.ParticipantAccepted).Error; err != nil {
 				return err
@@ -1191,18 +1200,18 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	// citations successfully built from this output. Otherwise a group made
 	// entirely of missing in-window indices could be mistaken for prose.
 	indices := make(map[int]bool, len(userMessages))
-	maxIndex := 0
 	for _, message := range userMessages {
 		indices[message.CitationIndex] = true
-		if message.CitationIndex > maxIndex {
-			maxIndex = message.CitationIndex
-		}
 	}
-	normalizedContent, citationErr := citationtext.Canonicalize(finalContent, func(n int) bool { return indices[n] }, maxIndex)
-	if citationErr != nil {
-		return "", nil, 0, 0, "", fmt.Errorf("citation normalization: %w", citationErr)
-	}
-	finalContent = normalizedContent
+	// Normalize compound citation groups the model may have emitted despite the
+	// single-marker OutputRule, but never rewrite ordinary bracketed-number prose
+	// and never abort the whole summary on a group the normalizer cannot resolve.
+	// The evidence window here is a contiguous 1..N range, so every small number
+	// looks "valid": Canonicalize would silently corrupt prose like "[3-5]万元"
+	// into false citations, and hard-fail on shapes like "GB/T [50011-2010]" with
+	// no repair path (PR#248 review B-1/B-2). CanonicalizeAdjacent only expands
+	// real citation clusters and leaves everything else byte-identical.
+	finalContent = citationtext.CanonicalizeAdjacent(finalContent, func(n int) bool { return indices[n] })
 	citations := buildCitations(finalContent, userMessages, messages, nameMap)
 	finalContent, citations = dedupCitations(finalContent, citations)
 	finalContent = stripOrphanCitations(finalContent, citations)

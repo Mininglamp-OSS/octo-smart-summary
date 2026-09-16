@@ -109,3 +109,33 @@ func TestUnknownEvidenceCannotExcuseMissingGroups(t *testing.T) {
 		t.Fatal("citation-free prose counted as supporting evidence")
 	}
 }
+
+// CanonicalizeAdjacent backs the Workflow generation path, whose evidence window
+// is a contiguous 1..N range. It must never rewrite isolated bracketed-number
+// prose (PR#248 review B-2) and never fail on an unresolvable group (B-1); it
+// expands only groups that abut another citation marker.
+func TestCanonicalizeAdjacent(t *testing.T) {
+	// window 1..30 — every small number "resolves", exactly the worker case.
+	valid := func(n int) bool { return n >= 1 && n <= 30 }
+	for _, tc := range []struct{ in, out string }{
+		// Isolated prose ranges/lists must stay byte-identical, not become citations.
+		{"预算区间 [3-5] 万元。", "预算区间 [3-5] 万元。"},
+		{"涉及 [1,2] 两类问题。", "涉及 [1,2] 两类问题。"},
+		{"参见附录 [12-14]。", "参见附录 [12-14]。"},
+		// Unresolvable / out-of-window shapes must not abort — left as prose.
+		{"依据 GB/T [50011-2010] 抗震规范执行。", "依据 GB/T [50011-2010] 抗震规范执行。"},
+		{"编号 [7;9] 待确认。", "编号 [7;9] 待确认。"},
+		{"排期 [2026-09] 确认。", "排期 [2026-09] 确认。"},
+		// A genuine citation cluster (compound abutting another marker) expands.
+		{"见消息 [1][3-5] 的讨论。", "见消息 [1][3][4][5] 的讨论。"},
+		{"结论 [3-5][7]。", "结论 [3][4][5][7]。"},
+		// A single marker adjacent with only spaces still counts as a cluster.
+		{"参考 [2] [4,6]。", "参考 [2] [4][6]。"},
+	} {
+		t.Run(tc.in, func(t *testing.T) {
+			if got := CanonicalizeAdjacent(tc.in, valid); got != tc.out {
+				t.Fatalf("got %q; want %q", got, tc.out)
+			}
+		})
+	}
+}
