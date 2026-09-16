@@ -14,6 +14,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/artifact"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/finishgate"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/worker"
@@ -275,6 +276,19 @@ func contentHasCitationMarker(content string) bool {
 //     run with 2 citations cannot have meant `[2024]`. Only an in-range miss —
 //     e.g. [3] when 1, 2 and 4 exist — indicates real citation corruption.
 func citationsValid(content string, cits []model.Citation, runFetchedAnything bool) bool {
+	// In-window numeric groups must resolve in full. Out-of-window prose and
+	// dates use the same policy as normalization at the other write surfaces.
+	indices := make(map[int]bool, len(cits))
+	maxIndex := -1 // No built citations may mean expired/failed evidence.
+	for _, cit := range cits {
+		indices[cit.Index] = true
+		if cit.Index > maxIndex {
+			maxIndex = cit.Index
+		}
+	}
+	if _, err := citationtext.Canonicalize(content, func(n int) bool { return indices[n] }, maxIndex); err != nil {
+		return false
+	}
 	if len(cits) == 0 {
 		if runFetchedAnything && contentHasCitationSequence(content) {
 			return false

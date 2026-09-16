@@ -7,18 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
-
-// citationMarkerRE matches numbered citation markers ([1], [2], ...) in
-// preview content. Same shape as the handler-side authority
-// (internal/api/handler/agent_summary_citations.go citationMarkerRE).
-var citationMarkerRE = regexp.MustCompile(`\[(\d+)\]`)
 
 const (
 	SummaryResultClarification        = "clarification"
@@ -102,6 +96,7 @@ type summaryCitationTrackingState struct {
 	evidenceKeys        map[summaryCitationEvidenceKey]struct{}
 	citationWindowKnown bool
 	citationWindowMax   int64
+	citationIndices     map[int]bool
 }
 
 type summaryCitationEvidenceKey struct {
@@ -160,7 +155,11 @@ func setSummaryCitationWindow(ctx context.Context, messages []pipeline.Message) 
 		return
 	}
 	var maxIndex int64
+	indices := make(map[int]bool)
 	for _, message := range messages {
+		if message.CitationIndex > 0 {
+			indices[message.CitationIndex] = true
+		}
 		if int64(message.CitationIndex) > maxIndex {
 			maxIndex = int64(message.CitationIndex)
 		}
@@ -168,6 +167,7 @@ func setSummaryCitationWindow(ctx context.Context, messages []pipeline.Message) 
 	state.mu.Lock()
 	state.citationWindowKnown = true
 	state.citationWindowMax = maxIndex
+	state.citationIndices = indices
 	state.mu.Unlock()
 }
 
@@ -184,22 +184,15 @@ func summaryCitationEvidenceWindow(ctx context.Context) (bool, int64) {
 	return len(state.evidenceKeys) > 0, int64(len(state.evidenceKeys))
 }
 
-// citationMarkersWithinEvidence reports whether every [N] marker in content
-// refers to an index in [1, evidenceCount] (the persisted evidence window) and
-// at least one marker exists. Bounding by the evidence pool is what stops a
-// stray prose "[1]" from spoofing coverage (review 5087740714 blocker 4).
-func citationMarkersWithinEvidence(content string, evidenceCount int64) bool {
-	markers := citationMarkerRE.FindAllStringSubmatch(content, -1)
-	if len(markers) == 0 {
-		return false
-	}
-	for _, marker := range markers {
-		index, err := strconv.ParseInt(marker[1], 10, 64)
-		if err != nil || index < 1 || index > evidenceCount {
-			return false
+func summaryCitationIndexAllowed(ctx context.Context, n int, fallbackMax int64) bool {
+	if state, ok := ctx.Value(summaryCitationTrackingContextKey{}).(*summaryCitationTrackingState); ok && state != nil {
+		state.mu.RLock()
+		defer state.mu.RUnlock()
+		if state.citationWindowKnown {
+			return state.citationIndices[n]
 		}
 	}
-	return true
+	return n > 0 && int64(n) <= fallbackMax
 }
 
 // EmitSummaryResponseTool returns the only successful termination mechanism
@@ -210,7 +203,7 @@ func EmitSummaryResponseTool() (Tool, TerminalHandler) {
 		Type: "function",
 		Function: ToolFunction{
 			Name:        "emit_summary_response",
-			Description: "提交本轮智能总结的结构化结果并结束回合。必须单独调用；reply 是对话气泡，预览正文只能放在 preview.content。",
+			Description: "提交本轮智能总结结果并结束回合，必须单独调用。预览正文先由prepare_summary_draft生成，这里只传preview.content_handle，不要复制正文；reply只写一句简短说明。",
 			Parameters: map[string]interface{}{
 				"type":                 "object",
 				"additionalProperties": false,
@@ -250,7 +243,7 @@ func EmitSummaryResponseTool() (Tool, TerminalHandler) {
 						"type":                 "object",
 						"additionalProperties": false,
 						"properties": map[string]interface{}{
-							"content":           map[string]interface{}{"type": "string"},
+							"content_handle":    map[string]interface{}{"type": "string", "description": "prepare_summary_draft返回的本次请求终稿编号，原样传入。"},
 							"version":           map[string]interface{}{"type": "integer"},
 							"parent_message_id": map[string]interface{}{"type": "integer"},
 							"assumptions": map[string]interface{}{
@@ -258,7 +251,7 @@ func EmitSummaryResponseTool() (Tool, TerminalHandler) {
 								"items": map[string]interface{}{"type": "string"},
 							},
 						},
-						"required": []string{"content", "version"},
+						"required": []string{"content_handle", "version"},
 					},
 					"confirmation": map[string]interface{}{
 						"type":        "object",
@@ -275,6 +268,10 @@ func EmitSummaryResponseTool() (Tool, TerminalHandler) {
 	}
 
 	handler := func(ctx context.Context, args json.RawMessage) (TerminalOutcome, error) {
+		args, err := resolveSummaryDraftArguments(ctx, args)
+		if err != nil {
+			return TerminalOutcome{}, err
+		}
 		payload, canonical, err := parseSummaryResponsePayload(args)
 		if err != nil {
 			return TerminalOutcome{}, err
@@ -287,13 +284,14 @@ func EmitSummaryResponseTool() (Tool, TerminalHandler) {
 		hasEvidence, evidenceCount := summaryCitationEvidenceWindow(ctx)
 		if hasEvidence &&
 			(payload.ResultType == SummaryResultAgentPreview || payload.ResultType == SummaryResultAgentRevision) &&
-			(payload.Preview == nil || !citationMarkersWithinEvidence(payload.Preview.Content, evidenceCount)) {
+			(payload.Preview == nil || !citationtext.Valid(payload.Preview.Content,
+				func(n int) bool { return summaryCitationIndexAllowed(ctx, n, evidenceCount) }, int(evidenceCount), true)) {
 			// Evidence-bounded marker guard (review 5087740714 blocker 4):
 			// every [N] must refer to an index inside the persisted evidence
 			// window, and at least one marker must exist. This accepts a
 			// legitimate preview citing only [2]/[3] and rejects prose whose
-			// "[1]" is not citation syntax at all. Marker shape matches the
-			// handler-side authority citationMarkerRE.
+			// "[1]" is not citation syntax at all. Explicit groups must also
+			// resolve in full against the exact frozen evidence set.
 			return TerminalOutcome{}, errors.New("preview.content must include citation markers such as [1] for chat-backed summaries")
 		}
 		return TerminalOutcome{

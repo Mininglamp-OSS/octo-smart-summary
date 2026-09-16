@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmfallback"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
@@ -577,6 +578,28 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 			return err
 		}
 		if participantCount <= 1 {
+			// A regeneration failure is not a replacement result. Re-expose the
+			// last committed body while keeping the failed status retryable.
+			var latest model.PersonalResultVersion
+			query := tx.Where("task_id = ? AND user_id = ?", pr.TaskID, pr.UserID)
+			if pr.CurrentVersionID != nil {
+				// A restored older version is the actual pre-regeneration body.
+				query = query.Where("id = ?", *pr.CurrentVersionID)
+			}
+			err := query.Order("version DESC").First(&latest).Error
+			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+			if err == nil {
+				if err := tx.Model(pr).Updates(map[string]interface{}{
+					"content": latest.Content, "citations_json": latest.CitationsJSON,
+					"current_version_id": latest.ID, "generated_at": latest.GeneratedAt,
+					"msg_count": latest.MsgCount, "total_token_used": latest.TotalTokenUsed,
+					"model_version": latest.ModelVersion,
+				}).Error; err != nil {
+					return err
+				}
+			}
 			// Single-person: keep prior behavior -- reset participant to Accepted and propagate failure to the task.
 			if err := tx.Model(participant).Update("status", model.ParticipantAccepted).Error; err != nil {
 				return err
@@ -727,13 +750,20 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	channelScopeOpts := channelScopeOptionsForTask(p.cfg.ChannelScopeEnabled, task.SpaceID, task.AgentSessionID, false, true)
 
 	fetchStart := time.Now()
-	messages, intentResult, err := pipeline.ResolveAndFetchMessagesForPersonal(
-		ctx, userID, nil, nil, specifiedSources, task.EffectiveTopic(),
-		task.TimeRangeStart, task.TimeRangeEnd,
-		p.imDB, p.octoClient, p.cfg.MessageFetchBackend, toolCallFn, llmFn,
-		p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency, p.cfg.OctoSearchPollSec,
-		channelScopeOpts, reportStage,
-	)
+	var messages []pipeline.Message
+	var intentResult *pipeline.IntentResult
+	var err error
+	if p.fetchPersonalMessagesFn != nil {
+		messages, intentResult, err = p.fetchPersonalMessagesFn(ctx, task, userID)
+	} else {
+		messages, intentResult, err = pipeline.ResolveAndFetchMessagesForPersonal(
+			ctx, userID, nil, nil, specifiedSources, task.EffectiveTopic(),
+			task.TimeRangeStart, task.TimeRangeEnd,
+			p.imDB, p.octoClient, p.cfg.MessageFetchBackend, toolCallFn, llmFn,
+			p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency, p.cfg.OctoSearchPollSec,
+			channelScopeOpts, reportStage,
+		)
+	}
 	timing.Observe(taskNo, "fetch_messages", fetchStart)
 	if err != nil {
 		return "", nil, 0, 0, "", fmt.Errorf("fetch messages: %w", err)
@@ -1157,6 +1187,22 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 
 	// Build citations from final content
 	citationStart := time.Now()
+	// Validate against the full authorized evidence window, not just the
+	// citations successfully built from this output. Otherwise a group made
+	// entirely of missing in-window indices could be mistaken for prose.
+	indices := make(map[int]bool, len(userMessages))
+	maxIndex := 0
+	for _, message := range userMessages {
+		indices[message.CitationIndex] = true
+		if message.CitationIndex > maxIndex {
+			maxIndex = message.CitationIndex
+		}
+	}
+	normalizedContent, citationErr := citationtext.Canonicalize(finalContent, func(n int) bool { return indices[n] }, maxIndex)
+	if citationErr != nil {
+		return "", nil, 0, 0, "", fmt.Errorf("citation normalization: %w", citationErr)
+	}
+	finalContent = normalizedContent
 	citations := buildCitations(finalContent, userMessages, messages, nameMap)
 	finalContent, citations = dedupCitations(finalContent, citations)
 	finalContent = stripOrphanCitations(finalContent, citations)

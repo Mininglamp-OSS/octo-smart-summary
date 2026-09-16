@@ -11,6 +11,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/finishgate"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
@@ -628,6 +629,11 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			task.TimeRangeStart = lockedRange.Start
 			task.TimeRangeEnd = lockedRange.End
 		}
+		requirement := agentMessageRequirement(tx, draftMsg, userID)
+		if requirement != "" {
+			task.GenerationRequirement = &requirement
+			task.Topic = truncateRunes(requirement, maxSummaryTopicRunes)
+		}
 		if err := tx.Create(&task).Error; err != nil {
 			return fmt.Errorf("create summary_task: %w", err)
 		}
@@ -747,6 +753,19 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 					req.SessionID, req.ReferencedTaskIDs[0])
 			}
 		}
+		// No built metadata is not proof of an empty evidence window here:
+		// fetch/build/borrow may have failed. Keep this save boundary strict.
+		if len(cits) == 0 {
+			if _, err := citationtext.Canonicalize(content, nil, -1); err != nil {
+				return fmt.Errorf("%w: compound references have no evidence", errWorkspacePreviewCitationUnresolved)
+			}
+		}
+		normalizedContent, citationErr := service.NormalizeGeneratedCitations(content, cits)
+		if citationErr != nil {
+			return fmt.Errorf("%w: compound references do not resolve", errWorkspacePreviewCitationUnresolved)
+		}
+		content = normalizedContent
+		creatorPR.Content = content
 		if workspaceSave && len(cits) > 0 && contentHasCitationMarker(content) && !citationsValid(content, cits, true) {
 			return fmt.Errorf("%w: fallback citations do not resolve preview markers", errWorkspacePreviewCitationUnresolved)
 		}

@@ -22,7 +22,17 @@ import (
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"gorm.io/gorm"
 )
+
+func seedScheduleSourceFixture(t *testing.T, db *gorm.DB, taskID int64) {
+	t.Helper()
+	for _, id := range []string{"grp_a", "grp_b"} {
+		if err := db.Create(&model.SummarySource{TaskID: taskID, SourceType: model.SourceGroup, SourceID: id}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
 
 // fullScheduleReqBody is the shape createScheduleReq exposes on the wire.
 // Kept as a helper so both create + update tests share the same field set.
@@ -58,6 +68,7 @@ func TestCreateSchedule_PersistsEveryField(t *testing.T) {
 	r := newScheduleTestRouter(db)
 
 	taskID := seedScheduleTask(t, db, "TSK-CREATE-FULL", "space1", "creator1")
+	seedScheduleSourceFixture(t, db, taskID)
 
 	body := fullScheduleReqBody(taskID)
 	w := scheduleReq(t, r, "creator1", "space1", http.MethodPost, "/api/v1/summary-schedules", body)
@@ -151,6 +162,7 @@ func TestUpdateSchedule_TitleOnlyPatch_DoesNotZeroOtherFields(t *testing.T) {
 	r := newScheduleTestRouter(db)
 
 	taskID := seedScheduleTask(t, db, "TSK-PATCH-1", "space1", "creator1")
+	seedScheduleSourceFixture(t, db, taskID)
 	create := fullScheduleReqBody(taskID)
 	w := scheduleReq(t, r, "creator1", "space1", http.MethodPost, "/api/v1/summary-schedules", create)
 	if w.Code != http.StatusOK {
@@ -232,6 +244,7 @@ func TestUpdateSchedule_GenerationInstructionOnly(t *testing.T) {
 	r := newScheduleTestRouter(db)
 
 	taskID := seedScheduleTask(t, db, "TSK-PATCH-2", "space1", "creator1")
+	seedScheduleSourceFixture(t, db, taskID)
 	w := scheduleReq(t, r, "creator1", "space1", http.MethodPost, "/api/v1/summary-schedules",
 		fullScheduleReqBody(taskID))
 	if w.Code != http.StatusOK {
