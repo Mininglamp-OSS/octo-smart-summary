@@ -36,6 +36,9 @@ const (
 	// legacySummaryDefaultTimeRangeDays is used only when the caller does not
 	// provide the configured legacy default.
 	legacySummaryDefaultTimeRangeDays = 31
+
+	// MaxDocumentSummarySourceCount is the phase-1 document-only task limit.
+	MaxDocumentSummarySourceCount = 10
 )
 
 var (
@@ -75,10 +78,15 @@ type SummaryWorkflowTimeRange struct {
 	End   time.Time
 }
 
-// SummaryWorkflowSource is one chat/thread/direct-message input source.
+// SummaryWorkflowSource is one normalized input source. SnapshotContent is set
+// only for document sources and is persisted atomically with the task.
 type SummaryWorkflowSource struct {
-	SourceType int
-	SourceID   string
+	SourceType      int
+	SourceID        string
+	SourceName      string
+	SourceVersion   string
+	SourceHash      string
+	SnapshotContent string
 }
 
 // SummaryWorkflowParticipant is one requested workflow participant. The
@@ -366,7 +374,16 @@ func (s *SummaryWorkflowService) normalize(in LegacyCreateSummaryWorkflowInput, 
 		timeStart = timeEnd.Add(-time.Duration(defaultTimeRangeDays) * 24 * time.Hour)
 	}
 
-	scope := model.SnapshotScope{ChannelIDs: workflowChannelIDs(sources)}
+	documentMode := workflowHasDocumentSource(sources)
+	if documentMode {
+		if bizErr := validateDocumentWorkflowInput(in, sources); bizErr != nil {
+			return normalizedSummaryWorkflowInput{}, bizErr
+		}
+	}
+	scope := model.SnapshotScope{
+		ChannelIDs:  workflowChannelIDs(sources),
+		DocumentIDs: workflowDocumentIDs(sources),
+	}
 	if explicitTimeRange {
 		scope.TimeRange = model.TimeRangeJSON{
 			Start: timeStart.Format(time.RFC3339),
@@ -454,14 +471,31 @@ func (s *SummaryWorkflowService) persist(ctx context.Context, in normalizedSumma
 			return err
 		}
 		for _, source := range in.sources {
+			sourceName := strings.TrimSpace(source.SourceName)
+			if sourceName == "" && source.SourceType != model.SourceDocument {
+				sourceName = ResolveSourceNameForActor(source.SourceID, source.SourceType, in.creatorID, s.imDB)
+			}
 			row := model.SummarySource{
-				TaskID:     task.ID,
-				SourceType: source.SourceType,
-				SourceID:   source.SourceID,
-				SourceName: ResolveSourceNameForActor(source.SourceID, source.SourceType, in.creatorID, s.imDB),
+				TaskID:        task.ID,
+				SourceType:    source.SourceType,
+				SourceID:      source.SourceID,
+				SourceName:    sourceName,
+				SourceVersion: source.SourceVersion,
+				SourceHash:    source.SourceHash,
 			}
 			if err := tx.Create(&row).Error; err != nil {
 				return err
+			}
+			if source.SourceType == model.SourceDocument {
+				snapshot := model.SummarySourceSnapshot{
+					SummarySourceID: row.ID,
+					Content:         source.SnapshotContent,
+					ContentBytes:    len([]byte(source.SnapshotContent)),
+					ContentHash:     source.SourceHash,
+				}
+				if err := tx.Create(&snapshot).Error; err != nil {
+					return err
+				}
 			}
 		}
 
@@ -637,11 +671,61 @@ func createSummaryWorkflowIdempotencyBinding(tx *gorm.DB, binding *model.Summary
 func workflowChannelIDs(sources []SummaryWorkflowSource) []string {
 	ids := make([]string, 0, len(sources))
 	for _, source := range sources {
-		if source.SourceID != "" {
+		if source.SourceID != "" && source.SourceType >= model.SourceGroup && source.SourceType <= model.SourceDirect {
 			ids = append(ids, source.SourceID)
 		}
 	}
 	return ids
+}
+
+func workflowDocumentIDs(sources []SummaryWorkflowSource) []string {
+	ids := make([]string, 0, len(sources))
+	for _, source := range sources {
+		if source.SourceType == model.SourceDocument && source.SourceID != "" {
+			ids = append(ids, source.SourceID)
+		}
+	}
+	return ids
+}
+
+func workflowHasDocumentSource(sources []SummaryWorkflowSource) bool {
+	for _, source := range sources {
+		if source.SourceType == model.SourceDocument {
+			return true
+		}
+	}
+	return false
+}
+
+func validateDocumentWorkflowInput(in LegacyCreateSummaryWorkflowInput, sources []SummaryWorkflowSource) *BizError {
+	if len(sources) > MaxDocumentSummarySourceCount {
+		return NewBizError(40001, "文档来源不能超过10个", http.StatusBadRequest)
+	}
+	if in.CreatorID != "" && in.CreatorID != in.ActorID {
+		return NewBizError(40001, "文档总结仅支持当前用户创建", http.StatusBadRequest)
+	}
+	if len(in.Participants) != 0 {
+		return NewBizError(40001, "文档总结暂不支持其他参与者", http.StatusBadRequest)
+	}
+	if in.TimeRange != nil {
+		return NewBizError(40001, "文档总结不支持时间范围", http.StatusBadRequest)
+	}
+	if in.OriginChannelID != "" || in.OriginChannelType != 0 {
+		return NewBizError(40001, "文档总结不支持来源会话", http.StatusBadRequest)
+	}
+	for _, source := range sources {
+		if source.SourceType != model.SourceDocument {
+			return NewBizError(40001, "文档总结不能混合聊天来源", http.StatusBadRequest)
+		}
+		if strings.TrimSpace(source.SourceID) == "" || strings.TrimSpace(source.SnapshotContent) == "" {
+			return NewBizError(40001, "文档来源缺少正文快照", http.StatusBadRequest)
+		}
+		hash := sha256.Sum256([]byte(source.SnapshotContent))
+		if source.SourceHash != hex.EncodeToString(hash[:]) {
+			return NewBizError(40001, "文档来源正文哈希不匹配", http.StatusBadRequest)
+		}
+	}
+	return nil
 }
 
 func deduplicateWorkflowSources(sources []SummaryWorkflowSource) []SummaryWorkflowSource {
@@ -698,6 +782,14 @@ func canonicalSummaryWorkflowRequestHash(in normalizedSummaryWorkflowInput) stri
 		timeStart = in.timeStart.UTC().Format(time.RFC3339Nano)
 		timeEnd = in.timeEnd.UTC().Format(time.RFC3339Nano)
 	}
+	type canonicalSource struct {
+		SourceType int    `json:"source_type"`
+		SourceID   string `json:"source_id"`
+	}
+	canonicalSources := make([]canonicalSource, 0, len(sources))
+	for _, source := range sources {
+		canonicalSources = append(canonicalSources, canonicalSource{SourceType: source.SourceType, SourceID: source.SourceID})
+	}
 	payload := struct {
 		CreatorID           string                       `json:"creator_id"`
 		Title               string                       `json:"title"`
@@ -705,7 +797,7 @@ func canonicalSummaryWorkflowRequestHash(in normalizedSummaryWorkflowInput) stri
 		TimeRangeMode       string                       `json:"time_range_mode"`
 		TimeStart           string                       `json:"time_start"`
 		TimeEnd             string                       `json:"time_end"`
-		Sources             []SummaryWorkflowSource      `json:"sources"`
+		Sources             []canonicalSource            `json:"sources"`
 		Participants        []SummaryWorkflowParticipant `json:"participants"`
 		ConfirmTimeoutHours int                          `json:"confirm_timeout_hours"`
 		OriginChannelID     string                       `json:"origin_channel_id"`
@@ -718,7 +810,7 @@ func canonicalSummaryWorkflowRequestHash(in normalizedSummaryWorkflowInput) stri
 		TimeRangeMode:       timeRangeMode,
 		TimeStart:           timeStart,
 		TimeEnd:             timeEnd,
-		Sources:             sources,
+		Sources:             canonicalSources,
 		Participants:        participants,
 		ConfirmTimeoutHours: in.confirmTimeoutHours,
 		OriginChannelID:     in.originChannelID,

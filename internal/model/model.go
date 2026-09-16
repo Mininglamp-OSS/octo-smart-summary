@@ -101,9 +101,10 @@ const (
 
 // Source type constants.
 const (
-	SourceGroup  = 1
-	SourceThread = 2
-	SourceDirect = 3
+	SourceGroup    = 1
+	SourceThread   = 2
+	SourceDirect   = 3
+	SourceDocument = 4
 )
 
 // Origin channel type constants.
@@ -231,6 +232,8 @@ type SummarySource struct {
 	SourceType    int    `gorm:"column:source_type;type:tinyint;not null;uniqueIndex:uk_summary_source_task_type_id" json:"source_type"`
 	SourceID      string `gorm:"column:source_id;type:varchar(64);not null;uniqueIndex:uk_summary_source_task_type_id" json:"source_id"`
 	SourceName    string `gorm:"column:source_name;type:varchar(200);not null;default:''" json:"source_name"`
+	SourceVersion string `gorm:"column:source_version;type:varchar(128);not null;default:''" json:"source_version,omitempty"`
+	SourceHash    string `gorm:"column:source_hash;type:char(64);not null;default:''" json:"source_hash,omitempty"`
 	ParticipantID *int64 `gorm:"column:participant_id;index:idx_participant_id" json:"participant_id"`
 	// R9 P1 (PR #190): 1 = row written by worker source backfill from the
 	// pipeline's auto-selected channels. Such rows are excluded from every
@@ -243,6 +246,20 @@ type SummarySource struct {
 }
 
 func (SummarySource) TableName() string { return "summary_source" }
+
+// SummarySourceSnapshot is the immutable, authorization-time input captured for
+// a document source. Workers read this row instead of retaining a user's token or
+// re-reading a document that may have changed after task creation.
+type SummarySourceSnapshot struct {
+	ID              int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	SummarySourceID int64     `gorm:"column:summary_source_id;not null;uniqueIndex:uk_summary_source_snapshot" json:"summary_source_id"`
+	Content         string    `gorm:"column:content;type:mediumtext;not null" json:"-"`
+	ContentBytes    int       `gorm:"column:content_bytes;not null" json:"content_bytes"`
+	ContentHash     string    `gorm:"column:content_hash;type:char(64);not null" json:"content_hash"`
+	CreatedAt       time.Time `gorm:"column:created_at;not null" json:"created_at"`
+}
+
+func (SummarySourceSnapshot) TableName() string { return "summary_source_snapshot" }
 
 // SummaryParticipant represents a participant in a by-person task.
 type SummaryParticipant struct {
@@ -281,8 +298,8 @@ func (SummaryChunk) TableName() string { return "summary_chunk" }
 
 // Citation represents a reference from a summary back to the original message.
 type Citation struct {
-	Index         int          `json:"index"`
-	Sender        string       `json:"sender"`
+	Index  int    `json:"index"`
+	Sender string `json:"sender"`
 	// SenderIsBot marks whether the citation's sender is a bot. Sourced
 	// from pipeline.Message.SenderIsBot (filled by the same batch resolver
 	// that populates Sender). Same judgement as the candidates API so the

@@ -86,7 +86,7 @@ func validateOriginChannel(originChannelID string, originChannelType int) *BizEr
 // the caller-site is the classic "at least one of sources/topic/time_range"
 // failure the traditional path has always rejected.
 func scopeHasSignal(scope model.SnapshotScope) bool {
-	if len(scope.ChannelIDs) > 0 {
+	if len(scope.ChannelIDs) > 0 || len(scope.DocumentIDs) > 0 {
 		return true
 	}
 	if scope.TimeRange.Start != "" || scope.TimeRange.End != "" {

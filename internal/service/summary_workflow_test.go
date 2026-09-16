@@ -4,6 +4,8 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"testing"
@@ -23,6 +25,7 @@ func newSummaryWorkflowTestService(t *testing.T) (*SummaryWorkflowService, *gorm
 	if err := db.AutoMigrate(
 		&model.SummaryTask{},
 		&model.SummarySource{},
+		&model.SummarySourceSnapshot{},
 		&model.SummaryParticipant{},
 		&model.PersonalResult{},
 		&model.SummaryWorkflowIdempotency{},
@@ -66,6 +69,55 @@ func TestSummaryWorkflowCreatePersonal(t *testing.T) {
 	db.Model(&model.PersonalResult{}).Count(&personalCount)
 	if taskCount != 1 || sourceCount != 1 || participantCount != 1 || personalCount != 1 {
 		t.Fatalf("row counts task/source/participant/personal = %d/%d/%d/%d, want 1/1/1/1", taskCount, sourceCount, participantCount, personalCount)
+	}
+}
+
+func TestSummaryWorkflowPersistsDocumentSnapshotAtomically(t *testing.T) {
+	svc, db := newSummaryWorkflowTestService(t)
+	content := "immutable document body"
+	hash := sha256.Sum256([]byte(content))
+	in := baseSummaryWorkflowInput()
+	in.Sources = []SummaryWorkflowSource{{
+		SourceType: model.SourceDocument, SourceID: "d_1", SourceName: "Design",
+		SourceVersion: "v3", SourceHash: hex.EncodeToString(hash[:]), SnapshotContent: content,
+	}}
+
+	if _, err := svc.CreateFromLegacyHTTP(context.Background(), in); err != nil {
+		t.Fatalf("CreateFromLegacyHTTP() error: %v", err)
+	}
+	var source model.SummarySource
+	if err := db.First(&source).Error; err != nil {
+		t.Fatal(err)
+	}
+	var snapshot model.SummarySourceSnapshot
+	if err := db.First(&snapshot, "summary_source_id = ?", source.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if source.SourceVersion != "v3" || source.SourceHash != snapshot.ContentHash || snapshot.Content != content || snapshot.ContentBytes != len([]byte(content)) {
+		t.Fatalf("source=%#v snapshot=%#v", source, snapshot)
+	}
+}
+
+func TestSummaryWorkflowRollsBackWhenDocumentSnapshotInsertFails(t *testing.T) {
+	svc, db := newSummaryWorkflowTestService(t)
+	if err := db.Exec(`CREATE TRIGGER reject_document_snapshot BEFORE INSERT ON summary_source_snapshot BEGIN SELECT RAISE(ABORT, 'snapshot rejected'); END`).Error; err != nil {
+		t.Fatal(err)
+	}
+	content := "body"
+	hash := sha256.Sum256([]byte(content))
+	in := baseSummaryWorkflowInput()
+	in.Sources = []SummaryWorkflowSource{{
+		SourceType: model.SourceDocument, SourceID: "d_1", SourceName: "Doc",
+		SourceHash: hex.EncodeToString(hash[:]), SnapshotContent: content,
+	}}
+	if _, err := svc.CreateFromLegacyHTTP(context.Background(), in); err == nil {
+		t.Fatal("CreateFromLegacyHTTP() succeeded, want snapshot insert failure")
+	}
+	for _, table := range []interface{}{&model.SummaryTask{}, &model.SummarySource{}, &model.SummaryParticipant{}, &model.PersonalResult{}} {
+		var count int64
+		if err := db.Model(table).Count(&count).Error; err != nil || count != 0 {
+			t.Fatalf("model %T count=%d err=%v, want rolled back", table, count, err)
+		}
 	}
 }
 
