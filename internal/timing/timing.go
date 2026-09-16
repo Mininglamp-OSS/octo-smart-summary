@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/metrics"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 )
 
@@ -29,6 +30,32 @@ import (
 // created automatically; mount it to the host (see deploy compose) if the log
 // must survive container restarts.
 const DefaultLogPath = "/var/log/smart-summary/timing.log"
+
+// durationBuckets are the second-boundaries for this package's latency
+// histograms. Same layout as llmobs's LLM histograms so pipeline-stage and
+// LLM-call distributions read against the same scale — spanning a sub-second
+// stage through a 300s long-context turn.
+var durationBuckets = []float64{0.5, 1, 2, 5, 10, 20, 30, 60, 90, 120, 180, 300}
+
+// stageDuration and llmDuration turn the existing stdout/report timings into
+// scrapeable distributions (#242 S3-b). They are the metric side of Record and
+// RecordLLM; the log/report side is unchanged.
+//
+// stage is a closed set of literal pipeline-step names (fetch_messages,
+// llm_map_summary, …) and purpose_class is the bounded classifier from #240 —
+// neither is derived from request data, so series count stays bounded.
+var (
+	stageDuration = metrics.NewHistogramVec("summary_stage_duration_seconds",
+		"Wall-clock of each smart-summary pipeline stage, by stage. The whole-pipeline latency the LLM-call histograms cannot show: use it to find which stage (fetch, map, reduce, citations) is the straggler across all traffic.",
+		durationBuckets)
+	llmDuration = metrics.NewHistogramVec("summary_llm_duration_seconds",
+		"Wall-clock of individual LLM calls made by the summary worker, by purpose_class (intent, map_chunk, reduce, … — see timing.PurposeClass). Separates e.g. recognize_intent latency from map-chunk latency, which #220 needs to size per-scenario timeouts.",
+		durationBuckets)
+)
+
+func init() {
+	metrics.Default.MustRegister(stageDuration, llmDuration)
+}
 
 var (
 	mu       sync.Mutex
@@ -79,6 +106,8 @@ func Record(taskNo, stage string, d time.Duration) {
 	ms := d.Milliseconds()
 	// Always echo to stdout so existing log-based observability still works.
 	log.Printf("[timing] task=%s stage=%s took=%dms", taskNo, stage, ms)
+	// Metric side: scrapeable distribution per stage (#242 S3-b).
+	stageDuration.Observe(metrics.Labels("stage", stage), d.Seconds())
 
 	f := ensureFile()
 	if f == nil {
@@ -154,6 +183,10 @@ func SetReportPath(p string) {
 // the gateway for that call (0 if unknown). It is safe for concurrent callers
 // (Map runs chunks in parallel).
 func RecordLLM(taskNo, purpose string, took time.Duration, tokens int) {
+	// Metric side first, before the taskNo guard: the distribution should count
+	// every call regardless of whether per-task report accounting applies.
+	// purpose is collapsed to a bounded class so the label space stays finite.
+	llmDuration.Observe(metrics.Labels("purpose_class", PurposeClass(purpose)), took.Seconds())
 	if taskNo == "" {
 		return
 	}

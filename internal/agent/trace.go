@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/metrics"
 )
 
 // Per-request latency instrumentation for the agent path.
@@ -24,8 +26,8 @@ import (
 //
 // The trace is deliberately NOT internal/timing: that package writes per-task
 // report files keyed by task_no, which an interactive chat turn does not have.
-// This is an in-memory, per-request accumulator that emits one structured log
-// block at the end of the run.
+// This is an in-memory, per-request accumulator that emits scrapeable metrics
+// always, and one structured log block when AGENT_TRACE is on.
 //
 // PRIVACY: this file must never log message content, prompt text, tool
 // arguments, user names, or channel names. Sizes, counts, durations, step
@@ -34,26 +36,67 @@ import (
 // else here is a number. Adding a field that carries content is a privacy
 // regression, not a debugging improvement.
 //
-// Everything is best-effort: a nil trace (tracing off, or no trace in
-// context) makes every method a no-op, so instrumentation never changes
-// control flow and costs nothing when disabled.
+// The metric side is ALWAYS on: the accumulator is allocated for every run
+// regardless of AGENT_TRACE (the measurement is a few time diffs, slice
+// appends and one length-sum per hop — negligible against an LLM round trip),
+// so per-request latency percentiles are scrapeable without flipping a flag
+// during the incident. AGENT_TRACE gates only the verbose per-step LOG block.
+// A nil trace is still a no-op for defensiveness, so a caller that never
+// started one changes no control flow.
 
-// TraceEnvVar gates the trace. Off by default.
+// TraceEnvVar gates the verbose per-step LOG block. Off by default.
 //
-// Gated for cost, not secrecy: a run emits one line per planner step plus
-// three summary lines — a few dozen lines for a large summary — which is
-// useful when diagnosing one request and noise when multiplied by production
-// traffic. Read straight from the environment rather than through
-// config.Config, following agentStepTimeoutOverride's precedent in
-// profile.go: tracing must work in unit tests that build a runner without
-// initializing the whole deps container.
+// It does NOT gate the metrics: those are always emitted (see the package
+// comment). It gates only the log output — a run emits one line per planner
+// step plus a few summary lines, useful when diagnosing one request and noise
+// when multiplied by production traffic. Read straight from the environment
+// rather than through config.Config, following agentStepTimeoutOverride's
+// precedent in profile.go: tracing must work in unit tests that build a runner
+// without initializing the whole deps container.
 const TraceEnvVar = "AGENT_TRACE"
 
-// TraceEnabled reports whether per-request agent tracing is on.
+// TraceEnabled reports whether the verbose per-request agent LOG is on.
 // Accepts the standard strconv.ParseBool spellings (1/t/true/T/TRUE...).
 func TraceEnabled() bool {
 	enabled, err := strconv.ParseBool(strings.TrimSpace(os.Getenv(TraceEnvVar)))
 	return err == nil && enabled
+}
+
+// agentDurationBuckets mirror llmobs/timing's second-boundaries so agent, LLM
+// and worker latencies read against one scale. agentStepBuckets and
+// agentPromptCharBuckets are shaped for their own quantities: a handful of
+// planner turns, and prompt sizes from a small refine to a very large
+// long-context turn.
+var (
+	agentDurationBuckets   = []float64{0.5, 1, 2, 5, 10, 20, 30, 60, 90, 120, 180, 300}
+	agentStepBuckets       = []float64{1, 2, 3, 5, 8, 13, 21}
+	agentPromptCharBuckets = []float64{1e3, 5e3, 1e4, 5e4, 1e5, 2.5e5, 5e5, 1e6}
+)
+
+// Agent-run metrics (#242 S3-b), always emitted from Report regardless of
+// AGENT_TRACE. Every label is a closed set (outcome ok|error|panic, phase
+// planning|tools) or a fixed registry vocabulary (tool name) — never request
+// data, so series count stays bounded.
+var (
+	agentRequestDur = metrics.NewHistogramVec("agent_request_duration_seconds",
+		"Wall-clock of a whole agent run, by outcome (ok|error|panic). The end-to-end latency a chat user feels; the llm_* histograms only cover the model round-trips inside it.",
+		agentDurationBuckets)
+	agentPhaseDur = metrics.NewHistogramVec("agent_phase_duration_seconds",
+		"Wall-clock per agent phase per run: planning (planner LLM turns) vs tools (tool-hop execution). Planning-dominated runs need prompt-size work; tool-dominated runs need tool parallelism.",
+		agentDurationBuckets)
+	agentToolDur = metrics.NewHistogramVec("agent_tool_duration_seconds",
+		"Wall-clock of individual agent tool invocations, by tool name (a fixed registry vocabulary). Names the straggler tool across all traffic.",
+		agentDurationBuckets)
+	agentSteps = metrics.NewHistogramVec("agent_steps",
+		"Distribution of planner turns per agent run. A growing tail means the agent is looping more to reach an answer.",
+		agentStepBuckets)
+	agentPromptChars = metrics.NewHistogramVec("agent_prompt_chars",
+		"Distribution of the largest planner prompt per agent run, in characters. Tracks prompt growth across releases; it is a LENGTH, never content.",
+		agentPromptCharBuckets)
+)
+
+func init() {
+	metrics.Default.MustRegister(agentRequestDur, agentPhaseDur, agentToolDur, agentSteps, agentPromptChars)
 }
 
 // stepSpan records one planner turn plus the tool hop it triggered.
@@ -93,8 +136,11 @@ type RunTrace struct {
 	mu        sync.Mutex
 	start     time.Time
 	sessionID string
-	steps     []stepSpan
-	tools     []toolSpan
+	// logVerbose is TraceEnabled() captured at StartTrace: it gates the
+	// per-step log block in Report, not the metrics.
+	logVerbose bool
+	steps      []stepSpan
+	tools      []toolSpan
 	// subPhases holds named sub-timings reported by tools themselves (e.g.
 	// the Map phase inside summarize_chunk), so a tool that is itself an LLM
 	// pipeline can explain its own cost instead of appearing as one opaque
@@ -107,16 +153,14 @@ type contextKeyTrace struct{}
 // ContextKeyTrace carries the *RunTrace for the in-flight request.
 var ContextKeyTrace = contextKeyTrace{}
 
-// StartTrace attaches a fresh RunTrace to ctx when tracing is enabled.
+// StartTrace attaches a fresh RunTrace to ctx. It is allocated for every run,
+// on or off: the metrics in Report are always-on and need the accumulator.
+// AGENT_TRACE only decides whether Report also writes the verbose log block.
 //
-// When disabled it returns ctx unchanged and a nil *RunTrace. Every method is
-// nil-safe, so callers never branch on the flag: the off path allocates
-// nothing and logs nothing.
+// Every method is nil-safe, so a caller that passes a nil *RunTrace (or never
+// starts one) changes no control flow.
 func StartTrace(ctx context.Context, sessionID string) (context.Context, *RunTrace) {
-	if !TraceEnabled() {
-		return ctx, nil
-	}
-	t := &RunTrace{start: time.Now(), sessionID: sessionID}
+	t := &RunTrace{start: time.Now(), sessionID: sessionID, logVerbose: TraceEnabled()}
 	return context.WithValue(ctx, ContextKeyTrace, t), t
 }
 
@@ -212,6 +256,23 @@ func (t *RunTrace) Report(outcome string) {
 		if s.PromptChars > maxPrompt {
 			maxPrompt = s.PromptChars
 		}
+	}
+
+	// Metrics are emitted ALWAYS, before the AGENT_TRACE-gated log below:
+	// gating them would recreate the blind spot this instrumentation exists to
+	// remove (#231/#242). Labels are closed sets / a fixed tool vocabulary.
+	agentRequestDur.Observe(metrics.Labels("outcome", outcome), float64(totalMs)/1000)
+	agentPhaseDur.Observe(metrics.Labels("phase", "planning"), float64(planMs)/1000)
+	agentPhaseDur.Observe(metrics.Labels("phase", "tools"), float64(toolMs)/1000)
+	agentSteps.Observe(metrics.Labels(), float64(len(t.steps)))
+	agentPromptChars.Observe(metrics.Labels(), float64(maxPrompt))
+	for _, ts := range t.tools {
+		agentToolDur.Observe(metrics.Labels("tool", ts.Name), float64(ts.Ms)/1000)
+	}
+
+	// AGENT_TRACE gates only the human-readable per-step log block below.
+	if !t.logVerbose {
+		return
 	}
 
 	log.Printf("[agent-trace] session=%s outcome=%s total=%dms planning=%dms(%s) tools=%dms(%s) other=%dms(%s) steps=%d max_prompt=%dchars",

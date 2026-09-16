@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/metrics"
 )
 
 func captureLog(t *testing.T, fn func()) string {
@@ -30,13 +32,46 @@ func TestTraceDisabledByDefault(t *testing.T) {
 		t.Fatal("tracing must be off by default")
 	}
 	ctx, tr := StartTrace(context.Background(), "sess-1")
-	if tr != nil {
-		t.Fatal("StartTrace returned a trace while disabled")
+	// The accumulator is now ALWAYS allocated, on or off, so the metrics in
+	// Report can be always-on (#242 S3-b). AGENT_TRACE gates only the log.
+	if tr == nil {
+		t.Fatal("StartTrace must allocate a trace even when AGENT_TRACE is off")
 	}
-	if TraceFromContext(ctx) != nil {
-		t.Fatal("a disabled trace must not be attached to ctx")
+	if TraceFromContext(ctx) != tr {
+		t.Fatal("trace must be attached to ctx")
 	}
-	// Every method must be a safe no-op on the nil trace.
+
+	// With the flag off, Report must emit NO log block...
+	out := captureLog(t, func() {
+		tr.AddStep(1, 10, 100, 2, 3)
+		tr.AddTool("fetch_channel", 5)
+		tr.CloseStep(1, 5, []string{"fetch_channel"})
+		tr.Report("ok")
+	})
+	if out != "" {
+		t.Fatalf("AGENT_TRACE off must suppress the log block, got %q", out)
+	}
+
+	// ...but the metrics must still be emitted — that is the whole point: an
+	// intermittent production issue must be visible without flipping a flag.
+	scrape := scrapeDefault()
+	for _, want := range []string{
+		`agent_request_duration_seconds_count{outcome="ok"}`,
+		`agent_tool_duration_seconds_count{tool="fetch_channel"}`,
+	} {
+		if !strings.Contains(scrape, want) {
+			t.Errorf("metric %q missing with AGENT_TRACE off:\n%s", want, scrape)
+		}
+	}
+}
+
+// TestNilTraceIsNoOp keeps the defensive contract: a nil trace changes no
+// control flow and emits nothing, so a caller that never started one is safe.
+func TestNilTraceIsNoOp(t *testing.T) {
+	var tr *RunTrace
+	if tr.Active() {
+		t.Fatal("nil trace reported Active")
+	}
 	out := captureLog(t, func() {
 		tr.AddStep(1, 10, 100, 2, 3)
 		tr.CloseStep(1, 5, []string{"fetch_channel"})
@@ -45,11 +80,14 @@ func TestTraceDisabledByDefault(t *testing.T) {
 		tr.Report("ok")
 	})
 	if out != "" {
-		t.Fatalf("disabled trace logged %q", out)
+		t.Fatalf("nil trace logged %q", out)
 	}
-	if tr.Active() {
-		t.Fatal("nil trace reported Active")
-	}
+}
+
+func scrapeDefault() string {
+	var buf bytes.Buffer
+	metrics.Default.WritePrometheus(&buf)
+	return buf.String()
 }
 
 func TestTraceEnabledSpellings(t *testing.T) {
@@ -247,4 +285,30 @@ func toolCallFixture(id, name, args string) ToolCall {
 	tc.Function.Name = name
 	tc.Function.Arguments = args
 	return tc
+}
+
+// TestTrace_EmitsAgentMetrics drives a run and checks every agent_* family and
+// its label appears, with bounded label values (outcome, phase, tool).
+func TestTrace_EmitsAgentMetrics(t *testing.T) {
+	t.Setenv(TraceEnvVar, "")
+	_, tr := StartTrace(context.Background(), "sess-metrics")
+	tr.AddStep(1, 1200, 40000, 6, 500) // planning 1.2s, prompt 40k chars
+	tr.AddTool("resolve_channel_scope", 300)
+	tr.CloseStep(1, 300, []string{"resolve_channel_scope"})
+	tr.Report("error")
+
+	out := scrapeDefault()
+	for _, want := range []string{
+		"# TYPE agent_request_duration_seconds histogram",
+		`agent_request_duration_seconds_count{outcome="error"}`,
+		`agent_phase_duration_seconds_count{phase="planning"}`,
+		`agent_phase_duration_seconds_count{phase="tools"}`,
+		`agent_tool_duration_seconds_count{tool="resolve_channel_scope"}`,
+		"# TYPE agent_steps histogram",
+		"# TYPE agent_prompt_chars histogram",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
 }

@@ -124,8 +124,20 @@ func TestMetricsBeforeInstallDoesNotPanic(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("status = %d before Install; want a benign empty 200 — a 500 on the monitoring endpoint reads as an outage", w.Code)
 	}
-	if body := w.Body.String(); body != "" {
-		t.Errorf("body = %q before Install; want empty", body)
+	// Before Install the llmobs (LLM-fallback) metric set is nil, so no llm_*
+	// family may appear. The app-level registry (metrics.Default) is populated
+	// at package init — internal/timing and the agent trace register their
+	// families there — so summary_* / agent_* HELP/TYPE lines are expected even
+	// before Install: advertising a registered family at zero is standard
+	// Prometheus behavior (and what client_golang does). The contract this
+	// guards is therefore: benign 200, no panic, and NO LLM metrics before the
+	// observer is installed.
+	//
+	// Match "# TYPE llm_" (family header), not a bare "llm_" substring: the app
+	// family summary_llm_duration_seconds legitimately contains "llm_", but its
+	// header is "# TYPE summary_llm_…", so this stays precise to llmobs families.
+	if body := w.Body.String(); strings.Contains(body, "# TYPE llm_") {
+		t.Errorf("llmobs llm_* family present before Install; want none:\n%s", body)
 	}
 }
 

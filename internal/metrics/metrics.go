@@ -85,6 +85,13 @@ type Registry struct {
 // NewRegistry returns an empty Registry.
 func NewRegistry() *Registry { return &Registry{} }
 
+// Default is the process-wide registry that application subsystems (worker
+// timing, agent trace) register their collectors into, rendered by the
+// /internal/metrics scrape handler alongside the llmobs LLM-fallback registry.
+// llmobs keeps its own registry rather than sharing this one so its exposition
+// output stays independent and stable.
+var Default = NewRegistry()
+
 // MustRegister appends collectors in order. Later WritePrometheus renders them
 // in exactly this order.
 func (r *Registry) MustRegister(cs ...Collector) {

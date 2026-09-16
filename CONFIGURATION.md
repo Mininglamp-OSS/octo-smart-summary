@@ -85,8 +85,9 @@ The following model identifiers are tested and supported:
 > `WORKER_INTERNAL_PORT` serve `/internal/*` with no credential check. That
 > surface includes the *mutating* `/internal/worker-trigger` and
 > `/internal/task-event`, and the read-only `/internal/metrics` scrape endpoint
-> (model identifiers and per-path failure volumes). A separate HTTP engine is
-> not an access-control boundary.
+> (LLM model identifiers and per-path failure volumes, plus pipeline-stage,
+> per-`purpose_class` LLM, and agent run/phase/tool latency histograms). A
+> separate HTTP engine is not an access-control boundary.
 >
 > Restrict both ports at the network layer — a Kubernetes NetworkPolicy, a
 > security group, or simply not publishing them. Do not expose them through an
