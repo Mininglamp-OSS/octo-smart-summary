@@ -785,8 +785,10 @@ func canonicalSummaryWorkflowRequestHash(in normalizedSummaryWorkflowInput) stri
 		timeEnd = in.timeEnd.UTC().Format(time.RFC3339Nano)
 	}
 	type canonicalSource struct {
-		SourceType int    `json:"source_type"`
-		SourceID   string `json:"source_id"`
+		// Preserve the historical JSON field names used in persisted
+		// idempotency hashes while intentionally excluding snapshot metadata.
+		SourceType int
+		SourceID   string
 	}
 	canonicalSources := make([]canonicalSource, 0, len(sources))
 	for _, source := range sources {

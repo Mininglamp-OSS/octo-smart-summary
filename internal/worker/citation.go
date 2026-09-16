@@ -239,7 +239,9 @@ func toContextMsg(msg pipeline.Message, nameMap map[string]string) model.Context
 	}
 }
 
-// dedupCitations merges citations that share the same (sender, content) pair.
+// dedupCitations merges chat citations that share the same (sender, content)
+// pair. Document citations additionally require identical immutable source
+// coordinates; titles and content prefixes are not document identities.
 // For each group of duplicates, the smallest index is kept as the representative.
 // All occurrences of duplicate indexes in text are replaced with the representative,
 // and consecutive identical markers (e.g. [1][1][1]) are collapsed to a single one.
@@ -249,12 +251,22 @@ func dedupCitations(text string, citations []model.Citation) (string, []model.Ci
 	}
 
 	// Group by (sender, content) — keep the smallest index as representative.
-	type key struct{ sender, content string }
+	type key struct {
+		sender, content             string
+		documentID, documentVersion string
+		documentChunk, channelType  int
+	}
 	mainIdx := make(map[key]int) // key -> smallest index
 	remap := make(map[int]int)   // oldIdx -> mainIdx
 
 	for _, c := range citations {
-		k := key{c.Sender, c.Content}
+		k := key{sender: c.Sender, content: c.Content}
+		if c.ChannelType == model.SourceDocument {
+			k.channelType = c.ChannelType
+			k.documentID = c.DocumentID
+			k.documentVersion = c.DocumentVersion
+			k.documentChunk = c.DocumentChunk
+		}
 		if existing, ok := mainIdx[k]; ok {
 			if c.Index < existing {
 				// New one is smaller; remap old main to new.

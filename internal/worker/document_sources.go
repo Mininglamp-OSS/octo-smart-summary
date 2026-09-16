@@ -5,14 +5,12 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/tokenizer"
 	"gorm.io/gorm"
 )
-
-const documentEvidenceChunkRunes = 40000
 
 const documentSnapshotTruncatedMarker = "\n[文档内容已按长度上限截断]"
 
@@ -37,7 +35,7 @@ func hasDocumentSource(sources []model.SummarySource) bool {
 	return false
 }
 
-func loadDocumentEvidence(db *gorm.DB, sources []model.SummarySource) ([]pipeline.Message, error) {
+func loadDocumentEvidence(db *gorm.DB, sources []model.SummarySource, tok tokenizer.Tokenizer, maxTokens int) ([]pipeline.Message, error) {
 	messages := make([]pipeline.Message, 0, len(sources))
 	for _, source := range sources {
 		var snapshot model.SummarySourceSnapshot
@@ -49,7 +47,7 @@ func loadDocumentEvidence(db *gorm.DB, sources []model.SummarySource) ([]pipelin
 		if actualHash != source.SourceHash || actualHash != snapshot.ContentHash {
 			return nil, fmt.Errorf("document snapshot hash mismatch source=%d", source.ID)
 		}
-		parts := splitDocumentEvidence(snapshot.Content, documentEvidenceChunkRunes)
+		parts := splitDocumentEvidence(snapshot.Content, tok, maxTokens)
 		if snapshot.Truncated && len(parts) > 0 {
 			parts[len(parts)-1] += documentSnapshotTruncatedMarker
 		}
@@ -72,20 +70,32 @@ func loadDocumentEvidence(db *gorm.DB, sources []model.SummarySource) ([]pipelin
 	return messages, nil
 }
 
-func splitDocumentEvidence(content string, maxRunes int) []string {
+func splitDocumentEvidence(content string, tok tokenizer.Tokenizer, maxTokens int) []string {
 	content = strings.TrimSpace(content)
-	if content == "" || maxRunes <= 0 {
+	if content == "" || tok == nil || maxTokens <= 0 {
 		return nil
 	}
-	if utf8.RuneCountInString(content) <= maxRunes {
+	if tok.Estimate(content) <= maxTokens {
 		return []string{content}
 	}
 	runes := []rune(content)
-	parts := make([]string, 0, (len(runes)+maxRunes-1)/maxRunes)
+	parts := make([]string, 0)
 	for len(runes) > 0 {
-		end := maxRunes
-		if end > len(runes) {
-			end = len(runes)
+		low, high, end := 1, len(runes), 0
+		for low <= high {
+			mid := low + (high-low)/2
+			if tok.Estimate(string(runes[:mid])) <= maxTokens {
+				end = mid
+				low = mid + 1
+			} else {
+				high = mid - 1
+			}
+		}
+		// Always make progress even for a tokenizer whose estimate for one rune
+		// exceeds the configured budget. The downstream warning remains the final
+		// guard for this pathological case.
+		if end == 0 {
+			end = 1
 		}
 		if end < len(runes) {
 			for i := end; i > end/2; i-- {
@@ -107,9 +117,9 @@ func splitDocumentEvidence(content string, maxRunes int) []string {
 func formatDocumentEvidence(message pipeline.Message) string {
 	version := ""
 	if message.SourceVersion != "" {
-		version = "｜版本：" + message.SourceVersion
+		version = "｜版本：" + escapeCitationMarkers(message.SourceVersion)
 	}
 	return fmt.Sprintf("[%d]【文档：%s%s｜片段：%d】\n%s",
-		message.CitationIndex, message.SourceName, version, message.MessageSeq,
+		message.CitationIndex, escapeCitationMarkers(message.SourceName), version, message.MessageSeq,
 		escapeCitationMarkers(message.Content))
 }

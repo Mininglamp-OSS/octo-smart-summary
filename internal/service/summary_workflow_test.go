@@ -6,8 +6,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -119,6 +121,56 @@ func TestSummaryWorkflowRollsBackWhenDocumentSnapshotInsertFails(t *testing.T) {
 		if err := db.Model(table).Count(&count).Error; err != nil || count != 0 {
 			t.Fatalf("model %T count=%d err=%v, want rolled back", table, count, err)
 		}
+	}
+}
+
+func TestCanonicalWorkflowHashPreservesLegacySourceShapeAndIgnoresSnapshotMetadata(t *testing.T) {
+	in := normalizedSummaryWorkflowInput{
+		creatorID:           "u",
+		title:               "t",
+		sources:             []SummaryWorkflowSource{{SourceType: model.SourceGroup, SourceID: "g"}},
+		participants:        []SummaryWorkflowParticipant{},
+		confirmTimeoutHours: 24,
+	}
+	legacyPayload := struct {
+		CreatorID     string `json:"creator_id"`
+		Title         string `json:"title"`
+		Topic         string `json:"topic"`
+		TimeRangeMode string `json:"time_range_mode"`
+		TimeStart     string `json:"time_start"`
+		TimeEnd       string `json:"time_end"`
+		Sources       []struct {
+			SourceType int
+			SourceID   string
+		} `json:"sources"`
+		Participants        []SummaryWorkflowParticipant `json:"participants"`
+		ConfirmTimeoutHours int                          `json:"confirm_timeout_hours"`
+		OriginChannelID     string                       `json:"origin_channel_id"`
+		OriginChannelType   int                          `json:"origin_channel_type"`
+		AgentSessionID      string                       `json:"agent_session_id,omitempty"`
+	}{
+		CreatorID: "u", Title: "t", TimeRangeMode: "default",
+		Sources: []struct {
+			SourceType int
+			SourceID   string
+		}{{SourceType: model.SourceGroup, SourceID: "g"}},
+		Participants: nil, ConfirmTimeoutHours: 24,
+	}
+	legacyJSON, err := json.Marshal(legacyPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := sha256.Sum256(legacyJSON)
+	if got := canonicalSummaryWorkflowRequestHash(in); got != hex.EncodeToString(want[:]) {
+		t.Fatalf("canonical hash=%s, want legacy-compatible %s", got, hex.EncodeToString(want[:]))
+	}
+
+	in.sources[0].SourceName = "ignored"
+	in.sources[0].SourceVersion = "v2"
+	in.sources[0].SourceHash = strings.Repeat("a", 64)
+	in.sources[0].SnapshotContent = "ignored snapshot"
+	if got := canonicalSummaryWorkflowRequestHash(in); got != hex.EncodeToString(want[:]) {
+		t.Fatalf("snapshot metadata changed canonical hash: %s", got)
 	}
 }
 

@@ -110,6 +110,14 @@ const noRelevantContentMessage = pipeline.NoRelevantContentMessage
 
 const noSelfMessagesMessage = pipeline.NoSelfMessagesMessage
 
+const (
+	personalMapSystemPromptTokens      = 3000
+	personalMapMessageFormattingTokens = 15
+	documentEvidenceHeaderTokenReserve = 256
+	minimumSupportedWorkerMapTokens    = 10000
+	fallbackWorkerMapTokens            = 100000
+)
+
 // decidePersonalMessages is a compatibility wrapper around pipeline.DecideMessages.
 // It chooses which messages feed the summary after target filtering, and decides
 // whether to early-return a user-facing message instead.
@@ -829,6 +837,24 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		}
 	}
 
+	// Resolve the tokenizer and Map budget before loading document snapshots so
+	// each generated evidence message is guaranteed to fit the same budget used
+	// by the downstream Map chunker.
+	tokCfg := tokenizer.Config{
+		CharsPerTokenCJK:   p.cfg.ResolveCharsPerTokenCJK(),
+		CharsPerTokenASCII: p.cfg.CharsPerTokenASCII,
+		KimiAPIKey:         p.cfg.KimiAPIKey,
+		HTTPTimeout:        p.cfg.TokenizerHTTPTimeout,
+	}
+	tok := tokenizer.New(p.cfg.LLMModel, tokCfg)
+	resolvedMapMaxTokens := p.cfg.ResolveMapMaxTokens()
+	if resolvedMapMaxTokens < minimumSupportedWorkerMapTokens {
+		log.Printf("[config] resolved MapMaxTokens=%d too small, using default %d", resolvedMapMaxTokens, fallbackWorkerMapTokens)
+		resolvedMapMaxTokens = fallbackWorkerMapTokens
+	}
+	effectiveMapMaxTokens := resolvedMapMaxTokens - personalMapSystemPromptTokens
+	documentContentTokenBudget := effectiveMapMaxTokens - personalMapMessageFormattingTokens - documentEvidenceHeaderTokenReserve
+
 	specifiedSources := explicitSpecifiedSources(sources)
 
 	// Unified LLM tool-call callback (shared by all Function Call sites).
@@ -863,7 +889,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	var intentResult *pipeline.IntentResult
 	var err error
 	if documentMode {
-		messages, err = loadDocumentEvidence(p.db, sources)
+		messages, err = loadDocumentEvidence(p.db, sources, tok, documentContentTokenBudget)
 	} else if p.fetchPersonalMessagesFn != nil {
 		messages, intentResult, err = p.fetchPersonalMessagesFn(ctx, task, userID)
 	} else {
@@ -1038,17 +1064,8 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		reportStage(model.WorkflowStageAnalyzeChatContent)
 	}
 
-	// Create tokenizer for token counting
-	tokCfg := tokenizer.Config{
-		CharsPerTokenCJK:   p.cfg.ResolveCharsPerTokenCJK(),
-		CharsPerTokenASCII: p.cfg.CharsPerTokenASCII,
-		KimiAPIKey:         p.cfg.KimiAPIKey,
-		HTTPTimeout:        p.cfg.TokenizerHTTPTimeout,
-	}
-	tok := tokenizer.New(p.cfg.LLMModel, tokCfg)
-
 	// System prompt overhead (same as used in chunking)
-	const systemPromptTokens = 3000
+	const systemPromptTokens = personalMapSystemPromptTokens
 
 	// Calculate total tokens for all messages
 	var allContent strings.Builder
@@ -1065,7 +1082,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	// Use the minimum of skipThreshold and mapMaxTokens, then subtract system prompt overhead
 	// to ensure we don't exceed the per-model context budget
 	skipThreshold := p.cfg.ResolveSkipMapReduceThreshold()
-	mapMaxTokens := p.cfg.ResolveMapMaxTokens()
+	mapMaxTokens := resolvedMapMaxTokens
 	if mapMaxTokens > 0 && mapMaxTokens < skipThreshold {
 		skipThreshold = mapMaxTokens
 	}
@@ -1077,12 +1094,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	}
 
 	// Token-aware chunking — resolve budget via explicit config / per-model default / global fallback
-	maxTokens := p.cfg.ResolveMapMaxTokens()
-	if maxTokens < 10000 {
-		log.Printf("[config] resolved MapMaxTokens=%d too small, using default 100000", maxTokens)
-		maxTokens = 100000
-	}
-	effectiveMax := maxTokens - systemPromptTokens
+	effectiveMax := effectiveMapMaxTokens
 
 	var chunks [][]pipeline.Message
 	var currentChunk []pipeline.Message

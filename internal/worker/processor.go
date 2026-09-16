@@ -751,9 +751,8 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 	// Build specified sources for pipeline
 	specifiedSources := explicitSpecifiedSources(sources)
 	if documentSourcesOnly(sources) {
-		if _, err := loadDocumentEvidence(p.db, sources); err != nil {
-			return err
-		}
+		// The personal pipeline loads and verifies snapshots with its resolved
+		// tokenizer budget. Avoid materializing every MEDIUMTEXT row twice here.
 		return nil
 	}
 	if hasDocumentSource(sources) {
