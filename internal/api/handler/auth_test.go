@@ -35,6 +35,7 @@ func setupTestDBs(t *testing.T) (db *gorm.DB, imDB *gorm.DB) {
 	if err := db.AutoMigrate(
 		&model.SummaryTask{},
 		&model.SummarySource{},
+		&model.SummarySourceSnapshot{},
 		&model.SummaryParticipant{},
 		&model.PersonalResult{},
 	); err != nil {
@@ -254,6 +255,18 @@ func TestDeleteSummary_RequiresAuth(t *testing.T) {
 	taskID := seedTask(t, db, imDB)
 	h := NewTaskHandler(db, imDB, "")
 	r := setupRouter(h)
+	var source model.SummarySource
+	if err := db.Where("task_id = ?", taskID).First(&source).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.SummarySourceSnapshot{
+		SummarySourceID: source.ID,
+		Content:         "snapshot",
+		ContentBytes:    len("snapshot"),
+		ContentHash:     "hash",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	w := doRequest(r, "DELETE", fmt.Sprintf("/api/v1/summaries/%d", taskID), "stranger1")
 	if w.Code != http.StatusForbidden {
@@ -264,6 +277,10 @@ func TestDeleteSummary_RequiresAuth(t *testing.T) {
 	w = doRequest(r, "DELETE", fmt.Sprintf("/api/v1/summaries/%d", taskID), "creator1")
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200 for delete by creator, got %d: %s", w.Code, w.Body.String())
+	}
+	var snapshotCount int64
+	if err := db.Model(&model.SummarySourceSnapshot{}).Count(&snapshotCount).Error; err != nil || snapshotCount != 0 {
+		t.Fatalf("snapshot count=%d err=%v, want zero after summary deletion", snapshotCount, err)
 	}
 }
 

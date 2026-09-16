@@ -46,6 +46,7 @@ type Snapshot struct {
 type SnapshotScope struct {
 	ChannelIDs   []string      `json:"channel_ids"`
 	ChannelNames []string      `json:"channel_names"`
+	DocumentIDs  []string      `json:"document_ids,omitempty"`
 	TimeRange    TimeRangeJSON `json:"time_range"`
 }
 

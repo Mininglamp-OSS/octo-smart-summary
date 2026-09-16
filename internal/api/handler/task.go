@@ -42,6 +42,7 @@ type TaskHandler struct {
 	imDB                *gorm.DB
 	workerTriggerURL    string
 	customTemplateLimit int
+	documentClient      documentSourceClient
 	// attentionCache serves the polling endpoint only. See attention.go for
 	// the TTL and the no-invalidation rationale.
 	attentionCache  *attentionCache
@@ -55,6 +56,7 @@ func NewTaskHandler(db, imDB *gorm.DB, workerTriggerURL string) *TaskHandler {
 		imDB:                imDB,
 		workerTriggerURL:    workerTriggerURL,
 		customTemplateLimit: defaultCustomTemplateLimit,
+		documentClient:      newDefaultDocumentSourceClient(),
 		attentionCache:      newAttentionCache(),
 		summaryWorkflow:     service.NewSummaryWorkflowService(db, imDB, pipeline.DefaultTimeRangeDays, pipeline.DefaultTimeRangeDays),
 	}
@@ -373,6 +375,13 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 	}
 	workflowInput.Sources = make([]service.SummaryWorkflowSource, 0, len(req.Sources))
 	for _, source := range req.Sources {
+		// The snapshot schema lands before the worker consumer. Keep the public
+		// create path closed in this independently deployable change so a document
+		// id can never be dispatched to the chat-only worker by an older release.
+		if source.SourceType == model.SourceDocument {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "文档总结功能尚未开放"})
+			return
+		}
 		workflowInput.Sources = append(workflowInput.Sources, service.SummaryWorkflowSource{
 			SourceType: source.SourceType,
 			SourceID:   source.SourceID,
@@ -687,11 +696,15 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			if s.Derived {
 				continue
 			}
-			srcList = append(srcList, gin.H{
+			sourceItem := gin.H{
 				"source_type": s.SourceType,
 				"source_id":   s.SourceID,
 				"source_name": displaySourceName(s, t.CreatorID, h.imDB),
-			})
+			}
+			if s.SourceType == model.SourceDocument {
+				sourceItem["source_version"] = s.SourceVersion
+			}
+			srcList = append(srcList, sourceItem)
 		}
 
 		latestResult, hasResult := h.pickDisplayResult(t.ID)
@@ -961,11 +974,15 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		if s.Derived {
 			continue
 		}
-		srcList = append(srcList, gin.H{
+		sourceItem := gin.H{
 			"source_type": s.SourceType,
 			"source_id":   s.SourceID,
 			"source_name": displaySourceName(s, task.CreatorID, h.imDB),
-		})
+		}
+		if s.SourceType == model.SourceDocument {
+			sourceItem["source_version"] = s.SourceVersion
+		}
+		srcList = append(srcList, sourceItem)
 	}
 
 	var participants []model.SummaryParticipant
@@ -1999,6 +2016,9 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 					Update("deleted_at", &now).Error; err != nil {
 					return err
 				}
+				if err := deleteSummarySourceSnapshotsForSchedule(tx, lockedSched.ID); err != nil {
+					return err
+				}
 				// Soft-delete EVERY live task in the group in one batch UPDATE (never
 				// loop per-row; a long-lived schedule may own thousands of tasks).
 				// schedule_id is preserved (no unbind) so deleted history stays
@@ -2024,6 +2044,9 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 			}
 		}
 
+		if err := deleteSummarySourceSnapshotsForTask(tx, liveTask.ID); err != nil {
+			return err
+		}
 		return tx.Model(&liveTask).Updates(map[string]interface{}{
 			"status":     -1,
 			"deleted_at": now,
@@ -2046,6 +2069,17 @@ func (h *TaskHandler) DeleteSummary(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok"})
+}
+
+func deleteSummarySourceSnapshotsForTask(tx *gorm.DB, taskID int64) error {
+	sourceIDs := tx.Model(&model.SummarySource{}).Select("id").Where("task_id = ?", taskID)
+	return tx.Where("summary_source_id IN (?)", sourceIDs).Delete(&model.SummarySourceSnapshot{}).Error
+}
+
+func deleteSummarySourceSnapshotsForSchedule(tx *gorm.DB, scheduleID int64) error {
+	taskIDs := tx.Model(&model.SummaryTask{}).Select("id").Where("schedule_id = ?", scheduleID)
+	sourceIDs := tx.Model(&model.SummarySource{}).Select("id").Where("task_id IN (?)", taskIDs)
+	return tx.Where("summary_source_id IN (?)", sourceIDs).Delete(&model.SummarySourceSnapshot{}).Error
 }
 
 // CancelSummary handles POST /api/v1/summaries/:id/cancel
