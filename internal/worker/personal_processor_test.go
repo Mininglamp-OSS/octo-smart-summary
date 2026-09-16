@@ -676,3 +676,103 @@ func TestMarkPersonalFailed_SequentialRetry_AccumulatesThenTerminal(t *testing.T
 		t.Fatalf("after reaching maxRetry: worker_status=%d, want Failed(terminal) -- no infinite re-run", g3.WorkerStatus)
 	}
 }
+
+// TestPersonalLeaseHeartbeatRenewsBeforeStuck pins the #220 invariant: a live
+// run must renew its leases often enough that the stuck scanner never mistakes
+// it for a dead worker. Requiring at least two heartbeats to fit inside the
+// lease means a single missed tick still cannot push a live run past the stuck
+// window.
+func TestPersonalLeaseHeartbeatRenewsBeforeStuck(t *testing.T) {
+	if personalLeaseHeartbeat <= 0 {
+		t.Fatalf("personalLeaseHeartbeat must be positive, got %v", personalLeaseHeartbeat)
+	}
+	if personalLeaseHeartbeat >= personalStuckLease {
+		t.Fatalf("heartbeat %v must be shorter than the stuck lease %v", personalLeaseHeartbeat, personalStuckLease)
+	}
+	if personalLeaseHeartbeat*2 >= personalStuckLease {
+		t.Errorf("heartbeat %v leaves no room for a missed tick under the %v lease; want at least two heartbeats to fit",
+			personalLeaseHeartbeat, personalStuckLease)
+	}
+	// The ceiling must clear a legitimate worst-case run (fetch ~20m + LLM ~12m),
+	// or it would re-truncate real work instead of only catching a wedge.
+	if personalRunCeiling <= 30*time.Minute {
+		t.Errorf("personalRunCeiling %v is not comfortably above the ~32m legitimate worst case", personalRunCeiling)
+	}
+}
+
+// TestLeaseHeartbeat_RenewsBothLeasesWhileProcessing is the renewal contract:
+// while the participant is Processing, both worker_started_at (participant
+// lease) and processing_deadline (task lease) are pushed forward, so neither
+// scanner re-dispatches a slow-but-live run.
+func TestLeaseHeartbeat_RenewsBothLeasesWhileProcessing(t *testing.T) {
+	db := newFileBackedTestDB(t)
+	stale := time.Now().UTC().Add(-9 * time.Minute)
+	task := model.SummaryTask{
+		TaskNo: "T-HB", SpaceID: "sp", CreatorID: "u1", SummaryMode: model.ModeByPerson,
+		Status: model.StatusProcessing, TriggerType: model.TriggerScheduled,
+		ProcessingDeadline: &stale, TimeRangeStart: stale, TimeRangeEnd: stale,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	part := model.SummaryParticipant{
+		TaskID: task.ID, UserID: "u1", Status: model.ParticipantProcessing, WorkerStartedAt: &stale,
+	}
+	if err := db.Create(&part).Error; err != nil {
+		t.Fatalf("create participant: %v", err)
+	}
+
+	p := &Processor{db: db, cfg: &config.Config{WorkerLeaseMinutes: 20}}
+	stop := p.startLeaseHeartbeatEvery(task.ID, part.ID, 10*time.Millisecond, time.Minute)
+
+	// Poll until the participant lease is renewed (or fail after a generous wait).
+	renewed := false
+	for i := 0; i < 100; i++ {
+		time.Sleep(10 * time.Millisecond)
+		var got model.SummaryParticipant
+		if err := db.Select("worker_started_at").First(&got, part.ID).Error; err == nil &&
+			got.WorkerStartedAt != nil && got.WorkerStartedAt.After(stale) {
+			renewed = true
+			break
+		}
+	}
+	stop()
+	if !renewed {
+		t.Fatal("participant worker_started_at was never renewed")
+	}
+	var gotTask model.SummaryTask
+	if err := db.Select("processing_deadline").First(&gotTask, task.ID).Error; err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	if gotTask.ProcessingDeadline == nil || !gotTask.ProcessingDeadline.After(stale) {
+		t.Errorf("task processing_deadline not renewed: got %v, want after %v", gotTask.ProcessingDeadline, stale)
+	}
+}
+
+// TestLeaseHeartbeat_StopsWhenNotProcessing is the fence: once the participant
+// leaves Processing (a scanner reset, or a re-dispatch taking over), the
+// heartbeat must not keep stamping worker_started_at — otherwise a run that has
+// lost its lease would fight the owner.
+func TestLeaseHeartbeat_StopsWhenNotProcessing(t *testing.T) {
+	db := newFileBackedTestDB(t)
+	stale := time.Now().UTC().Add(-9 * time.Minute)
+	part := model.SummaryParticipant{
+		TaskID: 1, UserID: "u1", Status: model.ParticipantAccepted, WorkerStartedAt: &stale,
+	}
+	if err := db.Create(&part).Error; err != nil {
+		t.Fatalf("create participant: %v", err)
+	}
+
+	p := &Processor{db: db, cfg: &config.Config{WorkerLeaseMinutes: 20}}
+	stop := p.startLeaseHeartbeatEvery(1, part.ID, 10*time.Millisecond, time.Minute)
+	time.Sleep(60 * time.Millisecond)
+	stop()
+
+	var got model.SummaryParticipant
+	if err := db.Select("worker_started_at").First(&got, part.ID).Error; err != nil {
+		t.Fatalf("reload participant: %v", err)
+	}
+	if got.WorkerStartedAt == nil || !got.WorkerStartedAt.Equal(stale) {
+		t.Errorf("worker_started_at was renewed on a non-Processing row: got %v, want unchanged %v", got.WorkerStartedAt, stale)
+	}
+}
