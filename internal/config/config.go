@@ -426,10 +426,17 @@ const defaultMapMaxTokens = 100000
 // MapSystemPromptReserve is the tokens held back from the Map context-window
 // budget (ResolveMapMaxTokens) for the fixed Map/summarize system prompt. It is
 // shared by BOTH Map paths — the agent's summarize_chunk (internal/agent
-// chunkTokenBudget) and the worker's Map chunking (internal/worker) — so they
-// budget identically. Before #241 the two paths used different values (agent
-// 800, worker 3000); unified here at the more conservative of the two.
+// chunkTokenBudget) and the worker's Map chunking (internal/worker) — via
+// ResolveMapInputBudget, so they reserve identically. Before #241 the two paths
+// used different values (agent 800, worker 3000); unified here at the more
+// conservative of the two.
 const MapSystemPromptReserve = 3000
+
+// minMapInputBudget is the smallest usable per-chunk INPUT budget. A configured
+// window that cannot hold MapWindowReserve plus this is treated as a degenerate
+// operator setting and falls back to the default window (see
+// ResolveMapInputBudget); the packer never runs with a non-positive budget.
+const minMapInputBudget = 2000
 
 // MapWindowReserve is the total budget to subtract from ResolveMapMaxTokens
 // (which is treated as the model's context window) so a chunk's INPUT leaves
@@ -439,6 +446,27 @@ const MapSystemPromptReserve = 3000
 // no room for the up-to-LLMMaxToken response and the call is rejected/truncated.
 func (c *Config) MapWindowReserve() int {
 	return MapSystemPromptReserve + c.LLMMaxToken
+}
+
+// ResolveMapInputBudget returns the per-chunk INPUT token budget the Map phase
+// may pack — the context window (ResolveMapMaxTokens) minus MapWindowReserve —
+// shared by both Map paths so they compute the same budget. Because the reserve
+// is dynamic (grows with LLMMaxToken), a small window can leave a non-positive
+// budget; when the window cannot hold the reserve plus minMapInputBudget it is
+// treated as a degenerate setting, the default window is used instead, and
+// fellBack is true so the caller can log it. The returned budget is always
+// >= minMapInputBudget.
+func (c *Config) ResolveMapInputBudget() (budget int, fellBack bool) {
+	window := c.ResolveMapMaxTokens()
+	if window-c.MapWindowReserve() < minMapInputBudget {
+		window = defaultMapMaxTokens
+		fellBack = true
+	}
+	budget = window - c.MapWindowReserve()
+	if budget < minMapInputBudget {
+		budget = minMapInputBudget
+	}
+	return budget, fellBack
 }
 
 const (

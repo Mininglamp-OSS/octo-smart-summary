@@ -131,3 +131,51 @@ func TestMapWindowReserve(t *testing.T) {
 		t.Errorf("MapWindowReserve() with LLMMaxToken=8192 = %d, want %d", got, want)
 	}
 }
+
+// TestResolveMapInputBudget is the #241 contract shared by both Map paths: the
+// per-chunk input budget is window - (system prompt + completion) reserve, with
+// a loud fallback to the default window when the configured window cannot hold
+// the reserve plus a minimal input, and a positive floor so the packer never
+// runs with a non-positive budget.
+func TestResolveMapInputBudget(t *testing.T) {
+	const llm = 8192
+	reserve := MapSystemPromptReserve + llm // 11192
+
+	t.Run("healthy explicit window", func(t *testing.T) {
+		c := Config{MapMaxTokens: 50000, LLMMaxToken: llm}
+		got, fell := c.ResolveMapInputBudget()
+		if fell || got != 50000-reserve {
+			t.Errorf("got (%d, fellBack=%v), want (%d, false)", got, fell, 50000-reserve)
+		}
+	})
+
+	t.Run("zero config resolves to default window, no fallback", func(t *testing.T) {
+		c := Config{LLMMaxToken: llm} // ResolveMapMaxTokens -> defaultMapMaxTokens
+		got, fell := c.ResolveMapInputBudget()
+		if fell || got != defaultMapMaxTokens-reserve {
+			t.Errorf("got (%d, fellBack=%v), want (%d, false)", got, fell, defaultMapMaxTokens-reserve)
+		}
+	})
+
+	t.Run("window too small for reserve falls back to default", func(t *testing.T) {
+		// 10000 - 11192 < minMapInputBudget -> degenerate -> default window.
+		c := Config{MapMaxTokens: 10000, LLMMaxToken: llm}
+		got, fell := c.ResolveMapInputBudget()
+		if !fell {
+			t.Errorf("expected fellBack=true for degenerate window")
+		}
+		if got != defaultMapMaxTokens-reserve {
+			t.Errorf("got budget %d, want %d (default window - reserve)", got, defaultMapMaxTokens-reserve)
+		}
+	})
+
+	t.Run("budget never non-positive even if the default cannot fit the reserve", func(t *testing.T) {
+		// A pathological completion budget larger than the default window: the
+		// floor must still return a positive budget rather than <= 0.
+		c := Config{MapMaxTokens: 10000, LLMMaxToken: defaultMapMaxTokens}
+		got, _ := c.ResolveMapInputBudget()
+		if got < minMapInputBudget {
+			t.Errorf("budget %d below floor %d", got, minMapInputBudget)
+		}
+	})
+}

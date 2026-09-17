@@ -38,17 +38,6 @@ const (
 	// ratio: that would re-diverge from internal/tokenizer/estimate.go
 	// (undoing the P2-1 parity fix) and ~4× Map-call counts for ASCII traffic.
 	hardMessageBackstop = 200
-	// minSaneMapMaxTokens mirrors the worker-path guard
-	// (internal/worker/personal_processor.go: resolved MapMaxTokens < 10000 →
-	// default, loudly). A resolved Map budget below this is treated as a
-	// degenerate operator setting: MAP_MAX_TOKENS just above the system-prompt
-	// reserve (e.g. 801) leaves a usable budget of ~1 token and splits one
-	// message per chunk — a 100k-message invocation becomes 100k sequential
-	// LLM calls (round-3 review, MAP_MAX_TOKENS 800→801 cliff; yujiawei P2-4).
-	minSaneMapMaxTokens = 10000
-	// fallbackMapMaxTokens is the loud fallback for a degenerate setting.
-	// Mirrors config.defaultMapMaxTokens (unexported there).
-	fallbackMapMaxTokens = 100000
 )
 
 // estimateTokens is a pure, cgo-free token estimate matching the tokenizer's
@@ -104,26 +93,20 @@ func renderMessageLine(m map[string]interface{}) string {
 // chunkTokenBudget resolves the per-chunk token budget from config (the Map
 // budget minus a system-prompt reserve).
 //
-// Cliff guard (round-3 review, yujiawei P2-4, review 4960791240): a resolved
-// Map budget just above the reserve — e.g. MAP_MAX_TOKENS=801 → usable budget
-// 1 token — splits one message per chunk, turning a 100k-message invocation
-// into 100k sequential LLM calls. The worker path already guards exactly this
-// (internal/worker/personal_processor.go: `if maxTokens < 10000 { ... using
-// default 100000 }`); yujiawei: "That precedent makes the case for adding
-// one." This guard mirrors it: below minSaneMapMaxTokens, fall back LOUDLY to
-// the global default. NOTE: this supersedes the round-1 P2-2 expectation that
-// a low-but-positive setting like MAP_MAX_TOKENS=1500 must be preserved (700
-// usable) — round-3's cliff finding takes precedence, and the fallback is
-// logged, not silent.
+// chunkTokenBudget returns the per-chunk INPUT token budget for the agent Map
+// path. The window-reserve math, the degenerate-window fallback and the
+// positive-budget floor all live in config.ResolveMapInputBudget so this path
+// and the worker path (#241) share one implementation and cannot drift; this
+// wrapper only adds the loud log the shared helper leaves to the caller.
 func chunkTokenBudget(cfg config.Config) int {
-	mapMax := cfg.ResolveMapMaxTokens()
-	if mapMax < minSaneMapMaxTokens {
-		log.Printf("[config] resolved MapMaxTokens=%d below sane floor %d, using default %d (agent Map path)", mapMax, minSaneMapMaxTokens, fallbackMapMaxTokens)
-		mapMax = fallbackMapMaxTokens
-	}
-	budget := mapMax - cfg.MapWindowReserve()
-	if budget < 1 {
-		budget = minChunkTokenBudget
+	budget, fellBack := cfg.ResolveMapInputBudget()
+	if fellBack {
+		// Loud fallback, mirroring the worker path: a window too small to hold
+		// the reserve (system prompt + completion) plus a minimal chunk is a
+		// degenerate operator setting, so the default window is used rather than
+		// splitting one message per chunk.
+		log.Printf("[config] resolved MapMaxTokens=%d cannot hold reserve %d + minimal input; using default window (agent Map path)",
+			cfg.ResolveMapMaxTokens(), cfg.MapWindowReserve())
 	}
 	return budget
 }

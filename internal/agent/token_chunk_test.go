@@ -313,34 +313,30 @@ func TestSplitClosesChunkSize201to500Route(t *testing.T) {
 // SUPERSEDES the round-1 P2-2 expectation that a low-but-positive setting
 // (MAP_MAX_TOKENS=1500 → 700 usable) must be preserved: round-3's cliff
 // finding takes precedence, and the fallback is logged, not silent.
-func TestChunkTokenBudgetCliffGuard(t *testing.T) {
-	// Both the system prompt AND the completion (LLMMaxToken) share the window,
-	// so the usable input budget is window - MapSystemPromptReserve - LLMMaxToken
-	// (#241 item 3).
-	const llmMax = 4096
-	reserve := config.MapSystemPromptReserve + llmMax
-	cases := []struct {
-		name   string
-		mapMax int
-		base   int // effective window after the cliff guard
-	}{
-		{"zero config -> global default", 0, fallbackMapMaxTokens},
-		{"cliff 801 -> loud fallback", 801, fallbackMapMaxTokens},
-		{"low positive 1500 -> loud fallback", 1500, fallbackMapMaxTokens},
-		{"sub-reserve 500 -> loud fallback", 500, fallbackMapMaxTokens},
-		{"just below floor -> loud fallback", minSaneMapMaxTokens - 1, fallbackMapMaxTokens},
-		{"at floor preserved", minSaneMapMaxTokens, minSaneMapMaxTokens},
-		{"healthy explicit preserved", 50000, 50000},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			cfg := config.Config{MapMaxTokens: c.mapMax, LLMMaxToken: llmMax}
-			want := c.base - reserve
-			if got := chunkTokenBudget(cfg); got != want {
-				t.Fatalf("chunkTokenBudget(MapMaxTokens=%d) = %d, want %d", c.mapMax, got, want)
-			}
-		})
-	}
+// TestChunkTokenBudgetDelegates checks the agent Map path returns the shared
+// window - reserve budget for a healthy window, and stays positive (loud
+// fallback to the default window) for a degenerate one — the reserve now
+// includes the completion budget (LLMMaxToken) that shares the window (#241).
+// The exhaustive fallback/floor cases live in config.TestResolveMapInputBudget.
+func TestChunkTokenBudgetDelegates(t *testing.T) {
+	const llmMax = 8192
+
+	t.Run("healthy window: window - reserve", func(t *testing.T) {
+		cfg := config.Config{MapMaxTokens: 50000, LLMMaxToken: llmMax}
+		want := 50000 - cfg.MapWindowReserve()
+		if got := chunkTokenBudget(cfg); got != want {
+			t.Fatalf("chunkTokenBudget = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("degenerate window stays positive via default-window fallback", func(t *testing.T) {
+		// 10000 - (3000+8192) < 0: must not return a non-positive budget (the
+		// bug that split one message per chunk); falls back to the default window.
+		cfg := config.Config{MapMaxTokens: 10000, LLMMaxToken: llmMax}
+		if got := chunkTokenBudget(cfg); got <= 0 {
+			t.Fatalf("chunkTokenBudget = %d, want a positive budget (default-window fallback)", got)
+		}
+	})
 }
 
 // TestFormatAndSplitShareOneWireFormat guards the P0-1 invariant structurally:

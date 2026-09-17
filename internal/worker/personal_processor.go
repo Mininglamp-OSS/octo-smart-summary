@@ -1054,13 +1054,15 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 			estimatedTotalTokens, effectiveSkipThreshold, tok.IsExact())
 	}
 
-	// Token-aware chunking — resolve budget via explicit config / per-model default / global fallback
-	maxTokens := p.cfg.ResolveMapMaxTokens()
-	if maxTokens < 10000 {
-		log.Printf("[config] resolved MapMaxTokens=%d too small, using default 100000", maxTokens)
-		maxTokens = 100000
+	// Token-aware chunking — the input budget (window minus the shared
+	// system-prompt + completion reserve, floored, with a loud fallback for a
+	// degenerate window) is computed by the same helper the agent path uses, so
+	// the two Map paths cannot drift and effectiveMax is never non-positive (#241).
+	effectiveMax, fellBack := p.cfg.ResolveMapInputBudget()
+	if fellBack {
+		log.Printf("[config] resolved MapMaxTokens=%d cannot hold reserve %d + minimal input; using default window (worker Map path)",
+			p.cfg.ResolveMapMaxTokens(), p.cfg.MapWindowReserve())
 	}
-	effectiveMax := maxTokens - p.cfg.MapWindowReserve()
 
 	var chunks [][]pipeline.Message
 	var currentChunk []pipeline.Message
