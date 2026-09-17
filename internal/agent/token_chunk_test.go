@@ -303,21 +303,12 @@ func TestSplitClosesChunkSize201to500Route(t *testing.T) {
 	}
 }
 
-// TestChunkTokenBudgetCliffGuard is round-3's cliff guard (yujiawei P2-4,
-// review 4960791240): a resolved Map budget in the cliff band
-// [mapSystemPromptReserve+1, minSaneMapMaxTokens) — e.g. MAP_MAX_TOKENS=801 →
-// usable budget 1 token — splits one message per chunk, turning a 100k-message
-// invocation into 100k sequential LLM calls. The guard mirrors the worker-path
-// precedent @yujiawei cited (internal/worker/personal_processor.go:
-// `if maxTokens < 10000 { ... using default 100000 }`, logged loudly) and
-// SUPERSEDES the round-1 P2-2 expectation that a low-but-positive setting
-// (MAP_MAX_TOKENS=1500 → 700 usable) must be preserved: round-3's cliff
-// finding takes precedence, and the fallback is logged, not silent.
 // TestChunkTokenBudgetDelegates checks the agent Map path returns the shared
-// window - reserve budget for a healthy window, and stays positive (loud
-// fallback to the default window) for a degenerate one — the reserve now
-// includes the completion budget (LLMMaxToken) that shares the window (#241).
-// The exhaustive fallback/floor cases live in config.TestResolveMapInputBudget.
+// window - reserve budget (the reserve now includes the completion budget,
+// LLMMaxToken, that shares the window — #241), and that a window too small for
+// the reserve is floored to a positive budget rather than splitting one message
+// per chunk. The exhaustive boundary/monotonicity cases live in
+// config.TestResolveMapInputBudget.
 func TestChunkTokenBudgetDelegates(t *testing.T) {
 	const llmMax = 8192
 
@@ -329,12 +320,17 @@ func TestChunkTokenBudgetDelegates(t *testing.T) {
 		}
 	})
 
-	t.Run("degenerate window stays positive via default-window fallback", func(t *testing.T) {
-		// 10000 - (3000+8192) < 0: must not return a non-positive budget (the
-		// bug that split one message per chunk); falls back to the default window.
+	t.Run("window too small for reserve: floored, not inflated", func(t *testing.T) {
+		// 10000 - (3000+8192) < 0: floored to the minimum positive budget (no
+		// one-message-per-chunk), and the declared 10000 window is NOT inflated
+		// to the default. Exact floor value is asserted in the config test.
 		cfg := config.Config{MapMaxTokens: 10000, LLMMaxToken: llmMax}
-		if got := chunkTokenBudget(cfg); got <= 0 {
-			t.Fatalf("chunkTokenBudget = %d, want a positive budget (default-window fallback)", got)
+		got := chunkTokenBudget(cfg)
+		if got <= 0 {
+			t.Fatalf("chunkTokenBudget = %d, want a positive floored budget", got)
+		}
+		if got >= 50000 {
+			t.Fatalf("chunkTokenBudget = %d — the small window was inflated, not floored", got)
 		}
 	})
 }

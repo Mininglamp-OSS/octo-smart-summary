@@ -1047,7 +1047,12 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	}
 	// Reserve the shared system-prompt + completion budget from the window, so
 	// a single-shot summary's input leaves room for its own response (#241).
+	// Floored at 0 (never negative): a window smaller than the reserve just means
+	// "never skip", consistent with the chunk-budget floor and warned once at Load.
 	effectiveSkipThreshold := skipThreshold - p.cfg.MapWindowReserve()
+	if effectiveSkipThreshold < 0 {
+		effectiveSkipThreshold = 0
+	}
 	skipMapReduce := tok.IsExact() && estimatedTotalTokens <= effectiveSkipThreshold
 	if skipMapReduce {
 		log.Printf("[personal-worker] skip Map-Reduce: totalTokens=%d <= threshold=%d (exact=%v)",
@@ -1055,14 +1060,11 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	}
 
 	// Token-aware chunking — the input budget (window minus the shared
-	// system-prompt + completion reserve, floored, with a loud fallback for a
-	// degenerate window) is computed by the same helper the agent path uses, so
-	// the two Map paths cannot drift and effectiveMax is never non-positive (#241).
-	effectiveMax, fellBack := p.cfg.ResolveMapInputBudget()
-	if fellBack {
-		log.Printf("[config] resolved MapMaxTokens=%d cannot hold reserve %d + minimal input; using default window (worker Map path)",
-			p.cfg.ResolveMapMaxTokens(), p.cfg.MapWindowReserve())
-	}
+	// system-prompt + completion reserve, floored) comes from the same helper the
+	// agent path uses, so the two Map paths cannot drift and effectiveMax is never
+	// non-positive (#241). A window too small for the reserve is warned once at
+	// config.Load, not here per task.
+	effectiveMax := p.cfg.ResolveMapInputBudget()
 
 	var chunks [][]pipeline.Message
 	var currentChunk []pipeline.Message

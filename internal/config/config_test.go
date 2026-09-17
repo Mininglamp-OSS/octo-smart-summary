@@ -141,41 +141,62 @@ func TestResolveMapInputBudget(t *testing.T) {
 	const llm = 8192
 	reserve := MapSystemPromptReserve + llm // 11192
 
-	t.Run("healthy explicit window", func(t *testing.T) {
-		c := Config{MapMaxTokens: 50000, LLMMaxToken: llm}
-		got, fell := c.ResolveMapInputBudget()
-		if fell || got != 50000-reserve {
-			t.Errorf("got (%d, fellBack=%v), want (%d, false)", got, fell, 50000-reserve)
+	// Budget = window - reserve, floored at minMapInputBudget, NEVER inflating a
+	// declared small window (that would overflow a genuinely small-context model)
+	// and monotonic in the window. Boundary values straddle the floor edge.
+	cases := []struct {
+		name       string
+		mapMax     int
+		wantBudget int
+	}{
+		{"healthy explicit window", 50000, 50000 - reserve},
+		{"zero config -> per-model/default window", 0, defaultMapMaxTokens - reserve},
+		{"just above floor edge", reserve + minMapInputBudget + 1, minMapInputBudget + 1},
+		{"exactly at floor edge", reserve + minMapInputBudget, minMapInputBudget},
+		{"just below floor edge -> floored, window NOT inflated", reserve + minMapInputBudget - 1, minMapInputBudget},
+		{"small declared window honored (floored), not inflated", 10000, minMapInputBudget},
+		{"9999 honored, not inflated to 100000", 9999, minMapInputBudget},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := Config{MapMaxTokens: c.mapMax, LLMMaxToken: llm}
+			if got := cfg.ResolveMapInputBudget(); got != c.wantBudget {
+				t.Errorf("ResolveMapInputBudget(MapMaxTokens=%d) = %d, want %d", c.mapMax, got, c.wantBudget)
+			}
+		})
+	}
+
+	t.Run("monotonic in the declared window", func(t *testing.T) {
+		prev := -1
+		for _, w := range []int{9000, 9999, 10000, 12000, 20000, 50000, 100000} {
+			cfg := Config{MapMaxTokens: w, LLMMaxToken: llm}
+			got := cfg.ResolveMapInputBudget()
+			if got < prev {
+				t.Errorf("budget decreased as window grew: window=%d budget=%d < prev %d", w, got, prev)
+			}
+			prev = got
 		}
 	})
 
-	t.Run("zero config resolves to default window, no fallback", func(t *testing.T) {
-		c := Config{LLMMaxToken: llm} // ResolveMapMaxTokens -> defaultMapMaxTokens
-		got, fell := c.ResolveMapInputBudget()
-		if fell || got != defaultMapMaxTokens-reserve {
-			t.Errorf("got (%d, fellBack=%v), want (%d, false)", got, fell, defaultMapMaxTokens-reserve)
-		}
-	})
-
-	t.Run("window too small for reserve falls back to default", func(t *testing.T) {
-		// 10000 - 11192 < minMapInputBudget -> degenerate -> default window.
-		c := Config{MapMaxTokens: 10000, LLMMaxToken: llm}
-		got, fell := c.ResolveMapInputBudget()
-		if !fell {
-			t.Errorf("expected fellBack=true for degenerate window")
-		}
-		if got != defaultMapMaxTokens-reserve {
-			t.Errorf("got budget %d, want %d (default window - reserve)", got, defaultMapMaxTokens-reserve)
-		}
-	})
-
-	t.Run("budget never non-positive even if the default cannot fit the reserve", func(t *testing.T) {
-		// A pathological completion budget larger than the default window: the
-		// floor must still return a positive budget rather than <= 0.
-		c := Config{MapMaxTokens: 10000, LLMMaxToken: defaultMapMaxTokens}
-		got, _ := c.ResolveMapInputBudget()
-		if got < minMapInputBudget {
+	t.Run("floor holds even if the window cannot fit the reserve", func(t *testing.T) {
+		// Pathological: completion budget alone exceeds the window; budget must
+		// still be positive (>= floor), never <= 0.
+		cfg := Config{MapMaxTokens: 10000, LLMMaxToken: defaultMapMaxTokens}
+		if got := cfg.ResolveMapInputBudget(); got < minMapInputBudget {
 			t.Errorf("budget %d below floor %d", got, minMapInputBudget)
 		}
 	})
+}
+
+// TestMapWindowFitsReserve pins the static-misconfiguration signal Load warns on
+// once: the window must hold the reserve plus a minimal input.
+func TestMapWindowFitsReserve(t *testing.T) {
+	const llm = 8192
+	reserve := MapSystemPromptReserve + llm
+	if !(&Config{MapMaxTokens: reserve + minMapInputBudget, LLMMaxToken: llm}).MapWindowFitsReserve() {
+		t.Error("a window exactly at reserve+min should fit")
+	}
+	if (&Config{MapMaxTokens: reserve + minMapInputBudget - 1, LLMMaxToken: llm}).MapWindowFitsReserve() {
+		t.Error("a window one below reserve+min should NOT fit")
+	}
 }

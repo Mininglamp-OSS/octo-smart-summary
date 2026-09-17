@@ -2,7 +2,6 @@ package agent
 
 import (
 	"fmt"
-	"log"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 )
@@ -15,11 +14,10 @@ import (
 // message-count backstop (P0-2) so no estimator bug can produce an unbounded
 // chunk.
 const (
-	// minChunkTokenBudget is the fallback budget used ONLY when the configured
-	// Map budget minus the window reserve (config.MapWindowReserve: system
-	// prompt + completion) leaves nothing usable (config <= reserve). A
-	// deliberately low MAP_MAX_TOKENS is never silently enlarged (PR #196 review
-	// P2-2).
+	// minChunkTokenBudget is a defensive floor inside splitMsgMapsByTokenBudget
+	// for a non-positive budget argument. The normal Map budget is already
+	// floored by config.ResolveMapInputBudget (config.minMapInputBudget, same
+	// value), so this only guards a direct caller passing budget < 1.
 	minChunkTokenBudget = 2000
 	// hardMessageBackstop caps messages per chunk regardless of the token
 	// budget and the chunk_size hint, so degenerate estimates (e.g. empty
@@ -90,25 +88,13 @@ func renderMessageLine(m map[string]interface{}) string {
 	return fmt.Sprintf("[%d] %s: %s\n", citationIndex, sender, content)
 }
 
-// chunkTokenBudget resolves the per-chunk token budget from config (the Map
-// budget minus a system-prompt reserve).
-//
 // chunkTokenBudget returns the per-chunk INPUT token budget for the agent Map
-// path. The window-reserve math, the degenerate-window fallback and the
-// positive-budget floor all live in config.ResolveMapInputBudget so this path
-// and the worker path (#241) share one implementation and cannot drift; this
-// wrapper only adds the loud log the shared helper leaves to the caller.
+// path. The window-reserve math and the positive-budget floor live in
+// config.ResolveMapInputBudget so this path and the worker path (#241) share one
+// implementation and cannot drift; a window too small for the reserve is warned
+// about once at config.Load, not per call.
 func chunkTokenBudget(cfg config.Config) int {
-	budget, fellBack := cfg.ResolveMapInputBudget()
-	if fellBack {
-		// Loud fallback, mirroring the worker path: a window too small to hold
-		// the reserve (system prompt + completion) plus a minimal chunk is a
-		// degenerate operator setting, so the default window is used rather than
-		// splitting one message per chunk.
-		log.Printf("[config] resolved MapMaxTokens=%d cannot hold reserve %d + minimal input; using default window (agent Map path)",
-			cfg.ResolveMapMaxTokens(), cfg.MapWindowReserve())
-	}
-	return budget
+	return cfg.ResolveMapInputBudget()
 }
 
 // splitMsgMapsByTokenBudget groups msgMaps into chunks bounded by a token
