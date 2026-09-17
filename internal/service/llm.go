@@ -25,6 +25,20 @@ const kimiRequiredTemperature = 0.6
 
 const maxLLMErrorBodyBytes = 4096
 
+// maxRequestBodyBytes is a coarse defense-in-depth ceiling on the serialized
+// request body (#241 item 1). The real over-budget case is prevented
+// structurally upstream by token-aware chunking (#241 item 3); this only stops
+// a pathological single oversized message from being sent — so it fails fast
+// with a clear error here instead of reactively as an upstream context-length
+// error. Deliberately generous: a legitimate max-context-window request
+// serializes well under this (a ~300k-token window is ~1–2 MB of text).
+const maxRequestBodyBytes = 10 << 20 // 10 MiB
+
+// ErrRequestTooLarge marks a request rejected before sending because its
+// serialized body exceeds maxRequestBodyBytes. It is terminal — retrying or
+// switching models cannot shrink the same body.
+var ErrRequestTooLarge = errors.New("LLM request body exceeds the size guard")
+
 // ErrReasoningBudgetExhausted marks a response whose reasoning consumed the
 // output budget before producing user-visible content.
 var ErrReasoningBudgetExhausted = errors.New("LLM returned empty content: reasoning consumed entire max_tokens budget")
@@ -308,6 +322,9 @@ func (c *LLMClient) callWithPolicyAndModel(ctx context.Context, messages []ChatM
 		if err != nil {
 			return result{}, llmfallback.Terminal, err
 		}
+		if len(body) > maxRequestBodyBytes {
+			return result{}, llmfallback.Terminal, fmt.Errorf("%w: %d bytes > %d", ErrRequestTooLarge, len(body), maxRequestBodyBytes)
+		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL+"/chat/completions", bytes.NewReader(body))
 		if err != nil {
 			return result{}, llmfallback.Terminal, err
@@ -439,6 +456,9 @@ func (c *LLMClient) callStreamWithModel(ctx context.Context, messages []ChatMess
 		body, err := json.Marshal(reqBody)
 		if err != nil {
 			return result{}, llmfallback.Terminal, err
+		}
+		if len(body) > maxRequestBodyBytes {
+			return result{}, llmfallback.Terminal, fmt.Errorf("%w: %d bytes > %d", ErrRequestTooLarge, len(body), maxRequestBodyBytes)
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL+"/chat/completions", bytes.NewReader(body))
 		if err != nil {
@@ -600,6 +620,9 @@ func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, t
 		body, err := json.Marshal(reqBody)
 		if err != nil {
 			return result{}, llmfallback.Terminal, fmt.Errorf("marshal request: %w", err)
+		}
+		if len(body) > maxRequestBodyBytes {
+			return result{}, llmfallback.Terminal, fmt.Errorf("%w: %d bytes > %d", ErrRequestTooLarge, len(body), maxRequestBodyBytes)
 		}
 
 		attemptCtx, cancel := context.WithTimeout(ctx, c.toolCallTimeout)
