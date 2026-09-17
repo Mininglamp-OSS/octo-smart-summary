@@ -515,3 +515,11 @@ func TestDeriveWorkspaceRouteFinalMatrix(t *testing.T) {
 		})
 	}
 }
+
+func TestDeriveWorkspaceRouteDocumentExplainClarifies(t *testing.T) {
+	context := summaryWorkspaceContext{Documents: []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}}}
+	got := deriveWorkspaceRoute(context, service.SummaryActionChat, service.SummaryIntentExplain, false, true, false, false, WorkspaceSnapshot{}, true, true, true)
+	if got != service.SummaryRouteClarification {
+		t.Fatalf("document explain route = %q, want clarification", got)
+	}
+}

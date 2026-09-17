@@ -246,6 +246,11 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			h.db.WithContext(c.Request.Context()), spaceID, userID, req, false,
 		)
 		if loadErr != nil {
+			var bizErrValue *service.BizError
+			if errors.As(loadErr, &bizErrValue) {
+				bizErr(c, bizErrValue)
+				return
+			}
 			if errors.Is(loadErr, errWorkspacePreviewSaveStale) {
 				writeWorkspacePreviewSaveConflict(c)
 				return
@@ -882,6 +887,11 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		return
 	}
 	if err != nil {
+		var bizErrValue *service.BizError
+		if errors.As(err, &bizErrValue) {
+			bizErr(c, bizErrValue)
+			return
+		}
 		log.Printf("[handler] CreateAgentSummary tx failed space=%s user=%s session=%s: %v", spaceID, userID, req.SessionID, err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "落库失败"})
 		return

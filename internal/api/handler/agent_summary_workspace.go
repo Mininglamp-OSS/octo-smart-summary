@@ -383,7 +383,11 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		snapshot, err = h.completeWorkspaceAgentTurn(c.Request.Context(), responder, key, begin.Turn.ID, begin.Turn.Attempt, req, contextValue, begin.Snapshot, route, openScopeAgent, inferredSource)
 	default:
 		reply := "请先选择一个你有权限的会话，再告诉我希望总结的内容。"
-		if len(contextValue.ReferencedTaskIDs) > 0 && !validation.referencesValid {
+		if len(contextValue.Documents) > 0 && len(contextValue.Participants) > 0 {
+			reply = "文档总结暂不支持多人协作，请移除参与者后再生成。"
+		} else if len(contextValue.Documents) > 0 {
+			reply = "文档问答/解释暂不支持，请输入总结要求后生成文档总结。"
+		} else if len(contextValue.ReferencedTaskIDs) > 0 && !validation.referencesValid {
 			reply = "部分引用总结不可用，请调整后重试。"
 		} else if len(contextValue.Participants) > 0 && !validation.participantsValid {
 			reply = summaryWorkspaceTeamScopeMessage(validation.teamScopeReason)
@@ -1322,6 +1326,16 @@ func containsAny(value string, needles ...string) bool {
 }
 
 func deriveWorkspaceRoute(context summaryWorkspaceContext, action service.SummaryAction, intent service.SummaryIntent, hasExplicitRunIntent, selectedSourceExplicit, hasRequirement, openScopeAgent bool, state WorkspaceSnapshot, participantsValid, sourcesValid, referencesValid bool) service.SummaryRoute {
+	if len(context.Documents) > 0 {
+		switch {
+		case len(context.Participants) > 0:
+			return service.SummaryRouteClarification
+		case intent == service.SummaryIntentExplain && !hasExplicitRunIntent && !hasRequirement:
+			return service.SummaryRouteClarification
+		default:
+			return service.SummaryRoutePersonalWorkflow
+		}
+	}
 	hasPreview := state.CurrentPreview != nil
 	return service.DeriveSummaryRoute(service.SummaryRouteInput{
 		Action:                     action,

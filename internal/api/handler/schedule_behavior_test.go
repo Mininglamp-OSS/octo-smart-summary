@@ -151,6 +151,20 @@ func TestCreateSchedule_RejectsAnchorModeMismatch(t *testing.T) {
 	}
 }
 
+func TestCreateSchedule_RejectsDocumentSource(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouter(db)
+	taskID := seedScheduleTask(t, db, "TDOC", "s1", "u1")
+
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID, "interval_days": 1, "run_time": "09:00",
+		"sources": []map[string]interface{}{{"source_type": model.SourceDocument, "source_id": "doc-1"}},
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 rejecting document schedule source, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestCreateSchedule_BindsUnscheduledTask(t *testing.T) {
 	db := newScheduleTestDB(t)
 	r := newScheduleTestRouter(db)
@@ -168,6 +182,33 @@ func TestCreateSchedule_BindsUnscheduledTask(t *testing.T) {
 	}
 	if task.ScheduleID == nil {
 		t.Fatal("task should be bound to a schedule after create")
+	}
+}
+
+func TestUpdateSchedule_RejectsDocumentSource(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouter(db)
+	taskID := seedScheduleTask(t, db, "TDOC-UPD", "s1", "u1")
+
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID, "interval_days": 1, "run_time": "09:00",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create schedule: %d %s", w.Code, w.Body.String())
+	}
+	var task model.SummaryTask
+	if err := db.First(&task, taskID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if task.ScheduleID == nil {
+		t.Fatal("task should be bound to a schedule")
+	}
+
+	w = scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(*task.ScheduleID), map[string]interface{}{
+		"sources": []map[string]interface{}{{"source_type": model.SourceDocument, "source_id": "doc-1"}},
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 rejecting document schedule source update, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

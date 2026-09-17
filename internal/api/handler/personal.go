@@ -1250,6 +1250,18 @@ func (h *PersonalHandler) AddMembers(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40005, Message: "任务已结束，无法添加成员"})
 		return
 	}
+	var documentSourceCount int64
+	if err := h.db.Model(&model.SummarySource{}).
+		Where("task_id = ? AND source_type = ?", task.ID, model.SourceDocument).
+		Count(&documentSourceCount).Error; err != nil {
+		log.Printf("[personal] AddMembers load sources failed task=%d: %v", task.ID, err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "internal error"})
+		return
+	}
+	if documentSourceCount > 0 {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "文档总结暂不支持其他参与者"})
+		return
+	}
 
 	// Dedup + drop blanks from the request roster.
 	seen := make(map[string]struct{}, len(req.UserIDs))

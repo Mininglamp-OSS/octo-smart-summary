@@ -229,6 +229,27 @@ func TestBuildScheduledTaskSources_FallbackWhenNoNameAndNoIMDB(t *testing.T) {
 	}
 }
 
+func TestBuildScheduledTaskSources_RejectsDocumentSource(t *testing.T) {
+	db := newReplaceTestDB(t)
+	if err := db.AutoMigrate(&model.SummarySource{}); err != nil {
+		t.Fatalf("migrate source: %v", err)
+	}
+	taskID := seedProcessingTask(t, db)
+
+	raw := model.JSON(`[{"source_type":4,"source_id":"doc-1"}]`)
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		return buildScheduledTaskSources(tx, nil, taskID, raw)
+	}); err == nil {
+		t.Fatal("expected document source to be rejected for scheduled task")
+	}
+
+	var sourceCount int64
+	db.Model(&model.SummarySource{}).Where("task_id = ?", taskID).Count(&sourceCount)
+	if sourceCount != 0 {
+		t.Fatalf("document source rejection must not insert sources, got %d", sourceCount)
+	}
+}
+
 // seedSubmittedContributor inserts a submitted personal_result row (a contributor
 // that participated in the meta aggregation) and returns its ID.
 func seedSubmittedContributor(t *testing.T, db *gorm.DB, taskID int64, userID string) int64 {

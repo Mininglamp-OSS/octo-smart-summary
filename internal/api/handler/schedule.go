@@ -93,6 +93,15 @@ var (
 	errRebindConcurrentModified = errors.New("scope=task concurrent rebind detected, please retry")
 )
 
+func rejectDocumentScheduleSources(sources []sourceReq) *service.BizError {
+	for _, source := range sources {
+		if source.SourceType == model.SourceDocument {
+			return service.NewBizError(40001, "文档总结暂不支持定时更新", http.StatusBadRequest)
+		}
+	}
+	return nil
+}
+
 // isMySQLDuplicateKey reports whether err is (or wraps) a MySQL 1062 duplicate key.
 func isMySQLDuplicateKey(err error) bool {
 	if err == nil {
@@ -554,6 +563,10 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 
 	var sourceConfig model.JSON
 	if len(req.Sources) > 0 {
+		if biz := rejectDocumentScheduleSources(req.Sources); biz != nil {
+			bizErr(c, biz)
+			return
+		}
 		b, _ := json.Marshal(req.Sources)
 		sourceConfig = b
 	}
@@ -1285,9 +1298,12 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		// Only rewrite source_config when the caller explicitly sends sources.
 		// A nil req.Sources on a task-scope edit (title/cadence) must not silently
 		// rewrite — or, for a zero-source Agent task, empty — an existing
-		// schedule's persisted config (PR#248 review P1-4).
-		if req.Sources != nil {
-			sources, hadStored, err := scheduleTaskSources(tx, task, req.Sources)
+	// schedule's persisted config (PR#248 review P1-4).
+	if req.Sources != nil {
+		if biz := rejectDocumentScheduleSources(req.Sources); biz != nil {
+			return biz
+		}
+		sources, hadStored, err := scheduleTaskSources(tx, task, req.Sources)
 			if err != nil {
 				return err
 			}

@@ -215,6 +215,34 @@ func TestCreateAgentSummary_WorkspaceSaveUsesPayloadAndPreservesHistory(t *testi
 	}
 }
 
+func TestCreateAgentSummary_WorkspaceSaveRejectsDocumentScope(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	fixture := seedWorkspaceSaveFixture(t, db, "workspace-save-document")
+	scope := summaryWorkspaceContext{
+		Documents: []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}},
+	}
+	scopeJSON, _, err := marshalSummaryWorkspaceContext(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&model.AgentSummarySession{}).Where("id = ?", fixture.Session.ID).Update("scope_json", string(scopeJSON)).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	w := doAgentSave(t, setupAgentSummaryRouter(h), fixture.Body, map[string]string{"Idempotency-Key": "workspace-save-document"})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("document workspace preview save want 400, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp apiResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v; body=%s", err, w.Body.String())
+	}
+	if resp.Code != 40001 {
+		t.Fatalf("response code=%d, want 40001; body=%s", resp.Code, w.Body.String())
+	}
+}
+
 func TestCreateAgentSummary_WorkspaceSaveAcceptsReplacementRunIdentity(t *testing.T) {
 	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
 	db := setupAgentSummaryTestDB(t)
