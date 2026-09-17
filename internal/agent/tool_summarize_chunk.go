@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -34,7 +35,19 @@ const (
 	// 的消息单独成片。阈值只服务于可观测性上报，与分片预算
 	// （ResolveMapMaxTokens 量级）无关。
 	oversizedMessageRunes = 4000
+	// maxChunkCalls caps the number of LLM calls one summarize_chunk invocation
+	// may fan out (#241 item 2). Chunk COUNT was previously unbounded — with
+	// MaxSafetyLimit=100000 messages upstream a single call could dispatch
+	// hundreds of LLM requests with no wall-clock or cost bound. Beyond this the
+	// input is pathological; reject with an actionable error rather than silently
+	// truncating (which would drop data) or spending unbounded tokens.
+	maxChunkCalls = 256
 )
+
+// errTooManyChunks marks a summarize_chunk invocation whose input splits into
+// more chunks than maxChunkCalls. Not retryable — the same input splits the
+// same way; the user must narrow the scope/time range.
+var errTooManyChunks = errors.New("summarize_chunk input exceeds the per-call chunk limit")
 
 // chunkCoverage 汇总 summarize_chunk 实际喂给模型的消息覆盖情况，随工具结果
 // 返回，让 Runner/Planner 能判断是否发生丢弃或截断，而不是只看到 chunk_count。
@@ -43,6 +56,7 @@ type chunkCoverage struct {
 	ProcessedCount        int  `json:"processed_count"`
 	DroppedCount          int  `json:"dropped_count"`
 	OversizedMessageCount int  `json:"oversized_message_count"`
+	FailedChunkCount      int  `json:"failed_chunk_count"`
 	Truncated             bool `json:"truncated"`
 	ChunkSize             int  `json:"chunk_size"`
 }
@@ -369,6 +383,13 @@ func SummarizeChunkTool() (Tool, Handler) {
 		msgsPerChunk := clampChunkSize(req.ChunkSize)
 		chunks := splitMsgMapsByTokenBudget(msgMaps, budget, msgsPerChunk, cfg.ResolveCharsPerTokenCJK(), cfg.CharsPerTokenASCII)
 
+		// Bound the LLM-call fan-out (#241 item 2): beyond maxChunkCalls the input
+		// is pathological. Reject with an actionable error rather than dispatching
+		// hundreds of unbounded calls or silently truncating the input.
+		if len(chunks) > maxChunkCalls {
+			return "", fmt.Errorf("%w: %d chunks > limit %d — narrow the time range or channel scope", errTooManyChunks, len(chunks), maxChunkCalls)
+		}
+
 		// Summarize each chunk and aggregate honest coverage counts. Token
 		// chunking + no format cap means processed == input, so dropped_count is
 		// 0; the counters stay truthful if a future change reintroduces a cap.
@@ -405,6 +426,7 @@ type summarizeChunkToolResult struct {
 	ProcessedCount        int    `json:"processed_count"`
 	DroppedCount          int    `json:"dropped_count"`
 	OversizedMessageCount int    `json:"oversized_message_count"`
+	FailedChunkCount      int    `json:"failed_chunk_count"`
 	Truncated             bool   `json:"truncated"`
 	ChunkSize             int    `json:"chunk_size"`
 }
@@ -425,6 +447,7 @@ func marshalSummarizeChunkResult(ctx context.Context, summary string, chunkCount
 		ProcessedCount:        cov.ProcessedCount,
 		DroppedCount:          cov.DroppedCount,
 		OversizedMessageCount: cov.OversizedMessageCount,
+		FailedChunkCount:      cov.FailedChunkCount,
 		Truncated:             cov.Truncated,
 		ChunkSize:             cov.ChunkSize,
 	})
@@ -593,8 +616,26 @@ type chunkMapOutcome struct {
 //     each worker must recover locally to preserve the same process-safety
 //     contract as the old serial loop.
 //
-// Concurrency 1 takes a dedicated serial path (see below) rather than a
-// one-permit semaphore, so it is a true rollback switch.
+// mapChunkSentinel is the placeholder inserted for a chunk whose summary failed,
+// so the summaries already computed for other chunks are NOT discarded (#241
+// item 2). The reduce step (merge_summaries) treats chunk summaries as opaque
+// concatenated text and its [n] citations index the frozen global manifest, not
+// chunk position, so a gap is safe; this string tells the reduce LLM which slice
+// is missing. Mirrors the worker path's service.MapFailedMarker.
+func mapChunkSentinel(idx int) string {
+	return fmt.Sprintf("(分片 %d %s)", idx+1, service.MapFailedMarker)
+}
+
+// isRunAbortError reports whether a per-chunk error should abort the whole map
+// phase rather than being tolerated as a single-chunk gap: caller cancellation
+// or a deadline means the run is over, so continuing to summarize is pointless.
+func isRunAbortError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// summarizeChunksConcurrently runs the per-chunk Map LLM calls. Concurrency 1
+// takes a dedicated serial path (see below) rather than a one-permit semaphore,
+// so it is a true rollback switch.
 func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]interface{}, specGuidance string, cov *chunkCoverage) ([]string, error) {
 	_, _, _, cfg := GetSummaryDeps()
 	concurrency := cfg.ResolveAgentMapConcurrency()
@@ -612,14 +653,26 @@ func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]inte
 		for i, chunk := range chunks {
 			summary, processed, oversized, err := summarizeChunkFn(ctx, chunk, specGuidance)
 			if err != nil {
-				return nil, fmt.Errorf("summarize chunk %d: %w", i, err)
+				if isRunAbortError(err) {
+					return nil, fmt.Errorf("summarize chunk %d: %w", i, err)
+				}
+				// Tolerate a single-chunk failure: keep the summaries already
+				// computed and mark this slice failed instead of discarding
+				// everything (#241 item 2).
+				log.Printf("[summarize_chunk] chunk %d failed, substituting sentinel: %v", i, err)
+				summaries = append(summaries, mapChunkSentinel(i))
+				cov.FailedChunkCount++
+				continue
 			}
 			summaries = append(summaries, summary)
 			cov.ProcessedCount += processed
 			cov.OversizedMessageCount += oversized
 		}
-		log.Printf("[summarize_chunk] map phase: chunks=%d concurrency=1 elapsed=%dms",
-			len(chunks), time.Since(start).Milliseconds())
+		if len(chunks) > 0 && cov.FailedChunkCount == len(chunks) {
+			return nil, fmt.Errorf("summarize_chunk: all %d chunks failed", len(chunks))
+		}
+		log.Printf("[summarize_chunk] map phase: chunks=%d concurrency=1 failed=%d elapsed=%dms",
+			len(chunks), cov.FailedChunkCount, time.Since(start).Milliseconds())
 		return summaries, nil
 	}
 
@@ -666,12 +719,25 @@ func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]inte
 	summaries := make([]string, 0, len(chunks))
 	for i, o := range outcomes {
 		if o.err != nil {
-			// Lowest-index error wins (see doc comment): deterministic across runs.
-			return nil, fmt.Errorf("summarize chunk %d: %w", i, o.err)
+			if isRunAbortError(o.err) {
+				// Caller went away / deadline: abort the whole phase (lowest-index
+				// abort wins — deterministic across runs).
+				return nil, fmt.Errorf("summarize chunk %d: %w", i, o.err)
+			}
+			// Tolerate a single-chunk failure: the other chunks' summaries are
+			// already computed in outcomes[]; keep them and mark this slice failed
+			// instead of discarding everything (#241 item 2).
+			log.Printf("[summarize_chunk] chunk %d failed, substituting sentinel: %v", i, o.err)
+			summaries = append(summaries, mapChunkSentinel(i))
+			cov.FailedChunkCount++
+			continue
 		}
 		summaries = append(summaries, o.summary)
 		cov.ProcessedCount += o.processed
 		cov.OversizedMessageCount += o.oversized
+	}
+	if len(chunks) > 0 && cov.FailedChunkCount == len(chunks) {
+		return nil, fmt.Errorf("summarize_chunk: all %d chunks failed", len(chunks))
 	}
 	return summaries, nil
 }
