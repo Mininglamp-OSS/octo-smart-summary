@@ -355,13 +355,7 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 	route := deriveWorkspaceRoute(contextValue, action, intent, explicitRunIntent, selectedSourceExplicit, hasRequirement, openScopeAgent, begin.Snapshot, validation.participantsValid, validation.sourcesValid, validation.referencesValid)
 	// A possible conversational scope change must pass through the Agent before
 	// any side-effecting workflow consumes it.
-	if openScopeAgent && route != service.SummaryRouteClarification && route != service.SummaryRouteExplanation {
-		if begin.Snapshot.CurrentPreview != nil && len(contextValue.Participants) == 0 {
-			route = service.SummaryRouteAgentRevision
-		} else {
-			route = service.SummaryRouteAgentPreview
-		}
-	}
+	route = workspaceRouteAfterOpenScopeAgentOverride(contextValue, route, openScopeAgent, begin.Snapshot)
 
 	var snapshot WorkspaceSnapshot
 	// The chat contract accepts request ids the workflow idempotency-key
@@ -1330,7 +1324,7 @@ func deriveWorkspaceRoute(context summaryWorkspaceContext, action service.Summar
 		switch {
 		case len(context.Participants) > 0:
 			return service.SummaryRouteClarification
-		case intent == service.SummaryIntentExplain && !hasExplicitRunIntent && !hasRequirement:
+		case intent == service.SummaryIntentExplain && !hasExplicitRunIntent:
 			return service.SummaryRouteClarification
 		default:
 			return service.SummaryRoutePersonalWorkflow
@@ -1354,6 +1348,16 @@ func deriveWorkspaceRoute(context summaryWorkspaceContext, action service.Summar
 		HasEnoughContextForPreview: referencesValid && (sourcesValid || len(context.ReferencedTaskIDs) > 0 || openScopeAgent),
 		HasHardMissingData:         !referencesValid,
 	})
+}
+
+func workspaceRouteAfterOpenScopeAgentOverride(context summaryWorkspaceContext, route service.SummaryRoute, openScopeAgent bool, state WorkspaceSnapshot) service.SummaryRoute {
+	if !openScopeAgent || len(context.Documents) > 0 || route == service.SummaryRouteClarification || route == service.SummaryRouteExplanation {
+		return route
+	}
+	if state.CurrentPreview != nil && len(context.Participants) == 0 {
+		return service.SummaryRouteAgentRevision
+	}
+	return service.SummaryRouteAgentPreview
 }
 
 func canonicalizeSummaryWorkspaceContextForActor(contextValue summaryWorkspaceContext, actorID string) summaryWorkspaceContext {

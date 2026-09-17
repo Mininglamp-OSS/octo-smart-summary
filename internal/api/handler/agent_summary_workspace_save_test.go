@@ -218,8 +218,18 @@ func TestCreateAgentSummary_WorkspaceSaveUsesPayloadAndPreservesHistory(t *testi
 func TestCreateAgentSummary_WorkspaceSaveRejectsDocumentScope(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
 	fixture := seedWorkspaceSaveFixture(t, db, "workspace-save-document")
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	ref := seedPipelineRefTask(t, h, "ST-DOC-SAVE-REF")
+	if err := db.Create(&model.SummarySource{
+		TaskID:     ref.ID,
+		SourceType: model.SourceGroup,
+		SourceID:   "CH-REF",
+	}).Error; err != nil {
+		t.Fatalf("seed reference source: %v", err)
+	}
 	scope := summaryWorkspaceContext{
-		Documents: []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}},
+		Documents:         []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}},
+		ReferencedTaskIDs: []int64{ref.ID},
 	}
 	scopeJSON, _, err := marshalSummaryWorkspaceContext(scope)
 	if err != nil {
@@ -229,7 +239,6 @@ func TestCreateAgentSummary_WorkspaceSaveRejectsDocumentScope(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
 	w := doAgentSave(t, setupAgentSummaryRouter(h), fixture.Body, map[string]string{"Idempotency-Key": "workspace-save-document"})
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("document workspace preview save want 400, got %d: %s", w.Code, w.Body.String())
@@ -240,6 +249,15 @@ func TestCreateAgentSummary_WorkspaceSaveRejectsDocumentScope(t *testing.T) {
 	}
 	if resp.Code != 40001 {
 		t.Fatalf("response code=%d, want 40001; body=%s", resp.Code, w.Body.String())
+	}
+	if resp.Message != "文档总结请通过工作流自动保存，暂不支持保存预览" {
+		t.Fatalf("response message=%q, want document preview-save guard", resp.Message)
+	}
+	var taskCount, documentSourceCount int64
+	db.Model(&model.SummaryTask{}).Where("creator_id = ? AND title = ?", "test-user", "工作台总结").Count(&taskCount)
+	db.Model(&model.SummarySource{}).Where("source_type = ?", model.SourceDocument).Count(&documentSourceCount)
+	if taskCount != 0 || documentSourceCount != 0 {
+		t.Fatalf("rejected document preview save must not persist task/source, tasks=%d document_sources=%d", taskCount, documentSourceCount)
 	}
 }
 

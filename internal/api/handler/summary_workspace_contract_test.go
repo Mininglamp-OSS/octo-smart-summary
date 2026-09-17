@@ -522,4 +522,22 @@ func TestDeriveWorkspaceRouteDocumentExplainClarifies(t *testing.T) {
 	if got != service.SummaryRouteClarification {
 		t.Fatalf("document explain route = %q, want clarification", got)
 	}
+	got = deriveWorkspaceRoute(context, service.SummaryActionChat, service.SummaryIntentExplain, false, true, true, false, WorkspaceSnapshot{}, true, true, true)
+	if got != service.SummaryRouteClarification {
+		t.Fatalf("document explain route with user text requirement = %q, want clarification", got)
+	}
+}
+
+func TestOpenScopeAgentOverrideDoesNotDemoteDocumentWorkflow(t *testing.T) {
+	context := summaryWorkspaceContext{Documents: []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}}}
+	got := workspaceRouteAfterOpenScopeAgentOverride(context, service.SummaryRoutePersonalWorkflow, true, WorkspaceSnapshot{})
+	if got != service.SummaryRoutePersonalWorkflow {
+		t.Fatalf("document route after open-scope override = %q, want personal workflow", got)
+	}
+
+	chatContext := summaryWorkspaceContext{}
+	got = workspaceRouteAfterOpenScopeAgentOverride(chatContext, service.SummaryRoutePersonalWorkflow, true, WorkspaceSnapshot{})
+	if got != service.SummaryRouteAgentPreview {
+		t.Fatalf("chat route after open-scope override = %q, want agent preview", got)
+	}
 }

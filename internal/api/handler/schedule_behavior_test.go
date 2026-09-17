@@ -165,6 +165,44 @@ func TestCreateSchedule_RejectsDocumentSource(t *testing.T) {
 	}
 }
 
+func TestCreateSchedule_RejectsDocumentTaskBinding(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouter(db)
+	taskID := seedScheduleTask(t, db, "TDOC-BIND", "s1", "u1")
+	source := model.SummarySource{
+		TaskID:        taskID,
+		SourceType:    model.SourceDocument,
+		SourceID:      "doc-1",
+		SourceName:    "方案",
+		SourceVersion: "v1",
+		SourceHash:    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}
+	if err := db.Create(&source).Error; err != nil {
+		t.Fatalf("seed document source: %v", err)
+	}
+	if err := db.Create(&model.SummarySourceSnapshot{
+		SummarySourceID: source.ID,
+		Content:         "snapshot",
+		ContentBytes:    len("snapshot"),
+		ContentHash:     source.SourceHash,
+	}).Error; err != nil {
+		t.Fatalf("seed document snapshot: %v", err)
+	}
+
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID, "interval_days": 1, "run_time": "09:00",
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 rejecting document task binding, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var scheduleCount int64
+	db.Model(&model.SummarySchedule{}).Where("id > 0").Count(&scheduleCount)
+	if scheduleCount != 0 {
+		t.Fatalf("document task binding must not create schedule, got %d", scheduleCount)
+	}
+}
+
 func TestCreateSchedule_BindsUnscheduledTask(t *testing.T) {
 	db := newScheduleTestDB(t)
 	r := newScheduleTestRouter(db)

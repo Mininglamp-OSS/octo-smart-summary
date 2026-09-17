@@ -147,6 +147,16 @@ func loadTaskParticipantCount(tx *gorm.DB, taskID int64) (int64, error) {
 	return participantCount, nil
 }
 
+func taskHasDocumentSource(tx *gorm.DB, taskID int64) (bool, error) {
+	var count int64
+	if err := tx.Model(&model.SummarySource{}).
+		Where("task_id = ? AND source_type = ?", taskID, model.SourceDocument).
+		Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 // participantsSubsetOfCreator reports whether every configured participant is the creator
 // (empty UserID counts as creator). False means the worker would inflate it past single-person.
 func participantsSubsetOfCreator(reqParticipants []participantReq, creatorID string) bool {
@@ -489,6 +499,11 @@ func loadBoundTaskForScheduleUpdate(tx *gorm.DB, lockedSched model.SummarySchedu
 	}
 	if task.CreatorID != userID {
 		return model.SummaryTask{}, service.NewBizError(40004, "无权限修改", http.StatusForbidden)
+	}
+	if hasDocumentSource, err := taskHasDocumentSource(tx, task.ID); err != nil {
+		return model.SummaryTask{}, err
+	} else if hasDocumentSource {
+		return model.SummaryTask{}, service.NewBizError(40001, "文档总结暂不支持定时更新", http.StatusBadRequest)
 	}
 	return task, nil
 }
@@ -1580,6 +1595,11 @@ func loadTaskForTaskScope(tx *gorm.DB, spaceID, userID string, taskID int64, fea
 	}
 	if task.CreatorID != userID {
 		return model.SummaryTask{}, service.NewBizError(40004, "仅创建者可绑定定时", http.StatusForbidden)
+	}
+	if hasDocumentSource, err := taskHasDocumentSource(tx, task.ID); err != nil {
+		return model.SummaryTask{}, err
+	} else if hasDocumentSource {
+		return model.SummaryTask{}, service.NewBizError(40001, "文档总结暂不支持定时更新", http.StatusBadRequest)
 	}
 	// Refuse binding a schedule to a multi-person task (same measure as the worker guard);
 	// otherwise the scheduler would skip it every cycle, leaving a silently dead timer.

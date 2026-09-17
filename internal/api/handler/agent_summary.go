@@ -660,6 +660,9 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			if s.SourceID == "" {
 				continue
 			}
+			if !validFrontendSourceType(s.SourceType) {
+				return service.NewBizError(40001, "文档来源请通过工作流自动保存，暂不支持通过 Agent 保存", http.StatusBadRequest)
+			}
 			key := fmt.Sprintf("%d:%s", s.SourceType, s.SourceID)
 			if _, dup := seenSrc[key]; dup {
 				continue
