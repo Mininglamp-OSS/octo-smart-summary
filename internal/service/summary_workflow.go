@@ -336,9 +336,12 @@ func (s *SummaryWorkflowService) persistIdempotently(ctx context.Context, in nor
 
 func validateAgentWorkflowSources(sources []SummaryWorkflowSource) *BizError {
 	for _, source := range sources {
-		if strings.TrimSpace(source.SourceID) == "" ||
-			source.SourceType < model.SourceGroup || source.SourceType > model.SourceDirect {
-			return NewBizError(40001, "each source requires source_id and source_type 1, 2, or 3", http.StatusBadRequest)
+		sourceTypeValid := source.SourceType >= model.SourceGroup && source.SourceType <= model.SourceDirect
+		if source.SourceType == model.SourceDocument {
+			sourceTypeValid = true
+		}
+		if strings.TrimSpace(source.SourceID) == "" || !sourceTypeValid {
+			return NewBizError(40001, "each source requires source_id and source_type 1, 2, 3, or 4", http.StatusBadRequest)
 		}
 	}
 	return nil

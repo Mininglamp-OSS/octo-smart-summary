@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 )
 
 type recordingDocumentSourceClient struct {
@@ -79,6 +80,71 @@ func TestCreateDocumentSummaryPersistsNormalizedSnapshots(t *testing.T) {
 	}
 	if client.tokens["d_1"] != "creator1" || client.tokens["d_2"] != "creator1" {
 		t.Fatalf("tokens = %#v, want caller Token forwarded", client.tokens)
+	}
+}
+
+func TestSummaryWorkspaceDocumentWorkflowPersistsSnapshots(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	if err := db.AutoMigrate(
+		&model.AgentMessage{},
+		&model.AgentSummarySession{},
+		&model.AgentSummaryTurn{},
+		&model.SummaryWorkflowIdempotency{},
+	); err != nil {
+		t.Fatalf("migrate workspace tables: %v", err)
+	}
+	client := &recordingDocumentSourceClient{docs: map[string]*documentSummarySource{
+		"d_1": {DocumentID: "d_1", Title: "Workbench方案", Version: "v1", Content: "文档正文"},
+	}}
+	h := &AgentChatHandler{
+		documentClient: client,
+		workspace: &summaryWorkspaceCoordinator{
+			db:       db,
+			imDB:     imDB,
+			store:    NewAgentWorkspaceStore(db),
+			workflow: service.NewSummaryWorkflowService(db, imDB, 31, 90),
+		},
+	}
+	key := WorkspaceSessionKey{SpaceID: "space-1", UserID: "creator1", SessionID: "workspace-doc"}
+	scope := summaryWorkspaceContext{
+		SelectedChannels:  []summaryWorkspaceChannel{},
+		Documents:         []summaryWorkspaceDocument{{DocumentID: "d_1", Title: "Workbench方案"}},
+		Participants:      []summaryWorkspaceParticipant{},
+		ReferencedTaskIDs: []int64{},
+		Template:          &summaryWorkspaceTemplate{TemplateID: "doc", Label: "文档总结", Requirement: "总结文档"},
+	}
+	begin := beginWorkspaceTurnForTest(t, h.workspace.store, key, "request-doc", 1, scope)
+	if begin.Disposition != WorkspaceTurnAcquired {
+		t.Fatalf("begin disposition = %s, want acquired", begin.Disposition)
+	}
+
+	snapshot, err := h.completeWorkspaceWorkflow(
+		context.Background(), http.Header{"Token": []string{"creator1"}}, key, begin.Turn.ID, begin.Turn.Attempt,
+		"workspace-doc-workflow-001", "开始总结", 1, scope, "总结文档",
+		service.SummaryWorkflowPersonal, false,
+	)
+	if err != nil {
+		t.Fatalf("complete document workflow: %v", err)
+	}
+	if snapshot.Session.WorkflowTaskID == 0 {
+		t.Fatalf("workflow task was not recorded: %#v", snapshot.Session)
+	}
+
+	var source model.SummarySource
+	if err := db.First(&source, "task_id = ? AND source_type = ?", snapshot.Session.WorkflowTaskID, model.SourceDocument).Error; err != nil {
+		t.Fatalf("load document source: %v", err)
+	}
+	var persistedSnapshot model.SummarySourceSnapshot
+	if err := db.First(&persistedSnapshot, "summary_source_id = ?", source.ID).Error; err != nil {
+		t.Fatalf("load document snapshot: %v", err)
+	}
+	if source.SourceName != "Workbench方案" || source.SourceVersion != "v1" || persistedSnapshot.Content != "文档正文" {
+		t.Fatalf("source=%#v snapshot=%#v", source, persistedSnapshot)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.tokens["d_1"] != "creator1" {
+		t.Fatalf("forwarded token = %q, want creator1", client.tokens["d_1"])
 	}
 }
 

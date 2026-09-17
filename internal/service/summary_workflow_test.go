@@ -471,6 +471,34 @@ func TestAgentPersonalWorkflowRequiresSafeBoundary(t *testing.T) {
 	}
 }
 
+func TestAgentPersonalWorkflowAcceptsDocumentSnapshot(t *testing.T) {
+	svc, db := newSummaryWorkflowTestService(t)
+	content := "agent document body"
+	hash := sha256.Sum256([]byte(content))
+	in := baseAgentWorkflowInput()
+	in.IdempotencyKey = "agent-document-workflow-001"
+	in.Sources = []SummaryWorkflowSource{{
+		SourceType: model.SourceDocument, SourceID: "d_1", SourceName: "Design Doc",
+		SourceHash: hex.EncodeToString(hash[:]), SnapshotContent: content,
+	}}
+
+	got, err := svc.CreatePersonalFromAgent(context.Background(), in)
+	if err != nil {
+		t.Fatalf("CreatePersonalFromAgent() document error: %v", err)
+	}
+	var source model.SummarySource
+	if err := db.First(&source, "task_id = ? AND source_type = ?", got.Task.ID, model.SourceDocument).Error; err != nil {
+		t.Fatalf("load document source: %v", err)
+	}
+	var snapshot model.SummarySourceSnapshot
+	if err := db.First(&snapshot, "summary_source_id = ?", source.ID).Error; err != nil {
+		t.Fatalf("load document snapshot: %v", err)
+	}
+	if source.SourceName != "Design Doc" || snapshot.Content != content || snapshot.ContentHash != source.SourceHash {
+		t.Fatalf("source=%#v snapshot=%#v", source, snapshot)
+	}
+}
+
 func TestAgentWorkflowRejectsWrongTargetMissingSourceOrKey(t *testing.T) {
 	svc, _ := newSummaryWorkflowTestService(t)
 

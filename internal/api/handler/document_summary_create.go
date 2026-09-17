@@ -75,6 +75,23 @@ func (h *TaskHandler) prepareDocumentSummarySources(
 	for _, source := range req.Sources {
 		refs = append(refs, documentRefReq{DocumentID: strings.TrimSpace(source.SourceID)})
 	}
+	sources, err := prepareDocumentSummarySourcesFromRefs(requestContext, h.documentClient, header, spaceID, userID, refs)
+	return sources, true, err
+}
+
+func prepareDocumentSummarySourcesFromRefs(
+	requestContext context.Context,
+	client documentSourceClient,
+	header http.Header,
+	spaceID, userID string,
+	refs []documentRefReq,
+) ([]service.SummaryWorkflowSource, *documentSummaryCreateError) {
+	badRequest := func(message string) ([]service.SummaryWorkflowSource, *documentSummaryCreateError) {
+		return nil, &documentSummaryCreateError{status: http.StatusBadRequest, code: 40001, message: message}
+	}
+	if len(refs) > service.MaxDocumentSummarySourceCount {
+		return badRequest("文档来源不能超过10个")
+	}
 	refs = normalizeDocumentRefs(refs)
 	if len(refs) == 0 {
 		return badRequest("document_id is required")
@@ -82,8 +99,8 @@ func (h *TaskHandler) prepareDocumentSummarySources(
 	if err := validateDocumentRefs(refs); err != nil {
 		return badRequest(err.Error())
 	}
-	if h.documentClient == nil {
-		return nil, true, &documentSummaryCreateError{status: http.StatusBadGateway, code: 50201, message: "document summary source API is not configured"}
+	if client == nil {
+		return nil, &documentSummaryCreateError{status: http.StatusBadGateway, code: 50201, message: "document summary source API is not configured"}
 	}
 
 	fetchContext, cancel := context.WithTimeout(requestContext, documentSummaryFetchTimeout)
@@ -98,7 +115,7 @@ func (h *TaskHandler) prepareDocumentSummarySources(
 		wg.Add(1)
 		go func(index int, documentRef documentRefReq) {
 			defer wg.Done()
-			results[index].document, results[index].err = h.documentClient.FetchSummarySource(
+			results[index].document, results[index].err = client.FetchSummarySource(
 				fetchContext, spaceID, userID, documentRef.DocumentID, "", header,
 			)
 		}(i, ref)
@@ -109,20 +126,20 @@ func (h *TaskHandler) prepareDocumentSummarySources(
 	aggregateRunes := 0
 	for i, result := range results {
 		if result.err != nil {
-			return nil, true, mapDocumentSummaryCreateError(result.err)
+			return nil, mapDocumentSummaryCreateError(result.err)
 		}
 		document := result.document
 		if document == nil {
-			return nil, true, &documentSummaryCreateError{status: http.StatusBadGateway, code: 50202, message: "文档服务暂不可用"}
+			return nil, &documentSummaryCreateError{status: http.StatusBadGateway, code: 50202, message: "文档服务暂不可用"}
 		}
 		normalizeFetchedDocumentSource(document, refs[i])
 		content := documentSnapshotContent(document)
 		if content == "" {
-			return nil, true, &documentSummaryCreateError{status: http.StatusBadRequest, code: 40004, message: "文档没有可总结内容"}
+			return nil, &documentSummaryCreateError{status: http.StatusBadRequest, code: 40004, message: "文档没有可总结内容"}
 		}
 		aggregateRunes += utf8.RuneCountInString(content)
 		if aggregateRunes > maxDocumentSummaryAggregateRunes {
-			return nil, true, &documentSummaryCreateError{status: http.StatusRequestEntityTooLarge, code: 40007, message: "文档总内容过大，请减少文档数量后重试"}
+			return nil, &documentSummaryCreateError{status: http.StatusRequestEntityTooLarge, code: 40007, message: "文档总内容过大，请减少文档数量后重试"}
 		}
 		hash := sha256.Sum256([]byte(content))
 		title := document.Title
@@ -139,7 +156,7 @@ func (h *TaskHandler) prepareDocumentSummarySources(
 			SnapshotTruncated: document.Truncated,
 		})
 	}
-	return sources, true, nil
+	return sources, nil
 }
 
 // documentSnapshotContent follows the same source contract as preview:

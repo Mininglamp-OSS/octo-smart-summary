@@ -132,6 +132,7 @@ type AgentChatHandler struct {
 	// entry. Nil keeps legacy/test constructors byte-compatible.
 	workspace             *summaryWorkspaceCoordinator
 	workspaceEntryEnabled bool
+	documentClient        documentSourceClient
 
 	// test-only fields: when set, bypass dynamic runner construction
 	testRunner *agent.Runner
@@ -165,6 +166,7 @@ func NewAgentChatHandler(db *gorm.DB, llmApiURL, llmApiKey, llmModel string, llm
 		store:             newAgentMessageRepo(db),
 		window:            agent.HistoryWindow(),
 		runStore:          summaryrun.NewStore(db),
+		documentClient:    newDefaultDocumentSourceClient(),
 	}
 }
 
