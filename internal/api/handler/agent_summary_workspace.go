@@ -528,9 +528,17 @@ func (h *AgentChatHandler) completeWorkspaceWorkflow(
 	originID, originType := summaryWorkspaceOrigin(contextValue)
 	sources := summaryWorkspaceSources(contextValue)
 	if len(contextValue.Documents) > 0 {
+		// Keep this defense even though normal routing rejects document + team
+		// scopes earlier: legacy callers and future route changes must not bypass
+		// the personal-only document workflow contract.
 		if target != service.SummaryWorkflowPersonal {
 			return WorkspaceSnapshot{}, service.NewBizError(40001, "文档总结暂不支持多人协作", http.StatusBadRequest)
 		}
+		releaseSlot, admitted := documentSummaryLimiterInstance.acquire(key.UserID)
+		if !admitted {
+			return WorkspaceSnapshot{}, service.NewBizError(42902, "文档总结请求过于频繁，请稍后重试", http.StatusTooManyRequests)
+		}
+		defer releaseSlot()
 		documentSources, documentErr := prepareDocumentSummarySourcesFromRefs(
 			ctx, h.documentClient, header, key.SpaceID, key.UserID, summaryWorkspaceDocumentRefs(contextValue),
 		)

@@ -153,6 +153,32 @@ func TestMaterializeWorkspaceAgentContextDoesNotMaterializeDefaultRangeForDocume
 	}
 }
 
+func TestMaterializeWorkspaceAgentContextDoesNotInferRecentChatForTemplateDocumentScope(t *testing.T) {
+	now := time.Date(2026, 9, 4, 16, 30, 0, 0, time.UTC)
+	coordinator := &summaryWorkspaceCoordinator{now: func() time.Time { return now }}
+	contextValue := emptySummaryWorkspaceContext()
+	contextValue.Documents = []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}}
+	contextValue.Template = &summaryWorkspaceTemplate{TemplateID: "doc", Label: "文档总结", Requirement: "总结文档"}
+
+	for _, inputOrigin := range []string{summaryWorkspaceInputTemplate, summaryWorkspaceInputSystemIntent} {
+		t.Run(inputOrigin, func(t *testing.T) {
+			got, inferred, err := coordinator.materializeWorkspaceAgentContext(
+				t.Context(), "space-a", "actor", contextValue, WorkspaceSnapshot{},
+				"", service.SummaryIntentGenerate, inputOrigin,
+			)
+			if err != nil {
+				t.Fatalf("materialize document context: %v", err)
+			}
+			if inferred || len(got.SelectedChannels) != 0 {
+				t.Fatalf("document context inferred recent chat: channels=%#v inferred=%t", got.SelectedChannels, inferred)
+			}
+			if got.TimeRange != nil {
+				t.Fatalf("document context materialized chat time range: %#v", got.TimeRange)
+			}
+		})
+	}
+}
+
 func TestMaterializeWorkspaceAgentContextClearsPersistedDefaultRangeForDocuments(t *testing.T) {
 	now := time.Date(2026, 9, 4, 16, 30, 0, 0, time.UTC)
 	coordinator := &summaryWorkspaceCoordinator{now: func() time.Time { return now }}

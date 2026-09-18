@@ -148,6 +148,64 @@ func TestSummaryWorkspaceDocumentWorkflowPersistsSnapshots(t *testing.T) {
 	}
 }
 
+func TestSummaryWorkspaceDocumentWorkflowSharesAdmissionLimit(t *testing.T) {
+	previous := documentSummaryLimiterInstance
+	documentSummaryLimiterInstance = newDocumentSummaryLimiter(1)
+	t.Cleanup(func() { documentSummaryLimiterInstance = previous })
+
+	release, ok := documentSummaryLimiterInstance.acquire("creator-limit")
+	if !ok {
+		t.Fatal("failed to occupy document summary slot")
+	}
+	defer release()
+
+	client := &recordingDocumentSourceClient{
+		docs: map[string]*documentSummarySource{},
+		errs: map[string]error{"d_1": errors.New("fetch must not run while admission is full")},
+	}
+	h := &AgentChatHandler{documentClient: client}
+	_, err := h.completeWorkspaceWorkflow(
+		context.Background(), http.Header{"Token": []string{"creator-limit"}},
+		WorkspaceSessionKey{SpaceID: "space-1", UserID: "creator-limit", SessionID: "workspace-doc-limit"},
+		1, 1, "workspace-doc-limit-001", "开始总结", 1,
+		summaryWorkspaceContext{Documents: []summaryWorkspaceDocument{{DocumentID: "d_1", Title: "方案"}}},
+		"总结文档", service.SummaryWorkflowPersonal, false,
+	)
+	var bizErr *service.BizError
+	if !errors.As(err, &bizErr) || bizErr.Code != 42902 || bizErr.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("error = %#v, want document admission rejection", err)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.tokens) != 0 {
+		t.Fatalf("document fetch ran despite full admission gate: %#v", client.tokens)
+	}
+}
+
+func TestSummaryWorkspaceDocumentWorkflowKeepsPersonalOnlyDefense(t *testing.T) {
+	client := &recordingDocumentSourceClient{
+		docs: map[string]*documentSummarySource{},
+		errs: map[string]error{"d_1": errors.New("team document fetch must not run")},
+	}
+	h := &AgentChatHandler{documentClient: client}
+	_, err := h.completeWorkspaceWorkflow(
+		context.Background(), http.Header{"Token": []string{"creator1"}},
+		WorkspaceSessionKey{SpaceID: "space-1", UserID: "creator1", SessionID: "workspace-doc-team"},
+		1, 1, "workspace-doc-team-001", "开始总结", 1,
+		summaryWorkspaceContext{Documents: []summaryWorkspaceDocument{{DocumentID: "d_1", Title: "方案"}}},
+		"总结文档", service.SummaryWorkflowTeam, false,
+	)
+	var bizErr *service.BizError
+	if !errors.As(err, &bizErr) || bizErr.Code != 40001 || bizErr.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("error = %#v, want personal-only document workflow rejection", err)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.tokens) != 0 {
+		t.Fatalf("team document fetch ran before personal-only guard: %#v", client.tokens)
+	}
+}
+
 func TestCreateDocumentSummaryRejectsAggregateOverBudget(t *testing.T) {
 	db, imDB := setupTestDBs(t)
 	content := strings.Repeat("文", 70000)

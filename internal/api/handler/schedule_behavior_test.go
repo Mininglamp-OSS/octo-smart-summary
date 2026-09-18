@@ -250,6 +250,77 @@ func TestUpdateSchedule_RejectsDocumentSource(t *testing.T) {
 	}
 }
 
+func TestUpdateSchedule_RejectsLegacyDocumentBoundTask(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouter(db)
+	taskID := seedScheduleTask(t, db, "TDOC-LEGACY-UPD", "s1", "u1")
+
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID, "interval_days": 1, "run_time": "09:00",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create schedule: %d %s", w.Code, w.Body.String())
+	}
+	var task model.SummaryTask
+	if err := db.First(&task, taskID).Error; err != nil || task.ScheduleID == nil {
+		t.Fatalf("load bound task: task=%#v err=%v", task, err)
+	}
+	if err := db.Create(&model.SummarySource{TaskID: taskID, SourceType: model.SourceDocument, SourceID: "doc-1"}).Error; err != nil {
+		t.Fatalf("seed legacy document source: %v", err)
+	}
+
+	w = scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(*task.ScheduleID), map[string]interface{}{
+		"interval_days": 2,
+	})
+	if w.Code != http.StatusBadRequest || respCode(t, w) != 40001 {
+		t.Fatalf("legacy document schedule update = %d %s, want 400/40001", w.Code, w.Body.String())
+	}
+	var schedule model.SummarySchedule
+	if err := db.First(&schedule, *task.ScheduleID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if schedule.IntervalDays != 1 {
+		t.Fatalf("rejected update changed interval_days to %d", schedule.IntervalDays)
+	}
+}
+
+func TestToggleSchedule_RejectsLegacyDocumentBoundTaskActivation(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouter(db)
+	taskID := seedScheduleTask(t, db, "TDOC-LEGACY-TOGGLE", "s1", "u1")
+
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID, "interval_days": 1, "run_time": "09:00",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create schedule: %d %s", w.Code, w.Body.String())
+	}
+	var task model.SummaryTask
+	if err := db.First(&task, taskID).Error; err != nil || task.ScheduleID == nil {
+		t.Fatalf("load bound task: task=%#v err=%v", task, err)
+	}
+	if err := db.Create(&model.SummarySource{TaskID: taskID, SourceType: model.SourceDocument, SourceID: "doc-1"}).Error; err != nil {
+		t.Fatalf("seed legacy document source: %v", err)
+	}
+	if err := db.Model(&model.SummarySchedule{}).Where("id = ?", *task.ScheduleID).Update("is_active", 0).Error; err != nil {
+		t.Fatalf("deactivate legacy schedule: %v", err)
+	}
+
+	w = scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(*task.ScheduleID)+"/toggle", map[string]interface{}{
+		"is_active": true,
+	})
+	if w.Code != http.StatusBadRequest || respCode(t, w) != 40001 {
+		t.Fatalf("legacy document schedule activation = %d %s, want 400/40001", w.Code, w.Body.String())
+	}
+	var schedule model.SummarySchedule
+	if err := db.First(&schedule, *task.ScheduleID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if schedule.IsActive != 0 {
+		t.Fatalf("rejected activation changed is_active to %d", schedule.IsActive)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Single-person invariant: scheduled summary rejects multi-person tasks.
 // ---------------------------------------------------------------------------
