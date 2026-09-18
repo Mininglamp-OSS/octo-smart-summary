@@ -4,8 +4,12 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +27,7 @@ func newSummaryWorkflowTestService(t *testing.T) (*SummaryWorkflowService, *gorm
 	if err := db.AutoMigrate(
 		&model.SummaryTask{},
 		&model.SummarySource{},
+		&model.SummarySourceSnapshot{},
 		&model.SummaryParticipant{},
 		&model.PersonalResult{},
 		&model.SummaryWorkflowIdempotency{},
@@ -66,6 +71,106 @@ func TestSummaryWorkflowCreatePersonal(t *testing.T) {
 	db.Model(&model.PersonalResult{}).Count(&personalCount)
 	if taskCount != 1 || sourceCount != 1 || participantCount != 1 || personalCount != 1 {
 		t.Fatalf("row counts task/source/participant/personal = %d/%d/%d/%d, want 1/1/1/1", taskCount, sourceCount, participantCount, personalCount)
+	}
+}
+
+func TestSummaryWorkflowPersistsDocumentSnapshotAtomically(t *testing.T) {
+	svc, db := newSummaryWorkflowTestService(t)
+	content := "immutable document body"
+	hash := sha256.Sum256([]byte(content))
+	in := baseSummaryWorkflowInput()
+	in.Sources = []SummaryWorkflowSource{{
+		SourceType: model.SourceDocument, SourceID: "d_1", SourceName: "Design",
+		SourceVersion: "v3", SourceHash: hex.EncodeToString(hash[:]), SnapshotContent: content,
+		SnapshotTruncated: true,
+	}}
+
+	if _, err := svc.CreateFromLegacyHTTP(context.Background(), in); err != nil {
+		t.Fatalf("CreateFromLegacyHTTP() error: %v", err)
+	}
+	var source model.SummarySource
+	if err := db.First(&source).Error; err != nil {
+		t.Fatal(err)
+	}
+	var snapshot model.SummarySourceSnapshot
+	if err := db.First(&snapshot, "summary_source_id = ?", source.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if source.SourceVersion != "v3" || source.SourceHash != snapshot.ContentHash || snapshot.Content != content || snapshot.ContentBytes != len([]byte(content)) || !snapshot.Truncated {
+		t.Fatalf("source=%#v snapshot=%#v", source, snapshot)
+	}
+}
+
+func TestSummaryWorkflowRollsBackWhenDocumentSnapshotInsertFails(t *testing.T) {
+	svc, db := newSummaryWorkflowTestService(t)
+	if err := db.Exec(`CREATE TRIGGER reject_document_snapshot BEFORE INSERT ON summary_source_snapshot BEGIN SELECT RAISE(ABORT, 'snapshot rejected'); END`).Error; err != nil {
+		t.Fatal(err)
+	}
+	content := "body"
+	hash := sha256.Sum256([]byte(content))
+	in := baseSummaryWorkflowInput()
+	in.Sources = []SummaryWorkflowSource{{
+		SourceType: model.SourceDocument, SourceID: "d_1", SourceName: "Doc",
+		SourceHash: hex.EncodeToString(hash[:]), SnapshotContent: content,
+	}}
+	if _, err := svc.CreateFromLegacyHTTP(context.Background(), in); err == nil {
+		t.Fatal("CreateFromLegacyHTTP() succeeded, want snapshot insert failure")
+	}
+	for _, table := range []interface{}{&model.SummaryTask{}, &model.SummarySource{}, &model.SummaryParticipant{}, &model.PersonalResult{}} {
+		var count int64
+		if err := db.Model(table).Count(&count).Error; err != nil || count != 0 {
+			t.Fatalf("model %T count=%d err=%v, want rolled back", table, count, err)
+		}
+	}
+}
+
+func TestCanonicalWorkflowHashPreservesLegacySourceShapeAndIgnoresSnapshotMetadata(t *testing.T) {
+	in := normalizedSummaryWorkflowInput{
+		creatorID:           "u",
+		title:               "t",
+		sources:             []SummaryWorkflowSource{{SourceType: model.SourceGroup, SourceID: "g"}},
+		participants:        []SummaryWorkflowParticipant{},
+		confirmTimeoutHours: 24,
+	}
+	legacyPayload := struct {
+		CreatorID     string `json:"creator_id"`
+		Title         string `json:"title"`
+		Topic         string `json:"topic"`
+		TimeRangeMode string `json:"time_range_mode"`
+		TimeStart     string `json:"time_start"`
+		TimeEnd       string `json:"time_end"`
+		Sources       []struct {
+			SourceType int
+			SourceID   string
+		} `json:"sources"`
+		Participants        []SummaryWorkflowParticipant `json:"participants"`
+		ConfirmTimeoutHours int                          `json:"confirm_timeout_hours"`
+		OriginChannelID     string                       `json:"origin_channel_id"`
+		OriginChannelType   int                          `json:"origin_channel_type"`
+		AgentSessionID      string                       `json:"agent_session_id,omitempty"`
+	}{
+		CreatorID: "u", Title: "t", TimeRangeMode: "default",
+		Sources: []struct {
+			SourceType int
+			SourceID   string
+		}{{SourceType: model.SourceGroup, SourceID: "g"}},
+		Participants: nil, ConfirmTimeoutHours: 24,
+	}
+	legacyJSON, err := json.Marshal(legacyPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := sha256.Sum256(legacyJSON)
+	if got := canonicalSummaryWorkflowRequestHash(in); got != hex.EncodeToString(want[:]) {
+		t.Fatalf("canonical hash=%s, want legacy-compatible %s", got, hex.EncodeToString(want[:]))
+	}
+
+	in.sources[0].SourceName = "ignored"
+	in.sources[0].SourceVersion = "v2"
+	in.sources[0].SourceHash = strings.Repeat("a", 64)
+	in.sources[0].SnapshotContent = "ignored snapshot"
+	if got := canonicalSummaryWorkflowRequestHash(in); got != hex.EncodeToString(want[:]) {
+		t.Fatalf("snapshot metadata changed canonical hash: %s", got)
 	}
 }
 
@@ -363,6 +468,34 @@ func TestAgentPersonalWorkflowRequiresSafeBoundary(t *testing.T) {
 	db.Model(&model.SummaryTask{}).Count(&count)
 	if count != 1 {
 		t.Fatalf("task count = %d, want 1", count)
+	}
+}
+
+func TestAgentPersonalWorkflowAcceptsDocumentSnapshot(t *testing.T) {
+	svc, db := newSummaryWorkflowTestService(t)
+	content := "agent document body"
+	hash := sha256.Sum256([]byte(content))
+	in := baseAgentWorkflowInput()
+	in.IdempotencyKey = "agent-document-workflow-001"
+	in.Sources = []SummaryWorkflowSource{{
+		SourceType: model.SourceDocument, SourceID: "d_1", SourceName: "Design Doc",
+		SourceHash: hex.EncodeToString(hash[:]), SnapshotContent: content,
+	}}
+
+	got, err := svc.CreatePersonalFromAgent(context.Background(), in)
+	if err != nil {
+		t.Fatalf("CreatePersonalFromAgent() document error: %v", err)
+	}
+	var source model.SummarySource
+	if err := db.First(&source, "task_id = ? AND source_type = ?", got.Task.ID, model.SourceDocument).Error; err != nil {
+		t.Fatalf("load document source: %v", err)
+	}
+	var snapshot model.SummarySourceSnapshot
+	if err := db.First(&snapshot, "summary_source_id = ?", source.ID).Error; err != nil {
+		t.Fatalf("load document snapshot: %v", err)
+	}
+	if source.SourceName != "Design Doc" || snapshot.Content != content || snapshot.ContentHash != source.SourceHash {
+		t.Fatalf("source=%#v snapshot=%#v", source, snapshot)
 	}
 }
 

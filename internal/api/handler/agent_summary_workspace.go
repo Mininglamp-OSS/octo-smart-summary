@@ -309,7 +309,7 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 	if begin.Snapshot.CurrentPreview != nil && hasExplicitSummaryExecutionCommand(req.Message) {
 		intent = service.SummaryIntentGenerate
 	}
-	selectedSourceExplicit := len(contextValue.SelectedChannels) > 0
+	selectedSourceExplicit := len(contextValue.SelectedChannels) > 0 || len(contextValue.Documents) > 0
 	hasRequirement := summaryWorkspaceHasRequirement(contextValue, req.Message, req.InputOrigin)
 	contextValue, inferredSource, err := h.workspace.materializeWorkspaceAgentContext(
 		c.Request.Context(), spaceID, uid, contextValue, begin.Snapshot, req.Message, intent, req.InputOrigin,
@@ -340,6 +340,9 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 	// list. Trusted template/system actions retain their deterministic Workflow
 	// routes, including direct team collaboration.
 	openScopeAgent := summaryWorkspaceShouldOpenScopeAgent(action, req.InputOrigin, intent)
+	if len(contextValue.Documents) > 0 {
+		openScopeAgent = false
+	}
 
 	validation, lookupErr := h.workspace.validateWorkspaceScope(c.Request.Context(), spaceID, uid, contextValue)
 	if lookupErr != nil {
@@ -352,13 +355,7 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 	route := deriveWorkspaceRoute(contextValue, action, intent, explicitRunIntent, selectedSourceExplicit, hasRequirement, openScopeAgent, begin.Snapshot, validation.participantsValid, validation.sourcesValid, validation.referencesValid)
 	// A possible conversational scope change must pass through the Agent before
 	// any side-effecting workflow consumes it.
-	if openScopeAgent && route != service.SummaryRouteClarification && route != service.SummaryRouteExplanation {
-		if begin.Snapshot.CurrentPreview != nil && len(contextValue.Participants) == 0 {
-			route = service.SummaryRouteAgentRevision
-		} else {
-			route = service.SummaryRouteAgentPreview
-		}
-	}
+	route = workspaceRouteAfterOpenScopeAgentOverride(contextValue, route, openScopeAgent, begin.Snapshot)
 
 	var snapshot WorkspaceSnapshot
 	// The chat contract accepts request ids the workflow idempotency-key
@@ -371,16 +368,20 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 	workflowIdempotencyKey := workspaceMutationRequestID("turn", req.RequestID)
 	switch route {
 	case service.SummaryRoutePersonalWorkflow:
-		snapshot, err = h.completeWorkspaceWorkflow(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, workflowIdempotencyKey, req.Message, req.ScopeVersion, contextValue, summaryWorkspaceExecutionRequirement(contextValue, req.Message, req.InputOrigin), service.SummaryWorkflowPersonal, false)
+		snapshot, err = h.completeWorkspaceWorkflow(c.Request.Context(), c.Request.Header, key, begin.Turn.ID, begin.Turn.Attempt, workflowIdempotencyKey, req.Message, req.ScopeVersion, contextValue, summaryWorkspaceExecutionRequirement(contextValue, req.Message, req.InputOrigin), service.SummaryWorkflowPersonal, false)
 	case service.SummaryRouteTeamWorkflow:
-		snapshot, err = h.completeWorkspaceWorkflow(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, workflowIdempotencyKey, req.Message, req.ScopeVersion, contextValue, summaryWorkspaceExecutionRequirement(contextValue, req.Message, req.InputOrigin), service.SummaryWorkflowTeam, false)
+		snapshot, err = h.completeWorkspaceWorkflow(c.Request.Context(), c.Request.Header, key, begin.Turn.ID, begin.Turn.Attempt, workflowIdempotencyKey, req.Message, req.ScopeVersion, contextValue, summaryWorkspaceExecutionRequirement(contextValue, req.Message, req.InputOrigin), service.SummaryWorkflowTeam, false)
 	case service.SummaryRouteTeamConfirmation:
 		snapshot, err = h.completeWorkspaceProposal(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, req, contextValue)
 	case service.SummaryRouteAgentPreview, service.SummaryRouteAgentRevision, service.SummaryRouteExplanation:
 		snapshot, err = h.completeWorkspaceAgentTurn(c.Request.Context(), responder, key, begin.Turn.ID, begin.Turn.Attempt, req, contextValue, begin.Snapshot, route, openScopeAgent, inferredSource)
 	default:
 		reply := "请先选择一个你有权限的会话，再告诉我希望总结的内容。"
-		if len(contextValue.ReferencedTaskIDs) > 0 && !validation.referencesValid {
+		if len(contextValue.Documents) > 0 && len(contextValue.Participants) > 0 {
+			reply = "文档总结暂不支持多人协作，请移除参与者后再生成。"
+		} else if len(contextValue.Documents) > 0 {
+			reply = "文档问答/解释暂不支持，请输入总结要求后生成文档总结。"
+		} else if len(contextValue.ReferencedTaskIDs) > 0 && !validation.referencesValid {
 			reply = "部分引用总结不可用，请调整后重试。"
 		} else if len(contextValue.Participants) > 0 && !validation.participantsValid {
 			reply = summaryWorkspaceTeamScopeMessage(validation.teamScopeReason)
@@ -508,6 +509,7 @@ func (h *AgentChatHandler) completeWorkspaceProposal(ctx context.Context, key Wo
 // the worker or inviting participants twice.
 func (h *AgentChatHandler) completeWorkspaceWorkflow(
 	ctx context.Context,
+	header http.Header,
 	key WorkspaceSessionKey,
 	turnID int64,
 	attempt int,
@@ -524,13 +526,34 @@ func (h *AgentChatHandler) completeWorkspaceWorkflow(
 		return WorkspaceSnapshot{}, err
 	}
 	originID, originType := summaryWorkspaceOrigin(contextValue)
+	sources := summaryWorkspaceSources(contextValue)
+	if len(contextValue.Documents) > 0 {
+		// Keep this defense even though normal routing rejects document + team
+		// scopes earlier: legacy callers and future route changes must not bypass
+		// the personal-only document workflow contract.
+		if target != service.SummaryWorkflowPersonal {
+			return WorkspaceSnapshot{}, service.NewBizError(40001, "文档总结暂不支持多人协作", http.StatusBadRequest)
+		}
+		releaseSlot, admitted := documentSummaryLimiterInstance.acquire(key.UserID)
+		if !admitted {
+			return WorkspaceSnapshot{}, service.NewBizError(42902, "文档总结请求过于频繁，请稍后重试", http.StatusTooManyRequests)
+		}
+		defer releaseSlot()
+		documentSources, documentErr := prepareDocumentSummarySourcesFromRefs(
+			ctx, h.documentClient, header, key.SpaceID, key.UserID, summaryWorkspaceDocumentRefs(contextValue),
+		)
+		if documentErr != nil {
+			return WorkspaceSnapshot{}, summaryWorkspaceDocumentBizError(documentErr)
+		}
+		sources = documentSources
+	}
 	input := service.AgentCreateSummaryWorkflowInput{
 		ActorID:           key.UserID,
 		SpaceID:           key.SpaceID,
 		Title:             summaryWorkspaceTitle(contextValue),
 		Requirement:       strings.TrimSpace(requirement),
 		TimeRange:         timeRange,
-		Sources:           summaryWorkspaceSources(contextValue),
+		Sources:           sources,
 		OriginChannelID:   originID,
 		OriginChannelType: originType,
 		IdempotencyKey:    idempotencyKey,
@@ -1072,7 +1095,7 @@ func (h *AgentChatHandler) ConfirmSummaryWorkspaceProposal(c *gin.Context) {
 	}
 	workflowIdempotencyKey := workspaceMutationRequestID("workflow", fmt.Sprintf("%s:%d", req.ProposalToken, proposalVersion))
 	snapshot, err := h.completeWorkspaceWorkflow(
-		c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt,
+		c.Request.Context(), c.Request.Header, key, begin.Turn.ID, begin.Turn.Attempt,
 		workflowIdempotencyKey, "确认并发起协作", req.ScopeVersion, contextValue, proposal.Requirement,
 		service.SummaryWorkflowTeam, true,
 	)
@@ -1305,6 +1328,16 @@ func containsAny(value string, needles ...string) bool {
 }
 
 func deriveWorkspaceRoute(context summaryWorkspaceContext, action service.SummaryAction, intent service.SummaryIntent, hasExplicitRunIntent, selectedSourceExplicit, hasRequirement, openScopeAgent bool, state WorkspaceSnapshot, participantsValid, sourcesValid, referencesValid bool) service.SummaryRoute {
+	if len(context.Documents) > 0 {
+		switch {
+		case len(context.Participants) > 0:
+			return service.SummaryRouteClarification
+		case intent == service.SummaryIntentExplain && !hasExplicitRunIntent:
+			return service.SummaryRouteClarification
+		default:
+			return service.SummaryRoutePersonalWorkflow
+		}
+	}
 	hasPreview := state.CurrentPreview != nil
 	return service.DeriveSummaryRoute(service.SummaryRouteInput{
 		Action:                     action,
@@ -1323,6 +1356,16 @@ func deriveWorkspaceRoute(context summaryWorkspaceContext, action service.Summar
 		HasEnoughContextForPreview: referencesValid && (sourcesValid || len(context.ReferencedTaskIDs) > 0 || openScopeAgent),
 		HasHardMissingData:         !referencesValid,
 	})
+}
+
+func workspaceRouteAfterOpenScopeAgentOverride(context summaryWorkspaceContext, route service.SummaryRoute, openScopeAgent bool, state WorkspaceSnapshot) service.SummaryRoute {
+	if !openScopeAgent || len(context.Documents) > 0 || route == service.SummaryRouteClarification || route == service.SummaryRouteExplanation {
+		return route
+	}
+	if state.CurrentPreview != nil && len(context.Participants) == 0 {
+		return service.SummaryRouteAgentRevision
+	}
+	return service.SummaryRouteAgentPreview
 }
 
 func canonicalizeSummaryWorkspaceContextForActor(contextValue summaryWorkspaceContext, actorID string) summaryWorkspaceContext {
@@ -1459,6 +1502,9 @@ func (w *summaryWorkspaceCoordinator) materializeWorkspaceAgentContext(
 		return contextValue, false, err
 	}
 	contextValue = effective
+	if len(contextValue.Documents) > 0 {
+		contextValue.TimeRange = nil
+	}
 
 	now := timezone.Now()
 	if w != nil && w.now != nil {
@@ -1466,6 +1512,7 @@ func (w *summaryWorkspaceCoordinator) materializeWorkspaceAgentContext(
 	}
 	needsRecentFallback := intent == service.SummaryIntentGenerate &&
 		len(contextValue.SelectedChannels) == 0 &&
+		len(contextValue.Documents) == 0 &&
 		len(contextValue.Participants) == 0 &&
 		len(contextValue.ReferencedTaskIDs) == 0 &&
 		contextValue.Template != nil &&
@@ -1484,7 +1531,9 @@ func (w *summaryWorkspaceCoordinator) materializeWorkspaceAgentContext(
 		return contextValue, true, nil
 	}
 
-	contextValue = materializeSummaryWorkspaceDefaultTimeRange(contextValue, now)
+	if len(contextValue.Documents) == 0 {
+		contextValue = materializeSummaryWorkspaceDefaultTimeRange(contextValue, now)
+	}
 	return contextValue, false, nil
 }
 
@@ -1780,6 +1829,12 @@ func summaryWorkspaceTitle(context summaryWorkspaceContext) string {
 	if context.Template != nil && strings.TrimSpace(context.Template.Label) != "" {
 		return strings.TrimSpace(context.Template.Label)
 	}
+	if len(context.Documents) > 0 {
+		if title := strings.TrimSpace(context.Documents[0].Title); title != "" {
+			return title + "总结"
+		}
+		return context.Documents[0].DocumentID + "总结"
+	}
 	if len(context.SelectedChannels) > 0 {
 		return context.SelectedChannels[0].Name + "总结"
 	}
@@ -1787,7 +1842,7 @@ func summaryWorkspaceTitle(context summaryWorkspaceContext) string {
 }
 
 func summaryWorkspaceSources(context summaryWorkspaceContext) []service.SummaryWorkflowSource {
-	sources := make([]service.SummaryWorkflowSource, 0, len(context.SelectedChannels))
+	sources := make([]service.SummaryWorkflowSource, 0, len(context.SelectedChannels)+len(context.Documents))
 	for _, channel := range context.SelectedChannels {
 		sourceType := 0
 		switch channel.ChatType {
@@ -1802,7 +1857,29 @@ func summaryWorkspaceSources(context summaryWorkspaceContext) []service.SummaryW
 			sources = append(sources, service.SummaryWorkflowSource{SourceType: sourceType, SourceID: channel.ChatID})
 		}
 	}
+	for _, document := range context.Documents {
+		sources = append(sources, service.SummaryWorkflowSource{
+			SourceType: model.SourceDocument,
+			SourceID:   document.DocumentID,
+			SourceName: document.Title,
+		})
+	}
 	return sources
+}
+
+func summaryWorkspaceDocumentRefs(context summaryWorkspaceContext) []documentRefReq {
+	refs := make([]documentRefReq, 0, len(context.Documents))
+	for _, document := range context.Documents {
+		refs = append(refs, documentRefReq{DocumentID: strings.TrimSpace(document.DocumentID)})
+	}
+	return refs
+}
+
+func summaryWorkspaceDocumentBizError(err *documentSummaryCreateError) error {
+	if err == nil {
+		return nil
+	}
+	return service.NewBizError(err.code, err.message, err.status)
 }
 
 func summaryWorkspaceParticipants(context summaryWorkspaceContext, actorID string) []service.SummaryWorkflowParticipant {
@@ -1853,9 +1930,13 @@ func summaryWorkspaceOrigin(context summaryWorkspaceContext) (string, int) {
 func (w *summaryWorkspaceCoordinator) validateWorkspaceScope(ctx context.Context, spaceID, actorID string, value summaryWorkspaceContext) (summaryWorkspaceScopeValidation, *summaryWorkspaceScopeLookupError) {
 	validation := summaryWorkspaceScopeValidation{teamScopeReason: teamScopeReasonNone}
 	var err error
-	validation.sourcesValid, err = w.validateSources(ctx, spaceID, actorID, value.SelectedChannels)
-	if err != nil {
-		return validation, &summaryWorkspaceScopeLookupError{turnCode: "SOURCE_LOOKUP_FAILED", message: "读取会话权限失败", cause: err}
+	if len(value.Documents) > 0 {
+		validation.sourcesValid = true
+	} else {
+		validation.sourcesValid, err = w.validateSources(ctx, spaceID, actorID, value.SelectedChannels)
+		if err != nil {
+			return validation, &summaryWorkspaceScopeLookupError{turnCode: "SOURCE_LOOKUP_FAILED", message: "读取会话权限失败", cause: err}
+		}
 	}
 	validation.participantsValid, err = w.validateParticipants(ctx, spaceID, actorID, value.Participants)
 	if err != nil {

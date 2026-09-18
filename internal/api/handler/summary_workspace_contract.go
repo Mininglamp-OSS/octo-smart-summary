@@ -11,6 +11,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 )
 
 const (
@@ -32,6 +33,7 @@ const (
 	workspaceActionContinueChat         = "continue_chat"
 	workspaceSnapshotVersion            = 1
 	maxSummaryWorkspaceSelectedChannels = agent.MaxWorkspaceSelectedChannels
+	maxSummaryWorkspaceDocuments        = service.MaxDocumentSummarySourceCount
 	maxSummaryWorkspaceParticipants     = 30
 	maxSummaryWorkspaceReferencedTask   = 20
 	maxSummaryWorkspaceIDLength         = 256
@@ -54,6 +56,11 @@ type summaryWorkspaceChannel struct {
 type summaryWorkspaceParticipant struct {
 	UserID   string `json:"user_id"`
 	UserName string `json:"user_name,omitempty"`
+}
+
+type summaryWorkspaceDocument struct {
+	DocumentID string `json:"document_id"`
+	Title      string `json:"title,omitempty"`
 }
 
 type summaryWorkspaceTemplate struct {
@@ -82,6 +89,7 @@ const (
 // collection fields.
 type summaryWorkspaceContext struct {
 	SelectedChannels  []summaryWorkspaceChannel     `json:"selected_channels"`
+	Documents         []summaryWorkspaceDocument    `json:"documents"`
 	Participants      []summaryWorkspaceParticipant `json:"participants"`
 	Template          *summaryWorkspaceTemplate     `json:"template"`
 	TimeRange         *summaryWorkspaceTimeRange    `json:"time_range"`
@@ -173,6 +181,7 @@ type summaryWorkspaceConfirmRequest struct {
 func emptySummaryWorkspaceContext() summaryWorkspaceContext {
 	return summaryWorkspaceContext{
 		SelectedChannels:  []summaryWorkspaceChannel{},
+		Documents:         []summaryWorkspaceDocument{},
 		Participants:      []summaryWorkspaceParticipant{},
 		ReferencedTaskIDs: []int64{},
 	}
@@ -202,6 +211,40 @@ func normalizeSummaryWorkspaceContext(in summaryWorkspaceContext) (summaryWorksp
 		}
 		seenChannels[key] = struct{}{}
 		out.SelectedChannels = append(out.SelectedChannels, channel)
+	}
+
+	if len(in.Documents) > maxSummaryWorkspaceDocuments {
+		return out, fmt.Errorf("%w: 文档来源不能超过%d个", errInvalidSummaryWorkspaceContext, maxSummaryWorkspaceDocuments)
+	}
+	seenDocuments := make(map[string]struct{}, len(in.Documents))
+	for _, document := range in.Documents {
+		document.DocumentID = strings.TrimSpace(document.DocumentID)
+		document.Title = strings.TrimSpace(document.Title)
+		if document.DocumentID == "" || len([]rune(document.DocumentID)) > maxSummaryWorkspaceIDLength ||
+			len([]rune(document.Title)) > maxSummaryWorkspaceLabelLength {
+			return out, fmt.Errorf("%w: document_id is required", errInvalidSummaryWorkspaceContext)
+		}
+		if _, exists := seenDocuments[document.DocumentID]; exists {
+			continue
+		}
+		seenDocuments[document.DocumentID] = struct{}{}
+		out.Documents = append(out.Documents, document)
+	}
+	dropDocumentDefaultTimeRange := false
+	if len(out.Documents) > 0 {
+		if len(out.SelectedChannels) > 0 || len(in.Participants) > 0 {
+			return out, fmt.Errorf("%w: 文档总结不能混合聊天、参与者或时间范围", errInvalidSummaryWorkspaceContext)
+		}
+		if in.TimeRange != nil {
+			source := strings.TrimSpace(in.TimeRange.Source)
+			if source == "" {
+				source = summaryWorkspaceTimeRangeSourcePicker
+			}
+			if source != summaryWorkspaceTimeRangeSourceDefault {
+				return out, fmt.Errorf("%w: 文档总结不能混合聊天、参与者或时间范围", errInvalidSummaryWorkspaceContext)
+			}
+			dropDocumentDefaultTimeRange = true
+		}
 	}
 
 	if len(in.Participants) > maxSummaryWorkspaceParticipants {
@@ -235,7 +278,7 @@ func normalizeSummaryWorkspaceContext(in summaryWorkspaceContext) (summaryWorksp
 		out.Template = &template
 	}
 
-	if in.TimeRange != nil {
+	if in.TimeRange != nil && !dropDocumentDefaultTimeRange {
 		timeRange := *in.TimeRange
 		timeRange.Start = strings.TrimSpace(timeRange.Start)
 		timeRange.End = strings.TrimSpace(timeRange.End)

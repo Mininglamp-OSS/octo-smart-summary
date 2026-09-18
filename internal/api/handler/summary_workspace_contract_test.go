@@ -184,6 +184,55 @@ func TestNormalizeSummaryWorkspaceContext(t *testing.T) {
 	}
 }
 
+func TestNormalizeSummaryWorkspaceContextPreservesDocuments(t *testing.T) {
+	got, err := normalizeSummaryWorkspaceContext(summaryWorkspaceContext{
+		Documents: []summaryWorkspaceDocument{
+			{DocumentID: " doc-1 ", Title: " 方案 "},
+			{DocumentID: "doc-1", Title: "重复"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("normalize document context: %v", err)
+	}
+	if len(got.Documents) != 1 || got.Documents[0].DocumentID != "doc-1" || got.Documents[0].Title != "方案" {
+		t.Fatalf("documents = %#v, want trimmed and deduplicated", got.Documents)
+	}
+	if got.SelectedChannels == nil || got.Participants == nil || got.ReferencedTaskIDs == nil {
+		t.Fatalf("collections must stay arrays: %#v", got)
+	}
+}
+
+func TestNormalizeSummaryWorkspaceContextRejectsMixedDocumentScope(t *testing.T) {
+	_, err := normalizeSummaryWorkspaceContext(summaryWorkspaceContext{
+		SelectedChannels: []summaryWorkspaceChannel{{ChatID: "group-1", ChatType: "group", Name: "项目群"}},
+		Documents:        []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}},
+	})
+	if err == nil {
+		t.Fatal("expected mixed document and chat scope to be rejected")
+	}
+}
+
+func TestNormalizeSummaryWorkspaceContextDropsDocumentDefaultTimeRange(t *testing.T) {
+	got, err := normalizeSummaryWorkspaceContext(summaryWorkspaceContext{
+		Documents: []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}},
+		TimeRange: &summaryWorkspaceTimeRange{
+			Start:  "2026-08-18T14:45:41+08:00",
+			End:    "2026-09-17T14:45:41+08:00",
+			Label:  "最近 30 天（默认）",
+			Source: summaryWorkspaceTimeRangeSourceDefault,
+		},
+	})
+	if err != nil {
+		t.Fatalf("normalize document context with default range: %v", err)
+	}
+	if len(got.Documents) != 1 {
+		t.Fatalf("documents=%#v, want preserved document", got.Documents)
+	}
+	if got.TimeRange != nil {
+		t.Fatalf("time range=%#v, want dropped default range", got.TimeRange)
+	}
+}
+
 func TestNormalizeSummaryWorkspaceContextRejectsInvalidRange(t *testing.T) {
 	_, err := normalizeSummaryWorkspaceContext(summaryWorkspaceContext{
 		TimeRange: &summaryWorkspaceTimeRange{
@@ -402,7 +451,8 @@ func TestEmptySummaryWorkspaceHistoryUsesV1Shape(t *testing.T) {
 	if history.ContractVersion != summaryWorkspaceContractVersion || history.SessionID != "session-1" || history.State.ScopeVersion != 1 {
 		t.Fatalf("unexpected empty history: %#v", history)
 	}
-	if history.Messages == nil || history.State.SummaryContext.SelectedChannels == nil || history.State.SummaryContext.Participants == nil || history.State.SummaryContext.ReferencedTaskIDs == nil {
+	if history.Messages == nil || history.State.SummaryContext.SelectedChannels == nil || history.State.SummaryContext.Documents == nil ||
+		history.State.SummaryContext.Participants == nil || history.State.SummaryContext.ReferencedTaskIDs == nil {
 		t.Fatalf("empty workspace collections must encode as arrays: %#v", history)
 	}
 	if history.State.CurrentPreview != nil || history.State.PendingProposal != nil || history.State.Workflow != nil {
@@ -443,6 +493,8 @@ func TestDeriveWorkspaceRouteFinalMatrix(t *testing.T) {
 		{name: "C only previews", context: summaryWorkspaceContext{SelectedChannels: []summaryWorkspaceChannel{channel}}, selectedSourceExplicit: true, sourcesValid: true, want: service.SummaryRouteAgentPreview},
 		{name: "T only inferred C previews", context: summaryWorkspaceContext{SelectedChannels: []summaryWorkspaceChannel{channel}, Template: template}, hasRequirement: true, sourcesValid: true, want: service.SummaryRouteAgentPreview},
 		{name: "C plus T runs personal workflow", context: summaryWorkspaceContext{SelectedChannels: []summaryWorkspaceChannel{channel}, Template: template}, selectedSourceExplicit: true, hasRequirement: true, sourcesValid: true, want: service.SummaryRoutePersonalWorkflow},
+		{name: "document plus T runs personal workflow", context: summaryWorkspaceContext{Documents: []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}}, Template: template}, selectedSourceExplicit: true, hasRequirement: true, sourcesValid: true, want: service.SummaryRoutePersonalWorkflow},
+		{name: "document plus user instruction runs personal workflow", context: summaryWorkspaceContext{Documents: []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}}}, selectedSourceExplicit: true, hasRequirement: true, sourcesValid: true, want: service.SummaryRoutePersonalWorkflow},
 		{name: "P only clarifies", context: summaryWorkspaceContext{Participants: []summaryWorkspaceParticipant{participant}}, want: service.SummaryRouteClarification},
 		{name: "C plus P without requirement clarifies", context: summaryWorkspaceContext{SelectedChannels: []summaryWorkspaceChannel{channel}, Participants: []summaryWorkspaceParticipant{participant}}, selectedSourceExplicit: true, sourcesValid: true, want: service.SummaryRouteClarification},
 		{name: "P plus T requires team confirmation", context: summaryWorkspaceContext{Participants: []summaryWorkspaceParticipant{participant}, Template: template}, hasRequirement: true, want: service.SummaryRouteTeamConfirmation},
@@ -461,5 +513,31 @@ func TestDeriveWorkspaceRouteFinalMatrix(t *testing.T) {
 				t.Fatalf("route = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestDeriveWorkspaceRouteDocumentExplainClarifies(t *testing.T) {
+	context := summaryWorkspaceContext{Documents: []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}}}
+	got := deriveWorkspaceRoute(context, service.SummaryActionChat, service.SummaryIntentExplain, false, true, false, false, WorkspaceSnapshot{}, true, true, true)
+	if got != service.SummaryRouteClarification {
+		t.Fatalf("document explain route = %q, want clarification", got)
+	}
+	got = deriveWorkspaceRoute(context, service.SummaryActionChat, service.SummaryIntentExplain, false, true, true, false, WorkspaceSnapshot{}, true, true, true)
+	if got != service.SummaryRouteClarification {
+		t.Fatalf("document explain route with user text requirement = %q, want clarification", got)
+	}
+}
+
+func TestOpenScopeAgentOverrideDoesNotDemoteDocumentWorkflow(t *testing.T) {
+	context := summaryWorkspaceContext{Documents: []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}}}
+	got := workspaceRouteAfterOpenScopeAgentOverride(context, service.SummaryRoutePersonalWorkflow, true, WorkspaceSnapshot{})
+	if got != service.SummaryRoutePersonalWorkflow {
+		t.Fatalf("document route after open-scope override = %q, want personal workflow", got)
+	}
+
+	chatContext := summaryWorkspaceContext{}
+	got = workspaceRouteAfterOpenScopeAgentOverride(chatContext, service.SummaryRoutePersonalWorkflow, true, WorkspaceSnapshot{})
+	if got != service.SummaryRouteAgentPreview {
+		t.Fatalf("chat route after open-scope override = %q, want agent preview", got)
 	}
 }

@@ -291,6 +291,35 @@ func TestDedupCitations_DuplicateContent(t *testing.T) {
 	}
 }
 
+func TestDedupCitations_DocumentCoordinatesRemainDistinct(t *testing.T) {
+	shared := strings.Repeat("共同前缀", 60)
+	citations := []model.Citation{
+		{Index: 1, Sender: "设计文档", Content: shared, ChannelType: model.SourceDocument, DocumentID: "docA", DocumentVersion: "v1", DocumentChunk: 1},
+		{Index: 2, Sender: "设计文档", Content: shared, ChannelType: model.SourceDocument, DocumentID: "docB", DocumentVersion: "v2", DocumentChunk: 1},
+		{Index: 3, Sender: "设计文档", Content: shared, ChannelType: model.SourceDocument, DocumentID: "docA", DocumentVersion: "v1", DocumentChunk: 2},
+	}
+	text, got := dedupCitations("结论一 [1]，结论二 [2]，结论三 [3]", citations)
+	if len(got) != 3 {
+		t.Fatalf("citations=%#v, want all document coordinates", got)
+	}
+	for _, marker := range []string{"[1]", "[2]", "[3]"} {
+		if !strings.Contains(text, marker) {
+			t.Fatalf("text=%q lost marker %s", text, marker)
+		}
+	}
+}
+
+func TestDedupCitations_ChatBehaviorUnchanged(t *testing.T) {
+	citations := []model.Citation{
+		{Index: 1, Sender: "Alice", Content: "same", ChannelID: "group-a", MessageSeq: 1},
+		{Index: 2, Sender: "Alice", Content: "same", ChannelID: "group-b", MessageSeq: 9},
+	}
+	text, got := dedupCitations("证据 [1][2]", citations)
+	if text != "证据 [1]" || len(got) != 1 || got[0].Index != 1 {
+		t.Fatalf("chat dedup changed: text=%q citations=%#v", text, got)
+	}
+}
+
 func TestDedupCitations_ConsecutiveDuplicateMarkers(t *testing.T) {
 	// Simulates the case where after replacement, consecutive identical markers appear.
 	text := "消息 [1][1][1] 很重要"

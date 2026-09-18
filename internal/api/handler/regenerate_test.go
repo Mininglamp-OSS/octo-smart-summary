@@ -28,6 +28,7 @@ func setupRegenerateDB(t *testing.T) *gorm.DB {
 	db.AutoMigrate(
 		&model.SummaryTask{},
 		&model.SummarySource{},
+		&model.SummarySourceSnapshot{},
 		&model.SummaryParticipant{},
 		&model.PersonalResult{},
 		&model.PersonalResultVersion{},
@@ -36,6 +37,45 @@ func setupRegenerateDB(t *testing.T) *gorm.DB {
 		&model.SummaryNotification{},
 	)
 	return db
+}
+
+func TestRegenerateDocumentSummaryKeepsOriginalSnapshot(t *testing.T) {
+	db := setupRegenerateDB(t)
+	taskID, _, _ := seedCompletedTask(t, db)
+	var source model.SummarySource
+	if err := db.Where("task_id = ?", taskID).First(&source).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&source).Updates(map[string]interface{}{
+		"source_type":    model.SourceDocument,
+		"source_id":      "d_1",
+		"source_name":    "设计文档",
+		"source_version": "v3",
+		"source_hash":    "hash-v3",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	snapshot := model.SummarySourceSnapshot{SummarySourceID: source.ID, Content: "原始版本正文", ContentBytes: len([]byte("原始版本正文")), ContentHash: "hash-v3"}
+	if err := db.Create(&snapshot).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewTaskHandler(db, nil, "")
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/v1/summaries/%d/regenerate", taskID), nil)
+	req.Header.Set("Token", "creator1")
+	req.Header.Set("X-Space-Id", "space1")
+	setupRegenerateRouter(h).ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("regenerate response = %d %s", w.Code, w.Body.String())
+	}
+	var got model.SummarySourceSnapshot
+	if err := db.First(&got, snapshot.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.Content != snapshot.Content || got.ContentHash != snapshot.ContentHash {
+		t.Fatalf("snapshot changed during regenerate: %#v", got)
+	}
 }
 
 func setupRegenerateRouter(h *TaskHandler) *gin.Engine {

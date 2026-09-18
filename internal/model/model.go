@@ -101,9 +101,10 @@ const (
 
 // Source type constants.
 const (
-	SourceGroup  = 1
-	SourceThread = 2
-	SourceDirect = 3
+	SourceGroup    = 1
+	SourceThread   = 2
+	SourceDirect   = 3
+	SourceDocument = 4
 )
 
 // Origin channel type constants.
@@ -242,6 +243,8 @@ type SummarySource struct {
 	SourceType    int    `gorm:"column:source_type;type:tinyint;not null;uniqueIndex:uk_summary_source_task_type_id" json:"source_type"`
 	SourceID      string `gorm:"column:source_id;type:varchar(64);not null;uniqueIndex:uk_summary_source_task_type_id" json:"source_id"`
 	SourceName    string `gorm:"column:source_name;type:varchar(200);not null;default:''" json:"source_name"`
+	SourceVersion string `gorm:"column:source_version;type:varchar(128);not null;default:''" json:"source_version,omitempty"`
+	SourceHash    string `gorm:"column:source_hash;type:char(64);not null;default:''" json:"source_hash,omitempty"`
 	ParticipantID *int64 `gorm:"column:participant_id;index:idx_participant_id" json:"participant_id"`
 	// R9 P1 (PR #190): 1 = row written by worker source backfill from the
 	// pipeline's auto-selected channels. Such rows are excluded from every
@@ -254,6 +257,23 @@ type SummarySource struct {
 }
 
 func (SummarySource) TableName() string { return "summary_source" }
+
+// SummarySourceSnapshot is immutable authorization-time input captured for a
+// document source. The row is retained while its summary is live and is removed
+// when that summary is soft-deleted; deleting the source physically also cascades.
+// Workers consume this row instead of retaining a user's token or re-reading a
+// document that may have changed after task creation.
+type SummarySourceSnapshot struct {
+	ID              int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	SummarySourceID int64     `gorm:"column:summary_source_id;not null;uniqueIndex:uk_summary_source_snapshot" json:"summary_source_id"`
+	Content         string    `gorm:"column:content;type:mediumtext;not null" json:"-"`
+	ContentBytes    int       `gorm:"column:content_bytes;not null" json:"content_bytes"`
+	ContentHash     string    `gorm:"column:content_hash;type:char(64);not null" json:"content_hash"`
+	Truncated       bool      `gorm:"column:truncated;type:tinyint;not null;default:0" json:"truncated"`
+	CreatedAt       time.Time `gorm:"column:created_at;not null" json:"created_at"`
+}
+
+func (SummarySourceSnapshot) TableName() string { return "summary_source_snapshot" }
 
 // SummaryParticipant represents a participant in a by-person task.
 type SummaryParticipant struct {
@@ -300,15 +320,18 @@ type Citation struct {
 	// frontend sees a consistent bot flag across endpoints. Included in
 	// JSON unconditionally so the frontend can filter by it — a `false`
 	// value is meaningful (this sender is confirmed not a bot).
-	SenderIsBot   bool         `json:"sender_is_bot"`
-	Content       string       `json:"content"`
-	SentAt        string       `json:"sent_at"`
-	Source        string       `json:"source"`
-	ChannelID     string       `json:"channel_id"`
-	ChannelType   int          `json:"channel_type"`
-	MessageSeq    int64        `json:"message_seq"`
-	ContextBefore []ContextMsg `json:"context_before,omitempty"`
-	ContextAfter  []ContextMsg `json:"context_after,omitempty"`
+	SenderIsBot     bool         `json:"sender_is_bot"`
+	Content         string       `json:"content"`
+	SentAt          string       `json:"sent_at"`
+	Source          string       `json:"source"`
+	ChannelID       string       `json:"channel_id"`
+	ChannelType     int          `json:"channel_type"`
+	MessageSeq      int64        `json:"message_seq"`
+	DocumentID      string       `json:"document_id,omitempty"`
+	DocumentVersion string       `json:"document_version,omitempty"`
+	DocumentChunk   int          `json:"document_chunk,omitempty"`
+	ContextBefore   []ContextMsg `json:"context_before,omitempty"`
+	ContextAfter    []ContextMsg `json:"context_after,omitempty"`
 }
 
 // ContextMsg represents a surrounding message used as context for a citation.

@@ -30,6 +30,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -205,6 +206,9 @@ func loadWorkspacePreviewForSave(
 	normalizedScope, err = hydrateSummaryWorkspaceContextFromPreview(normalizedScope, &message, userID)
 	if err != nil {
 		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: preview effective scope is invalid", errWorkspacePreviewSaveStale)
+	}
+	if len(normalizedScope.Documents) > 0 {
+		return workspacePreviewSaveCandidate{}, service.NewBizError(40001, "文档总结请通过工作流自动保存，暂不支持保存预览", http.StatusBadRequest)
 	}
 
 	return workspacePreviewSaveCandidate{

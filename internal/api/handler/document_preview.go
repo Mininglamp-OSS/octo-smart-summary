@@ -163,7 +163,7 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 	// slot) and BEFORE the fetch and the completion — the two expensive steps. See
 	// document_preview_limit.go for why this caps concurrency rather than rate, and
 	// for the honest statement of what a per-process counter does and does not buy.
-	releaseSlot, admitted := documentPreviewLimiterInstance.acquire(userID)
+	releaseSlot, admitted := documentSummaryLimiterInstance.acquire(userID)
 	if !admitted {
 		log.Printf("[handler] preview rejected, per-user in-flight cap reached doc=%q user=%q space=%q", ref.DocumentID, userID, spaceID)
 		c.Header("Retry-After", "1")

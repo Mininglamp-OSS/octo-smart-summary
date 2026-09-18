@@ -235,6 +235,44 @@ func TestCreateAgentSummary_DeriveOriginSkipsUnusableRows(t *testing.T) {
 	}
 }
 
+func TestCreateAgentSummary_LegacySaveRejectsDocumentSource(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	r := setupAgentSummaryRouter(h)
+
+	sessionID := "session-legacy-document-source"
+	if err := db.Create(&model.AgentMessage{
+		UserID: "test-user", SessionID: sessionID,
+		Role: "assistant", Content: "Legacy save content.",
+	}).Error; err != nil {
+		t.Fatalf("seed assistant message: %v", err)
+	}
+
+	w := postAgentSave(r, map[string]interface{}{
+		"session_id":          sessionID,
+		"title":               "Legacy document source",
+		"origin_channel_id":   "CH-ORIGIN",
+		"origin_channel_type": model.SourceGroup,
+		"sources":             []map[string]interface{}{{"source_type": model.SourceDocument, "source_id": "doc-9"}},
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 rejecting legacy document source save, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp apiResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v; body=%s", err, w.Body.String())
+	}
+	if resp.Code != 40001 {
+		t.Fatalf("response code=%d, want 40001; body=%s", resp.Code, w.Body.String())
+	}
+	var taskCount, sourceCount int64
+	db.Model(&model.SummaryTask{}).Where("creator_id = ?", "test-user").Count(&taskCount)
+	db.Model(&model.SummarySource{}).Where("source_type = ?", model.SourceDocument).Count(&sourceCount)
+	if taskCount != 0 || sourceCount != 0 {
+		t.Fatalf("rejected legacy save must not persist task/source, tasks=%d sources=%d", taskCount, sourceCount)
+	}
+}
+
 // TestCreateAgentSummary_DeriveOriginNoSourcesStill40001: referenced task
 // with NO summary_source rows (legacy/erased data) still dead-ends in 40001 —
 // the fail-closed contract is unchanged for genuinely origin-less summaries.

@@ -750,6 +750,14 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 
 	// Build specified sources for pipeline
 	specifiedSources := explicitSpecifiedSources(sources)
+	if documentSourcesOnly(sources) {
+		// The personal pipeline loads and verifies snapshots with its resolved
+		// tokenizer budget. Avoid materializing every MEDIUMTEXT row twice here.
+		return nil
+	}
+	if hasDocumentSource(sources) {
+		return fmt.Errorf("document sources cannot be mixed with chat sources")
+	}
 
 	// Fetch messages via pipeline. Tool-call / raw LLM uses in this (fetch) path
 	// are accounted under the same task_no, so they appear in the same per-run

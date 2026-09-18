@@ -2364,6 +2364,33 @@ func TestAddMembers_TaskCompleted_Allowed(t *testing.T) {
 	}
 }
 
+func TestAddMembers_DocumentSummaryRejected(t *testing.T) {
+	db := setupMembersTestDB(t)
+	taskID := seedMultiPersonTask(t, db)
+	if err := db.Where("task_id = ?", taskID).Delete(&model.SummarySource{}).Error; err != nil {
+		t.Fatalf("clear sources: %v", err)
+	}
+	if err := db.Create(&model.SummarySource{TaskID: taskID, SourceType: model.SourceDocument, SourceID: "doc-1"}).Error; err != nil {
+		t.Fatalf("seed document source: %v", err)
+	}
+	h := NewPersonalHandler(db, "", nil)
+	r := setupPersonalEditRouter(h)
+
+	w := doJSONRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/members", taskID), "creator1", map[string]interface{}{
+		"user_ids": []string{"newcomer1"},
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 adding members to document summary, got %d: %s", w.Code, w.Body.String())
+	}
+	assertBizCode(t, w, 40001)
+
+	var count int64
+	db.Model(&model.SummaryParticipant{}).Where("task_id = ? AND user_id = ?", taskID, "newcomer1").Count(&count)
+	if count != 0 {
+		t.Fatalf("document summary rejection must not add participant, got %d", count)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // P1 (fixer-104): PersonalEdit check-order + GET empty-space fail-closed gate.
 //

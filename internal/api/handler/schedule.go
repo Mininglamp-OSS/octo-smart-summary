@@ -93,6 +93,15 @@ var (
 	errRebindConcurrentModified = errors.New("scope=task concurrent rebind detected, please retry")
 )
 
+func rejectDocumentScheduleSources(sources []sourceReq) *service.BizError {
+	for _, source := range sources {
+		if source.SourceType == model.SourceDocument {
+			return service.NewBizError(40001, "文档总结暂不支持定时更新", http.StatusBadRequest)
+		}
+	}
+	return nil
+}
+
 // isMySQLDuplicateKey reports whether err is (or wraps) a MySQL 1062 duplicate key.
 func isMySQLDuplicateKey(err error) bool {
 	if err == nil {
@@ -136,6 +145,16 @@ func loadTaskParticipantCount(tx *gorm.DB, taskID int64) (int64, error) {
 		return 0, err
 	}
 	return participantCount, nil
+}
+
+func taskHasDocumentSource(tx *gorm.DB, taskID int64) (bool, error) {
+	var count int64
+	if err := tx.Model(&model.SummarySource{}).
+		Where("task_id = ? AND source_type = ?", taskID, model.SourceDocument).
+		Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 // participantsSubsetOfCreator reports whether every configured participant is the creator
@@ -481,6 +500,11 @@ func loadBoundTaskForScheduleUpdate(tx *gorm.DB, lockedSched model.SummarySchedu
 	if task.CreatorID != userID {
 		return model.SummaryTask{}, service.NewBizError(40004, "无权限修改", http.StatusForbidden)
 	}
+	if hasDocumentSource, err := taskHasDocumentSource(tx, task.ID); err != nil {
+		return model.SummaryTask{}, err
+	} else if hasDocumentSource {
+		return model.SummaryTask{}, service.NewBizError(40001, "文档总结暂不支持定时更新", http.StatusBadRequest)
+	}
 	return task, nil
 }
 
@@ -554,6 +578,10 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 
 	var sourceConfig model.JSON
 	if len(req.Sources) > 0 {
+		if biz := rejectDocumentScheduleSources(req.Sources); biz != nil {
+			bizErr(c, biz)
+			return
+		}
 		b, _ := json.Marshal(req.Sources)
 		sourceConfig = b
 	}
@@ -1285,9 +1313,12 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		// Only rewrite source_config when the caller explicitly sends sources.
 		// A nil req.Sources on a task-scope edit (title/cadence) must not silently
 		// rewrite — or, for a zero-source Agent task, empty — an existing
-		// schedule's persisted config (PR#248 review P1-4).
-		if req.Sources != nil {
-			sources, hadStored, err := scheduleTaskSources(tx, task, req.Sources)
+	// schedule's persisted config (PR#248 review P1-4).
+	if req.Sources != nil {
+		if biz := rejectDocumentScheduleSources(req.Sources); biz != nil {
+			return biz
+		}
+		sources, hadStored, err := scheduleTaskSources(tx, task, req.Sources)
 			if err != nil {
 				return err
 			}
@@ -1564,6 +1595,11 @@ func loadTaskForTaskScope(tx *gorm.DB, spaceID, userID string, taskID int64, fea
 	}
 	if task.CreatorID != userID {
 		return model.SummaryTask{}, service.NewBizError(40004, "仅创建者可绑定定时", http.StatusForbidden)
+	}
+	if hasDocumentSource, err := taskHasDocumentSource(tx, task.ID); err != nil {
+		return model.SummaryTask{}, err
+	} else if hasDocumentSource {
+		return model.SummaryTask{}, service.NewBizError(40001, "文档总结暂不支持定时更新", http.StatusBadRequest)
 	}
 	// Refuse binding a schedule to a multi-person task (same measure as the worker guard);
 	// otherwise the scheduler would skip it every cycle, leaving a silently dead timer.

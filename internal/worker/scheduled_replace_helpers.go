@@ -69,6 +69,9 @@ func buildScheduledTaskSources(tx *gorm.DB, imDB *gorm.DB, taskID int64, raw mod
 		if src.SourceID == "" {
 			return fmt.Errorf("scheduled source_id is required")
 		}
+		if src.SourceType == model.SourceDocument {
+			return service.NewBizError(40001, "文档总结暂不支持定时更新", http.StatusBadRequest)
+		}
 		// Always resolve the canonical source name from the IM DB; never trust a
 		// client-supplied source_name (the schedule-management UI can submit a raw
 		// group_no/thread id as the "name", e.g. "groupNo____shortId"). Resolving

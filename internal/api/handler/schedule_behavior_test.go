@@ -40,6 +40,7 @@ func newScheduleTestDB(t *testing.T) *gorm.DB {
 		&model.SummarySchedule{},
 		&model.SummaryParticipant{},
 		&model.SummarySource{},
+		&model.SummarySourceSnapshot{},
 		&model.SummaryResult{},
 		&model.SummaryChunk{},
 		&model.PersonalResult{},
@@ -150,6 +151,58 @@ func TestCreateSchedule_RejectsAnchorModeMismatch(t *testing.T) {
 	}
 }
 
+func TestCreateSchedule_RejectsDocumentSource(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouter(db)
+	taskID := seedScheduleTask(t, db, "TDOC", "s1", "u1")
+
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID, "interval_days": 1, "run_time": "09:00",
+		"sources": []map[string]interface{}{{"source_type": model.SourceDocument, "source_id": "doc-1"}},
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 rejecting document schedule source, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateSchedule_RejectsDocumentTaskBinding(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouter(db)
+	taskID := seedScheduleTask(t, db, "TDOC-BIND", "s1", "u1")
+	source := model.SummarySource{
+		TaskID:        taskID,
+		SourceType:    model.SourceDocument,
+		SourceID:      "doc-1",
+		SourceName:    "方案",
+		SourceVersion: "v1",
+		SourceHash:    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}
+	if err := db.Create(&source).Error; err != nil {
+		t.Fatalf("seed document source: %v", err)
+	}
+	if err := db.Create(&model.SummarySourceSnapshot{
+		SummarySourceID: source.ID,
+		Content:         "snapshot",
+		ContentBytes:    len("snapshot"),
+		ContentHash:     source.SourceHash,
+	}).Error; err != nil {
+		t.Fatalf("seed document snapshot: %v", err)
+	}
+
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID, "interval_days": 1, "run_time": "09:00",
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 rejecting document task binding, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var scheduleCount int64
+	db.Model(&model.SummarySchedule{}).Where("id > 0").Count(&scheduleCount)
+	if scheduleCount != 0 {
+		t.Fatalf("document task binding must not create schedule, got %d", scheduleCount)
+	}
+}
+
 func TestCreateSchedule_BindsUnscheduledTask(t *testing.T) {
 	db := newScheduleTestDB(t)
 	r := newScheduleTestRouter(db)
@@ -167,6 +220,104 @@ func TestCreateSchedule_BindsUnscheduledTask(t *testing.T) {
 	}
 	if task.ScheduleID == nil {
 		t.Fatal("task should be bound to a schedule after create")
+	}
+}
+
+func TestUpdateSchedule_RejectsDocumentSource(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouter(db)
+	taskID := seedScheduleTask(t, db, "TDOC-UPD", "s1", "u1")
+
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID, "interval_days": 1, "run_time": "09:00",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create schedule: %d %s", w.Code, w.Body.String())
+	}
+	var task model.SummaryTask
+	if err := db.First(&task, taskID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if task.ScheduleID == nil {
+		t.Fatal("task should be bound to a schedule")
+	}
+
+	w = scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(*task.ScheduleID), map[string]interface{}{
+		"sources": []map[string]interface{}{{"source_type": model.SourceDocument, "source_id": "doc-1"}},
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 rejecting document schedule source update, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestUpdateSchedule_RejectsLegacyDocumentBoundTask(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouter(db)
+	taskID := seedScheduleTask(t, db, "TDOC-LEGACY-UPD", "s1", "u1")
+
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID, "interval_days": 1, "run_time": "09:00",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create schedule: %d %s", w.Code, w.Body.String())
+	}
+	var task model.SummaryTask
+	if err := db.First(&task, taskID).Error; err != nil || task.ScheduleID == nil {
+		t.Fatalf("load bound task: task=%#v err=%v", task, err)
+	}
+	if err := db.Create(&model.SummarySource{TaskID: taskID, SourceType: model.SourceDocument, SourceID: "doc-1"}).Error; err != nil {
+		t.Fatalf("seed legacy document source: %v", err)
+	}
+
+	w = scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(*task.ScheduleID), map[string]interface{}{
+		"interval_days": 2,
+	})
+	if w.Code != http.StatusBadRequest || respCode(t, w) != 40001 {
+		t.Fatalf("legacy document schedule update = %d %s, want 400/40001", w.Code, w.Body.String())
+	}
+	var schedule model.SummarySchedule
+	if err := db.First(&schedule, *task.ScheduleID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if schedule.IntervalDays != 1 {
+		t.Fatalf("rejected update changed interval_days to %d", schedule.IntervalDays)
+	}
+}
+
+func TestToggleSchedule_RejectsLegacyDocumentBoundTaskActivation(t *testing.T) {
+	db := newScheduleTestDB(t)
+	r := newScheduleTestRouter(db)
+	taskID := seedScheduleTask(t, db, "TDOC-LEGACY-TOGGLE", "s1", "u1")
+
+	w := scheduleReq(t, r, "u1", "s1", http.MethodPost, "/api/v1/summary-schedules", map[string]interface{}{
+		"scope": "task", "task_id": taskID, "interval_days": 1, "run_time": "09:00",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create schedule: %d %s", w.Code, w.Body.String())
+	}
+	var task model.SummaryTask
+	if err := db.First(&task, taskID).Error; err != nil || task.ScheduleID == nil {
+		t.Fatalf("load bound task: task=%#v err=%v", task, err)
+	}
+	if err := db.Create(&model.SummarySource{TaskID: taskID, SourceType: model.SourceDocument, SourceID: "doc-1"}).Error; err != nil {
+		t.Fatalf("seed legacy document source: %v", err)
+	}
+	if err := db.Model(&model.SummarySchedule{}).Where("id = ?", *task.ScheduleID).Update("is_active", 0).Error; err != nil {
+		t.Fatalf("deactivate legacy schedule: %v", err)
+	}
+
+	w = scheduleReq(t, r, "u1", "s1", http.MethodPut, "/api/v1/summary-schedules/"+sid(*task.ScheduleID)+"/toggle", map[string]interface{}{
+		"is_active": true,
+	})
+	if w.Code != http.StatusBadRequest || respCode(t, w) != 40001 {
+		t.Fatalf("legacy document schedule activation = %d %s, want 400/40001", w.Code, w.Body.String())
+	}
+	var schedule model.SummarySchedule
+	if err := db.First(&schedule, *task.ScheduleID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if schedule.IsActive != 0 {
+		t.Fatalf("rejected activation changed is_active to %d", schedule.IsActive)
 	}
 }
 
@@ -235,6 +386,13 @@ func TestDeleteSummary_CreatorCascadeDeletesOwnSchedule(t *testing.T) {
 	var task model.SummaryTask
 	db.First(&task, taskID)
 	schedID := *task.ScheduleID
+	source := model.SummarySource{TaskID: taskID, SourceType: model.SourceDocument, SourceID: "d_1"}
+	if err := db.Create(&source).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.SummarySourceSnapshot{SummarySourceID: source.ID, Content: "snapshot", ContentBytes: 8, ContentHash: "hash"}).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	// Creator deletes their own summary -> the schedule is cascade soft-deleted.
 	w = scheduleReq(t, r, "u1", "s1", http.MethodDelete, "/api/v1/summaries/"+sid(taskID), nil)
@@ -247,6 +405,10 @@ func TestDeleteSummary_CreatorCascadeDeletesOwnSchedule(t *testing.T) {
 	}
 	if sched.DeletedAt == nil {
 		t.Error("schedule should be cascade soft-deleted by its creator")
+	}
+	var snapshotCount int64
+	if err := db.Model(&model.SummarySourceSnapshot{}).Count(&snapshotCount).Error; err != nil || snapshotCount != 0 {
+		t.Fatalf("snapshot count=%d err=%v, want zero after schedule group deletion", snapshotCount, err)
 	}
 }
 
