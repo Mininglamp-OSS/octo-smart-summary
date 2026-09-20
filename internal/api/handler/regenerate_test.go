@@ -5,6 +5,7 @@ package handler
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/gin-gonic/gin"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -75,6 +77,129 @@ func TestRegenerateDocumentSummaryKeepsOriginalSnapshot(t *testing.T) {
 	}
 	if got.Content != snapshot.Content || got.ContentHash != snapshot.ContentHash {
 		t.Fatalf("snapshot changed during regenerate: %#v", got)
+	}
+}
+
+func TestDocumentSummaryRejectsSourceReplacementWithoutDeletingSnapshot(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		method string
+		path   func(int64) string
+	}{
+		{name: "regenerate", method: http.MethodPost, path: func(id int64) string {
+			return fmt.Sprintf("/api/v1/summaries/%d/regenerate", id)
+		}},
+		{name: "generation config", method: http.MethodPut, path: func(id int64) string {
+			return fmt.Sprintf("/api/v1/summaries/%d/generation-config", id)
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			db := setupRegenerateDB(t)
+			taskID, source, snapshot := seedDocumentSnapshotForRegenerate(t, db)
+			installSummarySourceSnapshotCascade(t, db)
+
+			h := NewTaskHandler(db, nil, "")
+			r := setupRegenerateRouter(h)
+			r.PUT("/api/v1/summaries/:id/generation-config", h.SaveGenerationConfig)
+			w := doJSONRequest(r, tt.method, tt.path(taskID), "creator1", map[string]interface{}{
+				"sources": []sourceReq{{SourceType: model.SourceGroup, SourceID: "grp_replacement"}},
+			})
+			if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), documentSummarySourceReplacementMessage) {
+				t.Fatalf("response = %d %s", w.Code, w.Body.String())
+			}
+			assertDocumentSnapshotState(t, db, taskID, source, snapshot)
+		})
+	}
+}
+
+func TestSaveGenerationScopeRejectsDocumentSourceReplacementAtWriteBoundary(t *testing.T) {
+	db := setupRegenerateDB(t)
+	taskID, source, snapshot := seedDocumentSnapshotForRegenerate(t, db)
+	installSummarySourceSnapshotCascade(t, db)
+
+	h := NewTaskHandler(db, nil, "")
+	replacement := []sourceReq{{SourceType: model.SourceGroup, SourceID: "grp_replacement"}}
+	err := db.Transaction(func(tx *gorm.DB) error {
+		var task model.SummaryTask
+		if err := tx.First(&task, taskID).Error; err != nil {
+			return err
+		}
+		return h.saveGenerationScope(tx, task, regenerateReq{Sources: &replacement})
+	})
+	var bizErr *service.BizError
+	if !errors.As(err, &bizErr) || bizErr.Code != 40001 || bizErr.Message != documentSummarySourceReplacementMessage {
+		t.Fatalf("error = %#v", err)
+	}
+	assertDocumentSnapshotState(t, db, taskID, source, snapshot)
+}
+
+func seedDocumentSnapshotForRegenerate(t *testing.T, db *gorm.DB) (int64, model.SummarySource, model.SummarySourceSnapshot) {
+	t.Helper()
+	taskID, _, _ := seedCompletedTask(t, db)
+	var source model.SummarySource
+	if err := db.Where("task_id = ?", taskID).First(&source).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&source).Updates(map[string]interface{}{
+		"source_type":    model.SourceDocument,
+		"source_id":      "d_1",
+		"source_name":    "设计文档",
+		"source_version": "v3",
+		"source_hash":    "hash-v3",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	snapshot := model.SummarySourceSnapshot{
+		SummarySourceID: source.ID,
+		Content:         "原始版本正文",
+		ContentBytes:    len([]byte("原始版本正文")),
+		ContentHash:     "hash-v3",
+	}
+	if err := db.Create(&snapshot).Error; err != nil {
+		t.Fatal(err)
+	}
+	return taskID, source, snapshot
+}
+
+func installSummarySourceSnapshotCascade(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	if err := db.Exec(`CREATE TRIGGER summary_source_snapshot_delete_cascade
+		AFTER DELETE ON summary_source
+		BEGIN
+			DELETE FROM summary_source_snapshot WHERE summary_source_id = OLD.id;
+		END`).Error; err != nil {
+		t.Fatalf("install snapshot cascade trigger: %v", err)
+	}
+}
+
+func assertDocumentSnapshotState(
+	t *testing.T,
+	db *gorm.DB,
+	taskID int64,
+	wantSource model.SummarySource,
+	wantSnapshot model.SummarySourceSnapshot,
+) {
+	t.Helper()
+	var task model.SummaryTask
+	if err := db.First(&task, taskID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != model.StatusCompleted {
+		t.Fatalf("task status = %d, want completed", task.Status)
+	}
+	var sources []model.SummarySource
+	if err := db.Where("task_id = ?", taskID).Find(&sources).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 1 || sources[0].ID != wantSource.ID || sources[0].SourceType != model.SourceDocument || sources[0].SourceID != "d_1" {
+		t.Fatalf("document source changed: %#v", sources)
+	}
+	var snapshot model.SummarySourceSnapshot
+	if err := db.First(&snapshot, wantSnapshot.ID).Error; err != nil {
+		t.Fatalf("snapshot was deleted: %v", err)
+	}
+	if snapshot.Content != wantSnapshot.Content || snapshot.ContentHash != wantSnapshot.ContentHash {
+		t.Fatalf("snapshot changed: %#v", snapshot)
 	}
 }
 

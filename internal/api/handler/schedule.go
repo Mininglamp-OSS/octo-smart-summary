@@ -1313,12 +1313,12 @@ func (h *ScheduleHandler) UpdateSchedule(c *gin.Context) {
 		// Only rewrite source_config when the caller explicitly sends sources.
 		// A nil req.Sources on a task-scope edit (title/cadence) must not silently
 		// rewrite — or, for a zero-source Agent task, empty — an existing
-	// schedule's persisted config (PR#248 review P1-4).
-	if req.Sources != nil {
-		if biz := rejectDocumentScheduleSources(req.Sources); biz != nil {
-			return biz
-		}
-		sources, hadStored, err := scheduleTaskSources(tx, task, req.Sources)
+		// schedule's persisted config (PR#248 review P1-4).
+		if req.Sources != nil {
+			if biz := rejectDocumentScheduleSources(req.Sources); biz != nil {
+				return biz
+			}
+			sources, hadStored, err := scheduleTaskSources(tx, task, req.Sources)
 			if err != nil {
 				return err
 			}

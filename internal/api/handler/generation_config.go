@@ -17,6 +17,8 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+const documentSummarySourceReplacementMessage = "文档总结不支持更换来源"
+
 // Agent titles are display metadata, not evidence of the original instruction.
 // Resolve only the saved instruction or the selected message's owned run.
 func generationRequirement(db *gorm.DB, task model.SummaryTask) string {
@@ -71,6 +73,15 @@ func (h *TaskHandler) validateRegenerationConfigDB(c *gin.Context, db *gorm.DB, 
 		// so a caller-supplied set on a scheduled task is validated-for-
 		// nothing here and DROPPED there, never written (PR#251 review P2).
 		req.Sources = nil
+	}
+	if req.Sources != nil {
+		hasDocumentSource, err := taskHasDocumentSource(db, task.ID)
+		if err != nil {
+			return err
+		}
+		if hasDocumentSource {
+			return service.NewBizError(40001, documentSummarySourceReplacementMessage, http.StatusBadRequest)
+		}
 	}
 	limit := maxSummaryTopicRunes
 	if task.TriggerType == model.TriggerAgent {
@@ -207,6 +218,15 @@ func (h *TaskHandler) saveGenerationScope(tx *gorm.DB, task model.SummaryTask, r
 				return err
 			}
 			writeSources = false
+		}
+	}
+	if writeSources {
+		hasDocumentSource, err := taskHasDocumentSource(tx, task.ID)
+		if err != nil {
+			return err
+		}
+		if hasDocumentSource {
+			return service.NewBizError(40001, documentSummarySourceReplacementMessage, http.StatusBadRequest)
 		}
 	}
 	if req.TimeRange != nil {
