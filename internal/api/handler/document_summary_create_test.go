@@ -83,6 +83,38 @@ func TestCreateDocumentSummaryPersistsNormalizedSnapshots(t *testing.T) {
 	}
 }
 
+func TestCreateDocumentSummaryAppliesLimitAfterDuplicateNormalization(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	client := &recordingDocumentSourceClient{docs: map[string]*documentSummarySource{
+		"d_1": {DocumentID: "d_1", Title: "方案", Version: "v1", Content: "文档正文"},
+	}}
+	h := NewTaskHandler(db, imDB, "")
+	h.documentClient = client
+	sources := make([]map[string]interface{}, service.MaxDocumentSummarySourceCount+1)
+	for i := range sources {
+		sources[i] = map[string]interface{}{
+			"source_type": model.SourceDocument,
+			"source_id":   "d_1",
+		}
+	}
+
+	w := doCreateSummary(setupCreateRouter(h), map[string]interface{}{
+		"title":   "文档总结",
+		"sources": sources,
+	}, "creator1")
+	if w.Code != http.StatusOK || respCode(t, w) != 0 {
+		t.Fatalf("create response = %d %s", w.Code, w.Body.String())
+	}
+
+	var count int64
+	if err := db.Model(&model.SummarySource{}).Where("source_type = ?", model.SourceDocument).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("document source count = %d, want 1", count)
+	}
+}
+
 func TestSummaryWorkspaceDocumentWorkflowPersistsSnapshots(t *testing.T) {
 	db, imDB := setupTestDBs(t)
 	if err := db.AutoMigrate(

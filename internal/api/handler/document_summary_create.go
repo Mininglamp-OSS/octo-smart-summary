@@ -50,9 +50,6 @@ func (h *TaskHandler) prepareDocumentSummarySources(
 	badRequest := func(message string) ([]service.SummaryWorkflowSource, bool, *documentSummaryCreateError) {
 		return nil, true, &documentSummaryCreateError{status: http.StatusBadRequest, code: 40001, message: message}
 	}
-	if len(req.Sources) > service.MaxDocumentSummarySourceCount {
-		return badRequest("文档来源不能超过10个")
-	}
 	for _, source := range req.Sources {
 		if source.SourceType != model.SourceDocument {
 			return badRequest("文档总结不能混合聊天来源")
@@ -89,12 +86,12 @@ func prepareDocumentSummarySourcesFromRefs(
 	badRequest := func(message string) ([]service.SummaryWorkflowSource, *documentSummaryCreateError) {
 		return nil, &documentSummaryCreateError{status: http.StatusBadRequest, code: 40001, message: message}
 	}
-	if len(refs) > service.MaxDocumentSummarySourceCount {
-		return badRequest("文档来源不能超过10个")
-	}
 	refs = normalizeDocumentRefs(refs)
 	if len(refs) == 0 {
 		return badRequest("document_id is required")
+	}
+	if len(refs) > service.MaxDocumentSummarySourceCount {
+		return badRequest("文档来源不能超过10个")
 	}
 	if err := validateDocumentRefs(refs); err != nil {
 		return badRequest(err.Error())
