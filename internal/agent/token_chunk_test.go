@@ -303,39 +303,36 @@ func TestSplitClosesChunkSize201to500Route(t *testing.T) {
 	}
 }
 
-// TestChunkTokenBudgetCliffGuard is round-3's cliff guard (yujiawei P2-4,
-// review 4960791240): a resolved Map budget in the cliff band
-// [mapSystemPromptReserve+1, minSaneMapMaxTokens) — e.g. MAP_MAX_TOKENS=801 →
-// usable budget 1 token — splits one message per chunk, turning a 100k-message
-// invocation into 100k sequential LLM calls. The guard mirrors the worker-path
-// precedent @yujiawei cited (internal/worker/personal_processor.go:
-// `if maxTokens < 10000 { ... using default 100000 }`, logged loudly) and
-// SUPERSEDES the round-1 P2-2 expectation that a low-but-positive setting
-// (MAP_MAX_TOKENS=1500 → 700 usable) must be preserved: round-3's cliff
-// finding takes precedence, and the fallback is logged, not silent.
-func TestChunkTokenBudgetCliffGuard(t *testing.T) {
-	defaultBudget := fallbackMapMaxTokens - mapSystemPromptReserve
-	cases := []struct {
-		name       string
-		mapMax     int
-		wantBudget int
-	}{
-		{"zero config -> global default", 0, defaultBudget},
-		{"cliff 801 -> loud fallback", 801, defaultBudget},
-		{"low positive 1500 -> loud fallback", 1500, defaultBudget},
-		{"sub-reserve 500 -> loud fallback", 500, defaultBudget},
-		{"just below floor -> loud fallback", minSaneMapMaxTokens - 1, defaultBudget},
-		{"at floor preserved", minSaneMapMaxTokens, minSaneMapMaxTokens - mapSystemPromptReserve},
-		{"healthy explicit preserved", 50000, 50000 - mapSystemPromptReserve},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			cfg := config.Config{MapMaxTokens: c.mapMax}
-			if got := chunkTokenBudget(cfg); got != c.wantBudget {
-				t.Fatalf("chunkTokenBudget(MapMaxTokens=%d) = %d, want %d", c.mapMax, got, c.wantBudget)
-			}
-		})
-	}
+// TestChunkTokenBudgetDelegates checks the agent Map path returns the shared
+// window - reserve budget (the reserve now includes the completion budget,
+// LLMMaxToken, that shares the window — #241), and that a window too small for
+// the reserve is floored to a positive budget rather than splitting one message
+// per chunk. The exhaustive boundary/monotonicity cases live in
+// config.TestResolveMapInputBudget.
+func TestChunkTokenBudgetDelegates(t *testing.T) {
+	const llmMax = 8192
+
+	t.Run("healthy window: window - reserve", func(t *testing.T) {
+		cfg := config.Config{MapMaxTokens: 50000, LLMMaxToken: llmMax}
+		want := 50000 - cfg.MapWindowReserve()
+		if got := chunkTokenBudget(cfg); got != want {
+			t.Fatalf("chunkTokenBudget = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("window too small for reserve: floored, not inflated", func(t *testing.T) {
+		// 10000 - (3000+8192) < 0: floored to the minimum positive budget (no
+		// one-message-per-chunk), and the declared 10000 window is NOT inflated
+		// to the default. Exact floor value is asserted in the config test.
+		cfg := config.Config{MapMaxTokens: 10000, LLMMaxToken: llmMax}
+		got := chunkTokenBudget(cfg)
+		if got <= 0 {
+			t.Fatalf("chunkTokenBudget = %d, want a positive floored budget", got)
+		}
+		if got >= 50000 {
+			t.Fatalf("chunkTokenBudget = %d — the small window was inflated, not floored", got)
+		}
+	})
 }
 
 // TestFormatAndSplitShareOneWireFormat guards the P0-1 invariant structurally:

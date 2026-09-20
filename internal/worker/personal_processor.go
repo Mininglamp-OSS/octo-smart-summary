@@ -111,11 +111,8 @@ const noRelevantContentMessage = pipeline.NoRelevantContentMessage
 const noSelfMessagesMessage = pipeline.NoSelfMessagesMessage
 
 const (
-	personalMapSystemPromptTokens      = 3000
 	personalMapMessageFormattingTokens = 15
 	documentEvidenceHeaderTokenReserve = 256
-	minimumSupportedWorkerMapTokens    = 10000
-	fallbackWorkerMapTokens            = 100000
 )
 
 // decidePersonalMessages is a compatibility wrapper around pipeline.DecideMessages.
@@ -848,12 +845,8 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	}
 	tok := tokenizer.New(p.cfg.LLMModel, tokCfg)
 	resolvedMapMaxTokens := p.cfg.ResolveMapMaxTokens()
-	if resolvedMapMaxTokens < minimumSupportedWorkerMapTokens {
-		log.Printf("[config] resolved MapMaxTokens=%d too small, using default %d", resolvedMapMaxTokens, fallbackWorkerMapTokens)
-		resolvedMapMaxTokens = fallbackWorkerMapTokens
-	}
-	effectiveMapMaxTokens := resolvedMapMaxTokens - personalMapSystemPromptTokens
-	documentContentTokenBudget := effectiveMapMaxTokens - personalMapMessageFormattingTokens - documentEvidenceHeaderTokenReserve
+	mapInputTokenBudget := p.cfg.ResolveMapInputBudget()
+	documentContentTokenBudget := mapInputTokenBudget - personalMapMessageFormattingTokens - documentEvidenceHeaderTokenReserve
 
 	specifiedSources := explicitSpecifiedSources(sources)
 
@@ -1064,9 +1057,6 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		reportStage(model.WorkflowStageAnalyzeChatContent)
 	}
 
-	// System prompt overhead (same as used in chunking)
-	const systemPromptTokens = personalMapSystemPromptTokens
-
 	// Calculate total tokens for all messages
 	var allContent strings.Builder
 	for _, m := range userMessages {
@@ -1086,15 +1076,26 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	if mapMaxTokens > 0 && mapMaxTokens < skipThreshold {
 		skipThreshold = mapMaxTokens
 	}
-	effectiveSkipThreshold := skipThreshold - systemPromptTokens
+	// Reserve the shared system-prompt + completion budget from the window, so
+	// a single-shot summary's input leaves room for its own response (#241).
+	// Floored at 0 (never negative): a window smaller than the reserve just means
+	// "never skip", consistent with the chunk-budget floor and warned once at Load.
+	effectiveSkipThreshold := skipThreshold - p.cfg.MapWindowReserve()
+	if effectiveSkipThreshold < 0 {
+		effectiveSkipThreshold = 0
+	}
 	skipMapReduce := tok.IsExact() && estimatedTotalTokens <= effectiveSkipThreshold
 	if skipMapReduce {
 		log.Printf("[personal-worker] skip Map-Reduce: totalTokens=%d <= threshold=%d (exact=%v)",
 			estimatedTotalTokens, effectiveSkipThreshold, tok.IsExact())
 	}
 
-	// Token-aware chunking — resolve budget via explicit config / per-model default / global fallback
-	effectiveMax := effectiveMapMaxTokens
+	// Token-aware chunking — the input budget (window minus the shared
+	// system-prompt + completion reserve, floored) comes from the same helper the
+	// agent path uses, so the two Map paths cannot drift and effectiveMax is never
+	// non-positive (#241). A window too small for the reserve is warned once at
+	// config.Load, not here per task.
+	effectiveMax := mapInputTokenBudget
 
 	var chunks [][]pipeline.Message
 	var currentChunk []pipeline.Message

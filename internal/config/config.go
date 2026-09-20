@@ -220,7 +220,7 @@ func Load() *Config {
 	}
 	maxTimeRangeDays := envInt("MAX_TIME_RANGE_DAYS", maxTimeRangeDefault)
 
-	return &Config{
+	cfg := &Config{
 		MySQLDSN:   envStr("MYSQL_DSN", ""),
 		IMMySQLDSN: envStr("IM_MYSQL_DSN", ""),
 
@@ -304,6 +304,17 @@ func Load() *Config {
 		AppEnv:              envStr("APP_ENV", "dev"),
 		MaxNotifyAttempts:   envInt("MAX_NOTIFY_ATTEMPTS", 3),
 	}
+
+	// Static token-budget sanity, surfaced ONCE here rather than per Map call:
+	// if the window cannot hold the system-prompt + completion reserve plus a
+	// minimal input, every Map/skip call will pack a floored input and overflow
+	// the model context. Warn (not fatal) — degrade-and-log matches the rest of
+	// Load; the fix is an operator config change.
+	if !cfg.MapWindowFitsReserve() {
+		log.Printf("[config] WARNING: Map window %d (MAP_MAX_TOKENS/per-model default) cannot hold the reserve %d (system prompt %d + LLM_MAX_TOKENS %d) plus a minimal %d-token input; Map calls will overflow the model context. Raise MAP_MAX_TOKENS or lower LLM_MAX_TOKENS.",
+			cfg.ResolveMapMaxTokens(), cfg.MapWindowReserve(), MapSystemPromptReserve, cfg.LLMMaxToken, minMapInputBudget)
+	}
+	return cfg
 }
 
 func ValidateRequired(fields map[string]string) {
@@ -422,6 +433,61 @@ var modelMapThresholds = []modelThreshold{
 }
 
 const defaultMapMaxTokens = 100000
+
+// MapSystemPromptReserve is the tokens held back from the Map context-window
+// budget (ResolveMapMaxTokens) for the fixed Map/summarize system prompt. It is
+// shared by BOTH Map paths — the agent's summarize_chunk (internal/agent
+// chunkTokenBudget) and the worker's Map chunking (internal/worker) — via
+// ResolveMapInputBudget, so they reserve identically. Before #241 the two paths
+// used different values (agent 800, worker 3000); unified here at the more
+// conservative of the two.
+const MapSystemPromptReserve = 3000
+
+// minMapInputBudget is the smallest usable per-chunk INPUT budget. A configured
+// window that cannot hold MapWindowReserve plus this is treated as a degenerate
+// operator setting and falls back to the default window (see
+// ResolveMapInputBudget); the packer never runs with a non-positive budget.
+const minMapInputBudget = 2000
+
+// MapWindowReserve is the total budget to subtract from ResolveMapMaxTokens
+// (which is treated as the model's context window) so a chunk's INPUT leaves
+// room for both the system prompt AND the completion the same call produces:
+// LLMMaxToken output shares the one context window (#241 item 3). Both Map
+// paths must reserve this, or an input packed to nearly the whole window leaves
+// no room for the up-to-LLMMaxToken response and the call is rejected/truncated.
+func (c *Config) MapWindowReserve() int {
+	return MapSystemPromptReserve + c.LLMMaxToken
+}
+
+// ResolveMapInputBudget returns the per-chunk INPUT token budget the Map phase
+// may pack — the context window (ResolveMapMaxTokens) minus MapWindowReserve
+// (system prompt + completion) — shared by both Map paths so they compute the
+// same budget. It floors the result at minMapInputBudget so the packer never
+// runs with a non-positive budget; it deliberately does NOT substitute a
+// different window for a small one, so an operator's declared window is honored
+// and the budget is monotonic in it.
+//
+// The floor supersedes the earlier "window < 10000 → default 100000" cliff
+// guard: that guard existed only to stop a ~1-token budget from splitting one
+// message per chunk, which the floor now prevents WITHOUT inflating an
+// explicitly-configured small window (inflating would overflow a genuinely
+// small-context model). A window too small to hold the reserve is a static
+// misconfiguration surfaced once by MapWindowFitsReserve at Load, not per call.
+func (c *Config) ResolveMapInputBudget() int {
+	budget := c.ResolveMapMaxTokens() - c.MapWindowReserve()
+	if budget < minMapInputBudget {
+		budget = minMapInputBudget
+	}
+	return budget
+}
+
+// MapWindowFitsReserve reports whether the configured Map window can hold the
+// reserve (system prompt + completion) plus a minimal input. When false the
+// window is too small for the current LLM_MAX_TOKENS and every Map/skip call
+// will overflow it — a static config property Load warns about once.
+func (c *Config) MapWindowFitsReserve() bool {
+	return c.ResolveMapMaxTokens()-c.MapWindowReserve() >= minMapInputBudget
+}
 
 const (
 	// defaultAgentMapConcurrency is the agent Map-phase fan-out default.
