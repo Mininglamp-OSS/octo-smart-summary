@@ -826,13 +826,23 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		return "", nil, 0, 0, "", fmt.Errorf("load sources: %w", err)
 	}
 	documentMode := documentSourcesOnly(sources)
-	if !documentMode {
+	mixedMode := mixedHasDocumentSource(sources)
+	if !documentMode && !mixedMode {
 		for _, source := range sources {
 			if source.SourceType == model.SourceDocument {
 				return "", nil, 0, 0, "", fmt.Errorf("document sources cannot be mixed with chat sources")
 			}
 		}
 	}
+	chatSources, documentSources := splitMixedSources(sources)
+	if mixedMode && (len(chatSources) == 0 || len(documentSources) == 0) {
+		// Mixed orchestration is only for a true mixture; an empty side means
+		// the persisted rows are inconsistent with mixedHasDocumentSource.
+		return "", nil, 0, 0, "", fmt.Errorf("mixed task persisted without both source classes")
+	}
+	// Document snapshot evidence for mixed mode, loaded once and appended
+	// after the chat-side citation numbering below.
+	var mixedDocumentEvidence []pipeline.Message
 
 	// Resolve the tokenizer and Map budget before loading document snapshots so
 	// each generated evidence message is guaranteed to fit the same budget used
@@ -848,7 +858,14 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	mapInputTokenBudget := p.cfg.ResolveMapInputBudget()
 	documentContentTokenBudget := mapInputTokenBudget - personalMapMessageFormattingTokens - documentEvidenceHeaderTokenReserve
 
-	specifiedSources := explicitSpecifiedSources(sources)
+	// Chat-side fetch constraints carry ONLY chat sources: document IDs are
+	// not channels and must never enter channel discovery/coverage validation
+	// (plan §4.4 来源分流). In mixed mode the workspace coverage check would
+	// reject a document id as "unavailable channel" and abort the task.
+	fetchSpecifiedSources := explicitSpecifiedSources(sources)
+	if mixedMode {
+		fetchSpecifiedSources = explicitSpecifiedSources(chatSources)
+	}
 
 	// Unified LLM tool-call callback (shared by all Function Call sites).
 	// purpose is derived from forceFn so the report says what each call did
@@ -887,7 +904,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		messages, intentResult, err = p.fetchPersonalMessagesFn(ctx, task, userID)
 	} else {
 		messages, intentResult, err = pipeline.ResolveAndFetchMessagesForPersonal(
-			ctx, userID, nil, nil, specifiedSources, task.EffectiveTopic(),
+			ctx, userID, nil, nil, fetchSpecifiedSources, task.EffectiveTopic(),
 			task.TimeRangeStart, task.TimeRangeEnd,
 			p.imDB, p.octoClient, p.cfg.MessageFetchBackend, toolCallFn, llmFn,
 			p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency, p.cfg.OctoSearchPollSec,
@@ -897,6 +914,20 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	timing.Observe(taskNo, "fetch_messages", fetchStart)
 	if err != nil {
 		return "", nil, 0, 0, "", fmt.Errorf("fetch messages: %w", err)
+	}
+
+	if mixedMode {
+		// Mixed orchestration: load document snapshot evidence NOW (chat
+		// numbering happens later, after the context-window filter), then
+		// append with continuing citation indexes so both evidence classes
+		// share one numbering pool across Map/Reduce (plan §4.4). Snapshot
+		// load failure is hard: creation already verified snapshot presence,
+		// so a missing snapshot at execution time is corruption (plan §3.4).
+		loaded, loadErr := loadDocumentEvidence(p.db, documentSources, tok, documentContentTokenBudget)
+		if loadErr != nil {
+			return "", nil, 0, 0, "", fmt.Errorf("load mixed document evidence: %w", loadErr)
+		}
+		mixedDocumentEvidence = loaded
 	}
 
 	// Record message retrieval stats
@@ -1052,6 +1083,22 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	if documentMode {
 		targetMsgCount = len(sources)
 	}
+	if mixedMode {
+		// Mixed: append document evidence after the chat numbering so the two
+		// classes share ONE citation pool (plan §4.4 证据编号). Chat messages
+		// keep their just-assigned indexes; document chunks continue from the
+		// next free index. Chat-side cleaning/filtering above has already run
+		// and must not touch document rows (they carry no user sender).
+		documentStartIndex := citIdx // next free index after chat messages
+		appended, appendErr := appendDocumentEvidence(userMessages, documentSources,
+			func(sources []model.SummarySource) ([]pipeline.Message, error) {
+				return mixedDocumentEvidence, nil
+			}, documentStartIndex)
+		if appendErr != nil {
+			return "", nil, 0, 0, "", fmt.Errorf("append mixed document evidence: %w", appendErr)
+		}
+		userMessages = appended
+	}
 
 	if reportStage != nil {
 		reportStage(model.WorkflowStageAnalyzeChatContent)
@@ -1139,6 +1186,9 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		endTime = ""
 	}
 	sourceName := sourceNameForGeneration(sources)
+	if mixedMode {
+		sourceName = mixedSourceLabel(chatSources, documentSources)
+	}
 
 	// Determine userName: use target's name when topic points to someone else
 	var userName string
@@ -1164,6 +1214,8 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		for _, m := range userMessages {
 			if documentMode {
 				formatted = append(formatted, formatDocumentEvidence(m))
+			} else if mixedMode {
+				formatted = append(formatted, formatMixedEvidence(m))
 			} else {
 				formatted = append(formatted, fmt.Sprintf("[%d][%s] %s: %s",
 					m.CitationIndex, m.SendTime, m.SenderName,
@@ -1180,6 +1232,9 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		var err error
 		if documentMode {
 			finalContent, totalTokens, modelVer, err = p.llm.CallDocumentMapStreamWithModel(ctx,
+				joinStrings(formatted), sourceName, 0, len(userMessages), generationTopic, streamDelta)
+		} else if mixedMode {
+			finalContent, totalTokens, modelVer, err = p.llm.CallMixedMapStreamWithModel(ctx,
 				joinStrings(formatted), sourceName, 0, len(userMessages), generationTopic, streamDelta)
 		} else {
 			finalContent, totalTokens, modelVer, err = p.llm.CallMapStreamWithModel(ctx,
@@ -1241,6 +1296,8 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 				for _, m := range c {
 					if documentMode {
 						formatted = append(formatted, formatDocumentEvidence(m))
+					} else if mixedMode {
+						formatted = append(formatted, formatMixedEvidence(m))
 					} else {
 						formatted = append(formatted, fmt.Sprintf("[%d][%s] %s: %s",
 							m.CitationIndex, m.SendTime, m.SenderName,
@@ -1256,6 +1313,9 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 				if len(chunks) == 1 && documentMode {
 					summary, tokens, usedModel, err = p.llm.CallDocumentMapStreamWithModel(ctx,
 						joinStrings(formatted), sourceName, idx, len(c), generationTopic, streamDelta)
+				} else if len(chunks) == 1 && mixedMode {
+					summary, tokens, usedModel, err = p.llm.CallMixedMapStreamWithModel(ctx,
+						joinStrings(formatted), sourceName, idx, len(c), generationTopic, streamDelta)
 				} else if len(chunks) == 1 {
 					summary, tokens, usedModel, err = p.llm.CallMapStreamWithModel(ctx,
 						joinStrings(formatted), sourceName, idx, len(c),
@@ -1263,6 +1323,9 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 					)
 				} else if documentMode {
 					summary, tokens, usedModel, err = p.llm.CallDocumentMapWithModel(ctx,
+						joinStrings(formatted), sourceName, idx, len(c), generationTopic)
+				} else if mixedMode {
+					summary, tokens, usedModel, err = p.llm.CallMixedMapWithModel(ctx,
 						joinStrings(formatted), sourceName, idx, len(c), generationTopic)
 				} else {
 					summary, tokens, usedModel, err = p.llm.CallMapWithModel(ctx,
@@ -1332,6 +1395,9 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 			reduceCallStart := time.Now()
 			if documentMode {
 				finalContent, reduceTokens, modelVer, err = p.llm.CallDocumentReduceStreamWithModel(ctx,
+					chunkSummaries, sourceName, len(userMessages), generationTopic, streamDelta)
+			} else if mixedMode {
+				finalContent, reduceTokens, modelVer, err = p.llm.CallMixedReduceStreamWithModel(ctx,
 					chunkSummaries, sourceName, len(userMessages), generationTopic, streamDelta)
 			} else {
 				finalContent, reduceTokens, modelVer, err = p.llm.CallReduceStreamWithModel(ctx,
