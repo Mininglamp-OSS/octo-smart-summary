@@ -97,7 +97,7 @@ func aggregateCoverage(t *testing.T, inputCount, requestedChunkSize int) chunkCo
 	t.Helper()
 	msgMaps := makeMsgMaps(inputCount)
 	size := clampChunkSize(requestedChunkSize)
-	processed, dropped, _ := ProbeChunkCoverageDefault(msgMaps, requestedChunkSize)
+	processed, dropped, _, _ := ProbeChunkCoverageDefault(msgMaps, requestedChunkSize)
 
 	cov := chunkCoverage{InputCount: inputCount, ChunkSize: size}
 	cov.ProcessedCount = processed

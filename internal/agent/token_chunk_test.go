@@ -114,9 +114,12 @@ func TestSplitOversizedMessageOwnChunk(t *testing.T) {
 // any input size, zero drop.
 func TestProbeCoverageNoDrop(t *testing.T) {
 	for _, n := range []int{201, 500, 2000, 12345} {
-		p, d, chunks := ProbeChunkCoverageDefault(makeMsgMaps(n), 0)
+		p, d, chunks, capped := ProbeChunkCoverageDefault(makeMsgMaps(n), 0)
 		if p != n || d != 0 {
 			t.Fatalf("ProbeChunkCoverageDefault(%d) = processed %d dropped %d, want %d/0", n, p, d, n)
+		}
+		if capped != 0 {
+			t.Fatalf("ProbeChunkCoverageDefault(%d) = capped %d, want 0 (no fan-out cap at this size)", n, capped)
 		}
 		if chunks < 1 {
 			t.Fatalf("ProbeChunkCoverageDefault(%d) = %d chunks, want >= 1", n, chunks)
@@ -365,7 +368,7 @@ func TestFormatAndSplitShareOneWireFormat(t *testing.T) {
 // assert the probe counts chunks and lines honestly instead of by arithmetic.
 func TestProbeChunkCoverageDetectsCapRegression(t *testing.T) {
 	msgs := makeMsgMaps(500)
-	processed, dropped, chunks := ProbeChunkCoverageDefault(msgs, 0)
+	processed, dropped, chunks, _ := ProbeChunkCoverageDefault(msgs, 0)
 	if processed != 500 || dropped != 0 {
 		t.Fatalf("ProbeChunkCoverageDefault(500 msgs) = processed %d dropped %d, want 500/0", processed, dropped)
 	}
@@ -375,7 +378,7 @@ func TestProbeChunkCoverageDetectsCapRegression(t *testing.T) {
 
 	// Tighten the count cap via the requested chunk_size: still zero loss, but
 	// the probe must reflect the real (more numerous) chunking, not a formula.
-	processed, dropped, chunksTight := ProbeChunkCoverageDefault(msgs, 50)
+	processed, dropped, chunksTight, _ := ProbeChunkCoverageDefault(msgs, 50)
 	if processed != 500 || dropped != 0 {
 		t.Fatalf("chunk_size=50: processed %d dropped %d, want 500/0", processed, dropped)
 	}
@@ -384,5 +387,35 @@ func TestProbeChunkCoverageDetectsCapRegression(t *testing.T) {
 	}
 	if chunksTight <= chunks && chunks > 1 {
 		t.Fatalf("tighter chunk_size should not reduce chunk count: %d vs %d", chunksTight, chunks)
+	}
+}
+
+// TestProbeChunkCoverageReflectsFanOutCap is the golden case for the #256 fan-out
+// cap: the SS-02 probe must SEE the cap (chunks reported post-cap, the capped-out
+// tail surfaced) AND classify it as INTENTIONAL, not silent loss. With
+// chunk_size=1 every message is its own chunk, so maxChunkCalls+overflow messages
+// split into more chunks than capChunks keeps. The capped tail shows up in both
+// dropped and the dedicated capped count, so dropped-capped==0 — the SS-02 gate
+// (harness.NoSilentLoss) treats a disclosed cap as no loss, matching production
+// where CappedDroppedCount is kept out of the silent-loss signal (#256 P2). A
+// genuine splitter regression would instead push dropped above capped and fire.
+func TestProbeChunkCoverageReflectsFanOutCap(t *testing.T) {
+	const overflow = 44
+	msgs := makeMsgMaps(maxChunkCalls + overflow) // one message per chunk at chunk_size=1
+	processed, dropped, chunks, capped := ProbeChunkCoverageDefault(msgs, 1)
+	if chunks != maxChunkCalls {
+		t.Fatalf("chunks = %d, want %d (probe must report the POST-cap count)", chunks, maxChunkCalls)
+	}
+	if processed != maxChunkCalls {
+		t.Fatalf("processed = %d, want %d (only the kept chunks are covered)", processed, maxChunkCalls)
+	}
+	if dropped != overflow {
+		t.Fatalf("dropped = %d, want %d — the fan-out cap is invisible to the probe", dropped, overflow)
+	}
+	if capped != overflow {
+		t.Fatalf("capped = %d, want %d — the cap must be surfaced separately so the gate can treat it as intentional", capped, overflow)
+	}
+	if dropped-capped != 0 {
+		t.Fatalf("dropped-capped = %d, want 0 — a disclosed cap must not read as silent loss", dropped-capped)
 	}
 }

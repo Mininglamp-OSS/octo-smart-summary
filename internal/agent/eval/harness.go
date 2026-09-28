@@ -80,11 +80,21 @@ func LoadGoldenCases(dir string) ([]GoldenCase, error) {
 // over msgMaps built from the case's messages, so it validates the shipped
 // path end-to-end (PR #196 review P1-2).
 type CoverageMetric struct {
-	InputCount     int  `json:"input_count"`
-	ProcessedCount int  `json:"processed_count"`
-	DroppedCount   int  `json:"dropped_count"`
-	Chunks         int  `json:"chunks"`
-	NoSilentLoss   bool `json:"no_silent_loss"`
+	InputCount     int `json:"input_count"`
+	ProcessedCount int `json:"processed_count"`
+	// TotalDroppedCount is the probe's TOTAL drop, INCLUDING the intentional
+	// fan-out cap. This deliberately differs from production
+	// chunkCoverage.DroppedCount, which excludes the cap (that lives in
+	// CappedDroppedCount) — hence the distinct name and json tag, so an eval
+	// report can never be read as if it used the production field's semantics.
+	TotalDroppedCount int `json:"total_dropped_count"`
+	// CappedDroppedCount is the subset of TotalDroppedCount attributable to the
+	// fan-out cap alone (only when the cap fired).
+	CappedDroppedCount int `json:"capped_dropped_count"`
+	Chunks             int `json:"chunks"`
+	// NoSilentLoss is TotalDroppedCount minus the disclosed cap == 0: a disclosed
+	// cap is not silent loss, a splitter/formatter regression still is.
+	NoSilentLoss bool `json:"no_silent_loss"`
 }
 
 // Coverage runs the funnel for a case at the default chunk_size (0 → default).
@@ -97,13 +107,20 @@ func Coverage(gc GoldenCase) CoverageMetric {
 			"citation_index": i + 1,
 		}
 	}
-	processed, dropped, chunks := agent.ProbeChunkCoverageDefault(msgMaps, 0)
+	processed, dropped, chunks, capped := agent.ProbeChunkCoverageDefault(msgMaps, 0)
 	return CoverageMetric{
-		InputCount:     len(gc.Messages),
-		ProcessedCount: processed,
-		DroppedCount:   dropped,
-		Chunks:         chunks,
-		NoSilentLoss:   dropped == 0,
+		InputCount:         len(gc.Messages),
+		ProcessedCount:     processed,
+		TotalDroppedCount:  dropped,
+		CappedDroppedCount: capped,
+		Chunks:             chunks,
+		// The fan-out cap is INTENTIONAL and disclosed, so it is not silent loss:
+		// subtract it, matching production where CappedDroppedCount is kept out of
+		// the silent-loss signal. capped counts ONLY the cap-removed tail (probe
+		// gates it on the cap actually firing), so a genuine splitter/formatter
+		// regression — which loses messages the cap never touched — still makes
+		// (dropped-capped) go non-zero and fails the gate (#256 P2).
+		NoSilentLoss: dropped-capped == 0,
 	}
 }
 
@@ -191,8 +208,8 @@ func Evaluate(gc GoldenCase) CaseReport {
 func (r CaseReport) String() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "case=%s\n", r.Name)
-	fmt.Fprintf(&b, "  coverage: input=%d processed=%d dropped=%d chunks=%d no_silent_loss=%t\n",
-		r.Coverage.InputCount, r.Coverage.ProcessedCount, r.Coverage.DroppedCount, r.Coverage.Chunks, r.Coverage.NoSilentLoss)
+	fmt.Fprintf(&b, "  coverage: input=%d processed=%d total_dropped=%d capped=%d chunks=%d no_silent_loss=%t\n",
+		r.Coverage.InputCount, r.Coverage.ProcessedCount, r.Coverage.TotalDroppedCount, r.Coverage.CappedDroppedCount, r.Coverage.Chunks, r.Coverage.NoSilentLoss)
 	fmt.Fprintf(&b, "  citation: total=%d valid=%d out_of_range=%v all_resolvable=%t\n",
 		r.Citation.Total, r.Citation.Valid, r.Citation.OutOfRange, r.Citation.AllResolvable)
 	fmt.Fprintf(&b, "  format:   missing_sections=%v language_ok=%t adherent=%t",
