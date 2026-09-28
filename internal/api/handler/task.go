@@ -391,6 +391,27 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		})
 	}
 	workflowInput.Sources = make([]service.SummaryWorkflowSource, 0, len(req.Sources))
+	// Acquire the per-user in-flight slot BEFORE the document fetch, matching
+	// the sibling workspace path (agent_summary_workspace.go acquire→fetch).
+	// The limiter caps CONCURRENCY (see document_preview_limit.go): moving it
+	// to the far side of the fan-out would let one account fire N×(up to 10)
+	// upstream FetchSummarySource calls before any 429 — the amplifier this
+	// control exists to stop. Gate-off mixed rejection still returns a clean
+	// 400 here: it happens inside prepareDocumentSummarySources before any
+	// fetch, so the slot is held only for the instant of the check and
+	// released by defer; no upstream call is made for an inadmissible request.
+	hasDocumentSource := createSummaryHasDocumentSource(req)
+	var releaseSlot func()
+	if hasDocumentSource {
+		var admitted bool
+		releaseSlot, admitted = documentSummaryLimiterInstance.acquire(userID)
+		if !admitted {
+			c.Header("Retry-After", "1")
+			c.JSON(http.StatusTooManyRequests, apiResponse{Code: 42902, Message: "文档总结请求过于频繁，请稍后重试"})
+			return
+		}
+		defer releaseSlot()
+	}
 	documentSources, documentMode, documentErr := h.prepareDocumentSummarySources(c.Request.Context(), c.Request.Header, spaceID, userID, req)
 	if documentErr != nil {
 		if documentErr.retryAfter != "" {
@@ -398,22 +419,6 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		}
 		c.JSON(documentErr.status, apiResponse{Code: documentErr.code, Message: documentErr.message})
 		return
-	}
-	// The limiter slot is acquired only AFTER prepareDocumentSummarySources has
-	// accepted the request (and only when documents are actually present). A
-	// mixed request rejected at gate-off inside prepareDocumentSummarySources
-	// returns early above without ever holding a slot, so an inadmissible
-	// request gets the clean contract 400 instead of a 429/42902 when the user
-	// is already at the in-flight cap — the same wrong-error class the gate
-	// rejection was added to remove.
-	if documentMode {
-		releaseSlot, admitted := documentSummaryLimiterInstance.acquire(userID)
-		if !admitted {
-			c.Header("Retry-After", "1")
-			c.JSON(http.StatusTooManyRequests, apiResponse{Code: 42902, Message: "文档总结请求过于频繁，请稍后重试"})
-			return
-		}
-		defer releaseSlot()
 	}
 	if documentMode {
 		// Documents were fetched. mergeMixedWorkflowSources keeps the chat

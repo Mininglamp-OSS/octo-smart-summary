@@ -82,13 +82,15 @@ func (h *TaskHandler) prepareDocumentSummarySources(
 		}
 	} else if !service.MixedSourcesAdmissionEnabled() {
 		// Gate OFF (default until the worker executor lands): reject the mixed
-		// request HERE, before the limiter slot (acquired in CreateSummary only
-		// after this function accepts the request) and the per-document fetch,
-		// so a request that was never going to be admitted does not burn a
-		// rate-limiter slot or upstream Docs calls (and does not surface a 502
-		// when Docs is down instead of the clean contract 400). This mirrors
-		// the service-layer gate in validateDocumentWorkflowInput, but at the
-		// HTTP entry where the fetch would otherwise already have happened.
+		// request HERE, before the per-document fetch, so a request that was
+		// never going to be admitted does not burn upstream Docs calls (and
+		// does not surface a 502 when Docs is down instead of the clean
+		// contract 400). This mirrors the service-layer gate in
+		// validateDocumentWorkflowInput, but at the HTTP entry where the fetch
+		// would otherwise already have happened. (The limiter slot is already
+		// held at this point — acquired ahead of the fetch in CreateSummary —
+		// and is released by its defer; the point of the early reject is to
+		// skip the fetch itself, not the slot.)
 		return badRequest("文档总结不能混合聊天来源")
 	}
 

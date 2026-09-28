@@ -214,6 +214,44 @@ func TestSummaryWorkspaceDocumentWorkflowSharesAdmissionLimit(t *testing.T) {
 	}
 }
 
+// The legacy create path must acquire the per-user document slot BEFORE the
+// document fetch (mirroring the workspace sibling path) — otherwise a full
+// slot would not stop the upstream FetchSummarySource fan-out. Occupying the
+// slot up-front must produce a 42902 and zero fetch calls.
+func TestCreateSummaryDocumentSharesAdmissionLimit(t *testing.T) {
+	previous := documentSummaryLimiterInstance
+	documentSummaryLimiterInstance = newDocumentSummaryLimiter(1)
+	t.Cleanup(func() { documentSummaryLimiterInstance = previous })
+
+	release, ok := documentSummaryLimiterInstance.acquire("creator-limit")
+	if !ok {
+		t.Fatal("failed to occupy document summary slot")
+	}
+	defer release()
+
+	db, imDB := setupTestDBs(t)
+	client := &recordingDocumentSourceClient{
+		docs: map[string]*documentSummarySource{},
+		errs: map[string]error{"d_1": errors.New("fetch must not run while admission is full")},
+	}
+	h := NewTaskHandler(db, imDB, "")
+	h.documentClient = client
+
+	w := doCreateSummary(setupCreateRouter(h), map[string]interface{}{
+		"sources": []map[string]interface{}{
+			{"source_type": model.SourceDocument, "source_id": "d_1"},
+		},
+	}, "creator-limit")
+	if w.Code != http.StatusTooManyRequests || respCode(t, w) != 42902 {
+		t.Fatalf("response = %d %s", w.Code, w.Body.String())
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.versions) != 0 {
+		t.Fatalf("document fetch ran despite full admission gate: %#v", client.versions)
+	}
+}
+
 func TestSummaryWorkspaceDocumentWorkflowKeepsPersonalOnlyDefense(t *testing.T) {
 	client := &recordingDocumentSourceClient{
 		docs: map[string]*documentSummarySource{},
