@@ -146,7 +146,7 @@
 
 本期只接入用户明确选择来源后的个人 Workflow；不扩展自由 Agent 的文档检索、问答或混合预览工具链。已有预览状态在切换到混选后必须失效；历史纯聊天预览保持原行为。
 
-协议拟以可选能力字段 `mixed_document_chat_sources` 扩展，字段缺失视为 false。现有 `document_sources` 不等价于支持混选。若严格解码器验证表明新增可选字段即可兼容，则维持当前契约版本；否则同步协商版本，不能单侧升级。
+协议以可选能力字段 `mixed_sources` 扩展（实现落地字段名；早期草案记为 `mixed_document_chat_sources`），字段缺失视为 false。现有 `document_sources` 不等价于支持混选。该字段跟踪 `SUMMARY_MIXED_SOURCES_ENABLED` 门禁（默认关），与 worker 执行器 PR 同步开启；前端据此 feature-detect 而非依赖 `contract_version`（契约版本不因该可选增量字段而升级）。若严格解码器验证表明新增可选字段即可兼容，则维持当前契约版本；否则同步协商版本，不能单侧升级。
 
 ### 4.3 创建与持久化
 
