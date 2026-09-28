@@ -448,6 +448,40 @@ func TestSummarizeChunksConcurrently_FatalChunkErrorAborts(t *testing.T) {
 	}
 }
 
+// Under recovery-first ANY failure aborts, so "aborts" alone no longer pins that
+// ErrRequestTooLarge is FATAL. The observable difference is classification: a
+// fatal cause must win over a lower-index transient (isFatalChunkError short-
+// circuits the walk), so the invocation classifies non-retryable+fatal instead of
+// retryable. This mutation-kills removing ErrRequestTooLarge from isFatalChunkError
+// (#256 r9 P1, re-pinned at r12).
+func TestSummarizeChunksConcurrently_FatalWinsOverLowerIndexTransient(t *testing.T) {
+	for _, concurrency := range []int{1, 3} {
+		t.Run(fmt.Sprintf("concurrency=%d", concurrency), func(t *testing.T) {
+			withMapConcurrency(t, concurrency)
+			withStubMapCall(t, func(_ context.Context, chunk []map[string]interface{}, _ string) (string, int, int, error) {
+				switch chunk[0]["content"].(string) {
+				case "chunk-0":
+					return "", 0, 0, errors.New("rate limited: status 429") // lower-index transient
+				case "chunk-1":
+					return "", 0, 0, service.ErrRequestTooLarge // higher-index fatal
+				}
+				return "s", 1, 0, nil
+			})
+
+			var cov chunkCoverage
+			_, err := summarizeChunksConcurrently(context.Background(), makeChunks(3), "", &cov)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			// The fatal cause must drive classification, not the lower-index 429.
+			env := classifyToolError("summarize_chunk", err)
+			if env.Retryable || !env.Fatal || env.ErrorCode != "REQUEST_TOO_LARGE" {
+				t.Fatalf("fatal ErrRequestTooLarge must win over the lower-index transient; got %+v (err %v)", env, err)
+			}
+		})
+	}
+}
+
 // TestFinalizeDropCounts pins the handler's coverage arithmetic (#256 round-7
 // P2-1/P2-5): DroppedCount is accidental loss only (input − processed − capped),
 // but Truncated — the loudest model-facing boolean — flags ANY real gap, so a
