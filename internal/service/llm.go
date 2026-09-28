@@ -25,6 +25,56 @@ const kimiRequiredTemperature = 0.6
 
 const maxLLMErrorBodyBytes = 4096
 
+// MaxRequestBodyBytes is a coarse defense-in-depth ceiling on the serialized
+// request body (#241 item 1). The real over-budget case is prevented
+// structurally upstream by token-aware chunking (#241 item 3); this only stops
+// a pathological single oversized message from being sent — so it fails fast
+// with a clear error here instead of reactively as an upstream context-length
+// error. Exported so the agent planner client (agent/llm.go) shares it.
+//
+// Sized at 2× the agent per-request summary-handle text cap (8 MiB =
+// agent.maxSummaryHandleText). merge_summaries joins up to that much text into
+// ONE Reduce prompt. Outbound bodies are serialized with MarshalRequestBody,
+// which disables Go's HTML escaping (#256 P2-5), so &<> cost one byte each rather
+// than the 6-byte \u00XX json.Marshal would emit — a near-cap Reduce made almost
+// entirely of those metacharacters can no longer inflate ~6× and trip
+// REQUEST_TOO_LARGE on the critical merge_summaries tool, discarding a successful
+// Map phase. It does NOT remove all inflation: the encoder still escapes U+2028 /
+// U+2029 unconditionally (3 UTF-8 bytes → a 6-byte escape), so the worst case is
+// ~2×, not 1× — an 8 MiB body made entirely of line/paragraph separators still
+// approaches the ceiling before framing. That input is not something real chat
+// produces (those runes are vanishingly rare in messages), so the 2× headroom
+// covers realistic Reduce bodies plus framing; token-aware chunking (#241 item 3)
+// remains the structural prevention and this ceiling is the coarse backstop.
+const MaxRequestBodyBytes = 16 << 20 // 16 MiB (2× agent.maxSummaryHandleText; coarse backstop, not a worst-case guarantee)
+
+// MarshalRequestBody serializes an outbound chat request body WITHOUT Go's
+// default HTML escaping. json.Marshal rewrites the three metacharacters < > &
+// into their six-byte backslash-u escape forms, which is meaningless for an
+// application/json API body (that escaping only matters when embedding JSON
+// inside HTML) and inflates the serialized size up to ~6× for metacharacter-heavy
+// content. That inflation is not free: the pre-send size guard (ErrRequestTooLarge)
+// measures these exact bytes, so a completed but metacharacter-heavy Map/Reduce
+// body could be pushed past MaxRequestBodyBytes and the whole run discarded purely
+// by escaping (#256 P2-5). Leaving < > & unescaped is valid JSON per RFC 8259, so
+// the model API parses it fine. Encoder.Encode appends a trailing newline; trim it
+// so the body and the size it is judged by are byte-exact. Exported so the agent
+// planner client shares it.
+func MarshalRequestBody(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+// ErrRequestTooLarge marks a request rejected before sending because its
+// serialized body exceeds MaxRequestBodyBytes. It is terminal — retrying or
+// switching models cannot shrink the same body.
+var ErrRequestTooLarge = errors.New("LLM request body exceeds the size guard")
+
 // ErrReasoningBudgetExhausted marks a response whose reasoning consumed the
 // output budget before producing user-visible content.
 var ErrReasoningBudgetExhausted = errors.New("LLM returned empty content: reasoning consumed entire max_tokens budget")
@@ -304,9 +354,12 @@ func (c *LLMClient) callWithPolicyAndModel(ctx context.Context, messages []ChatM
 		reqBody.Thinking = thinking
 		reqBody.ChatTemplateKwargs = kwargs
 
-		body, err := json.Marshal(reqBody)
+		body, err := MarshalRequestBody(reqBody)
 		if err != nil {
 			return result{}, llmfallback.Terminal, err
+		}
+		if len(body) > MaxRequestBodyBytes {
+			return result{}, llmfallback.Terminal, fmt.Errorf("%w: %d bytes > %d", ErrRequestTooLarge, len(body), MaxRequestBodyBytes)
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL+"/chat/completions", bytes.NewReader(body))
 		if err != nil {
@@ -436,9 +489,12 @@ func (c *LLMClient) callStreamWithModel(ctx context.Context, messages []ChatMess
 		reqBody.Thinking = thinking
 		reqBody.ChatTemplateKwargs = kwargs
 
-		body, err := json.Marshal(reqBody)
+		body, err := MarshalRequestBody(reqBody)
 		if err != nil {
 			return result{}, llmfallback.Terminal, err
+		}
+		if len(body) > MaxRequestBodyBytes {
+			return result{}, llmfallback.Terminal, fmt.Errorf("%w: %d bytes > %d", ErrRequestTooLarge, len(body), MaxRequestBodyBytes)
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL+"/chat/completions", bytes.NewReader(body))
 		if err != nil {
@@ -597,9 +653,12 @@ func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, t
 		reqBody.Thinking = thinking
 		reqBody.ChatTemplateKwargs = kwargs
 
-		body, err := json.Marshal(reqBody)
+		body, err := MarshalRequestBody(reqBody)
 		if err != nil {
 			return result{}, llmfallback.Terminal, fmt.Errorf("marshal request: %w", err)
+		}
+		if len(body) > MaxRequestBodyBytes {
+			return result{}, llmfallback.Terminal, fmt.Errorf("%w: %d bytes > %d", ErrRequestTooLarge, len(body), MaxRequestBodyBytes)
 		}
 
 		attemptCtx, cancel := context.WithTimeout(ctx, c.toolCallTimeout)

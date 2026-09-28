@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 )
 
 // ToolErrorEnvelope is the structured result a failed tool returns to the model
@@ -80,6 +82,15 @@ func classifyToolError(toolName string, err error) ToolErrorEnvelope {
 	var outsideScope *ErrChannelOutsideSelectedScope
 	if errors.As(err, &outsideScope) {
 		env.ErrorCode, env.Retryable, env.Fatal = "CHANNEL_OUTSIDE_SELECTED_SCOPE", false, false
+		return env
+	}
+	// The pre-send size guard (#241): the serialized request exceeds the ceiling.
+	// A static property of this input — retrying the same body or switching
+	// models cannot shrink it — so NOT retryable; fatal for critical tools since
+	// the planner cannot make it smaller by re-calling. Identity-matched (not
+	// substring) so it can never fall through to the retryable default.
+	if errors.Is(err, service.ErrRequestTooLarge) {
+		env.ErrorCode, env.Retryable, env.Fatal = "REQUEST_TOO_LARGE", false, criticalTools[toolName]
 		return env
 	}
 
