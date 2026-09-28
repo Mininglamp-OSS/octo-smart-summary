@@ -1354,11 +1354,10 @@ func deriveWorkspaceRoute(context summaryWorkspaceContext, action service.Summar
 			// instead of silently dropping the chat or skipping the workflow.
 			// The permission result must gate workflow creation (plan §4.3).
 			return service.SummaryRouteClarification
-		case mixedChat && intent == service.SummaryIntentExplain && !hasExplicitRunIntent:
-			// Mixed scopes run the personal workflow; the docs-only
-			// explain-clarification does not apply once chats are present.
-			return service.SummaryRoutePersonalWorkflow
 		case mixedChat:
+			// Mixed scopes run the personal workflow; the docs-only
+			// explain-clarification does not apply once chats are present,
+			// regardless of intent or explicit run flag.
 			return service.SummaryRoutePersonalWorkflow
 		case intent == service.SummaryIntentExplain && !hasExplicitRunIntent:
 			return service.SummaryRouteClarification
@@ -2033,11 +2032,16 @@ func (w *summaryWorkspaceCoordinator) validateWorkspaceScope(ctx context.Context
 		if err != nil {
 			return validation, &summaryWorkspaceScopeLookupError{turnCode: "SOURCE_LOOKUP_FAILED", message: "读取会话权限失败", cause: err}
 		}
-	} else {
-		// Documents-only (or empty) scope: no chat sources to validate. The
-		// per-document authorization happens in prepareDocumentSummarySources
-		// at fetch time, and empty sources are handled by routing.
+	} else if len(value.Documents) > 0 {
+		// Documents-only scope: no chat sources to validate. The per-document
+		// authorization happens in prepareDocumentSummarySources at fetch time.
 		validation.sourcesValid = true
+	} else {
+		// Empty scope (no chats AND no documents): preserve pre-PR routing —
+		// an empty scope is NOT a valid source set, so sourcesValid stays
+		// false and routing falls through to clarification instead of firing
+		// an agent preview on a scope routing already knew was unsummarizable.
+		validation.sourcesValid = false
 	}
 	validation.participantsValid, err = w.validateParticipants(ctx, spaceID, actorID, value.Participants)
 	if err != nil {

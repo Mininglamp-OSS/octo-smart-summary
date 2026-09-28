@@ -160,6 +160,24 @@ func TestValidateWorkspaceScopeDocumentsOnlyShortCircuits(t *testing.T) {
 	}
 }
 
+// An EMPTY scope (no chats AND no documents) must not report sourcesValid=true:
+// it is not a valid source set, and pre-PR routing sent it to clarification
+// rather than firing an agent preview on a scope routing already knew was
+// unsummarizable. This pins the round-2 P1-1 regression fix.
+func TestValidateWorkspaceScopeEmptyScopeIsNotValid(t *testing.T) {
+	coordinator := &summaryWorkspaceCoordinator{store: &AgentWorkspaceStore{}}
+	validation, lookupErr := coordinator.validateWorkspaceScope(
+		context.Background(), "space-1", "user-1",
+		summaryWorkspaceContext{},
+	)
+	if lookupErr != nil {
+		t.Fatalf("lookup error: %v", lookupErr)
+	}
+	if validation.sourcesValid {
+		t.Fatal("empty scope (no chats, no documents) must report sourcesValid=false")
+	}
+}
+
 // deriveWorkspaceRoute: mixed + invalid chat sources → clarification, never a
 // silent workflow.
 func TestDeriveWorkspaceRouteMixedInvalidSourcesClarifies(t *testing.T) {

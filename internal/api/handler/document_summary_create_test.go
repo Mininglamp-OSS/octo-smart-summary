@@ -354,6 +354,119 @@ func TestCreateDocumentSummaryRejectsMixedOrTeamRequests(t *testing.T) {
 	}
 }
 
+// enableMixedAdmission flips the process-wide gate on for the duration of a
+// test and restores the PREVIOUS value afterward (not a hardcoded false), so
+// tests are order-independent and never clobber a gate another test relies on.
+func enableMixedAdmission(t *testing.T) {
+	t.Helper()
+	prev := service.MixedSourcesAdmissionEnabled()
+	service.SetMixedSourcesAdmission(true)
+	t.Cleanup(func() { service.SetMixedSourcesAdmission(prev) })
+}
+
+func TestCreateDocumentSummaryMixedGateOffRejectsBeforeFetchingDocs(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	client := &recordingDocumentSourceClient{docs: map[string]*documentSummarySource{"d_1": {Content: "正文"}}}
+	h := NewTaskHandler(db, imDB, "")
+	h.documentClient = client
+
+	// Gate OFF (default): a mixed request must be rejected at the HTTP entry,
+	// BEFORE any document fetch, so it costs no upstream call or limiter slot.
+	w := doCreateSummary(setupCreateRouter(h), map[string]interface{}{
+		"sources": []map[string]interface{}{
+			{"source_type": model.SourceDocument, "source_id": "d_1"},
+			{"source_type": model.SourceGroup, "source_id": "g_1"},
+		},
+	}, "creator1")
+	if w.Code != http.StatusBadRequest || respCode(t, w) != 40001 {
+		t.Fatalf("response = %d %s", w.Code, w.Body.String())
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.versions) != 0 {
+		t.Fatalf("document fetch ran %d times, want 0 (gate-off must reject before fetch)", len(client.versions))
+	}
+}
+
+func TestCreateDocumentSummaryMixedGateOnPersistsDocumentSnapshot(t *testing.T) {
+	enableMixedAdmission(t)
+	db, imDB := setupTestDBs(t)
+	client := &recordingDocumentSourceClient{docs: map[string]*documentSummarySource{
+		"d_1": {DocumentID: "d_1", Title: "方案", Version: "v1", Content: "文档正文"},
+	}}
+	h := NewTaskHandler(db, imDB, "")
+	h.documentClient = client
+
+	// Gate ON: the legacy HTTP mixed path must persist BOTH classes, with the
+	// document row carrying a non-empty source_hash (its fetched snapshot).
+	w := doCreateSummary(setupCreateRouter(h), map[string]interface{}{
+		"title": "混合总结",
+		"sources": []map[string]interface{}{
+			{"source_type": model.SourceGroup, "source_id": "g_1"},
+			{"source_type": model.SourceDocument, "source_id": "d_1"},
+		},
+	}, "creator1")
+	if w.Code != http.StatusOK || respCode(t, w) != 0 {
+		t.Fatalf("create response = %d %s", w.Code, w.Body.String())
+	}
+
+	var sources []model.SummarySource
+	if err := db.Order("source_type").Find(&sources).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 2 {
+		t.Fatalf("persisted %d sources, want 2 (group + document)", len(sources))
+	}
+	var groupRow, docRow *model.SummarySource
+	for i := range sources {
+		switch sources[i].SourceType {
+		case model.SourceGroup:
+			groupRow = &sources[i]
+		case model.SourceDocument:
+			docRow = &sources[i]
+		}
+	}
+	if groupRow == nil || groupRow.SourceID != "g_1" {
+		t.Fatalf("group source = %#v", groupRow)
+	}
+	if docRow == nil || docRow.SourceID != "d_1" {
+		t.Fatalf("document source = %#v", docRow)
+	}
+	if len(docRow.SourceHash) != 64 {
+		t.Fatalf("document source_hash = %q, want 64-char snapshot hash", docRow.SourceHash)
+	}
+}
+
+func TestCreateDocumentSummaryMixedGateOnRejectsBogusSourceType(t *testing.T) {
+	enableMixedAdmission(t)
+	db, imDB := setupTestDBs(t)
+	client := &recordingDocumentSourceClient{docs: map[string]*documentSummarySource{
+		"d_1": {DocumentID: "d_1", Title: "方案", Version: "v1", Content: "文档正文"},
+	}}
+	h := NewTaskHandler(db, imDB, "")
+	h.documentClient = client
+
+	// Gate ON but source_type 99 is not a valid chat enum: the mixed branch's
+	// whitelist must reject it rather than persisting an arbitrary type.
+	w := doCreateSummary(setupCreateRouter(h), map[string]interface{}{
+		"sources": []map[string]interface{}{
+			{"source_type": 99, "source_id": "x_1"},
+			{"source_type": model.SourceDocument, "source_id": "d_1"},
+		},
+	}, "creator1")
+	if w.Code != http.StatusBadRequest || respCode(t, w) != 40001 {
+		t.Fatalf("response = %d %s", w.Code, w.Body.String())
+	}
+
+	var count int64
+	if err := db.Model(&model.SummarySource{}).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("persisted %d sources, want 0 (bogus type must be rejected before persist)", count)
+	}
+}
+
 func TestMapDocumentSummaryCreateErrorFallback(t *testing.T) {
 	got := mapDocumentSummaryCreateError(errors.New("network"))
 	if got.status != http.StatusBadGateway || got.code != 50202 {

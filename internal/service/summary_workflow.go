@@ -724,6 +724,19 @@ func validateDocumentWorkflowInput(in LegacyCreateSummaryWorkflowInput, sources 
 		if !MixedSourcesAdmissionEnabled() {
 			return NewBizError(40001, "文档总结不能混合聊天来源", http.StatusBadRequest)
 		}
+		// The legacy entry never reaches validateAgentWorkflowSources (its only
+		// caller is createFromAgent), so the mixed branch must be
+		// self-sufficient: whitelist every non-document source type so a bogus
+		// enum (e.g. source_type 99) cannot ride through the mixed path.
+		for _, source := range sources {
+			if source.SourceType == model.SourceDocument {
+				continue
+			}
+			valid := source.SourceType >= model.SourceGroup && source.SourceType <= model.SourceDirect
+			if strings.TrimSpace(source.SourceID) == "" || !valid {
+				return NewBizError(40001, "每个来源需提供 source_id 与合法的 source_type", http.StatusBadRequest)
+			}
+		}
 		// Mixed scope: personal-only, no origin auto-reply. TimeRange is
 		// LEGAL for mixed scopes (it scopes the chat side), so the
 		// documents-only rejection does not fire when chat sources are
