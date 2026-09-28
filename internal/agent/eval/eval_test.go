@@ -33,7 +33,7 @@ func TestGoldenSet(t *testing.T) {
 			// Coverage: the P0 invariant — no snapshot message is silently lost.
 			if !rep.Coverage.NoSilentLoss {
 				t.Errorf("silent loss: input=%d processed=%d dropped=%d",
-					rep.Coverage.InputCount, rep.Coverage.ProcessedCount, rep.Coverage.DroppedCount)
+					rep.Coverage.InputCount, rep.Coverage.ProcessedCount, rep.Coverage.TotalDroppedCount)
 			}
 			if rep.Coverage.ProcessedCount != gc.Expected.MessageCount {
 				t.Errorf("processed=%d, want %d", rep.Coverage.ProcessedCount, gc.Expected.MessageCount)
@@ -80,8 +80,34 @@ func TestCoverageRegressionGuard(t *testing.T) {
 	// 500 input at default chunk_size must feed all 500 to the model.
 	fake := GoldenCase{Messages: make([]GoldenMessage, 500)}
 	cov := Coverage(fake)
-	if cov.DroppedCount != 0 || cov.ProcessedCount != 500 {
+	if cov.TotalDroppedCount != 0 || cov.ProcessedCount != 500 {
 		t.Fatalf("coverage regressed: processed=%d dropped=%d (chunk defaults likely back to 500)",
-			cov.ProcessedCount, cov.DroppedCount)
+			cov.ProcessedCount, cov.TotalDroppedCount)
+	}
+}
+
+// TestCoverageGateExemptsDisclosedCap drives the gate over an input large enough
+// to trip the 256-chunk fan-out cap and pins that a DISCLOSED cap is not counted
+// as silent loss (#256 r8 N4). At the default ~200-msg chunk size, 52000 messages
+// split into 260 chunks; the cap keeps 256 and drops the oldest 4 (800 messages).
+// dropped is therefore non-zero, so a `NoSilentLoss: dropped == 0` reversion would
+// wrongly fail here — the subtraction of the intentional, cap-fired count is what
+// keeps the gate honest.
+func TestCoverageGateExemptsDisclosedCap(t *testing.T) {
+	const n = 52000
+	cov := Coverage(GoldenCase{Messages: make([]GoldenMessage, n)})
+	if cov.Chunks != 256 {
+		t.Fatalf("chunks = %d, want 256 (fan-out cap must bind)", cov.Chunks)
+	}
+	if cov.TotalDroppedCount == 0 || cov.CappedDroppedCount == 0 {
+		t.Fatalf("want a real cap drop, got dropped=%d capped=%d", cov.TotalDroppedCount, cov.CappedDroppedCount)
+	}
+	// All loss here is the intentional cap, so the two counts must match exactly —
+	// no splitter/formatter loss leaked in.
+	if cov.TotalDroppedCount != cov.CappedDroppedCount {
+		t.Fatalf("dropped=%d capped=%d — the whole drop should be the disclosed cap", cov.TotalDroppedCount, cov.CappedDroppedCount)
+	}
+	if !cov.NoSilentLoss {
+		t.Fatalf("a disclosed fan-out cap must NOT fail the no-silent-loss gate; dropped=%d capped=%d", cov.TotalDroppedCount, cov.CappedDroppedCount)
 	}
 }
