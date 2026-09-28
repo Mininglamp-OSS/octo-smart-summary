@@ -171,12 +171,6 @@ type Config struct {
 	// environment rollback; enable per deployment with SUMMARY_WORKBENCH_ENABLED.
 	SummaryWorkbenchEnabled bool
 
-	// SummaryMixedSourcesEnabled gates mixed document+chat creation. Default
-	// false until the worker executor half lands (the executor hard-rejects
-	// mixed scopes today); enable per deployment with
-	// SUMMARY_MIXED_SOURCES_ENABLED in lockstep with the worker follow-up PR.
-	SummaryMixedSourcesEnabled bool
-
 	// Intent recognition shortcut (skip LLM for simple topics)
 	EnableIntentShortcut bool
 
@@ -291,8 +285,6 @@ func Load() *Config {
 		FeatureTeamSchedule: envBool("FEATURE_TEAM_SCHEDULE", true),
 
 		SummaryWorkbenchEnabled: envBool("SUMMARY_WORKBENCH_ENABLED", false),
-
-		SummaryMixedSourcesEnabled: envBool("SUMMARY_MIXED_SOURCES_ENABLED", false),
 
 		EnableIntentShortcut: envBool("ENABLE_INTENT_SHORTCUT", true),
 

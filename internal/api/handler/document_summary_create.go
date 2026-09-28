@@ -50,12 +50,11 @@ func (h *TaskHandler) prepareDocumentSummarySources(
 	badRequest := func(message string) ([]service.SummaryWorkflowSource, bool, *documentSummaryCreateError) {
 		return nil, true, &documentSummaryCreateError{status: http.StatusBadRequest, code: 40001, message: message}
 	}
-	// Mixed document+chat is admitted only when service.MixedSourcesAdmissionEnabled();
-	// the gate is checked HERE (before any fetch) for the mixed case, and again
-	// at validateDocumentWorkflowInput as the service-boundary backstop. This
-	// block also detects whether the request is mixed so the pure-document-only
-	// boundaries (no participants, no time range, no origin channel) are
-	// enforced exactly when there are no chat sources.
+	// Mixed document+chat is admitted unconditionally (the phase-1 gate was
+	// removed when the worker executor landed). This block detects whether the
+	// request is mixed so the pure-document-only boundaries (no participants,
+	// no time range, no origin channel) are enforced exactly when there are no
+	// chat sources.
 	mixedMode := false
 	hasChatSource := false
 	for _, source := range req.Sources {
@@ -80,18 +79,6 @@ func (h *TaskHandler) prepareDocumentSummarySources(
 		if req.OriginChannelID != "" || req.OriginChannelType != 0 {
 			return badRequest("文档总结不支持来源会话")
 		}
-	} else if !service.MixedSourcesAdmissionEnabled() {
-		// Gate OFF (default until the worker executor lands): reject the mixed
-		// request HERE, before the per-document fetch, so a request that was
-		// never going to be admitted does not burn upstream Docs calls (and
-		// does not surface a 502 when Docs is down instead of the clean
-		// contract 400). This mirrors the service-layer gate in
-		// validateDocumentWorkflowInput, but at the HTTP entry where the fetch
-		// would otherwise already have happened. (The limiter slot is already
-		// held at this point — acquired ahead of the fetch in CreateSummary —
-		// and is released by its defer; the point of the early reject is to
-		// skip the fetch itself, not the slot.)
-		return badRequest("文档总结不能混合聊天来源")
 	}
 
 	refs := make([]documentRefReq, 0, len(req.Sources))

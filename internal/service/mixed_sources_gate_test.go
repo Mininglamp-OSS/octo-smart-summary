@@ -8,18 +8,10 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 )
 
-// PR1: service-layer mixed validation (validateDocumentWorkflowInput runs on
-// BOTH create paths — legacy HTTP and agent workspace — so mixed admission
-// must be recognisable here). Admission is gated behind
-// MixedSourcesAdmissionEnabled (default OFF until the worker executor lands).
-
-// enableMixedAdmission turns the gate on for a test and restores the prior
-// state (default OFF) when the test finishes.
-func enableMixedAdmission(t *testing.T) {
-	t.Helper()
-	SetMixedSourcesAdmission(true)
-	t.Cleanup(func() { SetMixedSourcesAdmission(false) })
-}
+// Mixed document+chat invariant tests. Mixed admission is now unconditional
+// (the phase-1 gate was removed when the worker executor landed), so these
+// tests exercise the invariant subset directly: personal-only, no participants,
+// no origin auto-reply, snapshot presence, and the combined source cap.
 
 func mixedDocSource(id string) SummaryWorkflowSource {
 	content := "文档内容 " + id
@@ -41,7 +33,6 @@ func mixedWorkflowInput() LegacyCreateSummaryWorkflowInput {
 }
 
 func TestValidateDocumentWorkflowInputMixedAccepted(t *testing.T) {
-	enableMixedAdmission(t)
 	in := mixedWorkflowInput()
 	sources := []SummaryWorkflowSource{
 		{SourceType: model.SourceGroup, SourceID: "group-1"},
@@ -52,23 +43,7 @@ func TestValidateDocumentWorkflowInputMixedAccepted(t *testing.T) {
 	}
 }
 
-func TestValidateDocumentWorkflowInputMixedRejectedWhenGateOff(t *testing.T) {
-	// The admission gate defaults OFF; a mixed scope must be rejected with the
-	// same clear contract error the pure-document path uses BEFORE any snapshot
-	// work runs (kills the "capabilities/admission hardcodes true" mutant).
-	// No enableMixedAdmission call here.
-	in := mixedWorkflowInput()
-	sources := []SummaryWorkflowSource{
-		{SourceType: model.SourceGroup, SourceID: "group-1"},
-		mixedDocSource("doc-1"),
-	}
-	if bizErr := validateDocumentWorkflowInput(in, sources); bizErr == nil {
-		t.Fatal("mixed scope must be rejected when the admission gate is OFF")
-	}
-}
-
 func TestValidateDocumentWorkflowInputMixedRejectsParticipants(t *testing.T) {
-	enableMixedAdmission(t)
 	in := mixedWorkflowInput()
 	in.Participants = []SummaryWorkflowParticipant{{UserID: "user-2", UserName: "同事"}}
 	sources := []SummaryWorkflowSource{
@@ -81,7 +56,6 @@ func TestValidateDocumentWorkflowInputMixedRejectsParticipants(t *testing.T) {
 }
 
 func TestValidateDocumentWorkflowInputMixedRejectsBadSnapshot(t *testing.T) {
-	enableMixedAdmission(t)
 	in := mixedWorkflowInput()
 	sources := []SummaryWorkflowSource{
 		{SourceType: model.SourceGroup, SourceID: "group-1"},
@@ -93,7 +67,6 @@ func TestValidateDocumentWorkflowInputMixedRejectsBadSnapshot(t *testing.T) {
 }
 
 func TestValidateDocumentWorkflowInputMixedCountCap(t *testing.T) {
-	enableMixedAdmission(t)
 	in := mixedWorkflowInput()
 	sources := make([]SummaryWorkflowSource, 0, MixedMaxTotalSources+1)
 	sources = append(sources, SummaryWorkflowSource{SourceType: model.SourceGroup, SourceID: "group-1"})

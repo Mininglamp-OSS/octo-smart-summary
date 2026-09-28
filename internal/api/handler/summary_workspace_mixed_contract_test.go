@@ -7,27 +7,22 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
-
 	"github.com/gin-gonic/gin"
 )
 
-// PR1 contract for MIXED document+chat sources. Admission is gated behind
-// service.MixedSourcesAdmissionEnabled (default OFF until the worker executor
-// lands). The frozen contract
+// PR1 contract for MIXED document+chat sources. Mixed admission is now
+// unconditional (the phase-1 gate was removed when the worker executor
+// landed). The frozen contract
 // (docs/mixed-document-chat-summary-development-plan.md §4.2):
-//   - capabilities broadcast the additive mixed_sources field (== gate state);
-//   - with the gate ON, a mixed context (channels + documents, no extra
-//     participants) normalizes cleanly and keeps the chat time range;
+//   - capabilities broadcast the additive mixed_sources field (always true);
+//   - a mixed context (channels + documents, no extra participants)
+//     normalizes cleanly and keeps the chat time range;
 //   - participants and referenced tasks combined with documents stay rejected;
 //   - raw request arrays stay bounded: documents ≤
 //     MaxDocumentSummarySourceCount, chat+documents combined ≤
 //     mixedMaxTotalSources.
 
 func TestSummaryWorkspaceCapabilitiesAdvertisesMixedSources(t *testing.T) {
-	service.SetMixedSourcesAdmission(true)
-	t.Cleanup(func() { service.SetMixedSourcesAdmission(false) })
-
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(recorder)
@@ -48,34 +43,7 @@ func TestSummaryWorkspaceCapabilitiesAdvertisesMixedSources(t *testing.T) {
 		t.Fatalf("decode capabilities: %v", err)
 	}
 	if !payload.Data.MixedSources {
-		t.Fatal("mixed_sources = false, want true (gate on)")
-	}
-}
-
-// When the gate is OFF (default), the capabilities payload must report
-// mixed_sources=false so the frontend never offers a flow the worker rejects.
-func TestSummaryWorkspaceCapabilitiesOmitsMixedSourcesWhenGateOff(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	recorder := httptest.NewRecorder()
-	context, _ := gin.CreateTestContext(recorder)
-	handler := &AgentChatHandler{
-		workspaceEntryEnabled: true,
-		workspace:             &summaryWorkspaceCoordinator{store: &AgentWorkspaceStore{}},
-		documentClient:        &capabilityDocumentSourceClient{},
-	}
-
-	handler.SummaryWorkspaceCapabilities(context)
-
-	var payload struct {
-		Data struct {
-			MixedSources bool `json:"mixed_sources"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("decode capabilities: %v", err)
-	}
-	if payload.Data.MixedSources {
-		t.Fatal("mixed_sources = true, want false (gate off by default)")
+		t.Fatal("mixed_sources = false, want true (admission unconditional)")
 	}
 }
 
@@ -107,9 +75,6 @@ func mixedContext() summaryWorkspaceContext {
 }
 
 func TestNormalizeSummaryWorkspaceContextAcceptsMixed(t *testing.T) {
-	service.SetMixedSourcesAdmission(true)
-	t.Cleanup(func() { service.SetMixedSourcesAdmission(false) })
-
 	got, err := normalizeSummaryWorkspaceContext(mixedContext())
 	if err != nil {
 		t.Fatalf("normalize mixed context: %v", err)
@@ -124,9 +89,6 @@ func TestNormalizeSummaryWorkspaceContextAcceptsMixed(t *testing.T) {
 
 // Participants × documents stay rejected — phase 1 is personal-only.
 func TestNormalizeSummaryWorkspaceContextRejectsMixedWithParticipants(t *testing.T) {
-	service.SetMixedSourcesAdmission(true)
-	t.Cleanup(func() { service.SetMixedSourcesAdmission(false) })
-
 	context := mixedContext()
 	context.Participants = []summaryWorkspaceParticipant{
 		{UserID: "user-2", UserName: "同事"},
@@ -140,9 +102,6 @@ func TestNormalizeSummaryWorkspaceContextRejectsMixedWithParticipants(t *testing
 // Referenced tasks × documents stay rejected in phase 1: the mixed entry does
 // not stack the reference-summary combination (plan §1.3 item 5).
 func TestNormalizeSummaryWorkspaceContextRejectsMixedWithReferences(t *testing.T) {
-	service.SetMixedSourcesAdmission(true)
-	t.Cleanup(func() { service.SetMixedSourcesAdmission(false) })
-
 	context := mixedContext()
 	context.ReferencedTaskIDs = []int64{101}
 	_, err := normalizeSummaryWorkspaceContext(context)
@@ -154,9 +113,6 @@ func TestNormalizeSummaryWorkspaceContextRejectsMixedWithReferences(t *testing.T
 // Deduplication must not become a request-body amplifier: the RAW array is
 // bounded before dedup (plan §1.2).
 func TestNormalizeSummaryWorkspaceContextCapsRawMixedArrays(t *testing.T) {
-	service.SetMixedSourcesAdmission(true)
-	t.Cleanup(func() { service.SetMixedSourcesAdmission(false) })
-
 	context := mixedContext()
 	rawDocuments := make([]summaryWorkspaceDocument, 0, maxSummaryWorkspaceDocuments+1)
 	for i := 0; i <= maxSummaryWorkspaceDocuments; i++ {
