@@ -137,52 +137,52 @@ func TestSummarizeChunksConcurrently_AggregatesCoverageExactly(t *testing.T) {
 	}
 }
 
-// A per-chunk failure (run still alive) is TOLERATED (#241 item 2): the failed
-// slices are DROPPED from the reduce input (not replaced with a marker — the
-// gap is disclosed structurally via FailedChunkCount), the successes are kept,
-// and no error is returned — so a single bad chunk cannot discard a whole run.
-func TestSummarizeChunksConcurrently_FailedChunkDropped(t *testing.T) {
-	withMapConcurrency(t, 5)
+// Recovery-first (contract §2): a transient per-chunk failure, with the run still
+// alive, makes the WHOLE invocation return an error (it owes a retry) rather than
+// shipping the other chunks' summaries as a partial — so a hole can never reach
+// Reduce silently. The lowest-index cause drives classification.
+func TestSummarizeChunksConcurrently_FailedChunkAborts(t *testing.T) {
+	for _, concurrency := range []int{1, 5} {
+		t.Run(fmt.Sprintf("concurrency=%d", concurrency), func(t *testing.T) {
+			withMapConcurrency(t, concurrency)
 
-	errEarly := errors.New("chunk 1 failed")
-	errLate := errors.New("chunk 4 failed")
-	withStubMapCall(t, func(ctx context.Context, chunk []map[string]interface{}, _ string) (string, int, int, error) {
-		id := chunk[0]["content"].(string)
-		switch id {
-		case "chunk-4":
-			return "", 0, 0, errLate
-		case "chunk-1":
-			return "", 0, 0, errEarly
-		}
-		return "s", 1, 0, nil
-	})
+			errEarly := errors.New("chunk 1 failed")
+			errLate := errors.New("chunk 4 failed")
+			withStubMapCall(t, func(ctx context.Context, chunk []map[string]interface{}, _ string) (string, int, int, error) {
+				id := chunk[0]["content"].(string)
+				switch id {
+				case "chunk-4":
+					return "", 0, 0, errLate
+				case "chunk-1":
+					return "", 0, 0, errEarly
+				}
+				return "s", 1, 0, nil
+			})
 
-	var cov chunkCoverage
-	got, err := summarizeChunksConcurrently(context.Background(), makeChunks(5), "", &cov)
-	if err != nil {
-		t.Fatalf("a tolerated chunk failure must not return an error, got %v", err)
-	}
-	if len(got) != 3 {
-		t.Fatalf("want the 3 successful summaries (failures dropped), got %d", len(got))
-	}
-	for _, s := range got {
-		if s != "s" {
-			t.Errorf("kept summary = %q, want only successful ones", s)
-		}
-		if strings.Contains(s, service.MapFailedMarker) {
-			t.Errorf("failure marker leaked into reduce input: %q", s)
-		}
-	}
-	if cov.FailedChunkCount != 2 {
-		t.Errorf("FailedChunkCount = %d, want 2", cov.FailedChunkCount)
+			var cov chunkCoverage
+			got, err := summarizeChunksConcurrently(context.Background(), makeChunks(5), "", &cov)
+			if err == nil {
+				t.Fatal("a transient chunk failure must abort the invocation (owes a retry), got nil error")
+			}
+			if got != nil {
+				t.Fatalf("no partial summaries may be shipped on a failed invocation, got %d", len(got))
+			}
+			// Keyed on the lowest-index cause (chunk 1), not the later one.
+			if !errors.Is(err, errEarly) {
+				t.Fatalf("error must key on the lowest-index cause, got %v", err)
+			}
+			if cov.FailedChunkCount != 2 {
+				t.Errorf("FailedChunkCount = %d, want 2", cov.FailedChunkCount)
+			}
+		})
 	}
 }
 
-// A chunk whose Map call SUCCEEDS but returns a blank summary must be dropped,
-// NOT counted as processed — otherwise its messages read as covered while
-// contributing nothing to the output (silent loss, #256 P2-3). It is counted in
-// BlankChunkCount and its processed messages must not inflate ProcessedCount.
-func TestSummarizeChunksConcurrently_BlankSuccessDropped(t *testing.T) {
+// A blank-success chunk is COVERED, not lost (contract §2–§4): the model
+// considered the messages and found nothing worth reporting, so they count as
+// processed and a fully-covered-but-noisy run must not assert incompleteness.
+// BlankChunkCount tracks it for observability only.
+func TestSummarizeChunksConcurrently_BlankSuccessCovered(t *testing.T) {
 	for _, concurrency := range []int{1, 4} {
 		t.Run(fmt.Sprintf("concurrency=%d", concurrency), func(t *testing.T) {
 			withMapConcurrency(t, concurrency)
@@ -199,10 +199,11 @@ func TestSummarizeChunksConcurrently_BlankSuccessDropped(t *testing.T) {
 			var cov chunkCoverage
 			got, err := summarizeChunksConcurrently(context.Background(), makeChunks(5), "", &cov)
 			if err != nil {
-				t.Fatalf("blank successes must be tolerated, got %v", err)
+				t.Fatalf("blank successes are not failures, got %v", err)
 			}
+			// Only the 3 non-blank chunks contribute joined summaries.
 			if len(got) != 3 {
-				t.Fatalf("want the 3 non-blank summaries kept, got %d", len(got))
+				t.Fatalf("want the 3 non-blank summaries joined, got %d", len(got))
 			}
 			if cov.BlankChunkCount != 2 {
 				t.Errorf("BlankChunkCount = %d, want 2", cov.BlankChunkCount)
@@ -210,10 +211,10 @@ func TestSummarizeChunksConcurrently_BlankSuccessDropped(t *testing.T) {
 			if cov.FailedChunkCount != 0 {
 				t.Errorf("blank success is not a failure: FailedChunkCount = %d, want 0", cov.FailedChunkCount)
 			}
-			// Only the 3 non-blank chunks (5 messages each) may count as processed;
-			// the 2 blank chunks' 10 messages must NOT be counted as covered.
-			if cov.ProcessedCount != 15 {
-				t.Fatalf("ProcessedCount = %d, want 15 — blank chunk messages leaked into processed", cov.ProcessedCount)
+			// All 5 chunks (5 messages each) are COVERED — the 2 blank ones included,
+			// so a noisy run does not read as incomplete.
+			if cov.ProcessedCount != 25 {
+				t.Fatalf("ProcessedCount = %d, want 25 — blank chunks must count as covered", cov.ProcessedCount)
 			}
 		})
 	}
@@ -333,12 +334,13 @@ func TestSummarizeChunksConcurrently_CancelReleasesQueuedChunks(t *testing.T) {
 	}
 }
 
-// A panic below Registry.Dispatch's recovery boundary must be recovered (not
-// terminate the process) and then TOLERATED like any other chunk failure
-// (#241 item 2): the panicked slice is dropped, the others are preserved, and
-// no error escapes. Covers BOTH the concurrent goroutine recover and the serial
-// path's summarizeChunkRecovered wrapper.
-func TestSummarizeChunksConcurrently_PanicIsRecoveredAndTolerated(t *testing.T) {
+// A panic below Registry.Dispatch's recovery boundary must be RECOVERED (not
+// terminate the process) and then treated as a per-chunk failure: recovery-first
+// (contract §2) makes the invocation return an error (it owes a retry), it does
+// not ship the other chunks as a partial. Covers BOTH the concurrent goroutine
+// recover and the serial path's summarizeChunkRecovered wrapper — the key
+// property is that no panic escapes to crash the process.
+func TestSummarizeChunksConcurrently_PanicIsRecoveredThenAborts(t *testing.T) {
 	for _, concurrency := range []int{1, 2} {
 		t.Run(fmt.Sprintf("concurrency=%d", concurrency), func(t *testing.T) {
 			withMapConcurrency(t, concurrency)
@@ -350,17 +352,19 @@ func TestSummarizeChunksConcurrently_PanicIsRecoveredAndTolerated(t *testing.T) 
 			})
 
 			var cov chunkCoverage
+			// Must not panic out of here — a recovered panic becomes an error.
 			got, err := summarizeChunksConcurrently(context.Background(), makeChunks(3), "", &cov)
-			if err != nil {
-				t.Fatalf("a recovered panic in one chunk must be tolerated, got err %v", err)
+			if err == nil {
+				t.Fatal("a recovered panic must abort the invocation (owes a retry), got nil error")
 			}
-			if len(got) != 2 || cov.FailedChunkCount != 1 {
-				t.Fatalf("want 2 kept summaries + FailedChunkCount 1, got %d summaries / %d failed", len(got), cov.FailedChunkCount)
+			if !strings.Contains(err.Error(), "panicked") {
+				t.Fatalf("error must carry the recovered panic cause, got %v", err)
 			}
-			for _, s := range got {
-				if strings.Contains(s, service.MapFailedMarker) {
-					t.Errorf("failure marker leaked: %q", s)
-				}
+			if got != nil {
+				t.Fatalf("no partial summaries may ship on a panicked invocation, got %d", len(got))
+			}
+			if cov.FailedChunkCount != 1 {
+				t.Errorf("FailedChunkCount = %d, want 1", cov.FailedChunkCount)
 			}
 		})
 	}

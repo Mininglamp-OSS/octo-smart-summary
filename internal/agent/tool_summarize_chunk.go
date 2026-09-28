@@ -82,8 +82,10 @@ type chunkCoverage struct {
 	OversizedMessageCount int `json:"oversized_message_count"`
 	FailedChunkCount      int `json:"failed_chunk_count"`
 	// BlankChunkCount is chunks whose Map LLM call SUCCEEDED but returned an empty
-	// summary. Their messages are folded into DroppedCount (not ProcessedCount)
-	// so a blank result cannot masquerade as covered (#256 P2).
+	// summary — the model considered the messages and found nothing worth
+	// reporting (it is told to skip off-topic chatter). Those messages are COVERED
+	// (counted in ProcessedCount), not lost; BlankChunkCount is observability only
+	// and must not assert incompleteness (contract §3/§4).
 	BlankChunkCount  int  `json:"blank_chunk_count"`
 	ChunkCallsCapped bool `json:"chunk_calls_capped"`
 	Truncated        bool `json:"truncated"`
@@ -779,8 +781,8 @@ func summarizeChunkRecovered(ctx context.Context, idx int, chunk []map[string]in
 	return summarizeChunkFn(ctx, chunk, specGuidance)
 }
 
-// mapPhaseFailedErr builds the error returned when the Map phase produced no
-// usable summary. It keys %w — and therefore the Error() text classifyToolError
+// mapPhaseFailedErr builds the error returned when any chunk in the invocation
+// failed (recovery-first: the invocation owes a retry, contract §2). It keys %w — and therefore the Error() text classifyToolError
 // reads — on the LOWEST-INDEX cause ALONE. classifyToolError matches on BOTH
 // errors.Is and error-text substrings, so wrapping errors.Join (whose Is hits the
 // UNION and whose text concatenates every cause) would let one non-transient
@@ -822,27 +824,26 @@ func mapPhaseFailedErr(totalChunks int, errs []error) error {
 //     each worker must recover locally to preserve the same process-safety
 //     contract as the old serial loop.
 //
-// Failure policy (#241 item 2): a single chunk's failure does NOT discard the
-// summaries already computed for the others — the failed slice is dropped from
-// the reduce input (NOT replaced with a marker: the worker path filters its
-// MapFailedMarker out of reduce too, and the gap is disclosed structurally via
-// cov.FailedChunkCount → DroppedCount → PARTIAL). A chunk that SUCCEEDS but
-// returns a blank summary is likewise dropped and counted (cov.BlankChunkCount),
-// never counted as processed — otherwise its messages would read as covered
-// while contributing nothing (#256 P2). Only the RUN's own context being
-// cancelled/expired, or a fatal per-chunk error (truncation / reasoning-budget
-// exhaustion, see isFatalChunkError), aborts the whole phase — a single chunk's
-// own per-attempt timeout (which also unwraps to context.DeadlineExceeded) is a
-// tolerated per-chunk failure, not a reason to throw away the paid-for work.
+// Failure policy — recovery-first (see docs/summarize-chunk-completeness-contract.md):
+// a transient per-chunk failure (429/5xx/timeout/recovered panic) makes the whole
+// invocation return an error, so the runner MarkMapFailed's it and the invocation
+// owes a successful retry (a flag-independent, request-scoped gate) rather than
+// shipping a partial. A single chunk's own per-attempt timeout is such a transient
+// failure. A fatal per-chunk error (truncation / reasoning-budget exhaustion /
+// ErrRequestTooLarge, see isFatalChunkError) and the RUN's own
+// cancellation/expiry likewise abort the phase. The ONLY non-complete outcome that
+// is shipped rather than retried is the intentional fan-out cap (handler level,
+// disclosed). A chunk that SUCCEEDS but returns a blank summary is COVERED, not
+// lost — the model found nothing worth reporting — so its messages count as
+// processed and it is recorded only in cov.BlankChunkCount (contract §2–§4).
 //
-// Error reporting when no usable summary survives (every chunk failed, or the
-// only successes were blank): the phase errors via mapPhaseFailedErr, which keys
-// the wrap on the LOWEST-INDEX cause alone. It deliberately does NOT join all
-// causes: classifyToolError matches on both errors.Is and error text, so a union
-// would let one non-transient cause anywhere in the set drag the whole phase to
-// the most pessimistic (fatal, non-retryable) arm. Every cause is already logged
-// per-chunk as it is dropped, so triage keeps them; only classification keys on
-// the single deterministic lowest-index cause (#256 round-7 P1-1).
+// Error reporting: the phase errors via mapPhaseFailedErr, which keys the wrap on
+// the LOWEST-INDEX cause alone. It deliberately does NOT join all causes:
+// classifyToolError matches on both errors.Is and error text, so a union would let
+// one non-transient cause anywhere in the set drag the whole phase to the most
+// pessimistic (fatal, non-retryable) arm. Every cause is already logged per-chunk,
+// so triage keeps them; only classification keys on the single deterministic
+// lowest-index cause (#256 round-7 P1-1).
 func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]interface{}, specGuidance string, cov *chunkCoverage) ([]string, error) {
 	_, _, _, cfg := GetSummaryDeps()
 	concurrency := cfg.ResolveAgentMapConcurrency()
@@ -870,29 +871,37 @@ func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]inte
 					// droppable transient (mirrors worker isFatalMapError): abort.
 					return nil, fmt.Errorf("summarize chunk %d: %w", i, err)
 				}
-				// Per-chunk failure with the run still alive: drop this slice and
-				// keep the rest (#241 item 2). Gap disclosed via cov; the cause is
-				// retained (index order) so mapPhaseFailedErr below can key on the
-				// lowest-index one when nothing usable survives.
-				log.Printf("[summarize_chunk] chunk %d failed, dropping from reduce input: %v", i, err)
+				// Transient per-chunk failure, run still alive: record the cause.
+				// Under the recovery-first contract (§2) ANY failure makes the phase
+				// return an error below (the invocation owes a retry), keyed on the
+				// lowest-index cause; nothing is shipped as a partial.
+				log.Printf("[summarize_chunk] chunk %d failed; invocation owes a retry: %v", i, err)
 				errs = append(errs, fmt.Errorf("chunk %d: %w", i, err))
 				cov.FailedChunkCount++
 				continue
 			}
 			if strings.TrimSpace(summary) == "" {
-				// Successful call, blank summary: its messages contribute nothing to
-				// the output, so counting them as processed would hide the loss
-				// (#256 P2-3). Drop it — the messages fall into DroppedCount — and
-				// count it separately.
-				log.Printf("[summarize_chunk] chunk %d returned a blank summary, dropping from reduce input", i)
+				// Blank-success: the model considered these messages and found nothing
+				// worth reporting (the prompt tells it to skip off-topic chatter). They
+				// are COVERED, not lost — count them as processed so a noisy-but-fully-
+				// covered run does not assert incompleteness, and record BlankChunkCount
+				// for observability only (contract §3/§4; #256 r9 blank P2).
+				log.Printf("[summarize_chunk] chunk %d returned a blank summary; covered as noise, not appended", i)
 				cov.BlankChunkCount++
+				cov.ProcessedCount += processed
+				cov.OversizedMessageCount += oversized
 				continue
 			}
 			summaries = append(summaries, summary)
 			cov.ProcessedCount += processed
 			cov.OversizedMessageCount += oversized
 		}
-		if len(summaries) == 0 && len(errs) > 0 {
+		if len(errs) > 0 {
+			// Recovery-first (contract §2/§3): ANY transient per-chunk failure means
+			// the invocation owes a retry — do not ship a partial. Returning an error
+			// makes the runner MarkMapFailed (flag-independent), blocking Reduce and
+			// the final answer until a successful retry or a fail-closed run. The
+			// lowest-index cause drives classifyToolError.
 			return nil, mapPhaseFailedErr(len(chunks), errs)
 		}
 		log.Printf("[summarize_chunk] map phase: chunks=%d concurrency=1 failed=%d elapsed=%dms",
@@ -953,28 +962,32 @@ func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]inte
 				// droppable transient (mirrors worker isFatalMapError): abort.
 				return nil, fmt.Errorf("summarize chunk %d: %w", i, o.err)
 			}
-			// Per-chunk failure (e.g. this chunk's own upstream timeout) with the
-			// run still alive: drop this slice, keep the rest (#241 item 2). The
-			// cause is retained (index order) so mapPhaseFailedErr below can key on
-			// the lowest-index one when nothing usable survives.
-			log.Printf("[summarize_chunk] chunk %d failed, dropping from reduce input: %v", i, o.err)
+			// Transient per-chunk failure (e.g. this chunk's own upstream timeout),
+			// run still alive: record the cause. Recovery-first (§2) — any failure
+			// makes the phase return an error below (owes a retry), keyed on the
+			// lowest-index cause; nothing ships as a partial.
+			log.Printf("[summarize_chunk] chunk %d failed; invocation owes a retry: %v", i, o.err)
 			errs = append(errs, fmt.Errorf("chunk %d: %w", i, o.err))
 			cov.FailedChunkCount++
 			continue
 		}
 		if strings.TrimSpace(o.summary) == "" {
-			// Successful call, blank summary: its messages contribute nothing to the
-			// output, so counting them as processed would hide the loss (#256 P2-3).
-			// Drop it — the messages fall into DroppedCount — and count it separately.
-			log.Printf("[summarize_chunk] chunk %d returned a blank summary, dropping from reduce input", i)
+			// Blank-success: covered as noise, not lost — count as processed and
+			// record BlankChunkCount for observability only (contract §3/§4).
+			log.Printf("[summarize_chunk] chunk %d returned a blank summary; covered as noise, not appended", i)
 			cov.BlankChunkCount++
+			cov.ProcessedCount += o.processed
+			cov.OversizedMessageCount += o.oversized
 			continue
 		}
 		summaries = append(summaries, o.summary)
 		cov.ProcessedCount += o.processed
 		cov.OversizedMessageCount += o.oversized
 	}
-	if len(summaries) == 0 && len(errs) > 0 {
+	if len(errs) > 0 {
+		// Recovery-first (contract §2/§3): any transient per-chunk failure means
+		// the invocation owes a retry — do not ship a partial. The error makes the
+		// runner MarkMapFailed (flag-independent); the lowest-index cause classifies.
 		return nil, mapPhaseFailedErr(len(chunks), errs)
 	}
 	return summaries, nil
