@@ -97,6 +97,38 @@ func (c *LLMClient) models() []string {
 	return append([]string{c.model}, c.fallbackModels...)
 }
 
+// derivePerModelTimeout returns the per-attempt budget used to arm
+// llmfallback.Run's deadline-aware escalation, derived from the REMAINING parent
+// deadline so the shared Call/CallStream entry points behave correctly for both
+// consumers (#254 Part B):
+//
+//   - No parent deadline (worker Map/Reduce roots at context.Background) → 0,
+//     leaving the guard inert; the worker's bound is the lease world (#220 §2).
+//   - A parent deadline (API refine's ~90s budget) → remaining/(maxAttempts+1),
+//     ~22s, so the guard has a realistic per-attempt estimate and gives up the
+//     primary's remaining same-model retries to fit a fallback rather than
+//     stranding the run. Pinning a fixed LLM_TIMEOUT (180s) here instead would
+//     make remaining < backoff + 2*PerModelTimeout hold on every first retry of
+//     the 90s budget and trip budget_starved immediately.
+//
+// The estimate is capped at the client's own per-attempt timeout so a very long
+// parent budget cannot inflate it past what a single attempt can actually cost.
+func (c *LLMClient) derivePerModelTimeout(ctx context.Context, maxAttempts int) time.Duration {
+	dl, ok := ctx.Deadline()
+	if !ok {
+		return 0
+	}
+	remaining := time.Until(dl)
+	if remaining <= 0 || maxAttempts < 1 {
+		return 0
+	}
+	per := remaining / time.Duration(maxAttempts+1)
+	if c.timeout > 0 && per > c.timeout {
+		per = c.timeout
+	}
+	return per
+}
+
 // ChatMessage represents a single message in a chat completion request.
 type ChatMessage struct {
 	Role    string `json:"role"`
@@ -268,26 +300,23 @@ func (c *LLMClient) callWithPolicyAndModel(ctx context.Context, messages []ChatM
 	// Keep retry ownership in the shared runner: exhaust transient failures on
 	// one model before switching to the next model.
 	//
-	// PerModelTimeout is deliberately NOT set here, and setting it is not the
-	// harmless hardening it looks like. It arms Run's deadline-aware escalation,
-	// which is gated on the parent context carrying a deadline. The two consumers
-	// of this entry point sit on opposite sides of that gate:
+	// PerModelTimeout arms Run's deadline-aware escalation. It is derived from the
+	// REMAINING parent deadline (derivePerModelTimeout, #254 Part B) rather than
+	// left unset or pinned to a constant, because this entry point has two
+	// consumers on opposite sides of the deadline gate:
 	//
-	//   - worker Map/Reduce roots at context.Background() with no deadline
-	//     anywhere down the chain, so the guard cannot fire and the field would
-	//     be inert. The aggregate worker deadline is issue #220 §2.
-	//   - API refine passes a 90s budget while this client's per-attempt timeout
-	//     is LLM_TIMEOUT (180s default), so the guard's condition
-	//     (remaining < backoff + 2*PerModelTimeout) would hold on EVERY first
-	//     retry, abandoning the primary's remaining attempts on any transient
-	//     blip and logging budget_starved at ERROR each time.
-	//
-	// Arming it therefore requires either the worker deadline from #220 §2 or a
-	// per-attempt budget derived from the remaining parent budget — not this
-	// field on this line.
+	//   - worker Map/Reduce roots at context.Background() with no deadline, so
+	//     derivePerModelTimeout returns 0 and the guard stays inert (the worker's
+	//     bound is the lease world, #220 §2 / #249).
+	//   - API refine passes a ~90s budget; deriving ~90s/(MaxAttempts+1) ≈ 22s
+	//     gives the guard a realistic per-attempt estimate, so it gracefully gives
+	//     up the primary's remaining same-model retries to fit a fallback instead
+	//     of stranding the run — and does NOT trip budget_starved on every first
+	//     retry the way a fixed LLM_TIMEOUT (180s > 90s budget) would.
 	res, usedModel, err := llmfallback.Run(ctx, llmfallback.Config{
-		Models:      c.models(),
-		MaxAttempts: 3,
+		Models:          c.models(),
+		MaxAttempts:     3,
+		PerModelTimeout: c.derivePerModelTimeout(ctx, 3),
 	}, func(ctx context.Context, model string) (result, llmfallback.Outcome, error) {
 		temp := temperature
 		if config.IsKimiModel(model) {
@@ -411,12 +440,14 @@ func (c *LLMClient) callStreamWithModel(ctx context.Context, messages []ChatMess
 	// delta may still try the next model. Transient failures exhaust the current
 	// model's retry budget before switching models.
 	//
-	// PerModelTimeout is intentionally unset; see callWithPolicyAndModel for why
-	// arming the deadline guard on this entry point is either inert (worker) or
-	// actively harmful (refine).
+	// PerModelTimeout is derived from the remaining parent deadline
+	// (derivePerModelTimeout, #254 Part B): inert for the deadline-less worker,
+	// ~22s for API refine's ~90s budget. See callWithPolicyAndModel for the full
+	// rationale.
 	res, usedModel, err := llmfallback.Run(ctx, llmfallback.Config{
-		Models:      c.models(),
-		MaxAttempts: 3,
+		Models:          c.models(),
+		MaxAttempts:     3,
+		PerModelTimeout: c.derivePerModelTimeout(ctx, 3),
 	}, func(ctx context.Context, model string) (result, llmfallback.Outcome, error) {
 		temp := temperature
 		if config.IsKimiModel(model) {
