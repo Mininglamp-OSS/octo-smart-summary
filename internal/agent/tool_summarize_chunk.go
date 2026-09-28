@@ -752,10 +752,18 @@ func capChunks(chunks [][]map[string]interface{}) (kept [][]map[string]interface
 // could not produce a complete chunk summary — so the whole Map phase aborts
 // rather than silently omitting that slice. Keeps the agent path's tolerance
 // class aligned with the worker's.
+//
+// ErrRequestTooLarge is fatal here too (#256 r9 P1): item 1's whole target is a
+// single oversized message, which becomes its own chunk, and the guard fires
+// from that chunk with a DETERMINISTIC error — retrying the same body can't
+// shrink it. Tolerating it would swallow item 1's fatal REQUEST_TOO_LARGE
+// classification (summarize_chunk is a criticalTool) and drop the chunk silently
+// instead of failing fast, so item 2's tolerance must not apply to it.
 func isFatalChunkError(err error) bool {
 	return errors.Is(err, service.ErrOutputTruncated) ||
 		errors.Is(err, service.ErrStreamOutputTruncated) ||
-		errors.Is(err, service.ErrReasoningBudgetExhausted)
+		errors.Is(err, service.ErrReasoningBudgetExhausted) ||
+		errors.Is(err, service.ErrRequestTooLarge)
 }
 
 // summarizeChunkRecovered calls summarizeChunkFn and converts a panic below the

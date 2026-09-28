@@ -405,30 +405,42 @@ func TestSummarizeChunksConcurrently_ConcurrencyOneIsSerial(t *testing.T) {
 
 // A truncation / reasoning-budget-exhaustion result is FATAL, not a droppable
 // transient (mirrors the worker's isFatalMapError): one such chunk aborts the
-// whole Map phase rather than being silently omitted (#256 P2-3).
+// whole Map phase rather than being silently omitted (#256 P2-3). ErrRequestTooLarge
+// is fatal too (#256 r9 P1): it is deterministic (the chunk can't shrink on retry)
+// and item 2's tolerance must not swallow item 1's fatal REQUEST_TOO_LARGE.
 func TestSummarizeChunksConcurrently_FatalChunkErrorAborts(t *testing.T) {
-	for _, concurrency := range []int{1, 3} {
-		t.Run(fmt.Sprintf("concurrency=%d", concurrency), func(t *testing.T) {
-			withMapConcurrency(t, concurrency)
-			withStubMapCall(t, func(_ context.Context, chunk []map[string]interface{}, _ string) (string, int, int, error) {
-				if chunk[0]["content"].(string) == "chunk-2" {
-					return "", 0, 0, service.ErrOutputTruncated
-				}
-				return "s", 1, 0, nil
-			})
+	fatals := []struct {
+		name string
+		err  error
+	}{
+		{"output-truncated", service.ErrOutputTruncated},
+		{"reasoning-budget", service.ErrReasoningBudgetExhausted},
+		{"request-too-large", service.ErrRequestTooLarge},
+	}
+	for _, fatal := range fatals {
+		for _, concurrency := range []int{1, 3} {
+			t.Run(fmt.Sprintf("%s/concurrency=%d", fatal.name, concurrency), func(t *testing.T) {
+				withMapConcurrency(t, concurrency)
+				withStubMapCall(t, func(_ context.Context, chunk []map[string]interface{}, _ string) (string, int, int, error) {
+					if chunk[0]["content"].(string) == "chunk-2" {
+						return "", 0, 0, fatal.err
+					}
+					return "s", 1, 0, nil
+				})
 
-			var cov chunkCoverage
-			got, err := summarizeChunksConcurrently(context.Background(), makeChunks(4), "", &cov)
-			if err == nil {
-				t.Fatal("a truncated chunk must abort the phase, got nil error")
-			}
-			if !errors.Is(err, service.ErrOutputTruncated) {
-				t.Fatalf("abort error must wrap the fatal cause, got %v", err)
-			}
-			if got != nil {
-				t.Fatalf("expected no summaries on fatal abort, got %d", len(got))
-			}
-		})
+				var cov chunkCoverage
+				got, err := summarizeChunksConcurrently(context.Background(), makeChunks(4), "", &cov)
+				if err == nil {
+					t.Fatalf("a %s chunk must abort the phase, got nil error", fatal.name)
+				}
+				if !errors.Is(err, fatal.err) {
+					t.Fatalf("abort error must wrap the fatal cause, got %v", err)
+				}
+				if got != nil {
+					t.Fatalf("expected no summaries on fatal abort, got %d", len(got))
+				}
+			})
+		}
 	}
 }
 
