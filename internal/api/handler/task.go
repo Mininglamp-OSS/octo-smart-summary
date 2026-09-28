@@ -391,15 +391,6 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		})
 	}
 	workflowInput.Sources = make([]service.SummaryWorkflowSource, 0, len(req.Sources))
-	if createSummaryHasDocumentSource(req) {
-		releaseSlot, admitted := documentSummaryLimiterInstance.acquire(userID)
-		if !admitted {
-			c.Header("Retry-After", "1")
-			c.JSON(http.StatusTooManyRequests, apiResponse{Code: 42902, Message: "文档总结请求过于频繁，请稍后重试"})
-			return
-		}
-		defer releaseSlot()
-	}
 	documentSources, documentMode, documentErr := h.prepareDocumentSummarySources(c.Request.Context(), c.Request.Header, spaceID, userID, req)
 	if documentErr != nil {
 		if documentErr.retryAfter != "" {
@@ -407,6 +398,22 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		}
 		c.JSON(documentErr.status, apiResponse{Code: documentErr.code, Message: documentErr.message})
 		return
+	}
+	// The limiter slot is acquired only AFTER prepareDocumentSummarySources has
+	// accepted the request (and only when documents are actually present). A
+	// mixed request rejected at gate-off inside prepareDocumentSummarySources
+	// returns early above without ever holding a slot, so an inadmissible
+	// request gets the clean contract 400 instead of a 429/42902 when the user
+	// is already at the in-flight cap — the same wrong-error class the gate
+	// rejection was added to remove.
+	if documentMode {
+		releaseSlot, admitted := documentSummaryLimiterInstance.acquire(userID)
+		if !admitted {
+			c.Header("Retry-After", "1")
+			c.JSON(http.StatusTooManyRequests, apiResponse{Code: 42902, Message: "文档总结请求过于频繁，请稍后重试"})
+			return
+		}
+		defer releaseSlot()
 	}
 	if documentMode {
 		// Documents were fetched. mergeMixedWorkflowSources keeps the chat

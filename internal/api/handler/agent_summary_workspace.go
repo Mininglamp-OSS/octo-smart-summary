@@ -2002,6 +2002,15 @@ func workspaceWorkflowTimeRange(context summaryWorkspaceContext) (*service.Summa
 }
 
 func summaryWorkspaceOrigin(context summaryWorkspaceContext) (string, int) {
+	// Document-bearing tasks never derive an origin channel (plan §1.3/A17):
+	// a mixed document+chat scope must not auto-reply into the first chat's
+	// channel, whose members were never authorized on the document. The mixed
+	// branch of validateDocumentWorkflowInput enforces the same invariant at
+	// the service boundary; guarding here keeps the workspace creator from
+	// producing the forbidden value in the first place.
+	if len(context.Documents) > 0 {
+		return "", 0
+	}
 	if len(context.SelectedChannels) == 0 {
 		return "", 0
 	}

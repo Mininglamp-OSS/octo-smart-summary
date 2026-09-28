@@ -239,4 +239,44 @@ func TestSummaryWorkspaceTitleMixed(t *testing.T) {
 	}
 }
 
+// Plan §1.3/A17: a document-bearing scope must not derive an origin channel.
+// summaryWorkspaceOrigin must return empty whenever documents are present, even
+// with chats selected, so a mixed scope never persists origin_channel_id.
+func TestSummaryWorkspaceOriginEmptyForDocumentScope(t *testing.T) {
+	cases := []struct {
+		name    string
+		context summaryWorkspaceContext
+	}{
+		{
+			name: "mixed documents + chat",
+			context: summaryWorkspaceContext{
+				SelectedChannels: []summaryWorkspaceChannel{{ChatID: "group-1", ChatType: "group", Name: "群"}},
+				Documents:        []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}},
+			},
+		},
+		{
+			name: "documents only",
+			context: summaryWorkspaceContext{
+				Documents: []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}},
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			id, typ := summaryWorkspaceOrigin(c.context)
+			if id != "" || typ != 0 {
+				t.Fatalf("origin = (%q, %d), want empty for a document-bearing scope", id, typ)
+			}
+		})
+	}
+
+	// Contrast: a pure-chat scope still derives origin from the first channel.
+	id, typ := summaryWorkspaceOrigin(summaryWorkspaceContext{
+		SelectedChannels: []summaryWorkspaceChannel{{ChatID: "group-1", ChatType: "group", Name: "群"}},
+	})
+	if id != "group-1" || typ != model.OriginChannelGroup {
+		t.Fatalf("pure-chat origin = (%q, %d), want (group-1, group)", id, typ)
+	}
+}
+
 var _ = http.StatusOK

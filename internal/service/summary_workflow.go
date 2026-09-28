@@ -737,15 +737,35 @@ func validateDocumentWorkflowInput(in LegacyCreateSummaryWorkflowInput, sources 
 				return NewBizError(40001, "每个来源需提供 source_id 与合法的 source_type", http.StatusBadRequest)
 			}
 		}
-		// Mixed scope: personal-only, no origin auto-reply. TimeRange is
-		// LEGAL for mixed scopes (it scopes the chat side), so the
-		// documents-only rejection does not fire when chat sources are
+		// Mixed scope: personal-only, no participants, no origin auto-reply.
+		// TimeRange is LEGAL for mixed scopes (it scopes the chat side), so
+		// the documents-only rejection does not fire when chat sources are
 		// present.
 		if in.CreatorID != "" && in.CreatorID != in.ActorID {
 			return NewBizError(40001, "文档总结仅支持当前用户创建", http.StatusBadRequest)
 		}
 		if len(in.Participants) != 0 {
 			return NewBizError(40001, "混合来源总结暂不支持其他参与者", http.StatusBadRequest)
+		}
+		// Plan §1.3/A17: phase-1 document-bearing tasks must not derive or
+		// persist an origin channel (no auto-reply into the source chat, whose
+		// members were never authorized on the document). The workspace path
+		// auto-derives origin from SelectedChannels[0] unless summaryWorkspaceOrigin
+		// is guarded, and the legacy path accepts a caller-supplied origin, so the
+		// mixed branch enforces the invariant here as the single shared boundary —
+		// mirroring the pure-document rejection below — rather than relying on
+		// either caller to zero it.
+		if in.OriginChannelID != "" || in.OriginChannelType != 0 {
+			return NewBizError(40001, "混合来源总结不支持来源会话", http.StatusBadRequest)
+		}
+		documentCount := 0
+		for _, source := range sources {
+			if source.SourceType == model.SourceDocument {
+				documentCount++
+			}
+		}
+		if documentCount > MaxDocumentSummarySourceCount {
+			return NewBizError(40001, "文档来源不能超过10个", http.StatusBadRequest)
 		}
 		if len(sources) > MixedMaxTotalSources {
 			return MixedSourceCountExceededError()

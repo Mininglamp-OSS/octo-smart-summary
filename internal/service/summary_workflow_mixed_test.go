@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -135,5 +136,41 @@ func TestMixedWorkflowRejectedWhenGateOff(t *testing.T) {
 	in.Sources = mixedSourcesForTest()
 	if _, err := svc.CreateFromLegacyHTTP(context.Background(), in); err == nil {
 		t.Fatal("mixed create must be rejected when the admission gate is OFF")
+	}
+}
+
+// Plan §1.3/A17: a phase-1 document-bearing task must not persist an origin
+// channel (no auto-reply into a chat whose members were never authorized on
+// the document). The mixed branch enforces this at the service boundary; the
+// pure-document branch already did. A caller-supplied origin must be rejected.
+func TestMixedWorkflowRejectsOriginChannel(t *testing.T) {
+	enableMixedAdmission(t)
+	svc, _ := newSummaryWorkflowTestService(t)
+
+	in := baseSummaryWorkflowInput()
+	in.Sources = mixedSourcesForTest()
+	in.OriginChannelID = "group-origin"
+	in.OriginChannelType = model.OriginChannelGroup
+	if _, err := svc.CreateFromLegacyHTTP(context.Background(), in); err == nil {
+		t.Fatal("mixed create with an origin channel must be rejected")
+	}
+}
+
+// The service mixed branch must hold the per-document cap itself (the pure-
+// document cap of MaxDocumentSummarySourceCount), not just the combined cap —
+// 11 documents + 1 chat is below the combined 30 but above the document cap.
+func TestMixedWorkflowRejectsOverDocumentCap(t *testing.T) {
+	enableMixedAdmission(t)
+	svc, _ := newSummaryWorkflowTestService(t)
+
+	in := baseSummaryWorkflowInput()
+	sources := make([]SummaryWorkflowSource, 0, MaxDocumentSummarySourceCount+2)
+	sources = append(sources, SummaryWorkflowSource{SourceType: model.SourceGroup, SourceID: "group-1"})
+	for i := 0; i <= MaxDocumentSummarySourceCount; i++ {
+		sources = append(sources, mixedDocSource(fmt.Sprintf("doc-%d", i)))
+	}
+	in.Sources = sources
+	if _, err := svc.CreateFromLegacyHTTP(context.Background(), in); err == nil {
+		t.Fatal("mixed create with 11 documents must be rejected by the per-document cap")
 	}
 }

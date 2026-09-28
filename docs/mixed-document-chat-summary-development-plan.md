@@ -2,7 +2,7 @@
 
 日期：2026-09-22  
 状态：一期范围已确认；本文为开发计划，功能尚未实施。  
-交付位置：`/home/mlamp/octo-smart-summary/docs/mixed-document-chat-summary-development-plan.md`
+交付位置：`docs/mixed-document-chat-summary-development-plan.md`
 
 ## 1. 目标与范围
 
@@ -44,9 +44,9 @@
 
 | 仓库 | 本地参考工作树 | 提交 |
 |---|---|---|
-| Summary 后端 | `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability` | `ef7f74f` |
-| Web | `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-docs-no-appconfig` | `f18a3c73` |
-| 计划文档所在仓库 | `/home/mlamp/octo-smart-summary` | 当前主目录不作为文档功能实现基线 |
+| Summary 后端 | `summary-doc-capability` | `$SUMMARY_BACKEND_BASELINE` |
+| Web | `summary-docs-no-appconfig` | `$WEB_BASELINE` |
+| 计划文档所在仓库 | 本仓库（octo-smart-summary） | 当前主目录不作为文档功能实现基线 |
 
 正式开工时，先确认文档接入最终落在哪个集成分支，再从包含这些能力的提交创建独立 `codex/` 工作树。不得直接在现有参考工作树或 Web 主目录覆盖用户改动。
 
@@ -207,14 +207,14 @@
 
 | 文件 | 改动责任 |
 |---|---|
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/api/handler/task.go` | 普通创建入口保留两类来源，接入统一检查；核对重试、重新生成和 origin 相关行为 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/api/handler/document_summary_create.go` | 只提取文档准备快照，取消错误的纯文档假设，保留正文限制及限流 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/api/handler/summary_workspace_contract.go` | 允许混合上下文、保留聊天时间、校验总数量与不支持的组合 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/api/handler/agent_summary_workspace.go` | 修正来源替换、历史/上下文时间清空、默认时间补全、会话权限跳过、路由未消费校验结果和能力响应 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/service/summary_workflow.go` | 统一领域校验、数量、合并后的来源持久化和幂等语义 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/service/snapshot_validator.go` | 审查文档与会话并存时是否完整执行权限和时间约束 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/config/config.go` | 拟新增默认关闭的混选准入配置；配置名在 PR1 冻结 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/model/model.go` | 核对现有来源、快照和引用字段；本期默认不改表 |
+| `internal/api/handler/task.go` | 普通创建入口保留两类来源，接入统一检查；核对重试、重新生成和 origin 相关行为 |
+| `internal/api/handler/document_summary_create.go` | 只提取文档准备快照，取消错误的纯文档假设，保留正文限制及限流 |
+| `internal/api/handler/summary_workspace_contract.go` | 允许混合上下文、保留聊天时间、校验总数量与不支持的组合 |
+| `internal/api/handler/agent_summary_workspace.go` | 修正来源替换、历史/上下文时间清空、默认时间补全、会话权限跳过、路由未消费校验结果和能力响应 |
+| `internal/service/summary_workflow.go` | 统一领域校验、数量、合并后的来源持久化和幂等语义 |
+| `internal/service/snapshot_validator.go` | 审查文档与会话并存时是否完整执行权限和时间约束 |
+| `internal/config/config.go` | 拟新增默认关闭的混选准入配置；配置名在 PR1 冻结 |
+| `internal/model/model.go` | 核对现有来源、快照和引用字段；本期默认不改表 |
 
 `origin_channel` 不是信息来源数组。一期含文档任务不新增 origin 自动推导或回发会话能力，继续保持个人行为；提交来源中有聊天不代表可以向该聊天自动发送总结。
 
@@ -222,34 +222,34 @@
 
 | 文件 | 改动责任 |
 |---|---|
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/worker/personal_processor.go` | 接入混合执行，拆开整体 documentMode 对清洗、格式化、Map/Reduce 和统计的影响 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/worker/document_sources.go` | 复用快照校验、文档分块和格式化，仅接收文档来源 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/worker/specified_sources.go` | 保证发给聊天检索的显式来源不含文档及 Derived 行 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/worker/processor.go` | 审计旧执行入口；无法证明不可达时转入公共混合编排，不能留下可达的混选拒绝路径 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/worker/citation.go` | 复用并补足跨类型证据去重、编号和坐标输出 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/service/llm.go` | 复用现有两类 Map；混合 Reduce 沿用限流、超时、模型回退、token 统计 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/worker/mixed_sources.go`（拟新增） | 来源分流、公共证据编排及混合辅助逻辑 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/service/mixed_summary_prompt.go`（拟新增） | 混合归纳提示词与调用封装，避免继续扩大既有大文件 |
+| `internal/worker/personal_processor.go` | 接入混合执行，拆开整体 documentMode 对清洗、格式化、Map/Reduce 和统计的影响 |
+| `internal/worker/document_sources.go` | 复用快照校验、文档分块和格式化，仅接收文档来源 |
+| `internal/worker/specified_sources.go` | 保证发给聊天检索的显式来源不含文档及 Derived 行 |
+| `internal/worker/processor.go` | 审计旧执行入口；无法证明不可达时转入公共混合编排，不能留下可达的混选拒绝路径 |
+| `internal/worker/citation.go` | 复用并补足跨类型证据去重、编号和坐标输出 |
+| `internal/service/llm.go` | 复用现有两类 Map；混合 Reduce 沿用限流、超时、模型回退、token 统计 |
+| `internal/worker/mixed_sources.go`（拟新增） | 来源分流、公共证据编排及混合辅助逻辑 |
+| `internal/service/mixed_summary_prompt.go`（拟新增） | 混合归纳提示词与调用封装，避免继续扩大既有大文件 |
 
 ### 5.3 前端：来源状态、协议和视图
 
 | 文件 | 改动责任 |
 |---|---|
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-docs-no-appconfig/packages/dmworksummary/src/features/summaryWorkbench/scope.ts` | 两类选择互不清空，时间和参与者按混合规则处理 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-docs-no-appconfig/packages/dmworksummary/src/features/summaryWorkbench/SummaryWorkbenchFeature.tsx` | 添加/删除来源、提示、时间入口及提交状态 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-docs-no-appconfig/packages/dmworksummary/src/bridge/summaryWorkbench/protocol.ts` | 能力字段与已有混合上下文类型契约 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-docs-no-appconfig/packages/dmworksummary/src/bridge/summaryWorkbench/adapter.ts` | 请求序列化、服务端响应解码、历史恢复不丢聊天和时间 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-docs-no-appconfig/packages/dmworksummary/src/bridge/summaryWorkbench/model.ts` | 两类 context item、文案状态和预览失效 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-docs-no-appconfig/packages/dmworksummary/src/bridge/summaryWorkbench/useSummaryWorkbench.ts` | scope 版本、进行中请求及旧响应处理 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-docs-no-appconfig/packages/dmworksummary/src/Service/SummaryWorkbenchService.ts` | 新能力传递与完整上下文提交，保留 Service 边界 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-docs-no-appconfig/packages/dmworksummary/src/features/summaryWorkbench/availability.ts` | 混选能力缺失/关闭时安全降级，按空间隔离缓存 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-docs-no-appconfig/packages/dmworksummary/src/features/summaryWorkbench/sessionStorage.ts` | 回归草稿、空间切换和版本兼容，必要时修改 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-docs-no-appconfig/packages/dmworksummary/src/pages/SummaryCreatePage.tsx` | 对仍启用的旧入口做最小兼容，不另建新业务入口 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-docs-no-appconfig/packages/dmworksummary/src/ui/SummaryWorkbench/index.tsx` | 来源展示与聊天时间说明；只渲染 props |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-docs-no-appconfig/packages/dmworksummary/src/components/CitationBadge.tsx` | 检查两类引用路由，必要时补版本及无权限提示 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-docs-no-appconfig/packages/dmworksummary/src/components/SummaryReferenceSidePanel.tsx` | 混合引用展示回归；不得新增原文授权 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-docs-no-appconfig/packages/dmworksummary/src/i18n/zh-CN.json` | 中文来源、时间、异常与覆盖提示 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-docs-no-appconfig/packages/dmworksummary/src/i18n/en-US.json` | 对应英文文案 |
+| `packages/dmworksummary/src/features/summaryWorkbench/scope.ts` | 两类选择互不清空，时间和参与者按混合规则处理 |
+| `packages/dmworksummary/src/features/summaryWorkbench/SummaryWorkbenchFeature.tsx` | 添加/删除来源、提示、时间入口及提交状态 |
+| `packages/dmworksummary/src/bridge/summaryWorkbench/protocol.ts` | 能力字段与已有混合上下文类型契约 |
+| `packages/dmworksummary/src/bridge/summaryWorkbench/adapter.ts` | 请求序列化、服务端响应解码、历史恢复不丢聊天和时间 |
+| `packages/dmworksummary/src/bridge/summaryWorkbench/model.ts` | 两类 context item、文案状态和预览失效 |
+| `packages/dmworksummary/src/bridge/summaryWorkbench/useSummaryWorkbench.ts` | scope 版本、进行中请求及旧响应处理 |
+| `packages/dmworksummary/src/Service/SummaryWorkbenchService.ts` | 新能力传递与完整上下文提交，保留 Service 边界 |
+| `packages/dmworksummary/src/features/summaryWorkbench/availability.ts` | 混选能力缺失/关闭时安全降级，按空间隔离缓存 |
+| `packages/dmworksummary/src/features/summaryWorkbench/sessionStorage.ts` | 回归草稿、空间切换和版本兼容，必要时修改 |
+| `packages/dmworksummary/src/pages/SummaryCreatePage.tsx` | 对仍启用的旧入口做最小兼容，不另建新业务入口 |
+| `packages/dmworksummary/src/ui/SummaryWorkbench/index.tsx` | 来源展示与聊天时间说明；只渲染 props |
+| `packages/dmworksummary/src/components/CitationBadge.tsx` | 检查两类引用路由，必要时补版本及无权限提示 |
+| `packages/dmworksummary/src/components/SummaryReferenceSidePanel.tsx` | 混合引用展示回归；不得新增原文授权 |
+| `packages/dmworksummary/src/i18n/zh-CN.json` | 中文来源、时间、异常与覆盖提示 |
+| `packages/dmworksummary/src/i18n/en-US.json` | 对应英文文案 |
 
 复用文档和聊天选择器，不重写 Docs 搜索。新增 UI 状态先写 Story，再接入业务。国际化实施前阅读 Web 仓库现行 i18n 指南；交互不应混入通用 `Components/` 中新增完整流程。
 
@@ -318,16 +318,16 @@
 
 | 测试文件或拟新增文件 | 覆盖点 |
 |---|---|
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/api/handler/document_summary_create_test.go` | 两类来源保留、文档过滤、限额、权限与 Docs 失败 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/api/handler/summary_workspace_contract_test.go` | 混合上下文、时间与参与者边界 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/api/handler/agent_summary_workspace_source_update_test.go` | 来源变化、历史 scope、旧预览失效 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/api/handler/agent_summary_workspace_time_range_test.go` | 混选不清空时间、默认时间与纯文档回归 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/service/summary_workflow_test.go` | 事务、权限、数量、幂等与快照复用 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/worker/specified_sources_test.go` | 文档及 Derived 来源不进入聊天检索 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/worker/document_sources_test.go` | 快照加载、哈希、分块及原拒绝混选测试替换 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/worker/personal_citation_pipeline_test.go` | 引用编号与最终持久化 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/worker/mixed_sources_test.go`（拟新增） | 两路证据、类型碰撞、空会话、失败、取消与预算 |
-| `/home/mlamp/octo-smart-summary/.codex-worktrees/summary-doc-capability/internal/service/mixed_summary_prompt_test.go`（拟新增） | 冲突、证据约束及防止来源正文变成指令 |
+| `internal/api/handler/document_summary_create_test.go` | 两类来源保留、文档过滤、限额、权限与 Docs 失败 |
+| `internal/api/handler/summary_workspace_contract_test.go` | 混合上下文、时间与参与者边界 |
+| `internal/api/handler/agent_summary_workspace_source_update_test.go` | 来源变化、历史 scope、旧预览失效 |
+| `internal/api/handler/agent_summary_workspace_time_range_test.go` | 混选不清空时间、默认时间与纯文档回归 |
+| `internal/service/summary_workflow_test.go` | 事务、权限、数量、幂等与快照复用 |
+| `internal/worker/specified_sources_test.go` | 文档及 Derived 来源不进入聊天检索 |
+| `internal/worker/document_sources_test.go` | 快照加载、哈希、分块及原拒绝混选测试替换 |
+| `internal/worker/personal_citation_pipeline_test.go` | 引用编号与最终持久化 |
+| `internal/worker/mixed_sources_test.go`（拟新增） | 两路证据、类型碰撞、空会话、失败、取消与预算 |
+| `internal/service/mixed_summary_prompt_test.go`（拟新增） | 冲突、证据约束及防止来源正文变成指令 |
 
 在后端实施工作树中运行。以下是计划命令，本次编写文档没有执行这些测试：
 
@@ -343,10 +343,10 @@ go test -race ./internal/service ./internal/worker
 扩展 scope、adapter、Service、Feature、旧创建页和引用组件现有测试；新增混选 E2E 场景。命令中的绝对路径需在开工后替换为新 Web 实施工作树，不能误在参考工作树修改代码。
 
 ```bash
-pnpm --dir /home/mlamp/octo-smart-summary/.codex-worktrees/summary-docs-no-appconfig/packages/dmworksummary test
-pnpm --dir /home/mlamp/octo-smart-summary/.codex-worktrees/summary-docs-no-appconfig/packages/dmworksummary typecheck
-pnpm --dir /home/mlamp/octo-smart-summary/.codex-worktrees/summary-docs-no-appconfig i18n:check
-pnpm --dir /home/mlamp/octo-smart-summary/.codex-worktrees/summary-docs-no-appconfig/apps/web test:e2e e2e-kit/tests/summary
+pnpm --dir packages/dmworksummary test
+pnpm --dir packages/dmworksummary typecheck
+pnpm --dir packages/dmworksummary i18n:check
+pnpm --dir apps/web test:e2e e2e-kit/tests/summary
 ```
 
 E2E 应先按现有配置准备浏览器、依赖和应用服务。Mock E2E 证明交互契约，不能代替真实 Docs/聊天权限联调。Story 验证浅色、深色、长标题、空态、加载、异常及窄屏状态；需要新 Story 时复用现有组件，不另做产品原型。
