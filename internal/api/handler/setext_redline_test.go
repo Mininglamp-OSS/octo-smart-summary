@@ -219,3 +219,90 @@ func TestCreateAgentSummary_LegacySavePersistsNeutralizedContent(t *testing.T) {
 		t.Fatalf("M7: legacy agent save persisted raw setext content: %q", result.Content)
 	}
 }
+
+// A-13 boundary pins (Jerry-Xin r4 §5, yujiawei r4 P2-1, mocha r4 finding 1;
+// PR#268): the refine size gate must measure the STRIPPED, PRE-NORMALIZE
+// length. At head 695e3af, gate 1 measures the raw response (pre-strip) and
+// gate 2 re-measures the post-normalize, post-citation length — both bases
+// disagree with the prescription, so both probes fail on the current head:
+//
+//   - boundary: a raw response of EXACTLY maxContentBytes bytes containing one
+//     normalizable rule passes gate 1 (rawLen == cap) but gate 2 rejects the
+//     +1-byte normalized body (40010). pr-base accepted it. Must flip to
+//     accepted-and-persisted.
+//   - fence-overhead: a raw response of cap + fence overhead bytes whose
+//     stripped body is exactly the cap passed gate 1 at pr-base and at r3
+//     (which measured post-strip) but is now rejected at gate 1. Must flip to
+//     accepted-and-persisted.
+//
+// Killing rule: reverting either gate to any other basis (raw pre-strip as
+// today, or post-normalize as r3's gate 2) keeps at least one probe red
+// (kills the M-RAWLEN revert mutant).
+func TestRefineSizeGateMeasuresStrippedPreNormalizeLength(t *testing.T) {
+	const cap = maxContentBytes // 500 * 1024
+	leadIn := "现将进展整理如下：\n---\n### 一、已完成事项\n"
+
+	for _, tc := range []struct {
+		name    string
+		rawBody string // the body the model "returned", inside or outside a fence
+	}{
+		{
+			name:    "exactly_at_cap_with_rule",
+			rawBody: buildSetextBoundaryBody(cap, leadIn),
+		},
+		{
+			name:    "fence_overhead_at_cap",
+			rawBody: "```markdown\n" + buildSetextBoundaryBody(cap, leadIn) + "\n```",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{"choices": []interface{}{
+					map[string]interface{}{"message": map[string]string{"content": tc.rawBody}, "finish_reason": "stop"},
+				}})
+			}))
+			defer srv.Close()
+			llm := service.NewLLMClient(srv.URL, "test", "test", 5, 1024, false, 5, nil)
+			db := setupEditDB(t)
+			id, resultID, _ := seedEditableTask(t, db)
+			h := NewEditHandler(db, llm)
+			r := setupEditRouter(h)
+			w := doJSONRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/refine", id), "creator1", map[string]interface{}{"feedback": "保留正文", "base_result_id": resultID})
+			if w.Code != http.StatusOK {
+				t.Fatalf("A-13 %s: exactly-at-cap refine must stay accepted (pr-base behavior), got %d: %s", tc.name, w.Code, w.Body.String())
+			}
+			var saved model.SummaryResult
+			db.Order("id DESC").First(&saved)
+			if !strings.Contains(saved.Content, "如下：\n\n---") {
+				t.Fatalf("A-13 %s: refined body not persisted with neutralized shape: %q", tc.name, saved.Content)
+			}
+		})
+	}
+}
+
+// buildSetextBoundaryBody constructs a UTF-8 body of exactly want bytes whose
+// head is leadIn (containing one normalizable "text\n---\n" setext shape) and
+// whose tail is filler long enough to reach the target size. The filler is
+// ASCII so byte length is exact; residue is absorbed by a final partial line.
+func buildSetextBoundaryBody(want int, leadIn string) string {
+	base := []byte(leadIn)
+	if len(base) >= want {
+		return string(base[:want])
+	}
+	filler := want - len(base)
+	fullLines := filler / 100
+	residue := filler % 100
+	var b strings.Builder
+	b.Write(base)
+	for i := 0; i < fullLines; i++ {
+		b.WriteString(strings.Repeat("a", 99) + "\n")
+	}
+	if residue > 0 {
+		b.WriteString(strings.Repeat("a", residue))
+	}
+	out := b.String()
+	if len(out) != want {
+		panic(fmt.Sprintf("boundary fixture builder produced %d bytes, want %d", len(out), want))
+	}
+	return out
+}

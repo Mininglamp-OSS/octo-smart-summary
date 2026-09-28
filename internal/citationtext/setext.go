@@ -65,11 +65,14 @@ const (
 // see the package comment for why '=' is excluded). Lines inside fenced (```
 // or ~~~) or indented (4-space/tab) code blocks are never modified. ATX
 // headings (## …), list items, quotes and table rows are not underlines for
-// this purpose, so their --- neighbours inside those constructs stay untouched
-// except for the one ambiguity that matters: a bare rule after a
-// list/table/quote line is followed by setext rules in CommonMark only when
-// the preceding line could close the container; we only normalize the
-// plain-paragraph case, which is the shape the model actually emits.
+// this purpose. The insertion rule is unconditional on shape: it applies after
+// any non-blank, non-indented, non-rule line, including lines that close or
+// continue list/quote/table containers. For container predecessors the insert
+// is behaviorally inert — a bare rule after those constructs already parses as
+// a thematic break in CommonMark, so the blank line changes the rendered HTML
+// not at all (verified through a reference implementation, PR#268 round-4
+// P2-3); the insertion only matters for the plain-paragraph case, which is
+// the shape the model actually emits.
 func NormalizeSetextHeadings(content string) string {
 	if !strings.Contains(content, "\n") {
 		return content

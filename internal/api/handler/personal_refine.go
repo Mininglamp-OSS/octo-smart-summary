@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmfallback"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -118,26 +119,29 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "调整失败，请稍后重试"})
 		return
 	}
-	// Size gate on the RAW model output, before normalization (mochashanyao
-	// round-3 P2): the normalizer only adds bytes, so gating the normalized
-	// bytes would reject near-cap bodies pr-base accepted.
-	rawLen := len(newContent)
-	newContent = finalizeRefineContent(newContent)
-	if newContent == "" {
+	// Size gate on the STRIPPED, PRE-NORMALIZE length (A-13, PR#268 r4 §5;
+	// see edit.go non-stream twin for the full rationale).
+	stripped, strippedLen := splitRefineContent(newContent)
+	if stripped == "" {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "调整结果为空"})
 		return
 	}
-	if rawLen > maxContentBytes {
+	if strippedLen > maxContentBytes {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "调整结果超过 500KB 限制"})
 		return
 	}
+	newContent = citationtext.NormalizeSetextHeadings(stripped)
+	normalizeGrowth := len(newContent) - len(stripped)
 
 	newContent, err = service.NormalizeGeneratedCitations(newContent, pr.GetCitations())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "调整结果包含无效引用，请修改要求后重试"})
 		return
 	}
-	if len(newContent) > maxContentBytes {
+	// A-13: gate 2 measures the SAME strip basis, netting out the known
+	// normalize growth (inserted blank lines), so it still bounds citation
+	// churn growth without tripping on the normalizer's own inserts.
+	if len(newContent)-normalizeGrowth > maxContentBytes {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "调整结果超过 500KB 限制"})
 		return
 	}
@@ -372,25 +376,28 @@ func (h *PersonalHandler) RefinePersonalSummaryStream(c *gin.Context) {
 		writeStreamError("调整失败，请稍后重试")
 		return
 	}
-	// Size gate on the RAW model output, before normalization (see the
-	// non-stream twin above for the mochashanyao round-3 P2 rationale).
-	rawLen := len(newContent)
-	newContent = finalizeRefineContent(newContent)
-	if newContent == "" {
+	// Size gate on the STRIPPED, PRE-NORMALIZE length (A-13, see the
+	// non-stream twin above for the full rationale).
+	stripped, strippedLen := splitRefineContent(newContent)
+	if stripped == "" {
 		writeStreamError("调整结果为空")
 		return
 	}
-	if rawLen > maxContentBytes {
+	if strippedLen > maxContentBytes {
 		writeStreamError("调整结果超过 500KB 限制")
 		return
 	}
+	newContent = citationtext.NormalizeSetextHeadings(stripped)
+	normalizeGrowth := len(newContent) - len(stripped)
 
 	newContent, err = service.NormalizeGeneratedCitations(newContent, pr.GetCitations())
 	if err != nil {
 		writeStreamError("调整结果包含无效引用，请修改要求后重试")
 		return
 	}
-	if len(newContent) > maxContentBytes {
+	// A-13: gate 2 measures the SAME strip basis, netting out the known
+	// normalize growth (see the non-stream twin).
+	if len(newContent)-normalizeGrowth > maxContentBytes {
 		writeStreamError("调整结果超过 500KB 限制")
 		return
 	}

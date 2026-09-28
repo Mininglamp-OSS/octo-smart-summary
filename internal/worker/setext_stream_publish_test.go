@@ -80,6 +80,20 @@ func waitIngest(t *testing.T, rec *recordedEvents) {
 	}
 }
 
+// recordedSnapshotContent replays the last snapshot event's content.
+func recordedSnapshotContent(t *testing.T, rec *recordedEvents) string {
+	t.Helper()
+	types, bodies := rec.snapshot()
+	for i := len(types) - 1; i >= 0; i-- {
+		if types[i] == "snapshot" {
+			content, _ := bodies[i]["content"].(string)
+			return content
+		}
+	}
+	t.Fatal("no snapshot event recorded")
+	return ""
+}
+
 func assertNormalizedSnapshotEvent(t *testing.T, rec *recordedEvents) {
 	t.Helper()
 	types, bodies := rec.snapshot()
@@ -112,7 +126,11 @@ func assertNormalizedSnapshotEvent(t *testing.T, rec *recordedEvents) {
 	}
 }
 
-const setextStreamContent = "现将进展整理如下[1]：\n\n---\n\n### 一、已完成事项\n\n内容甲[2]。\n"
+// A-16 (mocha r4 finding 4, PR#268): the fixture emits the RAW setext shape —
+// a pre-normalized fixture would keep passing under a remove-the-normalize
+// mutant once the A-5 emptyLineRe fix stops deleting the blank line first, so
+// the pin's killing power must not depend on that unrelated bug.
+const setextStreamContent = "现将进展整理如下：\n---\n### 一、已完成事项\n\n内容甲[2]。\n"
 
 func TestPersonalPipelinePublishesNormalizedSnapshot(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -164,6 +182,17 @@ func TestPersonalPipelinePublishesNormalizedSnapshot(t *testing.T) {
 	p.processPersonalSummary(context.Background(), task.ID, part.ID)
 	waitIngest(t, rec)
 	assertNormalizedSnapshotEvent(t, rec)
+	// A-16 parity pin (yujiawei r4 P2-4 / Jerry §2 adoption): the wire bytes
+	// the client sees must equal the persisted bytes edit.go:121 compares
+	// against — read the row back and diff against the replayed snapshot.
+	var saved model.PersonalResult
+	if err := db.First(&saved, pr.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	wireContent := recordedSnapshotContent(t, rec)
+	if wireContent != saved.Content {
+		t.Fatalf("A-16: wire snapshot bytes != persisted row bytes:\n wire=%q\n row =%q", wireContent, saved.Content)
+	}
 }
 
 func TestMetaReducePublishesNormalizedSnapshot(t *testing.T) {

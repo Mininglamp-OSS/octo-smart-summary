@@ -286,20 +286,22 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "调整失败，请稍后重试"})
 		return
 	}
-	// Size gate on the RAW model output, before normalization (mochashanyao
-	// round-3 P2): the normalizer only adds bytes, so gating the normalized
-	// bytes would reject near-cap bodies pr-base accepted. bytesAdded is
-	// report-only (same accounting the agent-save audit log uses).
-	rawLen := len(newContent)
-	newContent = finalizeRefineContent(newContent)
-	if newContent == "" {
+	// Size gate on the STRIPPED, PRE-NORMALIZE length (A-13, PR#268 r4 §5):
+	// one gate, one basis — the post-citation re-check below measures the
+	// same quantity for bodies without citation churn, so near-cap bodies
+	// keep the pr-base accept boundary. (Supersedes the r3 raw-length gate,
+	// whose basis was executably refuted at the exactly-at-cap boundary.)
+	stripped, strippedLen := splitRefineContent(newContent)
+	if stripped == "" {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "调整结果为空"})
 		return
 	}
-	if rawLen > maxContentBytes {
+	if strippedLen > maxContentBytes {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "调整结果超过 500KB 限制"})
 		return
 	}
+	newContent = citationtext.NormalizeSetextHeadings(stripped)
+	normalizeGrowth := len(newContent) - len(stripped)
 
 	basePlainCitations := baseResult.GetCitations()
 	if !callerPlainCitationsVisible(h.db, &task, userID, &baseResult) {
@@ -310,7 +312,10 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "调整结果包含无效引用，请修改要求后重试"})
 		return
 	}
-	if len(newContent) > maxContentBytes {
+	// A-13: gate 2 measures the SAME strip basis, netting out the known
+	// normalize growth (inserted blank lines), so it still bounds citation
+	// churn growth without tripping on the normalizer's own inserts.
+	if len(newContent)-normalizeGrowth > maxContentBytes {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "调整结果超过 500KB 限制"})
 		return
 	}
@@ -476,18 +481,19 @@ func (h *EditHandler) RefineSummaryStream(c *gin.Context) {
 		writeStreamError("调整失败，请稍后重试")
 		return
 	}
-	// Size gate on the RAW model output, before normalization (see the
-	// non-stream twin above for the mochashanyao round-3 P2 rationale).
-	rawLen := len(newContent)
-	newContent = finalizeRefineContent(newContent)
-	if newContent == "" {
+	// Size gate on the STRIPPED, PRE-NORMALIZE length (A-13, see the
+	// non-stream twin above for the full rationale).
+	stripped, strippedLen := splitRefineContent(newContent)
+	if stripped == "" {
 		writeStreamError("调整结果为空")
 		return
 	}
-	if rawLen > maxContentBytes {
+	if strippedLen > maxContentBytes {
 		writeStreamError("调整结果超过 500KB 限制")
 		return
 	}
+	newContent = citationtext.NormalizeSetextHeadings(stripped)
+	normalizeGrowth := len(newContent) - len(stripped)
 
 	basePlainCitations := baseResult.GetCitations()
 	if !callerPlainCitationsVisible(h.db, &task, userID, &baseResult) {
@@ -498,7 +504,9 @@ func (h *EditHandler) RefineSummaryStream(c *gin.Context) {
 		writeStreamError("调整结果包含无效引用，请修改要求后重试")
 		return
 	}
-	if len(newContent) > maxContentBytes {
+	// A-13: gate 2 measures the SAME strip basis, netting out the known
+	// normalize growth (see the non-stream twin).
+	if len(newContent)-normalizeGrowth > maxContentBytes {
 		writeStreamError("调整结果超过 500KB 限制")
 		return
 	}
@@ -827,15 +835,19 @@ func stripMarkdownFence(s string) string {
 // funneling all of them through this helper is what makes the next twin
 // impossible to miss.
 func finalizeRefineContent(raw string) string {
+	stripped, _ := splitRefineContent(raw)
+	return citationtext.NormalizeSetextHeadings(stripped)
+}
+
+// splitRefineContent returns the fence-stripped, trimmed model output and its
+// byte length. The length is the SINGLE size-gate basis (A-13, PR#268 r4 §5,
+// prescription by yujiawei): measured after the strip and before the
+// normalize, so gate 1 and the post-citation gate 2 measure the same quantity
+// for bodies without citation churn. This preserves both pr-base behaviors:
+// a stripped body at exactly maxContentBytes is accepted (a normalize insert
+// of k bytes no longer trips the boundary), and a fence wrapper whose raw
+// length exceeds the cap only by fence overhead is accepted.
+func splitRefineContent(raw string) (string, int) {
 	newContent := strings.TrimSpace(stripMarkdownFence(raw))
-	if newContent == "" {
-		return ""
-	}
-	// Neutralize setext headings the refine model may emit (see
-	// citationtext.NormalizeSetextHeadings). Note the size gate at the call
-	// sites is applied to the RAW length (mochashanyao round-3 P2): the
-	// normalizer only adds bytes, so gating the normalized bytes would move
-	// the accept/reject boundary — a body just under the cap with a bare
-	// rule was accepted at pr-base and must stay accepted.
-	return citationtext.NormalizeSetextHeadings(newContent)
+	return newContent, len(newContent)
 }
