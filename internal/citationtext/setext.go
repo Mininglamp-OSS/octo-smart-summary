@@ -48,15 +48,27 @@ const (
 	// underline; longer "paragraphs" are treated as noise and left alone.
 	maxSetextContentRunes = 10000
 	// setextMaxContentBytes bounds the scanned body in BYTES. It is sized to
-	// the largest body the ENFORCING write sites accept: maxContentBytes is
-	// 500*1024 = 512000 bytes (internal/api/handler/edit.go), enforced by
-	// both refine transports and both team/personal write checks — so this
-	// guard sits ABOVE those, not below (PR#268 round-1 P2-1: the old
-	// 200000-byte guard silently bypassed accepted 200KB-500KB summaries).
-	// Known exception (mochashanyao round-3 P2): CreateAgentSummary enforces
-	// no content cap (ValidateAgentSave only rejects empty content), so an
-	// oversized agent deliverable above this bound skips normalization
-	// rather than being rejected.
+	// the largest body the ENFORCING refine write sites accept as raw input:
+	// maxContentBytes is 500*1024 = 512000 bytes
+	// (internal/api/handler/edit.go). The refine gates now measure the
+	// STRIPPED, PRE-NORMALIZE length (PR#268 round-4/5 A-13), so a stripped
+	// body at the cap is accepted and the persisted row can be up to
+	// cap + normalizeGrowth bytes; this guard sits ABOVE that expanded
+	// upper bound rather than tracking the input cap exactly (PR#268
+	// round-1 P2-1: the old 200000-byte guard silently bypassed accepted
+	// 200KB-500KB summaries).
+	// Known exceptions (documented, not enforced here):
+	//   - CreateAgentSummary (mochashanyao round-3 P2): no content cap on
+	//     the write path, so an oversized agent deliverable above this
+	//     bound skips normalization rather than being rejected.
+	//   - Hand-edit / restore paths (EditSummary, PersonalEdit, personal
+	//     draft, restore): reject `len(req.Content) > maxContentBytes` on
+	//     the RAW input basis and never invoke this normalizer — so a
+	//     client that round-trips a refine's persisted (cap + growth)
+	//     bytes back through a hand-edit gets 40010. This asymmetry is a
+	//     consequence of the A-13 strip-basis prescription (PR#268 A-17,
+	//     four-way convergence); see the follow-up issue for the cap
+	//     invariant decision.
 	setextMaxContentBytes = 512000
 )
 
@@ -78,10 +90,14 @@ func NormalizeSetextHeadings(content string) string {
 		return content
 	}
 	if len(content) > setextMaxContentBytes {
-		// Defensive bound: bodies above maxContentBytes (512000 bytes) are
-		// rejected by every write site, so anything larger is never
-		// modified rather than scanned. This guard must stay >=
-		// maxContentBytes or accepted bodies bypass the fix.
+		// Defensive bound: bodies above the maximum enforced raw input cap
+		// (maxContentBytes = 512000) are outside the refine strip-basis
+		// accept boundary; the guard on this line short-circuits scanning
+		// rather than modifying pathological inputs. This bound must stay
+		// >= maxContentBytes plus expected normalize growth or accepted
+		// bodies bypass the fix. See the constant's doc-comment above for
+		// the write-site cap matrix and the documented exceptions
+		// (agent-save, hand-edit / restore).
 		return content
 	}
 	lines := strings.Split(content, "\n")

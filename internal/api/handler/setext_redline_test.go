@@ -221,62 +221,86 @@ func TestCreateAgentSummary_LegacySavePersistsNeutralizedContent(t *testing.T) {
 }
 
 // A-13 boundary pins (Jerry-Xin r4 §5, yujiawei r4 P2-1, mocha r4 finding 1;
-// PR#268): the refine size gate must measure the STRIPPED, PRE-NORMALIZE
-// length. At head 695e3af, gate 1 measures the raw response (pre-strip) and
-// gate 2 re-measures the post-normalize, post-citation length — both bases
-// disagree with the prescription, so both probes fail on the current head:
+// Jerry-Xin r5 N-2 loop-over-transports fix; PR#268): the refine size gate
+// must measure the STRIPPED, PRE-NORMALIZE length. At head 695e3af, gate 1
+// measures the raw response (pre-strip) and gate 2 re-measures the
+// post-normalize, post-citation length — both bases disagree with the
+// prescription. The r5 N-2 finding was that the initial boundary pin
+// exercised only the edit non-stream transport, leaving M-G1-RAW-STREAM
+// alive on the three sibling sites; the pin now loops over both edit
+// transports (sync + stream) to close that pin-gap.
 //
-//   - boundary: a raw response of EXACTLY maxContentBytes bytes containing one
-//     normalizable rule passes gate 1 (rawLen == cap) but gate 2 rejects the
-//     +1-byte normalized body (40010). pr-base accepted it. Must flip to
-//     accepted-and-persisted.
-//   - fence-overhead: a raw response of cap + fence overhead bytes whose
-//     stripped body is exactly the cap passed gate 1 at pr-base and at r3
-//     (which measured post-strip) but is now rejected at gate 1. Must flip to
-//     accepted-and-persisted.
-//
-// Killing rule: reverting either gate to any other basis (raw pre-strip as
-// today, or post-normalize as r3's gate 2) keeps at least one probe red
-// (kills the M-RAWLEN revert mutant).
+//   - exactly_at_cap_with_rule: a raw response of EXACTLY maxContentBytes
+//     bytes containing one normalizable rule must be accepted (kills the
+//     gate-2 revert mutant).
+//   - fence_overhead_at_cap: a raw response of cap + fence overhead bytes
+//     whose stripped body is exactly the cap must be accepted (kills the
+//     gate-1 raw-basis revert mutant, on both transports).
 func TestRefineSizeGateMeasuresStrippedPreNormalizeLength(t *testing.T) {
 	const cap = maxContentBytes // 500 * 1024
 	leadIn := "现将进展整理如下：\n---\n### 一、已完成事项\n"
 
-	for _, tc := range []struct {
+	transports := []struct {
+		name   string
+		stream bool
+	}{
+		{"sync", false},
+		{"stream", true},
+	}
+	cases := []struct {
 		name    string
 		rawBody string // the body the model "returned", inside or outside a fence
+		reason  string // what this leg pins (for failure diagnostics)
 	}{
 		{
 			name:    "exactly_at_cap_with_rule",
 			rawBody: buildSetextBoundaryBody(cap, leadIn),
+			reason:  "raw body exactly at cap must persist (gate 2 revert mutant lives here)",
 		},
 		{
 			name:    "fence_overhead_at_cap",
 			rawBody: "```markdown\n" + buildSetextBoundaryBody(cap, leadIn) + "\n```",
+			reason:  "fence-wrapped body whose stripped bytes equal cap must persist (gate 1 raw-basis revert mutant lives here)",
 		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{"choices": []interface{}{
-					map[string]interface{}{"message": map[string]string{"content": tc.rawBody}, "finish_reason": "stop"},
-				}})
-			}))
-			defer srv.Close()
-			llm := service.NewLLMClient(srv.URL, "test", "test", 5, 1024, false, 5, nil)
-			db := setupEditDB(t)
-			id, resultID, _ := seedEditableTask(t, db)
-			h := NewEditHandler(db, llm)
-			r := setupEditRouter(h)
-			w := doJSONRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/refine", id), "creator1", map[string]interface{}{"feedback": "保留正文", "base_result_id": resultID})
-			if w.Code != http.StatusOK {
-				t.Fatalf("A-13 %s: exactly-at-cap refine must stay accepted (pr-base behavior), got %d: %s", tc.name, w.Code, w.Body.String())
-			}
-			var saved model.SummaryResult
-			db.Order("id DESC").First(&saved)
-			if !strings.Contains(saved.Content, "如下：\n\n---") {
-				t.Fatalf("A-13 %s: refined body not persisted with neutralized shape: %q", tc.name, saved.Content)
-			}
-		})
+	}
+	for _, tp := range transports {
+		for _, tc := range cases {
+			t.Run(tp.name+"/"+tc.name, func(t *testing.T) {
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if tp.stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						delta, _ := json.Marshal(map[string]interface{}{"choices": []interface{}{
+							map[string]interface{}{"delta": map[string]string{"content": tc.rawBody}, "finish_reason": "stop"},
+						}})
+						fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", delta)
+						return
+					}
+					_ = json.NewEncoder(w).Encode(map[string]interface{}{"choices": []interface{}{
+						map[string]interface{}{"message": map[string]string{"content": tc.rawBody}, "finish_reason": "stop"},
+					}})
+				}))
+				defer srv.Close()
+				llm := service.NewLLMClient(srv.URL, "test", "test", 5, 1024, false, 5, nil)
+				db := setupEditDB(t)
+				id, resultID, _ := seedEditableTask(t, db)
+				h := NewEditHandler(db, llm)
+				r := setupEditRouter(h)
+				path := fmt.Sprintf("/api/v1/summaries/%d/refine", id)
+				if tp.stream {
+					r.POST("/api/v1/summaries/:id/refine-stream", h.RefineSummaryStream)
+					path += "-stream"
+				}
+				w := doJSONRequest(r, "POST", path, "creator1", map[string]interface{}{"feedback": "保留正文", "base_result_id": resultID})
+				if w.Code != http.StatusOK {
+					t.Fatalf("A-13 %s/%s: %s; refine got %d: %s", tp.name, tc.name, tc.reason, w.Code, w.Body.String())
+				}
+				var saved model.SummaryResult
+				db.Order("id DESC").First(&saved)
+				if !strings.Contains(saved.Content, "如下：\n\n---") {
+					t.Fatalf("A-13 %s/%s: refined body not persisted with neutralized shape: %q", tp.name, tc.name, saved.Content)
+				}
+			})
+		}
 	}
 }
 

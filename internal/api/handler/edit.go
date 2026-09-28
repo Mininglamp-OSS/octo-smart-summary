@@ -828,17 +828,6 @@ func stripMarkdownFence(s string) string {
 	return trimmed
 }
 
-// finalizeRefineContent is the shared post-processing pipeline for every LLM
-// refine path (edit.go non-stream + stream, personal_refine.go non-stream +
-// stream). PR#268 round-1 B-2: two of the four structural-twin refine handlers
-// missed the setext-neutralization call because the sequence was copy-pasted;
-// funneling all of them through this helper is what makes the next twin
-// impossible to miss.
-func finalizeRefineContent(raw string) string {
-	stripped, _ := splitRefineContent(raw)
-	return citationtext.NormalizeSetextHeadings(stripped)
-}
-
 // splitRefineContent returns the fence-stripped, trimmed model output and its
 // byte length. The length is the SINGLE size-gate basis (A-13, PR#268 r4 §5,
 // prescription by yujiawei): measured after the strip and before the
@@ -847,6 +836,13 @@ func finalizeRefineContent(raw string) string {
 // a stripped body at exactly maxContentBytes is accepted (a normalize insert
 // of k bytes no longer trips the boundary), and a fence wrapper whose raw
 // length exceeds the cap only by fence overhead is accepted.
+//
+// This function is the shared strip step for every refine transport (edit.go
+// non-stream + stream, personal_refine.go non-stream + stream); its callers
+// then apply citationtext.NormalizeSetextHeadings and the two size gates in
+// the same shape. PR#268 round-1 B-2 was that two of the four structural-twin
+// refine handlers missed the setext-neutralization call because the sequence
+// was copy-pasted; grep for splitRefineContent to enumerate all sites.
 func splitRefineContent(raw string) (string, int) {
 	newContent := strings.TrimSpace(stripMarkdownFence(raw))
 	return newContent, len(newContent)
