@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmcompat"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmfallback"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 )
@@ -22,6 +23,8 @@ type Client struct {
 	fallbackModels []string
 	timeout        time.Duration
 	maxTokens      int
+	temperature    float64
+	enableThinking bool
 	http           *http.Client
 }
 
@@ -31,6 +34,12 @@ type Client struct {
 // Passing a nil / empty slice preserves the single-model behavior. See
 // issue #179 for motivation.
 func NewClient(apiURL, apiKey, model string, timeoutSec, maxTokens int, fallbackModels []string) *Client {
+	return NewClientWithModelConfig(apiURL, apiKey, model, timeoutSec, maxTokens, fallbackModels, 0.3, false)
+}
+
+// NewClientWithModelConfig constructs an agent client using the same generation
+// settings and model-specific compatibility rules as the worker LLM client.
+func NewClientWithModelConfig(apiURL, apiKey, model string, timeoutSec, maxTokens int, fallbackModels []string, temperature float64, enableThinking bool) *Client {
 	// Copy to isolate the caller's slice from mutation; also drop empty
 	// entries and any entry that duplicates the primary model (would waste
 	// the retry budget without gaining coverage).
@@ -50,18 +59,22 @@ func NewClient(apiURL, apiKey, model string, timeoutSec, maxTokens int, fallback
 		fallbackModels: fallbacks,
 		timeout:        time.Duration(timeoutSec) * time.Second,
 		maxTokens:      maxTokens,
+		temperature:    temperature,
+		enableThinking: enableThinking,
 		http:           &http.Client{},
 	}
 }
 
 // chatRequest / chatResponse 只描述我们真正会用到的字段。
 type chatRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Tools       []Tool    `json:"tools,omitempty"`
-	ToolChoice  string    `json:"tool_choice,omitempty"`
-	MaxTokens   int       `json:"max_tokens"`
-	Temperature float64   `json:"temperature"`
+	Model              string                   `json:"model"`
+	Messages           []Message                `json:"messages"`
+	Tools              []Tool                   `json:"tools,omitempty"`
+	ToolChoice         string                   `json:"tool_choice,omitempty"`
+	MaxTokens          int                      `json:"max_tokens"`
+	Temperature        float64                  `json:"temperature"`
+	Thinking           *llmcompat.ThinkingParam `json:"thinking,omitempty"`
+	ChatTemplateKwargs map[string]interface{}   `json:"chat_template_kwargs,omitempty"`
 }
 
 type chatResponse struct {
@@ -125,12 +138,16 @@ func (c *Client) attemptChat(ctx context.Context, model string, msgs []Message, 
 			return AssistantTurn{}, llmfallback.Terminal, invalid
 		}
 	}
+	temperature := llmcompat.Temperature(model, c.temperature)
+	thinking, kwargs := llmcompat.ThinkingConfig(model, c.enableThinking)
 	reqBody := chatRequest{
-		Model:       model,
-		Messages:    msgs,
-		Tools:       tools,
-		MaxTokens:   c.maxTokens,
-		Temperature: 0.3,
+		Model:              model,
+		Messages:           msgs,
+		Tools:              tools,
+		MaxTokens:          c.maxTokens,
+		Temperature:        temperature,
+		Thinking:           thinking,
+		ChatTemplateKwargs: kwargs,
 	}
 	if len(tools) > 0 {
 		reqBody.ToolChoice = "auto"

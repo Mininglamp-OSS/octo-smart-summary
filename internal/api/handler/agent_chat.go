@@ -118,6 +118,8 @@ type AgentChatHandler struct {
 	llmFallbackModels []string
 	llmTimeout        int
 	llmMaxTokens      int
+	llmTemperature    float64
+	llmEnableThinking bool
 
 	db     *gorm.DB          // 用于 fetch 引用总结的产物 + 快照(见 CHAT-REFERENCE-BASED-DESIGN-v1)
 	store  agentHistoryStore // 多轮记忆读写（生产为 gorm 实现，测试可注入 mock）
@@ -154,7 +156,7 @@ func newAgentChatHandlerWithRunner(r *agent.Runner, system string, store agentHi
 // 并接入多轮记忆存储（db）与滑窗。提示词/工具/策略在 profile.go 与 prompts/*.md 配置。
 // llmFallbackModels 是可选的按序 fallback 模型列表（LLM_FALLBACK_MODELS）；
 // 传 nil 保持单模型行为，见 issue #179。
-func NewAgentChatHandler(db *gorm.DB, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int, llmFallbackModels []string) *AgentChatHandler {
+func NewAgentChatHandler(db *gorm.DB, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int, llmFallbackModels []string, llmTemperature float64, llmEnableThinking bool) *AgentChatHandler {
 	return &AgentChatHandler{
 		llmApiURL:         llmApiURL,
 		llmApiKey:         llmApiKey,
@@ -162,6 +164,8 @@ func NewAgentChatHandler(db *gorm.DB, llmApiURL, llmApiKey, llmModel string, llm
 		llmFallbackModels: llmFallbackModels,
 		llmTimeout:        llmTimeout,
 		llmMaxTokens:      llmMaxTokens,
+		llmTemperature:    llmTemperature,
+		llmEnableThinking: llmEnableThinking,
 		db:                db,
 		store:             newAgentMessageRepo(db),
 		window:            agent.HistoryWindow(),
@@ -201,7 +205,7 @@ func (h *AgentChatHandler) buildRunnerForProfile(profileName, uid, sessionID str
 		return nil, "", fmt.Errorf("build registry: %w", err)
 	}
 
-	client := agent.NewClient(h.llmApiURL, h.llmApiKey, h.llmModel, h.llmTimeout, h.llmMaxTokens, h.llmFallbackModels)
+	client := agent.NewClientWithModelConfig(h.llmApiURL, h.llmApiKey, h.llmModel, h.llmTimeout, h.llmMaxTokens, h.llmFallbackModels, h.llmTemperature, h.llmEnableThinking)
 	pool := agent.NewPool(4)
 	runner := agent.NewRunner(client, reg, pool, profile.Policy)
 	return runner, system, nil

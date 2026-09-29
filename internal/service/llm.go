@@ -15,13 +15,12 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmcompat"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmfallback"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 )
 
 const MapFailedMarker = "总结失败"
-
-const kimiRequiredTemperature = 0.6
 
 const maxLLMErrorBodyBytes = 4096
 
@@ -128,9 +127,7 @@ type ToolChoiceFunction struct {
 }
 
 // ThinkingParam controls the thinking/reasoning behavior for supported models.
-type ThinkingParam struct {
-	Type string `json:"type"` // "enabled" or "disabled"
-}
+type ThinkingParam = llmcompat.ThinkingParam
 
 type chatRequestWithTools struct {
 	Model       string        `json:"model"`
@@ -199,16 +196,7 @@ type chatResponse struct {
 // buildThinkingConfig returns model-specific thinking parameters.
 // For Kimi: top-level thinking field. For Qwen/DeepSeek: chat_template_kwargs.
 func (c *LLMClient) buildThinkingConfig(model string) (*ThinkingParam, map[string]interface{}) {
-	if c.enableThinking {
-		return nil, nil
-	}
-	if config.IsKimiModel(model) {
-		return &ThinkingParam{Type: "disabled"}, nil
-	}
-	if config.IsQwenOrDeepSeekModel(model) {
-		return nil, map[string]interface{}{"enable_thinking": false}
-	}
-	return nil, nil
+	return llmcompat.ThinkingConfig(model, c.enableThinking)
 }
 
 func readErrorBody(body io.Reader) string {
@@ -289,10 +277,7 @@ func (c *LLMClient) callWithPolicyAndModel(ctx context.Context, messages []ChatM
 		Models:      c.models(),
 		MaxAttempts: 3,
 	}, func(ctx context.Context, model string) (result, llmfallback.Outcome, error) {
-		temp := temperature
-		if config.IsKimiModel(model) {
-			temp = kimiRequiredTemperature
-		}
+		temp := llmcompat.Temperature(model, temperature)
 		log.Printf("[llm] calling model=%s temperature=%.2f max_tokens=%d", model, temp, c.maxTokens)
 		reqBody := chatRequest{
 			Model:       model,
@@ -418,10 +403,7 @@ func (c *LLMClient) callStreamWithModel(ctx context.Context, messages []ChatMess
 		Models:      c.models(),
 		MaxAttempts: 3,
 	}, func(ctx context.Context, model string) (result, llmfallback.Outcome, error) {
-		temp := temperature
-		if config.IsKimiModel(model) {
-			temp = kimiRequiredTemperature
-		}
+		temp := llmcompat.Temperature(model, temperature)
 		log.Printf("[llm] streaming model=%s temperature=%.2f max_tokens=%d", model, temp, c.maxTokens)
 
 		reqBody := chatRequest{
@@ -573,10 +555,7 @@ func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, t
 		MaxAttempts:     3,
 		Path:            llmfallback.PathToolCall,
 	}, func(ctx context.Context, model string) (result, llmfallback.Outcome, error) {
-		temp := temperature
-		if config.IsKimiModel(model) {
-			temp = kimiRequiredTemperature
-		}
+		temp := llmcompat.Temperature(model, temperature)
 		log.Printf("[llm] CallWithTools: tool=%s temperature=%.2f model=%s", forceFn, temp, model)
 
 		var toolChoice interface{}
