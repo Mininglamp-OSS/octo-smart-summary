@@ -198,7 +198,7 @@ func (r *Runner) RunWithHistoryOutcome(ctx context.Context, system string, histo
 			}
 			planStart := time.Now()
 			var err error
-			schemas := r.reg.Schemas()
+			schemas := workspaceScopeSchemas(ctx, r.reg.Schemas(), r.reg)
 			if state := draftState(ctx); state != nil && state.handle != "" {
 				schemas = terminalSchemas(schemas, r.policy.TerminalTool)
 			}
