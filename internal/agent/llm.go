@@ -105,6 +105,12 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, tools []Tool) (Assist
 		OnHTTPStatus:            diagnostics.httpStatus,
 		ValidateResponse: func(_ string, response llmclient.Response) (llmfallback.Outcome, error) {
 			choice := response.Choices[0]
+			diagnostics.response(
+				choice.Message.Content,
+				fromLLMToolCalls(choice.Message.ToolCalls),
+				choice.FinishReason,
+				response.Usage.CompletionTokens,
+			)
 			if choice.FinishReason != "length" {
 				return llmfallback.Success, nil
 			}
@@ -122,7 +128,6 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, tools []Tool) (Assist
 	}
 	choice := result.Response.Choices[0]
 	toolCalls := fromLLMToolCalls(choice.Message.ToolCalls)
-	diagnostics.response(choice.Message.Content, toolCalls, choice.FinishReason, result.Response.Usage.CompletionTokens)
 	// Set alongside the prose notice below, never instead of it: the notice tells
 	// the reader where the text stops, the flag lets the runner record a fact the
 	// model cannot edit away. See AssistantTurn.Truncated.
