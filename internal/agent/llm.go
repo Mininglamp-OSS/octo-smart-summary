@@ -1,21 +1,17 @@
 package agent
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmcompat"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmclient"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmfallback"
-	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 )
 
-// Client 是 agent 自带的 LLM 客户端，独立于 service/llm.go，只依赖标准库。
+// Client adapts Agent's multi-turn domain types to the shared LLM pipeline.
 type Client struct {
 	apiURL         string
 	apiKey         string
@@ -53,7 +49,7 @@ func NewClientWithModelConfig(apiURL, apiKey, model string, timeoutSec, maxToken
 		fallbacks = append(fallbacks, m)
 	}
 	return &Client{
-		apiURL:         apiURL,
+		apiURL:         strings.TrimRight(apiURL, "/"),
 		apiKey:         apiKey,
 		model:          model,
 		fallbackModels: fallbacks,
@@ -63,32 +59,6 @@ func NewClientWithModelConfig(apiURL, apiKey, model string, timeoutSec, maxToken
 		enableThinking: enableThinking,
 		http:           &http.Client{},
 	}
-}
-
-// chatRequest / chatResponse 只描述我们真正会用到的字段。
-type chatRequest struct {
-	Model              string                   `json:"model"`
-	Messages           []Message                `json:"messages"`
-	Tools              []Tool                   `json:"tools,omitempty"`
-	ToolChoice         string                   `json:"tool_choice,omitempty"`
-	MaxTokens          int                      `json:"max_tokens"`
-	Temperature        float64                  `json:"temperature"`
-	Thinking           *llmcompat.ThinkingParam `json:"thinking,omitempty"`
-	ChatTemplateKwargs map[string]interface{}   `json:"chat_template_kwargs,omitempty"`
-}
-
-type chatResponse struct {
-	Choices []struct {
-		Message struct {
-			Content   string     `json:"content"`
-			ToolCalls []ToolCall `json:"tool_calls"`
-		} `json:"message"`
-		FinishReason string `json:"finish_reason"`
-	} `json:"choices"`
-	Usage struct {
-		TotalTokens      int `json:"total_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-	} `json:"usage"`
 }
 
 // Chat 发起一次多轮回喂中的单跳请求。
@@ -108,123 +78,111 @@ type chatResponse struct {
 // A bounded, single-line log is emitted on every model switch to make silent
 // quality drift observable without dumping full upstream response bodies.
 func (c *Client) Chat(ctx context.Context, msgs []Message, tools []Tool) (AssistantTurn, error) {
-	models := append([]string{c.model}, c.fallbackModels...)
-	turn, _, err := llmfallback.Run(ctx, llmfallback.Config{
-		Models:          models,
-		PerModelTimeout: c.timeout,
-		MaxAttempts:     3,
-		Path:            llmfallback.PathAgentChat,
-	}, func(ctx context.Context, model string) (AssistantTurn, llmfallback.Outcome, error) {
-		return c.attemptChat(ctx, model, msgs, tools)
-	})
-	return turn, err
-}
-
-// attemptChat performs one chat/completions request against `model` and maps
-// the result to an llmfallback.Outcome. It owns only the single request +
-// classification; retry / backoff / model-switch is driven by llmfallback.Run.
-//
-// Classification (shared policy — see llmfallback.ClassifyStatus):
-//   - parent-context cancellation -> Terminal (surface the cancel; do not
-//     spend a doomed round-trip on a fallback, issue #179 P2)
-//   - transport error -> RetrySameModel (a local timeout is worth retrying)
-//   - HTTP >=400 -> ClassifyStatus (429/5xx retry same model; 403 escalates to
-//     the next model — the Bedrock SCP-deny case, #211; other 4xx terminal)
-//   - decode error / empty choices -> Terminal
-func (c *Client) attemptChat(ctx context.Context, model string, msgs []Message, tools []Tool) (AssistantTurn, llmfallback.Outcome, error) {
 	// Defense in depth for legacy histories and callers outside Runner.
 	for _, message := range msgs {
 		if invalid := invalidToolArguments(message.ToolCalls); invalid != nil {
-			return AssistantTurn{}, llmfallback.Terminal, invalid
+			return AssistantTurn{}, invalid
 		}
-	}
-	temperature := llmcompat.Temperature(model, c.temperature)
-	thinking, kwargs := llmcompat.ThinkingConfig(model, c.enableThinking)
-	reqBody := chatRequest{
-		Model:              model,
-		Messages:           msgs,
-		Tools:              tools,
-		MaxTokens:          c.maxTokens,
-		Temperature:        temperature,
-		Thinking:           thinking,
-		ChatTemplateKwargs: kwargs,
-	}
-	if len(tools) > 0 {
-		reqBody.ToolChoice = "auto"
-	}
-	payload, err := json.Marshal(reqBody)
-	if err != nil {
-		return AssistantTurn{}, llmfallback.Terminal, fmt.Errorf("marshal request: %w", err)
 	}
 	diagnostics := beginToolDiagnostics(ctx, msgs, tools)
-
-	reqCtx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.apiURL+"/chat/completions", bytes.NewReader(payload))
+	request := llmclient.Request{
+		Messages:       toLLMMessages(msgs),
+		Tools:          toLLMTools(tools),
+		Temperature:    c.temperature,
+		MaxTokens:      c.maxTokens,
+		EnableThinking: c.enableThinking,
+	}
+	if len(tools) > 0 {
+		request.ToolChoice = llmclient.ToolChoice{Mode: llmclient.ToolChoiceAuto}
+	}
+	shared := llmclient.New(c.apiURL, c.apiKey, c.model, c.fallbackModels, c.http)
+	result, err := shared.Complete(ctx, request, llmclient.CallOptions{
+		Path:                    llmfallback.PathAgentChat,
+		AttemptTimeout:          c.timeout,
+		PerModelTimeout:         c.timeout,
+		MaxAttempts:             3,
+		TerminalOnProtocolError: true,
+		OnHTTPStatus:            diagnostics.httpStatus,
+		ValidateResponse: func(_ string, response llmclient.Response) (llmfallback.Outcome, error) {
+			choice := response.Choices[0]
+			if choice.FinishReason != "length" {
+				return llmfallback.Success, nil
+			}
+			if len(choice.Message.ToolCalls) > 0 {
+				return llmfallback.Terminal, fmt.Errorf("LLM tool response truncated: finish_reason=length")
+			}
+			if strings.TrimSpace(choice.Message.Content) == "" {
+				return llmfallback.RetrySameModel, fmt.Errorf("LLM response truncated before producing content: finish_reason=length")
+			}
+			return llmfallback.Success, nil
+		},
+	})
 	if err != nil {
-		return AssistantTurn{}, llmfallback.Terminal, fmt.Errorf("build request: %w", err)
+		return AssistantTurn{}, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		if ctx.Err() != nil {
-			return AssistantTurn{}, llmfallback.Terminal, ctx.Err()
-		}
-		return AssistantTurn{}, llmfallback.RetrySameModel, fmt.Errorf("http do: %w", err)
-	}
-	defer resp.Body.Close()
-	diagnostics.httpStatus(resp.StatusCode)
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return AssistantTurn{}, llmfallback.ClassifyNonOKStatus(resp.StatusCode),
-			&llmfallback.HTTPError{StatusCode: resp.StatusCode,
-				Err: fmt.Errorf("http status %d: %s", resp.StatusCode, llmfallback.SafeTextForLog(string(body), 200))}
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		if ctx.Err() != nil {
-			return AssistantTurn{}, llmfallback.Terminal, ctx.Err()
-		}
-		return AssistantTurn{}, llmfallback.RetrySameModel, fmt.Errorf("read response: %w", err)
-	}
-
-	var cr chatResponse
-	if err := json.Unmarshal(body, &cr); err != nil {
-		return AssistantTurn{}, llmfallback.Terminal, fmt.Errorf("decode response: %w", err)
-	}
-	if len(cr.Choices) == 0 {
-		return AssistantTurn{}, llmfallback.Terminal, fmt.Errorf("empty choices in response")
-	}
-	choice := cr.Choices[0]
-	msg := choice.Message
-	diagnostics.response(msg.Content, msg.ToolCalls, choice.FinishReason, cr.Usage.CompletionTokens)
+	choice := result.Response.Choices[0]
+	toolCalls := fromLLMToolCalls(choice.Message.ToolCalls)
+	diagnostics.response(choice.Message.Content, toolCalls, choice.FinishReason, result.Response.Usage.CompletionTokens)
 	// Set alongside the prose notice below, never instead of it: the notice tells
 	// the reader where the text stops, the flag lets the runner record a fact the
 	// model cannot edit away. See AssistantTurn.Truncated.
 	truncated := false
+	content := choice.Message.Content
 	if choice.FinishReason == "length" {
-		if len(msg.ToolCalls) > 0 {
-			// Tool-call arguments can be syntactically present but cut off mid-JSON.
-			// Never dispatch a truncated planner turn as if it were valid.
-			return AssistantTurn{}, llmfallback.Terminal, fmt.Errorf("LLM tool response truncated: finish_reason=length")
-		}
-		if strings.TrimSpace(msg.Content) == "" {
-			return AssistantTurn{}, llmfallback.RetrySameModel, fmt.Errorf("LLM response truncated before producing content: finish_reason=length")
-		}
 		// A content-only turn is the user-facing answer. It is degraded but still
 		// usable, so preserve it with an explicit disclosure instead of failing
 		// the whole request and discarding everything the model produced.
-		msg.Content += service.TruncationNotice
+		content += llmclient.TruncationNotice
 		truncated = true
 	}
 	return AssistantTurn{
-		Content:          msg.Content,
-		ToolCalls:        msg.ToolCalls,
-		Tokens:           cr.Usage.TotalTokens,
-		CompletionTokens: cr.Usage.CompletionTokens,
+		Content:          content,
+		ToolCalls:        toolCalls,
+		Tokens:           result.Response.Usage.TotalTokens,
+		CompletionTokens: result.Response.Usage.CompletionTokens,
 		Truncated:        truncated,
-	}, llmfallback.Success, nil
+	}, nil
+}
+
+func toLLMMessages(messages []Message) []llmclient.Message {
+	converted := make([]llmclient.Message, len(messages))
+	for i, message := range messages {
+		converted[i] = llmclient.Message{
+			Role: message.Role, Content: message.Content, ToolCallID: message.ToolCallID,
+			Name: message.Name, ToolCalls: toLLMToolCalls(message.ToolCalls),
+		}
+	}
+	return converted
+}
+
+func toLLMTools(tools []Tool) []llmclient.Tool {
+	converted := make([]llmclient.Tool, len(tools))
+	for i, tool := range tools {
+		converted[i] = llmclient.Tool{Type: tool.Type, Function: llmclient.ToolFunction{
+			Name: tool.Function.Name, Description: tool.Function.Description, Parameters: tool.Function.Parameters,
+		}}
+	}
+	return converted
+}
+
+func toLLMToolCalls(calls []ToolCall) []llmclient.ToolCall {
+	converted := make([]llmclient.ToolCall, len(calls))
+	for i, call := range calls {
+		converted[i].ID = call.ID
+		converted[i].Type = call.Type
+		converted[i].Function.Name = call.Function.Name
+		converted[i].Function.Arguments = call.Function.Arguments
+	}
+	return converted
+}
+
+func fromLLMToolCalls(calls []llmclient.ToolCall) []ToolCall {
+	converted := make([]ToolCall, len(calls))
+	for i, call := range calls {
+		converted[i].ID = call.ID
+		converted[i].Type = call.Type
+		converted[i].Function.Name = call.Function.Name
+		converted[i].Function.Arguments = call.Function.Arguments
+	}
+	return converted
 }
