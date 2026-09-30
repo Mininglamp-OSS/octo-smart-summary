@@ -277,6 +277,14 @@ func TestClassifyToolErrorStaleHandleIsNotFatalPermission(t *testing.T) {
 	}
 }
 
+func TestClassifyToolErrorUnknownCriticalToolIsNonFatal(t *testing.T) {
+	env := classifyToolError("fetch_channel", errors.New("unknown tool: fetch_channel"))
+	if env.ErrorCode != "INVALID_ARGUMENT" || env.Fatal || !env.Retryable {
+		t.Fatalf("unknown critical tool = %s retryable=%t fatal=%t, want retryable non-fatal INVALID_ARGUMENT",
+			env.ErrorCode, env.Retryable, env.Fatal)
+	}
+}
+
 // TestClassifyToolErrorPermissionAndIdentityTransientOrdering pins the branch
 // ordering around permission vs weak transient terms, plus the round-9 P1-2 / P2-1
 // carve-outs.

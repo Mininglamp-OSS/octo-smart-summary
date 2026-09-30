@@ -87,6 +87,12 @@ func classifyToolError(toolName string, err error) ToolErrorEnvelope {
 	switch {
 	case strings.Contains(low, "panicked"):
 		env.ErrorCode, env.Retryable, env.Fatal = "INTERNAL_ERROR", false, true
+	case strings.Contains(low, "unknown tool:"):
+		// An unregistered tool call is a planner/schema mismatch, not evidence
+		// that a critical data operation failed. This must precede the
+		// critical-tool default because the model-supplied name may itself be in
+		// criticalTools even though no handler ran and no coverage was lost.
+		env.ErrorCode, env.Retryable, env.Fatal = "INVALID_ARGUMENT", true, false
 	case errors.Is(err, context.DeadlineExceeded) || strings.Contains(low, "deadline") || strings.Contains(low, "timeout"):
 		env.ErrorCode, env.Retryable, env.Fatal = "TIMEOUT", true, false
 	case errors.Is(err, context.Canceled) || strings.Contains(low, "canceled") || strings.Contains(low, "cancelled"):

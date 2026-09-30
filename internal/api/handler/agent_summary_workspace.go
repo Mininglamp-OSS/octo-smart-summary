@@ -676,7 +676,7 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 			IsArchived:  channel.IsArchived,
 		})
 	}
-	ctx, system = applySelectedChannelContext(ctx, system, selected)
+	ctx, system = applySelectedChannelContext(ctx, system, selected, key.UserID, summaryWorkspaceProfile)
 	ctx = agent.WithWorkspaceSpaceID(ctx, key.SpaceID)
 	if openScopeAgent {
 		ctx = agent.WithDiscoverableChannelScopeForUser(ctx, key.UserID, allowedChannels)
