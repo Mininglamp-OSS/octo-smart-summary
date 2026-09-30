@@ -100,6 +100,24 @@ func TestClassifyToolError(t *testing.T) {
 	}
 }
 
+func TestClassifyFetchSummaryScopeErrors(t *testing.T) {
+	for _, msg := range []string{
+		"fetch_summary_scope requires an empty JSON object",
+		"summary scope has no channels",
+		"summary scope has no valid authoritative time range",
+	} {
+		env := classifyToolError(fetchSummaryScopeTool, errors.New(msg))
+		if env.ErrorCode != "INVALID_ARGUMENT" || !env.Retryable || env.Fatal {
+			t.Errorf("classifyToolError(%q) = %+v, want retryable non-fatal INVALID_ARGUMENT", msg, env)
+		}
+	}
+
+	env := classifyToolError(fetchSummaryScopeTool, errors.New("fetch_summary_scope failed for every channel: channel g1: channel g1 not accessible by user u1"))
+	if env.ErrorCode != "PERMISSION_DENIED" || env.Retryable || env.Fatal {
+		t.Fatalf("batch permission classification = %+v, want non-fatal PERMISSION_DENIED", env)
+	}
+}
+
 // TestRunnerToolErrorEnvelope verifies the runner emits the structured envelope
 // and fires OnToolError only when V2 is on; off keeps the legacy "错误:" string
 // and does not fire the hook.

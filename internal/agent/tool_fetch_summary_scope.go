@@ -22,6 +22,7 @@ type summaryScopeFetchRecord struct {
 	total     int
 	truncated bool
 	err       string
+	fatalErr  error
 	succeeded bool
 }
 
@@ -100,7 +101,7 @@ func newFetchSummaryScopeTool(fetchOne Handler) (Tool, Handler) {
 		sem := make(chan struct{}, 4)
 		for _, channel := range channels {
 			channel := channel
-			key := summaryScopeChannelKey(channel)
+			key := summaryScopeChannelKey(channel, start, end)
 			state.mu.Lock()
 			alreadySucceeded := state.records[key].succeeded
 			state.mu.Unlock()
@@ -112,6 +113,19 @@ func newFetchSummaryScopeTool(fetchOne Handler) (Tool, Handler) {
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
+				record := summaryScopeFetchRecord{}
+				defer func() {
+					if p := recover(); p != nil {
+						record.err = fmt.Sprintf("fetch_channel panicked: %v", p)
+						record.fatalErr = errors.New(record.err)
+					}
+					state.mu.Lock()
+					existing := state.records[key]
+					if record.succeeded || !existing.succeeded {
+						state.records[key] = record
+					}
+					state.mu.Unlock()
+				}()
 				callArgs, _ := json.Marshal(map[string]interface{}{
 					"channel_id":       channel.ChannelID,
 					"channel_type":     channel.ChannelType,
@@ -120,9 +134,11 @@ func newFetchSummaryScopeTool(fetchOne Handler) (Tool, Handler) {
 					"include_archived": channel.IsArchived,
 				})
 				out, err := fetchOne(ctx, callArgs)
-				record := summaryScopeFetchRecord{}
 				if err != nil {
 					record.err = err.Error()
+					if classifyToolError("fetch_channel", err).Fatal {
+						record.fatalErr = err
+					}
 				} else {
 					var result struct {
 						Total          int    `json:"total"`
@@ -131,7 +147,7 @@ func newFetchSummaryScopeTool(fetchOne Handler) (Tool, Handler) {
 					}
 					if decodeErr := json.Unmarshal([]byte(out), &result); decodeErr != nil || result.MessagesHandle == "" {
 						record.err = "invalid fetch_channel result"
-					} else if messages := messageCache.Retrieve(result.MessagesHandle, uid, sessionID); messages == nil {
+					} else if messages, ok := messageCache.RetrieveOK(result.MessagesHandle, uid, sessionID); !ok {
 						record.err = "fetch_channel returned an unavailable messages_handle"
 					} else {
 						record.messages = append([]pipeline.Message(nil), messages...)
@@ -140,9 +156,6 @@ func newFetchSummaryScopeTool(fetchOne Handler) (Tool, Handler) {
 						record.succeeded = true
 					}
 				}
-				state.mu.Lock()
-				state.records[key] = record
-				state.mu.Unlock()
 			}()
 		}
 		wg.Wait()
@@ -160,9 +173,10 @@ func newFetchSummaryScopeTool(fetchOne Handler) (Tool, Handler) {
 		seenMessages := make(map[string]struct{})
 		successCount := 0
 		truncated := false
+		var fatalErr error
 		state.mu.Lock()
 		for _, channel := range channels {
-			record := state.records[summaryScopeChannelKey(channel)]
+			record := state.records[summaryScopeChannelKey(channel, start, end)]
 			item := channelResult{ChannelID: channel.ChannelID, ChannelType: channel.ChannelType}
 			if record.succeeded {
 				item.Status = "succeeded"
@@ -181,12 +195,22 @@ func newFetchSummaryScopeTool(fetchOne Handler) (Tool, Handler) {
 			} else {
 				item.Status = "failed"
 				item.Error = record.err
+				if fatalErr == nil && record.fatalErr != nil {
+					fatalErr = record.fatalErr
+				}
 			}
 			results = append(results, item)
 		}
 		state.mu.Unlock()
+		if fatalErr != nil {
+			return "", fatalErr
+		}
 		if successCount == 0 {
-			return "", errors.New("fetch_summary_scope failed for every channel")
+			reasons := make([]string, 0, len(results))
+			for _, result := range results {
+				reasons = append(reasons, fmt.Sprintf("channel %s: %s", result.ChannelID, result.Error))
+			}
+			return "", fmt.Errorf("fetch_summary_scope failed for every channel: %s", strings.Join(reasons, "; "))
 		}
 		sort.Slice(aggregate, func(i, j int) bool {
 			if aggregate[i].Timestamp != aggregate[j].Timestamp {
@@ -216,6 +240,6 @@ func newFetchSummaryScopeTool(fetchOne Handler) (Tool, Handler) {
 	return schema, handler
 }
 
-func summaryScopeChannelKey(channel ChannelScope) string {
-	return fmt.Sprintf("%d:%s", channel.ChannelType, strings.TrimSpace(channel.ChannelID))
+func summaryScopeChannelKey(channel ChannelScope, start, end time.Time) string {
+	return fmt.Sprintf("%d:%s:%d:%d", channel.ChannelType, strings.TrimSpace(channel.ChannelID), start.Unix(), end.Unix())
 }
