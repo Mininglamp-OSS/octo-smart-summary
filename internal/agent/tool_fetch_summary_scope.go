@@ -22,6 +22,7 @@ const (
 type summaryScopeFetchStateKey struct{}
 
 type summaryScopeFetchRecord struct {
+	channelID string
 	messages  []pipeline.Message
 	total     int
 	truncated bool
@@ -68,7 +69,7 @@ func newFetchSummaryScopeTool(fetchOne Handler) (Tool, Handler) {
 		Type: "function",
 		Function: ToolFunction{
 			Name:        fetchSummaryScopeTool,
-			Description: "批量抓取服务端已确认的全部总结频道和时间范围。只传空对象{}；返回一个聚合messages_handle及逐频道覆盖状态。失败后重试只处理失败频道；每次返回的messages_handle都会取代上一次，只使用最新handle。",
+			Description: "批量抓取服务端已确认的全部总结频道和时间范围。只传空对象{}；返回一个聚合messages_handle及逐频道覆盖状态。若failure_count大于0应重试，重试只处理失败频道；每次返回的messages_handle都会取代上一次，只使用最新handle。",
 			Parameters: map[string]interface{}{
 				"type":                 "object",
 				"additionalProperties": false,
@@ -122,7 +123,7 @@ func newFetchSummaryScopeTool(fetchOne Handler) (Tool, Handler) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				record := summaryScopeFetchRecord{}
+				record := summaryScopeFetchRecord{channelID: channel.ChannelID}
 				defer func() {
 					if p := recover(); p != nil {
 						record.err = fmt.Sprintf("fetch_channel panicked: %v", p)
@@ -279,4 +280,24 @@ func withSummaryScopeSelectedThreads(ctx context.Context, channels []ChannelScop
 		return ctx
 	}
 	return context.WithValue(ctx, ContextKeyAllowedArchivedChannels, selected)
+}
+
+func invalidateSummaryScopeFetchChannels(ctx context.Context, channelIDs []string) {
+	state, _ := ctx.Value(summaryScopeFetchStateKey{}).(*summaryScopeFetchState)
+	if state == nil || len(channelIDs) == 0 {
+		return
+	}
+	missing := make(map[string]struct{}, len(channelIDs))
+	for _, id := range channelIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			missing[id] = struct{}{}
+		}
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	for key, record := range state.records {
+		if _, ok := missing[record.channelID]; ok {
+			delete(state.records, key)
+		}
+	}
 }

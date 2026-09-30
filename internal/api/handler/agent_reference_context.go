@@ -311,7 +311,7 @@ func buildReferencedSummariesContextWithArtifacts(
 				sb.WriteString("  (你可以复用其中一个,或让用户明确,或用 list_channels 探索其他)\n")
 			}
 			if showCandidateChannelType {
-				sb.WriteString("  ⚠️ 调用 fetch_channel/peek_channel 时必须**原样复制**上面的 channel_type 数字,不要猜、不要默认 1\n")
+				sb.WriteString("  ⚠️ 调用当前可用的频道读取工具时必须**原样复制**上面的 channel_type 数字,不要猜、不要默认 1\n")
 			}
 			sb.WriteString("  ⚠️ 上面的老时间窗已过期,不要复制作为 fetch 参数\n")
 			sb.WriteString("  (若用户说'最新/今天/最近'请用 get_current_time 决定新时间窗)\n\n")

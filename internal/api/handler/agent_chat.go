@@ -17,6 +17,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryspec"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -578,8 +579,9 @@ func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid strin
 	objective := truncateRunes(req.Message, 1000)
 	draft := summaryspec.Draft{Objective: &objective}
 	for _, ch := range normalizedChannels {
+		channelID := pipeline.NormalizeDMChannelID(ch.ChannelID, uid, toolChannelType(ch.ChannelType))
 		draft.Channels = append(draft.Channels, summaryspec.Channel{
-			ChannelID: ch.ChannelID, Name: ch.Name, Type: ch.ChannelType,
+			ChannelID: channelID, Name: ch.Name, Type: ch.ChannelType,
 		})
 	}
 	spec, sources, err := summaryspec.Validate(draft, summaryspec.Options{

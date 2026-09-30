@@ -41,6 +41,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryspec"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
 
 // ToolChannelType maps the Spec/UI channel type string to the INTEGER
@@ -348,6 +349,14 @@ func checkCoverageBeforeFreeze(ctx context.Context, uid, sessionID, runID string
 		runID, sessionID, stepInfo.step, stepInfo.maxSteps, round, maxRounds, len(missingIDs))
 	instruction := buildCoverageGateInstruction(missing, spec.TimeRange)
 	if summaryScopeFetchStateAvailable(ctx) {
+		// The durable coverage row is authoritative. If it says a channel was
+		// never attempted, discard any in-memory success for that channel so the
+		// batch retry can re-run fetch_channel and repair a dropped coverage write.
+		retryIDs := append([]string(nil), missingIDs...)
+		for _, channel := range missing {
+			retryIDs = append(retryIDs, pipeline.NormalizeDMChannelID(channel.ChannelID, uid, ToolChannelType(channel.Type)))
+		}
+		invalidateSummaryScopeFetchChannels(ctx, retryIDs)
 		instruction = buildScopeBatchCoverageGateInstruction(missing)
 	}
 	return &CoverageGateError{
@@ -453,6 +462,6 @@ func buildScopeBatchCoverageGateInstruction(missing []summaryspec.Channel) strin
 		}
 		names = append(names, name)
 	}
-	return fmt.Sprintf("覆盖检查未通过：仍有 %d 个频道未成功抓取（%s）。请重新调用 fetch_summary_scope({})；该工具会跳过已成功频道，只重试失败频道。每次调用返回的新 messages_handle 会取代旧 handle；成功后请使用最新 handle 重新调用 summarize_chunk。若重试后仍失败，请基于其余频道继续并如实披露缺口。",
+	return fmt.Sprintf("覆盖检查未通过：仍有 %d 个频道未抓取（%s）。请重新调用 fetch_summary_scope({})；该工具会跳过已成功频道，只重试缺失频道。每次调用返回的新 messages_handle 会取代旧 handle；成功后请使用最新 handle 重新调用 summarize_chunk。若重试后仍失败，请基于其余频道继续并如实披露缺口。",
 		len(missing), strings.Join(names, "、"))
 }
