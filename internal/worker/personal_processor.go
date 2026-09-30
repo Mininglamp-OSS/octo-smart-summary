@@ -843,6 +843,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	// Document snapshot evidence for mixed mode, loaded once and appended
 	// after the chat-side citation numbering below.
 	var mixedDocumentEvidence []pipeline.Message
+	var mixedChatEvidenceCount int
 
 	// Resolve the tokenizer and Map budget before loading document snapshots so
 	// each generated evidence message is guaranteed to fit the same budget used
@@ -1090,6 +1091,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		targetMsgCount = len(sources)
 	}
 	if mixedMode {
+		mixedChatEvidenceCount = len(userMessages)
 		// Mixed: append document evidence after the chat numbering so the two
 		// classes share ONE citation pool (plan §4.4 证据编号). Chat messages
 		// keep their just-assigned indexes; document chunks continue from the
@@ -1198,11 +1200,18 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		endTime = ""
 	}
 	sourceName := sourceNameForGeneration(sources)
+	mixedTaskScope := service.MixedTaskScope{}
 	if mixedMode {
 		// Mixed keeps the chat-side time window (startTime/endTime above stay
 		// populated): documents are version-frozen but the chat half must
 		// state which window it covers (plan §3.4 显式展示覆盖范围限制 / A01).
 		sourceName = mixedSourceLabel(chatSources, documentSources)
+		mixedTaskScope = service.MixedTaskScope{
+			ChatEvidenceCount:     mixedChatEvidenceCount,
+			DocumentEvidenceCount: len(mixedDocumentEvidence),
+			TimeStart:             startTime,
+			TimeEnd:               endTime,
+		}
 	}
 
 	// Determine userName: use target's name when topic points to someone else
@@ -1250,8 +1259,8 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 				joinStrings(formatted), sourceName, 0, len(userMessages), generationTopic, streamDelta)
 		} else if mixedMode {
 			finalContent, totalTokens, modelVer, err = p.llm.CallMixedMapStreamWithModel(ctx,
-				joinStrings(formatted), sourceName, 0, len(userMessages),
-				startTime, endTime, generationTopic, userName, streamDelta)
+				joinStrings(formatted), sourceName, 0,
+				mixedMapScope(mixedTaskScope, userMessages), generationTopic, userName, streamDelta)
 		} else {
 			finalContent, totalTokens, modelVer, err = p.llm.CallMapStreamWithModel(ctx,
 				joinStrings(formatted), sourceName, 0, len(userMessages),
@@ -1331,8 +1340,8 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 						joinStrings(formatted), sourceName, idx, len(c), generationTopic, streamDelta)
 				} else if len(chunks) == 1 && mixedMode {
 					summary, tokens, usedModel, err = p.llm.CallMixedMapStreamWithModel(ctx,
-						joinStrings(formatted), sourceName, idx, len(c),
-						startTime, endTime, generationTopic, userName, streamDelta)
+						joinStrings(formatted), sourceName, idx,
+						mixedMapScope(mixedTaskScope, c), generationTopic, userName, streamDelta)
 				} else if len(chunks) == 1 {
 					summary, tokens, usedModel, err = p.llm.CallMapStreamWithModel(ctx,
 						joinStrings(formatted), sourceName, idx, len(c),
@@ -1343,8 +1352,8 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 						joinStrings(formatted), sourceName, idx, len(c), generationTopic)
 				} else if mixedMode {
 					summary, tokens, usedModel, err = p.llm.CallMixedMapWithModel(ctx,
-						joinStrings(formatted), sourceName, idx, len(c),
-						startTime, endTime, generationTopic, userName)
+						joinStrings(formatted), sourceName, idx,
+						mixedMapScope(mixedTaskScope, c), generationTopic, userName)
 				} else {
 					summary, tokens, usedModel, err = p.llm.CallMapWithModel(ctx,
 						joinStrings(formatted), sourceName, idx, len(c),
@@ -1434,7 +1443,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 					chunkSummaries, sourceName, len(userMessages), generationTopic, streamDelta)
 			} else if mixedMode {
 				finalContent, reduceTokens, modelVer, err = p.llm.CallMixedReduceStreamWithModel(ctx,
-					chunkSummaries, sourceName, len(userMessages), generationTopic, streamDelta)
+					chunkSummaries, sourceName, mixedTaskScope, generationTopic, streamDelta)
 			} else {
 				finalContent, reduceTokens, modelVer, err = p.llm.CallReduceStreamWithModel(ctx,
 					chunkSummaries, sourceName, startTime, endTime, targetMsgCount, generationTopic, streamDelta,

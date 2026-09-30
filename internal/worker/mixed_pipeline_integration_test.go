@@ -68,6 +68,32 @@ func mixedStubLLM(t *testing.T, content string, calls *atomic.Int32) *service.LL
 	return service.NewLLMClient(srv.URL, "test-key", "test-model", 5, 1000, false, 1, nil)
 }
 
+func mixedCapturingStubLLM(t *testing.T, content string, calls *atomic.Int32) (*service.LLMClient, *atomic.Value) {
+	t.Helper()
+	captured := &atomic.Value{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		var request struct {
+			Messages []service.ChatMessage `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode LLM request: %v", err)
+		}
+		parts := make([]string, 0, len(request.Messages))
+		for _, message := range request.Messages {
+			parts = append(parts, message.Content)
+		}
+		captured.Store(strings.Join(parts, "\n"))
+		w.Header().Set("Content-Type", "text/event-stream")
+		data, _ := json.Marshal(map[string]interface{}{"choices": []interface{}{
+			map[string]interface{}{"delta": map[string]string{"content": content}, "finish_reason": "stop"},
+		}})
+		fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", data)
+	}))
+	t.Cleanup(srv.Close)
+	return service.NewLLMClient(srv.URL, "test-key", "test-model", 5, 1000, false, 1, nil), captured
+}
+
 // A mixed task whose chat side yields ZERO messages in the window must NOT
 // return 「没有可总结内容」: the loaded document evidence is summarized and
 // the chat gap is stated (plan §3.4 / A08).
@@ -77,9 +103,10 @@ func TestExecutePersonalPipelineMixedEmptyChatFallsBackToDocuments(t *testing.T)
 		t.Fatal(err)
 	}
 	var calls atomic.Int32
+	llm, capturedPrompt := mixedCapturingStubLLM(t, "文档结论 [1]。", &calls)
 	p := &Processor{
-		db: db,
-		llm: mixedStubLLM(t, "文档结论 [1]。所选会话在该时间范围内无消息。", &calls),
+		db:  db,
+		llm: llm,
 		cfg: &config.Config{LLMModel: "test-model", MapMaxTokens: 10000, CharsPerTokenCJK: 1, CharsPerTokenASCII: 4},
 		fetchPersonalMessagesFn: func(context.Context, model.SummaryTask, string) ([]pipeline.Message, *pipeline.IntentResult, error) {
 			// Chat side is empty: the selected window holds no messages.
@@ -100,6 +127,13 @@ func TestExecutePersonalPipelineMixedEmptyChatFallsBackToDocuments(t *testing.T)
 	if calls.Load() == 0 {
 		t.Fatal("the document evidence was never sent to the model")
 	}
+	prompt, _ := capturedPrompt.Load().(string)
+	if !strings.Contains(prompt, "所选会话在该时间范围内无可用消息") {
+		t.Fatalf("empty-chat gap was not carried into the model prompt: %q", prompt)
+	}
+	if strings.Contains(prompt, "时间范围（仅聊天侧）") {
+		t.Fatalf("document-only Map chunk must not claim chat evidence: %q", prompt)
+	}
 }
 
 // A targeted-user empty (creator never spoke) with documents present must
@@ -111,11 +145,14 @@ func TestExecutePersonalPipelineMixedSelfEmptyFallsBackToDocuments(t *testing.T)
 	}
 	var calls atomic.Int32
 	p := &Processor{
-		db: db,
+		db:  db,
 		llm: mixedStubLLM(t, "文档结论 [1]。", &calls),
 		cfg: &config.Config{LLMModel: "test-model", MapMaxTokens: 10000, CharsPerTokenCJK: 1, CharsPerTokenASCII: 4},
 		fetchPersonalMessagesFn: func(context.Context, model.SummaryTask, string) ([]pipeline.Message, *pipeline.IntentResult, error) {
-			return []pipeline.Message{}, &pipeline.IntentResult{Skipped: true, SkipReason: "pure_generic_topic"}, nil
+			intent := &pipeline.IntentResult{}
+			intent.TargetPersons.UIDs = []string{"u1"}
+			intent.TargetPersons.HasTarget = true
+			return []pipeline.Message{}, intent, nil
 		},
 	}
 	task := seedMixedTask(t, db, "MIXED-SELF-EMPTY", "文档正文：架构决策记录。")
@@ -138,7 +175,7 @@ func TestExecutePersonalPipelineMixedCitationIndexesUnique(t *testing.T) {
 	}
 	var calls atomic.Int32
 	p := &Processor{
-		db: db,
+		db:  db,
 		llm: mixedStubLLM(t, "聊天要点 [1][2]，文档要点 [3]。", &calls),
 		cfg: &config.Config{LLMModel: "test-model", MapMaxTokens: 10000, CharsPerTokenCJK: 1, CharsPerTokenASCII: 4},
 		fetchPersonalMessagesFn: func(context.Context, model.SummaryTask, string) ([]pipeline.Message, *pipeline.IntentResult, error) {

@@ -20,12 +20,38 @@ import (
 // being silently resolved. The chat and document sides keep their own
 // citation shapes, so no citation-format change ships with this file.
 
+// MixedTaskScope describes the evidence available across the whole mixed task.
+// The chat time range applies only to chat evidence; document snapshots are
+// version-frozen at creation time.
+type MixedTaskScope struct {
+	ChatEvidenceCount     int
+	DocumentEvidenceCount int
+	TimeStart             string
+	TimeEnd               string
+}
+
+func (s MixedTaskScope) chatSideEmpty() bool {
+	return s.ChatEvidenceCount == 0
+}
+
+// MixedMapScope adds the evidence composition of the current Map chunk. A
+// token-based split commonly produces chat-only or document-only chunks even
+// though the task as a whole contains both source classes.
+type MixedMapScope struct {
+	Task                  MixedTaskScope
+	ChatEvidenceCount     int
+	DocumentEvidenceCount int
+}
+
 // buildMixedMapSystemPrompt is the system prompt for a mixed Map chunk. It
 // keeps the chat-side role (time-scoped conversation analysis) and adds the
 // document-side rules. userName names the topic's target person ("我" in the
 // topic refers to them) and may be empty for generic topics.
-func buildMixedMapSystemPrompt(topic, userName string) string {
-	prompt := `你是一个专业的综合总结助手。本次总结的证据包含两类来源：
+//
+// scope carries both the task-level coverage and THIS chunk's evidence
+// composition. The prompt must describe the chunk the model actually sees.
+func buildMixedMapSystemPrompt(topic, userName string, scope MixedMapScope) string {
+	prompt := `你是一个专业的综合总结助手。本次任务可能包含两类来源：
 - 聊天记录：形如 [n][时间] 发送人: 内容
 - 文档内容：形如 [n]【文档：标题｜版本：v｜片段：k】
 
@@ -52,6 +78,16 @@ func buildMixedMapSystemPrompt(topic, userName string) string {
 - 不得捏造或修改引用编号
 - 输出语言与证据的主要语言保持一致
 `
+	prompt += fmt.Sprintf("\n当前分片证据组成：聊天 %d 条，文档 %d 条。\n", scope.ChatEvidenceCount, scope.DocumentEvidenceCount)
+	if scope.ChatEvidenceCount == 0 {
+		prompt += "当前分片没有聊天证据，不得假设本分片包含聊天进展或对话结论。\n"
+	}
+	if scope.DocumentEvidenceCount == 0 {
+		prompt += "当前分片没有文档证据，不得假设本分片包含文档结论。\n"
+	}
+	if scope.Task.chatSideEmpty() {
+		prompt += "所选会话在该时间范围内无可用消息。最终正文必须明确说明这一覆盖缺口，且不得编造聊天进展。\n"
+	}
 	if strings.TrimSpace(topic) != "" {
 		prompt += fmt.Sprintf("\n用户要求：%s\n", topic)
 	}
@@ -63,7 +99,7 @@ func buildMixedMapSystemPrompt(topic, userName string) string {
 
 // buildMixedReduceSystemPrompt merges mixed chunk summaries. It keeps the
 // reduce rules and adds the cross-class conflict requirement.
-func buildMixedReduceSystemPrompt(topic string) string {
+func buildMixedReduceSystemPrompt(topic string, scope MixedTaskScope) string {
 	prompt := `你是一个专业的综合总结助手。请将多个混合来源分片总结合并为一份完整报告。证据同时包含聊天记录与文档内容。
 
 要求：
@@ -75,6 +111,9 @@ func buildMixedReduceSystemPrompt(topic string) string {
 - 默认输出不超过 2000 token；用户明确要求详细展开时，可在模型预算内适当展开
 - 输出语言与输入的主要语言保持一致
 `
+	if scope.chatSideEmpty() {
+		prompt += "\n所选会话在该时间范围内无可用消息。最终正文必须保留这一覆盖缺口，且不得编造聊天进展。\n"
+	}
 	if strings.TrimSpace(topic) != "" {
 		prompt += fmt.Sprintf("\n用户要求：%s\n", topic)
 	}
@@ -85,16 +124,34 @@ func buildMixedReduceSystemPrompt(topic string) string {
 // rows in one numbering pool). Mirrors CallDocumentMapWithModel's failure
 // contract: sentinel errors propagate as fatal; other failures return the
 // MapFailedMarker string with nil error so per-chunk retry semantics hold.
-// timeStart/timeEnd scope the CHAT side only (documents are version-frozen
-// snapshots); userName is the topic's target person for chat-side emphasis.
-func (c *LLMClient) CallMixedMapWithModel(ctx context.Context, formattedEvidence, sourceName string, chunkIndex, evidenceCount int, timeStart, timeEnd, topic, userName string) (string, int, string, error) {
+// scope describes both the whole-task coverage and this chunk's actual
+// evidence; userName is the topic's target person for chat-side emphasis.
+func buildMixedMapUserPrompt(formattedEvidence, sourceName string, scope MixedMapScope) string {
+	lines := []string{
+		fmt.Sprintf("任务来源范围：%s", sourceName),
+		fmt.Sprintf("当前分片证据：聊天 %d 条，文档 %d 条", scope.ChatEvidenceCount, scope.DocumentEvidenceCount),
+	}
+	if scope.ChatEvidenceCount > 0 {
+		lines = append(lines, fmt.Sprintf("时间范围（仅聊天侧）：%s ~ %s", scope.Task.TimeStart, scope.Task.TimeEnd))
+	}
+	if scope.Task.chatSideEmpty() {
+		lines = append(lines, "覆盖缺口：所选会话在该时间范围内无可用消息；最终正文必须明确说明。")
+	}
+	lines = append(lines,
+		fmt.Sprintf("证据条数：%d", scope.ChatEvidenceCount+scope.DocumentEvidenceCount),
+		fmt.Sprintf("\n证据内容（编号连续）：\n%s", formattedEvidence),
+	)
+	return strings.Join(lines, "\n")
+}
+
+func (c *LLMClient) CallMixedMapWithModel(ctx context.Context, formattedEvidence, sourceName string, chunkIndex int, scope MixedMapScope, topic, userName string) (string, int, string, error) {
 	ctx = llmfallback.WithPath(ctx, llmfallback.PathWorkerMap)
 	if strings.TrimSpace(formattedEvidence) == "" {
 		return "(无可总结内容)", 0, c.model, nil
 	}
-	userPrompt := fmt.Sprintf("来源：%s\n时间范围（仅聊天侧）：%s ~ %s\n证据条数：%d\n\n证据内容（聊天与文档混排，编号连续）：\n%s", sourceName, timeStart, timeEnd, evidenceCount, formattedEvidence)
+	userPrompt := buildMixedMapUserPrompt(formattedEvidence, sourceName, scope)
 	content, _, tokens, usedModel, err := c.callWithPolicyAndModel(ctx, []ChatMessage{
-		{Role: "system", Content: buildMixedMapSystemPrompt(topic, userName)},
+		{Role: "system", Content: buildMixedMapSystemPrompt(topic, userName, scope)},
 		{Role: "user", Content: userPrompt},
 	}, 0.1, truncateReject)
 	if err == nil {
@@ -111,14 +168,12 @@ func (c *LLMClient) CallMixedMapWithModel(ctx context.Context, formattedEvidence
 }
 
 // CallMixedMapStreamWithModel is the streaming single-chunk mixed path.
-// timeStart/timeEnd scope the CHAT side only; userName is the topic's target
-// person for chat-side emphasis.
-func (c *LLMClient) CallMixedMapStreamWithModel(ctx context.Context, formattedEvidence, sourceName string, chunkIndex, evidenceCount int, timeStart, timeEnd, topic, userName string, onDelta func(string) error) (string, int, string, error) {
+func (c *LLMClient) CallMixedMapStreamWithModel(ctx context.Context, formattedEvidence, sourceName string, chunkIndex int, scope MixedMapScope, topic, userName string, onDelta func(string) error) (string, int, string, error) {
 	ctx = llmfallback.WithPath(ctx, llmfallback.PathWorkerMap)
 	if strings.TrimSpace(formattedEvidence) == "" {
 		return "(无可总结内容)", 0, c.model, nil
 	}
-	userPrompt := fmt.Sprintf("来源：%s\n时间范围（仅聊天侧）：%s ~ %s\n证据条数：%d\n\n证据内容（聊天与文档混排，编号连续）：\n%s", sourceName, timeStart, timeEnd, evidenceCount, formattedEvidence)
+	userPrompt := buildMixedMapUserPrompt(formattedEvidence, sourceName, scope)
 	var emitted bool
 	wrappedDelta := func(delta string) error {
 		emitted = true
@@ -128,7 +183,7 @@ func (c *LLMClient) CallMixedMapStreamWithModel(ctx context.Context, formattedEv
 		return onDelta(delta)
 	}
 	content, tokens, usedModel, err := c.callStreamWithModel(ctx, []ChatMessage{
-		{Role: "system", Content: buildMixedMapSystemPrompt(topic, userName)},
+		{Role: "system", Content: buildMixedMapSystemPrompt(topic, userName, scope)},
 		{Role: "user", Content: userPrompt},
 	}, 0.1, wrappedDelta, true)
 	if err == nil {
@@ -148,10 +203,9 @@ func (c *LLMClient) CallMixedMapStreamWithModel(ctx context.Context, formattedEv
 }
 
 // CallMixedReduceStreamWithModel merges mixed chunk summaries while
-// preserving both citation classes. sourceName/evidenceCount carry the
-// mixed scope label; the reduce prompt needs no time window because chunk
-// summaries already embed the chat-side context.
-func (c *LLMClient) CallMixedReduceStreamWithModel(ctx context.Context, chunkSummaries []string, sourceName string, evidenceCount int, topic string, onDelta func(string) error) (string, int, string, error) {
+// preserving both citation classes. sourceName/scope carry task-level
+// coverage so an empty chat side cannot disappear during reduction.
+func (c *LLMClient) CallMixedReduceStreamWithModel(ctx context.Context, chunkSummaries []string, sourceName string, scope MixedTaskScope, topic string, onDelta func(string) error) (string, int, string, error) {
 	ctx = llmfallback.WithPath(ctx, llmfallback.PathWorkerReduce)
 	if len(chunkSummaries) == 1 {
 		if onDelta != nil && chunkSummaries[0] != "" {
@@ -165,10 +219,14 @@ func (c *LLMClient) CallMixedReduceStreamWithModel(ctx context.Context, chunkSum
 	for i, summary := range chunkSummaries {
 		parts = append(parts, fmt.Sprintf("【分片 %d】\n%s", i+1, summary))
 	}
-	userPrompt := fmt.Sprintf("来源：%s\n证据条数：%d\n\n以下是各分片总结（混合来源），请合并：\n\n%s",
-		sourceName, evidenceCount, strings.Join(parts, "\n\n---\n\n"))
+	coverage := ""
+	if scope.chatSideEmpty() {
+		coverage = "\n覆盖缺口：所选会话在该时间范围内无可用消息；最终正文必须明确保留该说明。"
+	}
+	userPrompt := fmt.Sprintf("任务来源范围：%s\n证据条数：%d%s\n\n以下是各分片总结（混合来源），请合并：\n\n%s",
+		sourceName, scope.ChatEvidenceCount+scope.DocumentEvidenceCount, coverage, strings.Join(parts, "\n\n---\n\n"))
 	return c.callStreamWithModel(ctx, []ChatMessage{
-		{Role: "system", Content: buildMixedReduceSystemPrompt(topic)},
+		{Role: "system", Content: buildMixedReduceSystemPrompt(topic, scope)},
 		{Role: "user", Content: userPrompt},
 	}, 0.1, onDelta, true)
 }

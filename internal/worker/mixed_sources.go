@@ -5,6 +5,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 )
 
 // Mixed document+chat worker orchestration (phase 1). See
@@ -106,6 +107,18 @@ func formatMixedEvidence(message pipeline.Message) string {
 	return fmt.Sprintf("[%d][%s] %s: %s",
 		message.CitationIndex, message.SendTime, message.SenderName,
 		escapeCitationMarkers(message.Content))
+}
+
+func mixedMapScope(taskScope service.MixedTaskScope, messages []pipeline.Message) service.MixedMapScope {
+	scope := service.MixedMapScope{Task: taskScope}
+	for _, message := range messages {
+		if message.ChannelType == model.SourceDocument {
+			scope.DocumentEvidenceCount++
+		} else {
+			scope.ChatEvidenceCount++
+		}
+	}
+	return scope
 }
 
 // mixedSourceLabel builds the user-prompt source label for a mixed task,

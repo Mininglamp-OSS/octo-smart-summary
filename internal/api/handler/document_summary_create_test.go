@@ -5,6 +5,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -439,6 +440,80 @@ func TestCreateDocumentSummaryMixedPersistsDocumentSnapshot(t *testing.T) {
 	}
 }
 
+func TestCreateDocumentSummaryMixedRejectsInvalidRequestsBeforeFetch(t *testing.T) {
+	overLimitSources := make([]map[string]interface{}, 0, service.MixedMaxTotalSources+1)
+	for i := 0; i < service.MixedMaxTotalSources; i++ {
+		overLimitSources = append(overLimitSources, map[string]interface{}{
+			"source_type": model.SourceGroup,
+			"source_id":   fmt.Sprintf("g_%d", i),
+		})
+	}
+	overLimitSources = append(overLimitSources, map[string]interface{}{
+		"source_type": model.SourceDocument,
+		"source_id":   "d_1",
+	})
+
+	tests := []struct {
+		name string
+		body map[string]interface{}
+	}{
+		{
+			name: "non-self creator",
+			body: map[string]interface{}{
+				"uid": "other-user",
+				"sources": []map[string]interface{}{
+					{"source_type": model.SourceGroup, "source_id": "g_1"},
+					{"source_type": model.SourceDocument, "source_id": "d_1"},
+				},
+			},
+		},
+		{
+			name: "participants",
+			body: map[string]interface{}{
+				"participants": []map[string]interface{}{{"user_id": "u2"}},
+				"sources": []map[string]interface{}{
+					{"source_type": model.SourceGroup, "source_id": "g_1"},
+					{"source_type": model.SourceDocument, "source_id": "d_1"},
+				},
+			},
+		},
+		{
+			name: "origin channel",
+			body: map[string]interface{}{
+				"origin_channel_id":   "g_1",
+				"origin_channel_type": 1,
+				"sources": []map[string]interface{}{
+					{"source_type": model.SourceGroup, "source_id": "g_1"},
+					{"source_type": model.SourceDocument, "source_id": "d_1"},
+				},
+			},
+		},
+		{name: "combined cap", body: map[string]interface{}{"sources": overLimitSources}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db, imDB := setupTestDBs(t)
+			client := &recordingDocumentSourceClient{
+				docs: map[string]*documentSummarySource{},
+				errs: map[string]error{"d_1": errors.New("document fetch must not run")},
+			}
+			h := NewTaskHandler(db, imDB, "")
+			h.documentClient = client
+
+			w := doCreateSummary(setupCreateRouter(h), test.body, "creator1")
+			if w.Code != http.StatusBadRequest || respCode(t, w) != 40001 {
+				t.Fatalf("response = %d %s", w.Code, w.Body.String())
+			}
+			client.mu.Lock()
+			defer client.mu.Unlock()
+			if len(client.versions) != 0 {
+				t.Fatalf("document fetch ran before mixed validation: %#v", client.versions)
+			}
+		})
+	}
+}
+
 func TestCreateDocumentSummaryRejectsBogusSourceType(t *testing.T) {
 	db, imDB := setupTestDBs(t)
 	client := &recordingDocumentSourceClient{docs: map[string]*documentSummarySource{
@@ -465,6 +540,11 @@ func TestCreateDocumentSummaryRejectsBogusSourceType(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("persisted %d sources, want 0 (bogus type must be rejected before persist)", count)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.versions) != 0 {
+		t.Fatalf("document fetch ran before bogus mixed source rejection: %#v", client.versions)
 	}
 }
 

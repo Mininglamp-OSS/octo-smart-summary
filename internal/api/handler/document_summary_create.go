@@ -36,6 +36,18 @@ func createSummaryHasDocumentSource(req createSummaryReq) bool {
 	return false
 }
 
+func uniqueCreateSummarySourceCount(sources []sourceReq) int {
+	type sourceKey struct {
+		sourceType int
+		sourceID   string
+	}
+	seen := make(map[sourceKey]struct{}, len(sources))
+	for _, source := range sources {
+		seen[sourceKey{sourceType: source.SourceType, sourceID: strings.TrimSpace(source.SourceID)}] = struct{}{}
+	}
+	return len(seen)
+}
+
 func (h *TaskHandler) prepareDocumentSummarySources(
 	requestContext context.Context,
 	header http.Header,
@@ -78,6 +90,32 @@ func (h *TaskHandler) prepareDocumentSummarySources(
 		}
 		if req.OriginChannelID != "" || req.OriginChannelType != 0 {
 			return badRequest("文档总结不支持来源会话")
+		}
+	} else {
+		// Reject permanent mixed-scope errors before the document fan-out below.
+		// The service validator repeats these checks as a persistence boundary,
+		// but running them only after FetchSummarySource can turn an invalid 400
+		// into a misleading 502 when the document service is degraded.
+		if req.UID != "" && req.UID != userID {
+			return badRequest("文档总结仅支持当前用户创建")
+		}
+		if len(req.Participants) != 0 {
+			return badRequest("混合来源总结暂不支持其他参与者")
+		}
+		if req.OriginChannelID != "" || req.OriginChannelType != 0 {
+			return badRequest("混合来源总结不支持来源会话")
+		}
+		if uniqueCreateSummarySourceCount(req.Sources) > service.MixedMaxTotalSources {
+			return badRequest(service.MixedSourceCountExceededError().Message)
+		}
+		for _, source := range req.Sources {
+			if source.SourceType == model.SourceDocument {
+				continue
+			}
+			validType := source.SourceType >= model.SourceGroup && source.SourceType <= model.SourceDirect
+			if strings.TrimSpace(source.SourceID) == "" || !validType {
+				return badRequest("每个来源需提供 source_id 与合法的 source_type")
+			}
 		}
 	}
 
