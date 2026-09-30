@@ -3,8 +3,10 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -132,5 +134,54 @@ func TestMixedSourceCountLimit(t *testing.T) {
 	if mixedMaxTotalSources < maxSummaryWorkspaceDocuments {
 		t.Fatalf("mixedMaxTotalSources = %d must allow the pure-document maximum %d",
 			mixedMaxTotalSources, maxSummaryWorkspaceDocuments)
+	}
+}
+
+// The combined cap must be reachable in isolation on the workspace surface
+// too: documents stay at the per-document cap while chat sources cross the
+// combined bound, so the rejection message is the combined-cap one (A05).
+// The channel cap (30) equals the combined cap (30), so the isolating shape
+// is 30 chats + 1 doc: the channel cap passes (30 ≤ 30) and the combined cap
+// rejects (31 > 30). The admitted boundary (29 chats + 1 doc = 30) pins the
+// other end.
+func TestNormalizeSummaryWorkspaceContextCombinedCapBoundary(t *testing.T) {
+	context := mixedContext()
+	channels := make([]summaryWorkspaceChannel, 0, mixedMaxTotalSources)
+	for i := 0; i < mixedMaxTotalSources-maxSummaryWorkspaceDocuments+2; i++ {
+		channels = append(channels, summaryWorkspaceChannel{ChatID: fmt.Sprintf("group-%d", i), ChatType: "group", Name: fmt.Sprintf("群%d", i)})
+	}
+	context.SelectedChannels = channels[:mixedMaxTotalSources-maxSummaryWorkspaceDocuments+1] // 21 chats
+	context.Documents = []summaryWorkspaceDocument{
+		{DocumentID: "doc-1", Title: "产品方案"},
+		{DocumentID: "doc-2", Title: "设计稿"},
+	} // 21 chats + 2 docs = 23 total, under the combined cap
+	if _, err := normalizeSummaryWorkspaceContext(context); err != nil {
+		t.Fatalf("23 sources (21 chats + 2 docs) must normalize: %v", err)
+	}
+
+	thirtyChats := make([]summaryWorkspaceChannel, 0, maxSummaryWorkspaceSelectedChannels)
+	for i := 0; i < maxSummaryWorkspaceSelectedChannels; i++ {
+		thirtyChats = append(thirtyChats, summaryWorkspaceChannel{ChatID: fmt.Sprintf("chat-%d", i), ChatType: "group", Name: fmt.Sprintf("群%d", i)})
+	}
+	boundary := mixedContext()
+	boundary.SelectedChannels = thirtyChats[:maxSummaryWorkspaceSelectedChannels-1] // 29 chats
+	boundary.Documents = []summaryWorkspaceDocument{
+		{DocumentID: "doc-1", Title: "产品方案"},
+	} // 29 chats + 1 doc = 30: admitted
+	if _, err := normalizeSummaryWorkspaceContext(boundary); err != nil {
+		t.Fatalf("30 sources (29 chats + 1 doc) must normalize: %v", err)
+	}
+
+	over := mixedContext()
+	over.SelectedChannels = thirtyChats // exactly 30 chats: channel cap passes
+	over.Documents = []summaryWorkspaceDocument{
+		{DocumentID: "doc-1", Title: "产品方案"},
+	} // 30 chats + 1 doc = 31: combined cap rejects
+	_, err := normalizeSummaryWorkspaceContext(over)
+	if err == nil {
+		t.Fatal("23 sources (22 chats + 1 doc) must be rejected by the combined cap")
+	}
+	if !strings.Contains(err.Error(), "混合来源总数不能超过") {
+		t.Fatalf("rejection must come from the combined cap, got: %v", err)
 	}
 }

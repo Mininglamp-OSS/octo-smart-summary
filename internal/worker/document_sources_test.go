@@ -43,7 +43,7 @@ func TestLoadDocumentEvidenceUsesPersistedSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	messages, err := loadDocumentEvidence(db, []model.SummarySource{source}, runeCountTokenizer{}, 1000)
+	messages, err := loadDocumentEvidence(context.Background(), db, []model.SummarySource{source}, runeCountTokenizer{}, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestLoadDocumentEvidenceSurfacesSnapshotTruncation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	messages, err := loadDocumentEvidence(db, []model.SummarySource{source}, runeCountTokenizer{}, 1000)
+	messages, err := loadDocumentEvidence(context.Background(), db, []model.SummarySource{source}, runeCountTokenizer{}, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestLoadDocumentEvidenceRejectsChangedSnapshot(t *testing.T) {
 	if err := db.Create(&model.SummarySourceSnapshot{SummarySourceID: source.ID, Content: "changed", ContentBytes: 7, ContentHash: strings.Repeat("0", 64)}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadDocumentEvidence(db, []model.SummarySource{source}, runeCountTokenizer{}, 1000); err == nil {
+	if _, err := loadDocumentEvidence(context.Background(), db, []model.SummarySource{source}, runeCountTokenizer{}, 1000); err == nil {
 		t.Fatal("loadDocumentEvidence accepted a snapshot whose content hash changed")
 	}
 }

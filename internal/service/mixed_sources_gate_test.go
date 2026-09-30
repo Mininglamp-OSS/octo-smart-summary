@@ -3,6 +3,8 @@ package service
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -75,6 +77,33 @@ func TestValidateDocumentWorkflowInputMixedCountCap(t *testing.T) {
 	}
 	if bizErr := validateDocumentWorkflowInput(in, sources); bizErr == nil {
 		t.Fatal("mixed scope over the combined cap must be rejected")
+	}
+}
+
+// The combined cap must be exercised in ISOLATION: documents stay at the
+// per-document maximum so the >MixedMaxTotalSources branch (not the 10-document
+// cap) produces the rejection, and the admitted boundary case (documents ≤10,
+// chat+documents = 30) passes. A05 pins both ends of 「合计 30/31 个」.
+func TestValidateDocumentWorkflowInputCombinedCapIsolating(t *testing.T) {
+	in := mixedWorkflowInput()
+	sources := make([]SummaryWorkflowSource, 0, MixedMaxTotalSources)
+	for i := 0; i < MaxDocumentSummarySourceCount; i++ {
+		sources = append(sources, mixedDocSource(fmt.Sprintf("doc-%d", i)))
+	}
+	for i := 0; i < MixedMaxTotalSources-MaxDocumentSummarySourceCount; i++ {
+		sources = append(sources, SummaryWorkflowSource{SourceType: model.SourceGroup, SourceID: fmt.Sprintf("group-%d", i)})
+	}
+	if bizErr := validateDocumentWorkflowInput(in, sources); bizErr != nil {
+		t.Fatalf("30 sources (10 docs + 20 chats) must be admitted: %v", bizErr)
+	}
+
+	over := append(sources, SummaryWorkflowSource{SourceType: model.SourceGroup, SourceID: "group-over"})
+	bizErr := validateDocumentWorkflowInput(in, over)
+	if bizErr == nil {
+		t.Fatal("31 sources (10 docs + 21 chats) must be rejected by the combined cap")
+	}
+	if !strings.Contains(bizErr.Error(), "混合来源总数不能超过30个") {
+		t.Fatalf("rejection must come from the combined cap, got: %v", bizErr)
 	}
 }
 

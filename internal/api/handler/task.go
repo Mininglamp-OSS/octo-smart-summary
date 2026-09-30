@@ -396,10 +396,12 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 	// The limiter caps CONCURRENCY (see document_preview_limit.go): moving it
 	// to the far side of the fan-out would let one account fire N×(up to 10)
 	// upstream FetchSummarySource calls before any 429 — the amplifier this
-	// control exists to stop. Gate-off mixed rejection still returns a clean
-	// 400 here: it happens inside prepareDocumentSummarySources before any
-	// fetch, so the slot is held only for the instant of the check and
-	// released by defer; no upstream call is made for an inadmissible request.
+	// control exists to stop. Mixed admission is unconditional now, so the
+	// surviving mixed rejections (participants/origin/caps) still return a
+	// clean 400 before any fetch: they happen inside
+	// prepareDocumentSummarySources / the service validator before upstream
+	// calls, so the slot is held only for the instant of the check and
+	// released by defer.
 	hasDocumentSource := createSummaryHasDocumentSource(req)
 	var releaseSlot func()
 	if hasDocumentSource {

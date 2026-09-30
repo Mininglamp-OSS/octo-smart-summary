@@ -70,9 +70,12 @@ func mixedHasDocumentSource(sources []model.SummarySource) bool {
 // one numbering pool across the whole Map/Reduce (plan §4.4 证据编号: 唯一
 // 编号贯穿两路,不各自从 1 开始).
 //
-// documentStartIndex is the first free citation index after the chat side;
-// loadDocumentEvidence numbers its chunks from 1, so every document message
-// gets offset by (documentStartIndex - 1).
+// documentStartIndex is the first free citation index after the chat side.
+// Document chunks are numbered documentStartIndex, documentStartIndex+1, … in
+// load order — the loader sets MessageSeq (per-document chunk number) but
+// leaves CitationIndex at its zero value, so the continuing index MUST be
+// assigned explicitly here rather than offset from a base the loader never
+// writes (plan §4.4 证据编号: 唯一编号贯穿两路,不各自从 1 开始).
 func appendDocumentEvidence(chatMessages []pipeline.Message, documentSources []model.SummarySource, loader documentEvidenceLoader, documentStartIndex int) ([]pipeline.Message, error) {
 	if len(documentSources) == 0 {
 		return chatMessages, nil
@@ -81,9 +84,8 @@ func appendDocumentEvidence(chatMessages []pipeline.Message, documentSources []m
 	if err != nil {
 		return nil, err
 	}
-	offset := documentStartIndex - 1
 	for i := range documentMessages {
-		documentMessages[i].CitationIndex += offset
+		documentMessages[i].CitationIndex = documentStartIndex + i
 	}
 	return append(chatMessages, documentMessages...), nil
 }
