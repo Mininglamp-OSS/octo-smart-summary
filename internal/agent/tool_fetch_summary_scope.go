@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
 
@@ -94,6 +95,12 @@ func newFetchSummaryScopeTool(fetchOne Handler) (Tool, Handler) {
 		if len(channels) == 0 {
 			return "", errors.New("summary scope has no channels")
 		}
+		// Keep archived-thread discovery narrow: every authoritative thread in
+		// the scope is eligible for the selected-thread query path, while the DB
+		// membership join remains the access-control boundary. Do not forward the
+		// client-originated IsArchived bit as include_archived=true, which would
+		// widen discovery to all archived threads.
+		ctx = withSummaryScopeSelectedThreads(ctx, channels)
 		start, end := ResolveAllowedTimeRange(ctx, time.Time{}, time.Time{})
 		if start.IsZero() || end.IsZero() || !end.After(start) {
 			return "", errors.New("summary scope has no valid authoritative time range")
@@ -167,6 +174,9 @@ func newFetchSummaryScopeTool(fetchOne Handler) (Tool, Handler) {
 			}()
 		}
 		wg.Wait()
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 
 		type channelResult struct {
 			ChannelID   string `json:"channel_id"`
@@ -251,4 +261,22 @@ func newFetchSummaryScopeTool(fetchOne Handler) (Tool, Handler) {
 func summaryScopeChannelKey(channel ChannelScope, start, end time.Time) string {
 	return fmt.Sprintf("%d:%s:%s:%s", channel.ChannelType, strings.TrimSpace(channel.ChannelID),
 		start.UTC().Format(time.RFC3339Nano), end.UTC().Format(time.RFC3339Nano))
+}
+
+func withSummaryScopeSelectedThreads(ctx context.Context, channels []ChannelScope) context.Context {
+	selected := make(map[string]bool)
+	for _, id := range SelectedArchivedChannelIDs(ctx) {
+		selected[id] = true
+	}
+	for _, channel := range channels {
+		if channel.ChannelType == model.ChannelTypeThread {
+			if id := strings.TrimSpace(channel.ChannelID); id != "" {
+				selected[id] = true
+			}
+		}
+	}
+	if len(selected) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, ContextKeyAllowedArchivedChannels, selected)
 }

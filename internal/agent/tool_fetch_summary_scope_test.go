@@ -208,6 +208,65 @@ func TestFetchSummaryScopeDoesNotForwardArchivedHint(t *testing.T) {
 	}
 }
 
+func TestFetchSummaryScopeTotalFailurePreservesFatalCause(t *testing.T) {
+	ResetForTest()
+	const uid, sessionID = "user-total-fatal", "summaryws:total-fatal"
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	ctx := scopeFetchTestContext(uid, sessionID, start, start.Add(24*time.Hour), []ChannelScope{
+		{ChannelID: "denied", ChannelType: model.ChannelTypeGroup},
+		{ChannelID: "database", ChannelType: model.ChannelTypeGroup},
+	})
+	fetchOne := func(_ context.Context, args json.RawMessage) (string, error) {
+		var req struct {
+			ChannelID string `json:"channel_id"`
+		}
+		_ = json.Unmarshal(args, &req)
+		if req.ChannelID == "denied" {
+			return "", errors.New("channel denied not accessible by user user-total-fatal")
+		}
+		return "", errors.New("fetch messages: Error 1040: Too many connections")
+	}
+	_, handler := newFetchSummaryScopeTool(fetchOne)
+
+	_, err := handler(ctx, json.RawMessage(`{}`))
+	if err == nil || !strings.Contains(err.Error(), "Too many connections") {
+		t.Fatalf("total failure = %v, want fatal child cause", err)
+	}
+	if env := classifyToolError(fetchSummaryScopeTool, err); !env.Fatal || env.Retryable == false {
+		t.Fatalf("fatal child classification = %+v", env)
+	}
+}
+
+func TestFetchSummaryScopeReturnsCancellationAfterPartialWork(t *testing.T) {
+	ResetForTest()
+	const uid, sessionID = "user-cancel", "summaryws:cancel"
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	base := scopeFetchTestContext(uid, sessionID, start, start.Add(24*time.Hour), []ChannelScope{
+		{ChannelID: "cancel", ChannelType: model.ChannelTypeGroup},
+		{ChannelID: "good", ChannelType: model.ChannelTypeGroup},
+	})
+	ctx, cancel := context.WithCancel(base)
+	fetchOne := func(ctx context.Context, args json.RawMessage) (string, error) {
+		var req struct {
+			ChannelID string `json:"channel_id"`
+		}
+		_ = json.Unmarshal(args, &req)
+		if req.ChannelID == "cancel" {
+			<-ctx.Done()
+			return "", ctx.Err()
+		}
+		handle := messageCache.Store([]pipeline.Message{{ChannelID: "good", MessageSeq: 1}}, uid, sessionID)
+		cancel()
+		data, _ := json.Marshal(map[string]interface{}{"total": 1, "messages_handle": handle})
+		return string(data), nil
+	}
+	_, handler := newFetchSummaryScopeTool(fetchOne)
+
+	if _, err := handler(ctx, json.RawMessage(`{}`)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation error = %v, want context.Canceled", err)
+	}
+}
+
 func TestFetchSummaryScopeCacheIncludesTimeRange(t *testing.T) {
 	ResetForTest()
 	const uid, sessionID = "user-range", "summaryws:range"
