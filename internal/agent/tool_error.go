@@ -23,11 +23,12 @@ type ToolErrorEnvelope struct {
 // criticalTools are the tools whose failure compromises data completeness; a
 // fatal error from them must block a COMPLETE verdict.
 var criticalTools = map[string]bool{
-	"fetch_channel":   true,
-	"search_messages": true,
-	"filter_relevant": true,
-	"summarize_chunk": true,
-	"merge_summaries": true,
+	"fetch_channel":       true,
+	"fetch_summary_scope": true,
+	"search_messages":     true,
+	"filter_relevant":     true,
+	"summarize_chunk":     true,
+	"merge_summaries":     true,
 }
 
 // classifyToolError maps a tool failure to a structured envelope. The rules are

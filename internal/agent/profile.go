@@ -38,6 +38,7 @@ var toolFactories = map[string]ToolFactory{
 	"find_shared_channels":     FindSharedChannelsTool,
 	"peek_channel":             PeekChannelTool,
 	"fetch_channel":            FetchChannelTool,
+	"fetch_summary_scope":      FetchSummaryScopeTool,
 	"search_messages":          SearchMessagesTool,
 	"filter_relevant":          FilterRelevantTool,
 	"summarize_chunk":          SummarizeChunkTool,
@@ -53,6 +54,7 @@ var toolPhases = map[string]ToolPhase{
 	"find_shared_channels":     ToolPhaseScopePreparation,
 	"set_summary_scope":        ToolPhaseScopeCommit,
 	"fetch_channel":            ToolPhaseFetch,
+	"fetch_summary_scope":      ToolPhaseFetch,
 	"summarize_chunk":          ToolPhaseSummarize,
 }
 
@@ -105,7 +107,7 @@ var profiles = map[string]Profile{
 			"get_current_time", "extract_time_range",
 			"set_summary_scope",
 			"list_channels", "narrow_channels_by_topic", "find_shared_channels",
-			"peek_channel", "fetch_channel", "search_messages",
+			"peek_channel", "fetch_summary_scope", "search_messages",
 			"filter_relevant", "summarize_chunk", "merge_summaries",
 			prepareSummaryDraftTool,
 			"emit_summary_response",

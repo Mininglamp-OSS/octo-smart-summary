@@ -193,6 +193,9 @@ func TestGetProfile_SummaryWorkspace(t *testing.T) {
 			t.Fatalf("summary_workspace is missing guarded discovery tool %q", discoveryTool)
 		}
 	}
+	if !reg.Has("fetch_summary_scope") || reg.Has("fetch_channel") {
+		t.Fatal("summary_workspace must expose only the authoritative scope batch fetch")
+	}
 
 	prompt, err := LoadPrompt(profile.PromptFile)
 	if err != nil {

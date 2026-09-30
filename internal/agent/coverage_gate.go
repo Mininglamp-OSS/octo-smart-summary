@@ -346,9 +346,13 @@ func checkCoverageBeforeFreeze(ctx context.Context, uid, sessionID, runID string
 	missing := channelsForIDs(spec.Channels, missingIDs)
 	log.Printf("[coverage_gate] run=%s session=%s step=%d/%d round=%d/%d: blocking the citation freeze, %d expected channel(s) never fetched",
 		runID, sessionID, stepInfo.step, stepInfo.maxSteps, round, maxRounds, len(missingIDs))
+	instruction := buildCoverageGateInstruction(missing, spec.TimeRange)
+	if summaryScopeFetchStateAvailable(ctx) {
+		instruction = buildScopeBatchCoverageGateInstruction(missing)
+	}
 	return &CoverageGateError{
 		Missing:     missing,
-		Instruction: buildCoverageGateInstruction(missing, spec.TimeRange),
+		Instruction: instruction,
 	}
 }
 
@@ -438,4 +442,17 @@ func buildCoverageGateInstruction(missing []summaryspec.Channel, tr summaryspec.
 	}
 	b.WriteString("。抓完后再重新调用 summarize_chunk。若某个频道确实抓不到(无权限/已删除),说明原因后继续处理其余频道,不要编造内容。")
 	return b.String()
+}
+
+func buildScopeBatchCoverageGateInstruction(missing []summaryspec.Channel) string {
+	names := make([]string, 0, len(missing))
+	for _, channel := range missing {
+		name := strings.TrimSpace(channel.Name)
+		if name == "" {
+			name = channel.ChannelID
+		}
+		names = append(names, name)
+	}
+	return fmt.Sprintf("覆盖检查未通过：仍有 %d 个频道未成功抓取（%s）。请重新调用 fetch_summary_scope({})；该工具会跳过已成功频道，只重试失败频道。成功后再重新调用 summarize_chunk。若重试后仍失败，请基于其余频道继续并如实披露缺口。",
+		len(missing), strings.Join(names, "、"))
 }
