@@ -65,7 +65,6 @@ func setupAgentImDB(t *testing.T) *gorm.DB {
 	db.Exec(`CREATE TABLE group_member (group_no TEXT NOT NULL, uid TEXT NOT NULL, is_deleted INTEGER DEFAULT 0, role INTEGER DEFAULT 0)`)
 	db.Exec(`CREATE TABLE conversation_extra (uid TEXT, channel_id TEXT, channel_type INTEGER, updated_at INTEGER DEFAULT 0)`)
 	db.Exec(`CREATE TABLE space_member (space_id TEXT NOT NULL, uid TEXT NOT NULL, status INTEGER DEFAULT 1)`)
-	db.Exec(`CREATE TABLE message (message_seq INTEGER, from_uid TEXT, channel_id TEXT, channel_type INTEGER, timestamp INTEGER, payload BLOB, is_deleted INTEGER DEFAULT 0)`)
 	return db
 }
 
@@ -350,6 +349,7 @@ func TestSelectedArchivedChannelsBridge(t *testing.T) {
 func TestFetchSummaryScopeBridgesDiscoveredArchivedThread(t *testing.T) {
 	ResetForTest()
 	db := setupAgentImDB(t)
+	db.Exec(`CREATE TABLE message (message_seq INTEGER, from_uid TEXT, channel_id TEXT, channel_type INTEGER, timestamp INTEGER, payload BLOB, is_deleted INTEGER DEFAULT 0)`)
 	db.Exec(`INSERT INTO "group" (group_no, name, space_id, status, creator) VALUES ('grp1', 'Group 1', 'space', 1, 'user-1'), ('grp2', 'Group 2', 'space', 1, 'user-2')`)
 	db.Exec(`INSERT INTO group_member (group_no, uid, is_deleted, role) VALUES ('grp1', 'user-1', 0, 0), ('grp2', 'user-2', 0, 0)`)
 	db.Exec(`INSERT INTO thread (id, short_id, name, group_no, status, creator_uid) VALUES (1, 'arch', 'Archived', 'grp1', 2, 'user-1'), (2, 'secret', 'Secret', 'grp2', 2, 'user-2')`)
