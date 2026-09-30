@@ -128,6 +128,86 @@ func TestFetchSummaryScopeRecoversChildPanic(t *testing.T) {
 	}
 }
 
+func TestFetchSummaryScopePreservesSuccessesAlongsideFatalChild(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		panicWith string
+		err       error
+	}{
+		{name: "panic", panicWith: "boom"},
+		{name: "unrecognized database error", err: errors.New("fetch messages: Error 1040: Too many connections")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ResetForTest()
+			const uid, sessionID = "user-partial-fatal", "summaryws:partial-fatal"
+			start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+			ctx := scopeFetchTestContext(uid, sessionID, start, start.Add(24*time.Hour), []ChannelScope{
+				{ChannelID: "bad", ChannelType: model.ChannelTypeGroup},
+				{ChannelID: "good", ChannelType: model.ChannelTypeGroup},
+			})
+			fetchOne := func(_ context.Context, args json.RawMessage) (string, error) {
+				var req struct {
+					ChannelID string `json:"channel_id"`
+				}
+				if err := json.Unmarshal(args, &req); err != nil {
+					return "", err
+				}
+				if req.ChannelID == "bad" {
+					if tc.panicWith != "" {
+						panic(tc.panicWith)
+					}
+					return "", tc.err
+				}
+				messages := []pipeline.Message{{ChannelID: "good", MessageSeq: 1, Content: "usable"}}
+				handle := messageCache.Store(messages, uid, sessionID)
+				data, _ := json.Marshal(map[string]interface{}{"total": 1, "messages_handle": handle})
+				return string(data), nil
+			}
+			_, handler := newFetchSummaryScopeTool(fetchOne)
+
+			result := runScopeFetch(t, ctx, handler)
+			if result.SuccessCount != 1 || result.FailureCount != 1 || result.Total != 1 || result.MessagesHandle == "" {
+				t.Fatalf("result = %+v, want usable partial-success payload", result)
+			}
+			if got := messageCache.Retrieve(result.MessagesHandle, uid, sessionID); len(got) != 1 || got[0].ChannelID != "good" {
+				t.Fatalf("aggregate messages = %+v, want successful sibling", got)
+			}
+			if errText := channelFetchError(result.Channels, "bad"); errText == "" {
+				t.Fatalf("failed channel error was not disclosed: %+v", result.Channels)
+			}
+		})
+	}
+}
+
+func TestFetchSummaryScopeDoesNotForwardArchivedHint(t *testing.T) {
+	ResetForTest()
+	const uid, sessionID = "user-archived", "summaryws:archived"
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	ctx := scopeFetchTestContext(uid, sessionID, start, start.Add(24*time.Hour), []ChannelScope{
+		{ChannelID: "thread-a", ChannelType: model.ChannelTypeThread, IsArchived: true},
+	})
+	fetchOne := func(_ context.Context, args json.RawMessage) (string, error) {
+		var req struct {
+			IncludeArchived bool `json:"include_archived"`
+		}
+		if err := json.Unmarshal(args, &req); err != nil {
+			return "", err
+		}
+		if req.IncludeArchived {
+			return "", errors.New("client archived hint widened discovery")
+		}
+		handle := messageCache.Store(nil, uid, sessionID)
+		data, _ := json.Marshal(map[string]interface{}{"total": 0, "messages_handle": handle})
+		return string(data), nil
+	}
+	_, handler := newFetchSummaryScopeTool(fetchOne)
+
+	result := runScopeFetch(t, ctx, handler)
+	if result.SuccessCount != 1 || result.FailureCount != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
 func TestFetchSummaryScopeCacheIncludesTimeRange(t *testing.T) {
 	ResetForTest()
 	const uid, sessionID = "user-range", "summaryws:range"

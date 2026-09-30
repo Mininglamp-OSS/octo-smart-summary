@@ -13,7 +13,10 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
 
-const fetchSummaryScopeTool = "fetch_summary_scope"
+const (
+	fetchSummaryScopeTool        = "fetch_summary_scope"
+	summaryScopeFetchConcurrency = 4
+)
 
 type summaryScopeFetchStateKey struct{}
 
@@ -64,7 +67,7 @@ func newFetchSummaryScopeTool(fetchOne Handler) (Tool, Handler) {
 		Type: "function",
 		Function: ToolFunction{
 			Name:        fetchSummaryScopeTool,
-			Description: "批量抓取服务端已确认的全部总结频道和时间范围。只传空对象{}；返回一个聚合messages_handle及逐频道覆盖状态。失败后重试只处理失败频道。",
+			Description: "批量抓取服务端已确认的全部总结频道和时间范围。只传空对象{}；返回一个聚合messages_handle及逐频道覆盖状态。失败后重试只处理失败频道；每次返回的messages_handle都会取代上一次，只使用最新handle。",
 			Parameters: map[string]interface{}{
 				"type":                 "object",
 				"additionalProperties": false,
@@ -98,7 +101,8 @@ func newFetchSummaryScopeTool(fetchOne Handler) (Tool, Handler) {
 
 		state := summaryScopeFetchStateFromContext(ctx)
 		var wg sync.WaitGroup
-		sem := make(chan struct{}, 4)
+		// Keep fan-out below the DB-heavy legacy fetch path's wider worker pool.
+		sem := make(chan struct{}, summaryScopeFetchConcurrency)
 		for _, channel := range channels {
 			channel := channel
 			key := summaryScopeChannelKey(channel, start, end)
@@ -111,8 +115,6 @@ func newFetchSummaryScopeTool(fetchOne Handler) (Tool, Handler) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				sem <- struct{}{}
-				defer func() { <-sem }()
 				record := summaryScopeFetchRecord{}
 				defer func() {
 					if p := recover(); p != nil {
@@ -126,12 +128,18 @@ func newFetchSummaryScopeTool(fetchOne Handler) (Tool, Handler) {
 					}
 					state.mu.Unlock()
 				}()
+				select {
+				case sem <- struct{}{}:
+					defer func() { <-sem }()
+				case <-ctx.Done():
+					record.err = ctx.Err().Error()
+					return
+				}
 				callArgs, _ := json.Marshal(map[string]interface{}{
-					"channel_id":       channel.ChannelID,
-					"channel_type":     channel.ChannelType,
-					"time_start":       start.Format(time.RFC3339),
-					"time_end":         end.Format(time.RFC3339),
-					"include_archived": channel.IsArchived,
+					"channel_id":   channel.ChannelID,
+					"channel_type": channel.ChannelType,
+					"time_start":   start.Format(time.RFC3339),
+					"time_end":     end.Format(time.RFC3339),
 				})
 				out, err := fetchOne(ctx, callArgs)
 				if err != nil {
@@ -202,7 +210,7 @@ func newFetchSummaryScopeTool(fetchOne Handler) (Tool, Handler) {
 			results = append(results, item)
 		}
 		state.mu.Unlock()
-		if fatalErr != nil {
+		if fatalErr != nil && successCount == 0 {
 			return "", fatalErr
 		}
 		if successCount == 0 {
@@ -241,5 +249,6 @@ func newFetchSummaryScopeTool(fetchOne Handler) (Tool, Handler) {
 }
 
 func summaryScopeChannelKey(channel ChannelScope, start, end time.Time) string {
-	return fmt.Sprintf("%d:%s:%d:%d", channel.ChannelType, strings.TrimSpace(channel.ChannelID), start.Unix(), end.Unix())
+	return fmt.Sprintf("%d:%s:%s:%s", channel.ChannelType, strings.TrimSpace(channel.ChannelID),
+		start.UTC().Format(time.RFC3339Nano), end.UTC().Format(time.RFC3339Nano))
 }
