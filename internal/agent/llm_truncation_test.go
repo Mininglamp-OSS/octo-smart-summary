@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +11,12 @@ import (
 )
 
 func TestAgentLLMRejectsLengthTruncatedToolCall(t *testing.T) {
+	t.Setenv(toolDiagnosticRunEnv, "truncated-tool-call")
+	var logs bytes.Buffer
+	previousLogWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousLogWriter) })
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
@@ -25,11 +33,23 @@ func TestAgentLLMRejectsLengthTruncatedToolCall(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL, "key", "test-model", 5, 12000, nil)
-	_, err := client.Chat(context.Background(), []Message{{Role: "user", Content: "summarize"}}, []Tool{{
+	ctx := context.WithValue(context.Background(), ContextKeyRunID, "truncated-tool-call")
+	_, err := client.Chat(ctx, []Message{{Role: "user", Content: "summarize"}}, []Tool{{
 		Type: "function", Function: ToolFunction{Name: "merge_summaries"},
 	}})
 	if err == nil || !strings.Contains(err.Error(), "finish_reason=length") {
 		t.Fatalf("error = %v, want explicit length-truncation failure", err)
+	}
+	for _, expected := range []string{
+		"phase=response",
+		"finish=length",
+		"tool=merge_summaries",
+		"json_valid=false",
+		"syntax_offset=",
+	} {
+		if !strings.Contains(logs.String(), expected) {
+			t.Fatalf("truncated tool response diagnostic missing %q: %s", expected, logs.String())
+		}
 	}
 }
 
