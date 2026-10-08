@@ -86,28 +86,27 @@ func TestCoverageRegressionGuard(t *testing.T) {
 	}
 }
 
-// TestCoverageGateExemptsDisclosedCap drives the gate over an input large enough
-// to trip the 256-chunk fan-out cap and pins that a DISCLOSED cap is not counted
-// as silent loss (#256 r8 N4). At the default ~200-msg chunk size, 52000 messages
-// split into 260 chunks; the cap keeps 256 and drops the oldest 4 (800 messages).
-// dropped is therefore non-zero, so a `NoSilentLoss: dropped == 0` reversion would
-// wrongly fail here — the subtraction of the intentional, cap-fired count is what
-// keeps the gate honest.
+// TestCoverageGateExemptsDisclosedCap pins the coverage gate over a huge default
+// input. Post-floor-fix (B-1a, Jerry-Xin 5338024667 §3): floorMsgsPerChunk
+// raises the per-chunk count to ceil(n/256) whenever the model-chosen size would
+// fan out past the cap, so at the DEFAULT configuration the cap can no longer
+// fire at any input size — 52000 messages split into ~255 chunks with zero drop.
+// The gate's disclosed-cap exemption (NoSilentLoss = dropped−capped == 0) remains
+// pinned by construction here and by the cap-classification unit pins
+// (TestCapChunks) for the residual huge-input/token-budget-forced route.
 func TestCoverageGateExemptsDisclosedCap(t *testing.T) {
 	const n = 52000
 	cov := Coverage(GoldenCase{Messages: make([]GoldenMessage, n)})
-	if cov.Chunks != 256 {
-		t.Fatalf("chunks = %d, want 256 (fan-out cap must bind)", cov.Chunks)
+	if cov.Chunks > 256 {
+		t.Fatalf("chunks = %d exceeds the fan-out cap", cov.Chunks)
 	}
-	if cov.TotalDroppedCount == 0 || cov.CappedDroppedCount == 0 {
-		t.Fatalf("want a real cap drop, got dropped=%d capped=%d", cov.TotalDroppedCount, cov.CappedDroppedCount)
+	if cov.TotalDroppedCount != 0 || cov.CappedDroppedCount != 0 {
+		t.Fatalf("default config must not drop anything post-floor-fix, got dropped=%d capped=%d", cov.TotalDroppedCount, cov.CappedDroppedCount)
 	}
-	// All loss here is the intentional cap, so the two counts must match exactly —
-	// no splitter/formatter loss leaked in.
-	if cov.TotalDroppedCount != cov.CappedDroppedCount {
-		t.Fatalf("dropped=%d capped=%d — the whole drop should be the disclosed cap", cov.TotalDroppedCount, cov.CappedDroppedCount)
+	if cov.ProcessedCount != n {
+		t.Fatalf("processed=%d, want %d", cov.ProcessedCount, n)
 	}
 	if !cov.NoSilentLoss {
-		t.Fatalf("a disclosed fan-out cap must NOT fail the no-silent-loss gate; dropped=%d capped=%d", cov.TotalDroppedCount, cov.CappedDroppedCount)
+		t.Fatal("no-silent-loss gate must hold on a clean huge input")
 	}
 }

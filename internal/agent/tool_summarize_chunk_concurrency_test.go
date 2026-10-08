@@ -544,8 +544,8 @@ func TestCapChunks(t *testing.T) {
 
 // TestAssembleMapOutput pins the #256 P1-R4 empty-Map guard + the disclosure
 // contract on the production assembly path: real content + a drop appends the
-// notice; all-blank output errors (recoverable) instead of shipping a
-// notice-only body; a clean full-coverage run gets no notice.
+// notice; all-blank output completes as the fixed non-empty allBlankMapBody
+// (N-R12-3 closure — no retry spin); a clean full-coverage run gets no notice.
 func TestAssembleMapOutput(t *testing.T) {
 	t.Run("drop with real content: notice appended", func(t *testing.T) {
 		out, err := assembleMapOutput([]string{"real summary"}, true)
@@ -562,10 +562,21 @@ func TestAssembleMapOutput(t *testing.T) {
 			t.Fatalf("want notice on cap, got %q err %v", out, err)
 		}
 	})
-	t.Run("all-blank output errors (no notice-only body ships)", func(t *testing.T) {
+	t.Run("all-blank output completes as a fixed non-empty body (N-R12-3)", func(t *testing.T) {
+		// Post-N-R12-3 (Jerry-Xin 5338024667 §4 / yujiawei 5337380127 §2 P2):
+		// an all-blank Map no longer errors into the critical-tool retry spin
+		// (same handle deterministically reproduces blanks → MaxSteps). It
+		// completes as a SUCCESS with the fixed non-empty allBlankMapBody; the
+		// blank breakdown travels in the coverage JSON instead.
 		out, err := assembleMapOutput([]string{"", "  "}, true)
-		if err == nil {
-			t.Fatalf("want a no-usable-Map error, got %q", out)
+		if err != nil {
+			t.Fatalf("all-blank must complete, got error: %v", err)
+		}
+		if strings.TrimSpace(out) == "" {
+			t.Fatal("fixed body must be non-empty (store empty guard)")
+		}
+		if out != allBlankMapBody {
+			t.Fatalf("got %q, want the fixed all-blank body (no notice-only ship)", out)
 		}
 	})
 	t.Run("full coverage: no notice", func(t *testing.T) {

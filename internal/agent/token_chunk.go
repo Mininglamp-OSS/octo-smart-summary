@@ -120,8 +120,15 @@ func splitMsgMapsByTokenBudget(msgMaps []map[string]interface{}, budget, maxMsgs
 	if asciiRatio < 1 {
 		asciiRatio = 1
 	}
+	// maxMsgs is the EFFECTIVE per-chunk cap: clampChunkSize has already
+	// trimmed the model-supplied chunk_size to [1, hardMessageBackstop]
+	// (P1-1), so any value above the backstop arriving here was raised by the
+	// B-1a floor (floorMsgsPerChunk) — that raise is load-bearing (it keeps
+	// ceil(n/256) chunks inside the fan-out cap) and must survive. The
+	// splitter therefore only FILLS the zero case with the backstop; it never
+	// lowers an explicit caller value.
 	msgCap := maxMsgs
-	if msgCap <= 0 || msgCap > hardMessageBackstop {
+	if msgCap <= 0 {
 		msgCap = hardMessageBackstop
 	}
 	var chunks [][]map[string]interface{}

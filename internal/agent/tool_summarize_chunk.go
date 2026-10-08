@@ -26,8 +26,9 @@ import (
 // SS-06b 随后引入 token-aware 分片并删除了 200 格式化上限，分片改由 token 预算
 // （按渲染行计费）+ hardMessageBackstop 双重约束。
 //
-// #241 item 2 之后覆盖不再恒为 100%：单块 LLM 调用失败会被容忍并从 reduce 输入
-// 剔除，且扇出超过 maxChunkCalls 时截断最旧的分片——两种缺口都经 cov
+// #241 item 2 之后覆盖不再恒为 100%：任一分片失败即整次调用报错（recovery-first，
+// 契约 §2，拒绝 option-Y 的容忍策略），且扇出超过 maxChunkCalls 时截断最旧的
+// 分片——两类缺口都经 cov
 // （failed_chunk_count / chunk_calls_capped / dropped_count / truncated）披露，
 // 并在合并文本里追加一条 mapCoverageGapNotice 作为尽力而为的提示——它是 Reduce
 // 输入，会经 merge/planner 两次模型改写，模型可能删掉；真正模型删不掉的结构性披露
@@ -54,14 +55,22 @@ const (
 )
 
 // mapCoverageGapNotice is appended to the combined Map output whenever coverage
-// is incomplete for ANY reason — a tolerated per-chunk failure, a blank-but-
-// successful chunk, a message dropped after the citation manifest froze, or the
-// maxChunkCalls fan-out truncation — so the gap is disclosed IN the summary text,
+// is incomplete for ANY reason — a manifest-miss (a message fetched after the
+// citation manifest froze) or the maxChunkCalls fan-out truncation. Failed
+// chunks never ship (recovery-first §2: the invocation errors and owes a retry)
+// and blank chunks are covered, so neither is a gap source. The notice goes IN
+// the summary text,
 // independent of the V2 run-row disclosure (recordDroppedMessages → finishgate
 // PARTIAL), which ships dark by default, meaning the combined text alone would
 // otherwise read complete (#256 P1). merge_summaries treats it as ordinary text;
 // the reduce prompt (prompts/summary.md) lists the coverage fields the planner
 // must act on.
+// allBlankMapBody is the fixed body shipped when every kept chunk returned a
+// blank summary (N-R12-3 closure): non-empty so it clears the handle store's
+// guard, and phrased as a completed observation of an all-noise batch — the
+// coverage JSON (blank_chunk_count / input / processed) carries the detail.
+const allBlankMapBody = "本批次消息均为噪声或与主题无关，没有值得汇报的内容。"
+
 const mapCoverageGapNotice = "\n\n---\n\n（注意：部分聊天内容未能纳入本次总结，结果可能不完整。）"
 
 // chunkCoverage 汇总 summarize_chunk 实际喂给模型的消息覆盖情况，随工具结果
@@ -70,10 +79,13 @@ type chunkCoverage struct {
 	InputCount     int `json:"input_count"`
 	ProcessedCount int `json:"processed_count"`
 	// DroppedCount is ACCIDENTAL/silent loss only: messages not represented in
-	// the Map output because their chunk failed, returned blank, or was fetched
-	// after the citation manifest froze. Intentional fan-out-cap drops live in
+	// the Map output because they were fetched after the citation manifest froze
+	// (manifest-miss). A failed chunk never reaches a returned result (the
+	// invocation errors, recovery-first §2), and a blank chunk is covered, so
+	// neither can contribute. Intentional fan-out-cap drops live in
 	// CappedDroppedCount instead — a disclosed cap is not a silent loss — so a
-	// "did we lose data unexpectedly?" check keys on this field alone (#256 P2).
+	// "did we lose data unexpectedly?" check keys on this field alone (#256 P2;
+	// schema sentence aligned to match).
 	DroppedCount int `json:"dropped_count"`
 	// CappedDroppedCount is the messages dropped by the maxChunkCalls fan-out cap
 	// (#241). It is intentional and disclosed via ChunkCallsCapped, and is kept
@@ -122,6 +134,27 @@ func clampChunkSize(requested int) int {
 	return requested
 }
 
+
+// floorMsgsPerChunk is the B-1a floor fix (Jerry-Xin 5338024667 §3 closure /
+// yujiawei 5337380127 P1 / mochashanyao 5338040645 P1): the effective per-chunk
+// message count never drops below ceil(len(msgMaps)/maxChunkCalls). Without the
+// floor, a model-chosen chunk_size=1 manufactures a fan-out-cap drop at ordinary
+// input sizes (257 messages -> 257 chunks -> the oldest chunk is discarded) in
+// every V2 mode. The floor keeps the splitter's chunk count within maxChunkCalls
+// for any input the cap could otherwise truncate, so the residual cap route
+// requires input so large the TOKEN budget alone forces >maxChunkCalls chunks.
+func floorMsgsPerChunk(requested, totalMsgs int) int {
+	size := clampChunkSize(requested)
+	if totalMsgs <= maxChunkCalls*size {
+		return size
+	}
+	floor := (totalMsgs + maxChunkCalls - 1) / maxChunkCalls
+	if floor > size {
+		return floor
+	}
+	return size
+}
+
 // ProbeChunkCoverage drives the PRODUCTION chunking path — clampChunkSize ->
 // splitMsgMapsByTokenBudget -> formatChunkForLLM — over msgMaps without any
 // LLM call, and reports the coverage funnel the model would actually receive:
@@ -144,7 +177,7 @@ func ProbeChunkCoverage(msgMaps []map[string]interface{}, requestedChunkSize, bu
 	if len(msgMaps) == 0 {
 		return 0, 0, 0, 0
 	}
-	size := clampChunkSize(requestedChunkSize)
+	size := floorMsgsPerChunk(requestedChunkSize, len(msgMaps))
 	chunked := splitMsgMapsByTokenBudget(msgMaps, budget, size, cjkRatio, asciiRatio)
 	// Count the messages the splitter emitted BEFORE the cap, so capped can be the
 	// exact size of the cap-removed tail rather than input−kept (which would also
@@ -184,19 +217,25 @@ func ProbeChunkCoverage(msgMaps []map[string]interface{}, requestedChunkSize, bu
 // (the worst fan-out). Gates that must not depend on injected deps — the eval
 // harness, CI — probe through this.
 func ProbeChunkCoverageDefault(msgMaps []map[string]interface{}, requestedChunkSize int) (processed, dropped, chunks, capped int) {
+	// Per-ratio residual aggregation (yujiawei r13 prescription; Jerry-Xin
+	// §8.5): `dropped` and `capped` are aggregated as the WORST PER-RATIO
+	// RESIDUAL (dropped−capped) plus that ratio's capped, not as independent
+	// maxima. Independent maxima can cross-cancel — a ratio-specific splitter
+	// regression in one ratio vs a cap-only drop in the other — making
+	// dropped−capped == 0 and silencing a real regression. Choosing the max
+	// residual then reporting ITS capped keeps dropped−capped == residual,
+	// so the SS-02 gate stays sound by construction.
 	for _, cjk := range []int{1, 2} {
 		cfg := config.Config{CharsPerTokenCJK: cjk, CharsPerTokenASCII: 4}
 		p, d, c, capd := ProbeChunkCoverage(msgMaps, requestedChunkSize, chunkTokenBudget(cfg), cfg.ResolveCharsPerTokenCJK(), cfg.CharsPerTokenASCII)
 		if p < processed || processed == 0 {
 			processed = p
 		}
-		if d > dropped {
-			dropped = d
-		}
 		if c > chunks {
 			chunks = c
 		}
-		if capd > capped {
+		if residual := d - capd; residual > dropped-capped {
+			dropped = d
 			capped = capd
 		}
 	}
@@ -328,7 +367,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 					},
 					"chunk_size": map[string]interface{}{
 						"type":        "integer",
-						"description": fmt.Sprintf("可选：每片最大消息数（叠加在 token 预算之上，取值收敛到 [1, %d]，<=0 按 %d）；分片同时受 token 预算与消息数双重约束，且单次调用最多 %d 个分片，超出时保留最近的分片、丢弃更早的（chunk_calls_capped=true）。返回值含 input_count/processed_count/dropped_count/capped_dropped_count/oversized_message_count/failed_chunk_count/blank_chunk_count/chunk_calls_capped/truncated/chunk_size；truncated 或 failed_chunk_count>0 或 chunk_calls_capped 时表示覆盖不完整。dropped_count 只计意外丢失（分块失败/空结果/引用清单外），capped_dropped_count 单列因分片上限有意丢弃的消息数。", hardMessageBackstop, defaultChunkSize, maxChunkCalls),
+						"description": fmt.Sprintf("可选：每片最大消息数（叠加在 token 预算之上，取值收敛到 [1, %d]，<=0 按 %d）；分片同时受 token 预算与消息数双重约束，且单次调用最多 %d 个分片，超出时保留最近的分片、丢弃更早的（chunk_calls_capped=true）。返回值含 input_count/processed_count/dropped_count/capped_dropped_count/oversized_message_count/failed_chunk_count/blank_chunk_count/chunk_calls_capped/truncated/chunk_size；truncated 或 failed_chunk_count>0 或 chunk_calls_capped 时表示覆盖不完整。dropped_count 只计意外丢失（仅引用清单外；分块失败会整体报错重试、空结果已计入 processed，均不会进入此字段），capped_dropped_count 单列因分片上限有意丢弃的消息数。", hardMessageBackstop, defaultChunkSize, maxChunkCalls),
 					},
 				},
 				"required": []string{"messages_handle"},
@@ -457,7 +496,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 		// schema documents a bound the handler must actually enforce.
 		_, _, _, cfg := GetSummaryDeps()
 		budget := chunkTokenBudget(cfg)
-		msgsPerChunk := clampChunkSize(req.ChunkSize)
+		msgsPerChunk := floorMsgsPerChunk(req.ChunkSize, len(msgMaps))
 		chunks := splitMsgMapsByTokenBudget(msgMaps, budget, msgsPerChunk, cfg.ResolveCharsPerTokenCJK(), cfg.CharsPerTokenASCII)
 
 		// Bound the LLM-call fan-out (#241 item 2). Beyond maxChunkCalls, TRUNCATE
@@ -467,10 +506,12 @@ func SummarizeChunkTool() (Tool, Handler) {
 		chunks, capped := capChunks(chunks)
 		cappedDropped := 0
 		if capped {
-			// Count the messages the cap discarded. chunks partitions msgMaps, so
-			// the kept messages plus the capped-away tail sum to len(msgMaps); the
-			// difference is the intentional drop, reported separately from the
-			// silent-loss DroppedCount (#256 P2-4).
+			// Count the messages the cap discarded: input minus what the kept
+			// chunks hold. Under the floor fix the splitter never drops messages
+			// (floorMsgsPerChunk keeps the chunk count within the cap), so this
+			// coincides with the probe's preCap−kept formula; the probe keeps the
+			// explicit derivation so any future splitter regression would surface
+			// in DroppedCount, not hide inside capped (§8.6 alignment).
 			keptMsgs := 0
 			for _, c := range chunks {
 				keptMsgs += len(c)
@@ -707,13 +748,11 @@ type chunkMapOutcome struct {
 // notice so the incompleteness is visible IN the text, not only in the run row.
 //
 // It appends the notice ONLY when there is real content to ship. An all-blank
-// input (every entry whitespace — e.g. the caller handed through summaries that
-// all came back empty) is a no-usable-Map result, returned as an error so
-// classifyToolError makes it fatal-and-retryable and the planner can recover,
-// rather than shipping a "summary" whose entire body is the notice (which would
-// slip past the handle store's empty guard and reduce into a vacuous deliverable
-// — #256 P1-R4). In production summarizeChunksConcurrently already drops blank
-// chunks, so this guard is defense-in-depth. Pure + testable (#256 P2).
+// input (every kept chunk returned blank) completes as a SUCCESS result with
+// the fixed allBlankMapBody: an error here would be classified retryable and
+// the same handle would deterministically reproduce blanks (N-R12-3 closure).
+// The handle store's empty guard is respected by the fixed non-empty body; the
+// blank breakdown stays in the coverage JSON. Pure + testable (#256 P2).
 func assembleMapOutput(summaries []string, coverageGap bool) (string, error) {
 	// Emptiness must be judged on the SUMMARIES, not the joined string: the
 	// "\n\n---\n\n" separator is itself non-whitespace, so a TrimSpace on the
@@ -726,7 +765,18 @@ func assembleMapOutput(summaries []string, coverageGap bool) (string, error) {
 		}
 	}
 	if !hasContent {
-		return "", fmt.Errorf("summarize_chunk: no usable Map output (every kept chunk failed, was dropped, or returned blank)")
+		// All-blank success path (N-R12-3 closure, Jerry-Xin 5338024667 §4 /
+		// yujiawei 5337380127 §2 P2): every kept chunk succeeded but found
+		// nothing worth reporting. Erroring here classifies as
+		// CRITICAL_TOOL_ERROR (retryable) and the planner retries the SAME
+		// handle — which deterministically reproduces blanks — spinning to
+		// MaxSteps with zero output. The contract calls blank chunks "not a
+		// gap", so the honest completion is a SUCCESS result with a fixed
+		// non-empty body (the store's empty guard demands non-empty) plus the
+		// blank_chunk_count / input / processed breakdown in the coverage
+		// JSON. The caller keeps its no-usable-output detail via the coverage
+		// breakdown instead of the error text.
+		return allBlankMapBody, nil
 	}
 	combined := strings.Join(summaries, "\n\n---\n\n")
 	if coverageGap {
