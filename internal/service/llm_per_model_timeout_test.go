@@ -2,6 +2,11 @@ package service
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -56,4 +61,67 @@ func TestDerivePerModelTimeout(t *testing.T) {
 			t.Fatalf("got %v, want 0", got)
 		}
 	})
+}
+
+func TestPerModelTimeoutWiredIntoPublicCallPaths(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		call func(context.Context, *LLMClient) (string, int, error)
+	}{
+		{
+			name: "complete",
+			call: func(ctx context.Context, c *LLMClient) (string, int, error) {
+				return c.Call(ctx, []ChatMessage{{Role: "user", Content: "hello"}}, 0.3)
+			},
+		},
+		{
+			name: "stream",
+			call: func(ctx context.Context, c *LLMClient) (string, int, error) {
+				return c.CallStream(ctx, []ChatMessage{{Role: "user", Content: "hello"}}, 0.3, nil)
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var primaryAttempts atomic.Int32
+			var fallbackAttempts atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					Model string `json:"model"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatalf("decode request: %v", err)
+				}
+				if body.Model == "primary" {
+					primaryAttempts.Add(1)
+					http.Error(w, "try fallback", http.StatusInternalServerError)
+					return
+				}
+				fallbackAttempts.Add(1)
+				if tt.name == "stream" {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"total_tokens\":2}}\n\n")
+					return
+				}
+				_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"total_tokens":2}}`)
+			}))
+			defer server.Close()
+
+			client := NewLLMClient(server.URL, "key", "primary", 180, 128, false, 5, []string{"fallback"})
+			ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+			defer cancel()
+			content, _, err := tt.call(ctx, client)
+			if err != nil {
+				t.Fatalf("call: %v", err)
+			}
+			if content != "ok" {
+				t.Fatalf("content=%q, want fallback result", content)
+			}
+			if got := primaryAttempts.Load(); got != 1 {
+				t.Fatalf("primary attempts=%d, want 1; PerModelTimeout wiring should skip same-model retries", got)
+			}
+			if got := fallbackAttempts.Load(); got != 1 {
+				t.Fatalf("fallback attempts=%d, want 1", got)
+			}
+		})
+	}
 }
