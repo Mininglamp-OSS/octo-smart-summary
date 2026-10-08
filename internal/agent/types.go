@@ -419,6 +419,19 @@ func AllowedChannelScopes(ctx context.Context) []ChannelScope {
 	return scope.channelsLocked()
 }
 
+// WorkspaceScopeLocked reports whether a request carries an authoritative
+// channel scope that can no longer be changed. A UI-selected scope starts
+// locked; a discoverable scope becomes locked after set_summary_scope succeeds.
+func WorkspaceScopeLocked(ctx context.Context) (present, locked bool) {
+	scope, ok := ctx.Value(contextKeyAllowedChannelScope{}).(*mutableChannelScope)
+	if !ok || scope == nil {
+		return false, false
+	}
+	scope.mu.RLock()
+	defer scope.mu.RUnlock()
+	return true, !scope.discoveryOpen || scope.declared
+}
+
 // RestrictDiscoveredChannels keeps discovery results inside a closed UI scope.
 // Open discovery and legacy contexts pass through; only explicit workspace
 // selections are reduced to their allowlisted channels.

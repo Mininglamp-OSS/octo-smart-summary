@@ -111,7 +111,7 @@ var profiles = map[string]Profile{
 			"emit_summary_response",
 		},
 		Policy: Policy{
-			MaxSteps:     24,
+			MaxSteps:     40,
 			MaxTokens:    120000,
 			StepTimeout:  240 * time.Second,
 			TerminalTool: "emit_summary_response",
