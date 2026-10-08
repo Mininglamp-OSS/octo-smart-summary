@@ -26,7 +26,8 @@ Each chunk ends in exactly one class:
 |---|---|---|
 | **success** | non-empty summary | n/a |
 | **blank-success** | call succeeded, summary whitespace-only (the prompt tells the model to skip off-topic chatter) | n/a — the messages were considered, nothing was worth reporting |
-| **transient failure** | 429 / 5xx / network / per-attempt timeout / recovered panic | **yes** |
+| **transient failure** | 429 / 5xx / network / per-attempt timeout | **yes** |
+| **recovered panic** | a Map chunk panicked below the Dispatch recovery boundary; classified `INTERNAL_ERROR`, retryable=false, fatal=true (pinned by `TestClassifyToolError/panic`) | **no** — aborts like a fatal (fail-closed; row aligned with the classifier, N-R12-2) |
 | **fatal failure** | output truncated, reasoning-budget exhausted, `ErrRequestTooLarge` | **no** — the same input can't shrink/complete on retry |
 | **cap drop** | chunk beyond `maxChunkCalls` (256), removed by `capChunks` | **no** — retrying re-hits the cap |
 | **manifest-miss** | message fetched after the citation manifest froze (V2 only) | **no** — not citable under this run |
@@ -37,7 +38,8 @@ A transient per-chunk failure is **recovered by a retry**, not tolerated-and-shi
 as a partial. This is the pivotal choice (option X): a transient blip on one of up
 to 256 chunk calls is the common case, and retrying yields a **complete** summary
 with no reliance on a disclosure the model might drop. Only genuinely
-**unrecoverable-by-retry** gaps — the intentional fan-out **cap**, or a **fatal**
+**unrecoverable-by-retry** gaps — the intentional fan-out **cap**, a
+**manifest-miss** (V2 only; shipped disclosed, not retried), or a **fatal**
 error — produce a non-complete outcome, and the cap's is disclosed.
 
 The rejected alternative (option Y: keep shipping the partial and guarantee a
@@ -60,7 +62,7 @@ Which mechanism is authoritative, and whether it depends on `AGENT_SUMMARY_V2_MO
 | **transient failure** | **request-scoped Map-retry gate** (`MarkMapFailed` → `PendingMapFailures` → Reduce blocked + final-answer fail-closed) | **NO — flag-independent** | The tool returns an error; the invocation **owes a successful retry**. Reduce/final-answer blocked until every failed Map invocation is retried, or the run fails closed at the step ceiling. Never silently shipped. |
 | **fatal failure** | abort the phase (`isFatalChunkError` → tool errors) | no | Invocation fails; `classifyToolError` maps it (`REQUEST_TOO_LARGE` = fatal, non-retryable for a critical tool). |
 | **cap drop** | disclosure (`ChunkCallsCapped` + `CappedDroppedCount` + inline notice; V2: `PARTIAL`) | disclosure V2-gated | Intentional, **not** a retry obligation. Shipped as a disclosed partial. Model-proof `V2=off` disclosure = **#267**. |
-| **blank-success** | none — **not a gap** | n/a | Counted as **processed** (covered) and in `BlankChunkCount` for observability; **not** loss, does **not** assert incompleteness. The code cannot distinguish "model found nothing" from "gateway ate the response"; per r9 the false-incompleteness (crying wolf) is the worse failure, so blank is treated as covered. |
+| **blank-success** | none — **not a gap** | n/a | Counted as **processed** (covered) and in `BlankChunkCount` for observability; **not** loss, does **not** assert incompleteness. The code cannot distinguish "model found nothing" from "gateway ate the response"; per r9 the false-incompleteness (crying wolf) is the worse failure, so blank is treated as covered. **All-blank completion (N-R12-3 closure)**: when EVERY kept chunk is blank the invocation returns a SUCCESS result with the fixed non-empty `allBlankMapBody` plus the coverage JSON — it must NOT error, because a retryable classification sends the planner back to the same handle, which deterministically reproduces blanks and spins to `MaxSteps`. |
 | **manifest-miss** | disclosure (`DroppedCount`; V2: `PARTIAL`) | disclosure V2-gated | Accidental loss; disclosed. |
 
 ## 4. Coverage field semantics (`chunkCoverage` / tool result)
