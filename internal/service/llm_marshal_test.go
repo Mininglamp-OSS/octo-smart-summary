@@ -55,11 +55,12 @@ func TestMarshalRequestBody(t *testing.T) {
 		t.Fatalf("round-trip changed the value: got %+v, want %+v", back, in)
 	}
 
-	// 4. Residual inflation is real (matches the MaxRequestBodyBytes comment):
-	//    U+2028 / U+2029 are escaped UNCONDITIONALLY, independent of SetEscapeHTML,
-	//    so the worst case is ~2×, not 1×. The RAW rune must NOT appear in the
-	//    output (it was expanded to a 6-byte escape). Pin it so the comment cannot
-	//    drift from behaviour.
+	// 4. Residual inflation is real: U+2028 / U+2029 are escaped
+	//    UNCONDITIONALLY, independent of SetEscapeHTML. They expand from a
+	//    3-byte UTF-8 rune to a 6-byte escape (~2×). This test pins that common
+	//    residual class only; other rare JSON-required escape classes such as
+	//    C0 controls can still expand more. The size guard is intentionally a
+	//    coarse backstop, not a proof that every possible byte pattern fits.
 	lineSep := string(rune(0x2028))
 	sep, err := MarshalRequestBody(payload{Msg: "x" + lineSep + "y"})
 	if err != nil {
