@@ -22,8 +22,8 @@ func TestCallUsesCallerSpecificLengthTruncationPolicy(t *testing.T) {
 	if err != nil || content != "partial summary" {
 		t.Fatalf("generic Call = (%q, %v), want usable partial content", content, err)
 	}
-	if _, _, err := client.CallStrict(context.Background(), []ChatMessage{{Role: "user", Content: "go"}}, 0.1); err == nil || !strings.Contains(err.Error(), "truncated") {
-		t.Fatalf("strict error = %v, want non-empty length truncation to fail", err)
+	if _, tokens, err := client.CallStrict(context.Background(), []ChatMessage{{Role: "user", Content: "go"}}, 0.1); err == nil || !strings.Contains(err.Error(), "truncated") || tokens != 100 {
+		t.Fatalf("strict result = tokens %d, error %v; want token usage preserved with truncation error", tokens, err)
 	}
 }
 
