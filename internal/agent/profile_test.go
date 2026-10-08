@@ -174,7 +174,7 @@ func TestGetProfile_SummaryWorkspace(t *testing.T) {
 	if profile.Policy.TerminalTool != "emit_summary_response" {
 		t.Fatalf("TerminalTool = %q", profile.Policy.TerminalTool)
 	}
-	if profile.Policy.MaxSteps != 24 || profile.Policy.MaxTokens != 120000 || profile.Policy.StepTimeout != 240*time.Second {
+	if profile.Policy.MaxSteps != 40 || profile.Policy.MaxTokens != 120000 || profile.Policy.StepTimeout != 240*time.Second {
 		t.Fatalf("Policy = %+v", profile.Policy)
 	}
 
