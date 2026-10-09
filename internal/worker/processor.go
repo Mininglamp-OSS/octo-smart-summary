@@ -755,8 +755,17 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 		// tokenizer budget. Avoid materializing every MEDIUMTEXT row twice here.
 		return nil
 	}
-	if hasDocumentSource(sources) {
-		return fmt.Errorf("document sources cannot be mixed with chat sources")
+	// Mixed document+chat tasks (phase 1) fetch chat history through this
+	// stage exactly like pure chat tasks — but the fetch constraints carry
+	// ONLY the chat sources: document IDs are not channels and would fail
+	// source-coverage validation. Snapshot evidence is loaded by
+	// executePersonalPipeline's mixed orchestration. The old unconditional
+	// mixed rejection here was a reachable failure path for mixed tasks
+	// claimed by the poll loop (plan §6.2 step 4 audit).
+	fetchSpecifiedSources := specifiedSources
+	if mixedHasDocumentSource(sources) {
+		chatSources, _ := splitMixedSources(sources)
+		fetchSpecifiedSources = explicitSpecifiedSources(chatSources)
 	}
 
 	// Fetch messages via pipeline. Tool-call / raw LLM uses in this (fetch) path
@@ -802,7 +811,7 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 
 	fetchStart := time.Now()
 	messages, _, err = pipeline.ResolveAndFetchMessagesForPersonal(
-		ctx, task.CreatorID, participantUIDs, participantNames, specifiedSources, task.EffectiveTopic(),
+		ctx, task.CreatorID, participantUIDs, participantNames, fetchSpecifiedSources, task.EffectiveTopic(),
 		task.TimeRangeStart, task.TimeRangeEnd,
 		p.imDB, p.octoClient, p.cfg.MessageFetchBackend, toolCallFn, llmFn, p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency, p.cfg.OctoSearchPollSec,
 		channelScopeOpts, nil,

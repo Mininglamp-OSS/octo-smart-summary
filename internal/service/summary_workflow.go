@@ -703,6 +703,80 @@ func workflowHasDocumentSource(sources []SummaryWorkflowSource) bool {
 }
 
 func validateDocumentWorkflowInput(in LegacyCreateSummaryWorkflowInput, sources []SummaryWorkflowSource) *BizError {
+	// Mixed document+chat scope is admitted unconditionally (the phase-1
+	// admission gate was removed when the worker executor landed). Here only
+	// the mixed-invariant subset of the pure-document rules applies:
+	// personal-only, no participants, no origin auto-reply. TimeRange is LEGAL
+	// for mixed scopes (it scopes the chat side), so the documents-only
+	// rejection does not fire when chat sources are present.
+	mixedChat := false
+	for _, source := range sources {
+		if source.SourceType != model.SourceDocument {
+			mixedChat = true
+			break
+		}
+	}
+	if mixedChat {
+		// The legacy entry never reaches validateAgentWorkflowSources (its only
+		// caller is createFromAgent), so the mixed branch must be
+		// self-sufficient: whitelist every non-document source type so a bogus
+		// enum (e.g. source_type 99) cannot ride through the mixed path.
+		for _, source := range sources {
+			if source.SourceType == model.SourceDocument {
+				continue
+			}
+			valid := source.SourceType >= model.SourceGroup && source.SourceType <= model.SourceDirect
+			if strings.TrimSpace(source.SourceID) == "" || !valid {
+				return NewBizError(40001, "每个来源需提供 source_id 与合法的 source_type", http.StatusBadRequest)
+			}
+		}
+		// Mixed scope: personal-only, no participants, no origin auto-reply.
+		// TimeRange is LEGAL for mixed scopes (it scopes the chat side), so
+		// the documents-only rejection does not fire when chat sources are
+		// present.
+		if in.CreatorID != "" && in.CreatorID != in.ActorID {
+			return NewBizError(40001, "文档总结仅支持当前用户创建", http.StatusBadRequest)
+		}
+		if len(in.Participants) != 0 {
+			return NewBizError(40001, "混合来源总结暂不支持其他参与者", http.StatusBadRequest)
+		}
+		// Plan §1.3/A17: phase-1 document-bearing tasks must not derive or
+		// persist an origin channel (no auto-reply into the source chat, whose
+		// members were never authorized on the document). The workspace path
+		// auto-derives origin from SelectedChannels[0] unless summaryWorkspaceOrigin
+		// is guarded, and the legacy path accepts a caller-supplied origin, so the
+		// mixed branch enforces the invariant here as the single shared boundary —
+		// mirroring the pure-document rejection below — rather than relying on
+		// either caller to zero it.
+		if in.OriginChannelID != "" || in.OriginChannelType != 0 {
+			return NewBizError(40001, "混合来源总结不支持来源会话", http.StatusBadRequest)
+		}
+		documentCount := 0
+		for _, source := range sources {
+			if source.SourceType == model.SourceDocument {
+				documentCount++
+			}
+		}
+		if documentCount > MaxDocumentSummarySourceCount {
+			return NewBizError(40001, "文档来源不能超过10个", http.StatusBadRequest)
+		}
+		if len(sources) > MixedMaxTotalSources {
+			return MixedSourceCountExceededError()
+		}
+		for _, source := range sources {
+			if source.SourceType != model.SourceDocument {
+				continue
+			}
+			if strings.TrimSpace(source.SourceID) == "" || strings.TrimSpace(source.SnapshotContent) == "" {
+				return NewBizError(40001, "文档来源缺少正文快照", http.StatusBadRequest)
+			}
+			hash := sha256.Sum256([]byte(source.SnapshotContent))
+			if source.SourceHash != hex.EncodeToString(hash[:]) {
+				return NewBizError(40001, "文档来源正文哈希不匹配", http.StatusBadRequest)
+			}
+		}
+		return nil
+	}
 	if len(sources) > MaxDocumentSummarySourceCount {
 		return NewBizError(40001, "文档来源不能超过10个", http.StatusBadRequest)
 	}

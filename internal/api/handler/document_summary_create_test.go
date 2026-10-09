@@ -5,6 +5,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -214,6 +215,44 @@ func TestSummaryWorkspaceDocumentWorkflowSharesAdmissionLimit(t *testing.T) {
 	}
 }
 
+// The legacy create path must acquire the per-user document slot BEFORE the
+// document fetch (mirroring the workspace sibling path) — otherwise a full
+// slot would not stop the upstream FetchSummarySource fan-out. Occupying the
+// slot up-front must produce a 42902 and zero fetch calls.
+func TestCreateSummaryDocumentSharesAdmissionLimit(t *testing.T) {
+	previous := documentSummaryLimiterInstance
+	documentSummaryLimiterInstance = newDocumentSummaryLimiter(1)
+	t.Cleanup(func() { documentSummaryLimiterInstance = previous })
+
+	release, ok := documentSummaryLimiterInstance.acquire("creator-limit")
+	if !ok {
+		t.Fatal("failed to occupy document summary slot")
+	}
+	defer release()
+
+	db, imDB := setupTestDBs(t)
+	client := &recordingDocumentSourceClient{
+		docs: map[string]*documentSummarySource{},
+		errs: map[string]error{"d_1": errors.New("fetch must not run while admission is full")},
+	}
+	h := NewTaskHandler(db, imDB, "")
+	h.documentClient = client
+
+	w := doCreateSummary(setupCreateRouter(h), map[string]interface{}{
+		"sources": []map[string]interface{}{
+			{"source_type": model.SourceDocument, "source_id": "d_1"},
+		},
+	}, "creator-limit")
+	if w.Code != http.StatusTooManyRequests || respCode(t, w) != 42902 {
+		t.Fatalf("response = %d %s", w.Code, w.Body.String())
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.versions) != 0 {
+		t.Fatalf("document fetch ran despite full admission gate: %#v", client.versions)
+	}
+}
+
 func TestSummaryWorkspaceDocumentWorkflowKeepsPersonalOnlyDefense(t *testing.T) {
 	client := &recordingDocumentSourceClient{
 		docs: map[string]*documentSummarySource{},
@@ -333,12 +372,11 @@ func TestCreateDocumentSummaryRequiresAllFetchesBeforeWriting(t *testing.T) {
 	}
 }
 
-func TestCreateDocumentSummaryRejectsMixedOrTeamRequests(t *testing.T) {
+func TestCreateDocumentSummaryRejectsTeamOrTimedDocumentRequests(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		body map[string]interface{}
 	}{
-		{"mixed", map[string]interface{}{"sources": []map[string]interface{}{{"source_type": model.SourceDocument, "source_id": "d_1"}, {"source_type": model.SourceGroup, "source_id": "g_1"}}}},
 		{"participant", map[string]interface{}{"sources": []map[string]interface{}{{"source_type": model.SourceDocument, "source_id": "d_1"}}, "participants": []map[string]interface{}{{"user_id": "u2"}}}},
 		{"time range", map[string]interface{}{"sources": []map[string]interface{}{{"source_type": model.SourceDocument, "source_id": "d_1"}}, "time_range": map[string]interface{}{"start": "2026-09-01T00:00:00Z", "end": "2026-09-02T00:00:00Z"}}},
 	} {
@@ -351,6 +389,162 @@ func TestCreateDocumentSummaryRejectsMixedOrTeamRequests(t *testing.T) {
 				t.Fatalf("response = %d %s", w.Code, w.Body.String())
 			}
 		})
+	}
+}
+
+func TestCreateDocumentSummaryMixedPersistsDocumentSnapshot(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	client := &recordingDocumentSourceClient{docs: map[string]*documentSummarySource{
+		"d_1": {DocumentID: "d_1", Title: "方案", Version: "v1", Content: "文档正文"},
+	}}
+	h := NewTaskHandler(db, imDB, "")
+	h.documentClient = client
+
+	// The legacy HTTP mixed path must persist BOTH classes, with the
+	// document row carrying a non-empty source_hash (its fetched snapshot).
+	w := doCreateSummary(setupCreateRouter(h), map[string]interface{}{
+		"title": "混合总结",
+		"sources": []map[string]interface{}{
+			{"source_type": model.SourceGroup, "source_id": "g_1"},
+			{"source_type": model.SourceDocument, "source_id": "d_1"},
+		},
+	}, "creator1")
+	if w.Code != http.StatusOK || respCode(t, w) != 0 {
+		t.Fatalf("create response = %d %s", w.Code, w.Body.String())
+	}
+
+	var sources []model.SummarySource
+	if err := db.Order("source_type").Find(&sources).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 2 {
+		t.Fatalf("persisted %d sources, want 2 (group + document)", len(sources))
+	}
+	var groupRow, docRow *model.SummarySource
+	for i := range sources {
+		switch sources[i].SourceType {
+		case model.SourceGroup:
+			groupRow = &sources[i]
+		case model.SourceDocument:
+			docRow = &sources[i]
+		}
+	}
+	if groupRow == nil || groupRow.SourceID != "g_1" {
+		t.Fatalf("group source = %#v", groupRow)
+	}
+	if docRow == nil || docRow.SourceID != "d_1" {
+		t.Fatalf("document source = %#v", docRow)
+	}
+	if len(docRow.SourceHash) != 64 {
+		t.Fatalf("document source_hash = %q, want 64-char snapshot hash", docRow.SourceHash)
+	}
+}
+
+func TestCreateDocumentSummaryMixedRejectsInvalidRequestsBeforeFetch(t *testing.T) {
+	overLimitSources := make([]map[string]interface{}, 0, service.MixedMaxTotalSources+1)
+	for i := 0; i < service.MixedMaxTotalSources; i++ {
+		overLimitSources = append(overLimitSources, map[string]interface{}{
+			"source_type": model.SourceGroup,
+			"source_id":   fmt.Sprintf("g_%d", i),
+		})
+	}
+	overLimitSources = append(overLimitSources, map[string]interface{}{
+		"source_type": model.SourceDocument,
+		"source_id":   "d_1",
+	})
+
+	tests := []struct {
+		name string
+		body map[string]interface{}
+	}{
+		{
+			name: "non-self creator",
+			body: map[string]interface{}{
+				"uid": "other-user",
+				"sources": []map[string]interface{}{
+					{"source_type": model.SourceGroup, "source_id": "g_1"},
+					{"source_type": model.SourceDocument, "source_id": "d_1"},
+				},
+			},
+		},
+		{
+			name: "participants",
+			body: map[string]interface{}{
+				"participants": []map[string]interface{}{{"user_id": "u2"}},
+				"sources": []map[string]interface{}{
+					{"source_type": model.SourceGroup, "source_id": "g_1"},
+					{"source_type": model.SourceDocument, "source_id": "d_1"},
+				},
+			},
+		},
+		{
+			name: "origin channel",
+			body: map[string]interface{}{
+				"origin_channel_id":   "g_1",
+				"origin_channel_type": 1,
+				"sources": []map[string]interface{}{
+					{"source_type": model.SourceGroup, "source_id": "g_1"},
+					{"source_type": model.SourceDocument, "source_id": "d_1"},
+				},
+			},
+		},
+		{name: "combined cap", body: map[string]interface{}{"sources": overLimitSources}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db, imDB := setupTestDBs(t)
+			client := &recordingDocumentSourceClient{
+				docs: map[string]*documentSummarySource{},
+				errs: map[string]error{"d_1": errors.New("document fetch must not run")},
+			}
+			h := NewTaskHandler(db, imDB, "")
+			h.documentClient = client
+
+			w := doCreateSummary(setupCreateRouter(h), test.body, "creator1")
+			if w.Code != http.StatusBadRequest || respCode(t, w) != 40001 {
+				t.Fatalf("response = %d %s", w.Code, w.Body.String())
+			}
+			client.mu.Lock()
+			defer client.mu.Unlock()
+			if len(client.versions) != 0 {
+				t.Fatalf("document fetch ran before mixed validation: %#v", client.versions)
+			}
+		})
+	}
+}
+
+func TestCreateDocumentSummaryRejectsBogusSourceType(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	client := &recordingDocumentSourceClient{docs: map[string]*documentSummarySource{
+		"d_1": {DocumentID: "d_1", Title: "方案", Version: "v1", Content: "文档正文"},
+	}}
+	h := NewTaskHandler(db, imDB, "")
+	h.documentClient = client
+
+	// source_type 99 is not a valid chat enum: the mixed branch's
+	// whitelist must reject it rather than persisting an arbitrary type.
+	w := doCreateSummary(setupCreateRouter(h), map[string]interface{}{
+		"sources": []map[string]interface{}{
+			{"source_type": 99, "source_id": "x_1"},
+			{"source_type": model.SourceDocument, "source_id": "d_1"},
+		},
+	}, "creator1")
+	if w.Code != http.StatusBadRequest || respCode(t, w) != 40001 {
+		t.Fatalf("response = %d %s", w.Code, w.Body.String())
+	}
+
+	var count int64
+	if err := db.Model(&model.SummarySource{}).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("persisted %d sources, want 0 (bogus type must be rejected before persist)", count)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.versions) != 0 {
+		t.Fatalf("document fetch ran before bogus mixed source rejection: %#v", client.versions)
 	}
 }
 

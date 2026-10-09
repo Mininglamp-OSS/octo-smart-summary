@@ -15,6 +15,17 @@ returns `enabled: true` and `contract_version: "2"`.
 - Reusing the same `request_id` is idempotent and does not dispatch a second
   workflow.
 
+## Mixed sources (document + chat)
+
+- `mixed_sources: true` means the server admits a document+chat source scope
+  (both the workspace and legacy HTTP create paths) and the client may offer
+  mixed selection. Mixed admission is unconditional (the phase-1 roll-out gate
+  was removed when the worker executor landed), so the field is always `true`;
+  the client feature-detects on it rather than on `contract_version`, which is
+  intentionally not bumped for this additive optional field.
+- A mixed scope is personal-only (no participants, no origin auto-reply) and
+  does not support stacking a referenced summary.
+
 ## Input origin and routing
 
 - `action: "chat"` with `input_origin: "user"` is conversational. Except for

@@ -36,6 +36,18 @@ func createSummaryHasDocumentSource(req createSummaryReq) bool {
 	return false
 }
 
+func uniqueCreateSummarySourceCount(sources []sourceReq) int {
+	type sourceKey struct {
+		sourceType int
+		sourceID   string
+	}
+	seen := make(map[sourceKey]struct{}, len(sources))
+	for _, source := range sources {
+		seen[sourceKey{sourceType: source.SourceType, sourceID: strings.TrimSpace(source.SourceID)}] = struct{}{}
+	}
+	return len(seen)
+}
+
 func (h *TaskHandler) prepareDocumentSummarySources(
 	requestContext context.Context,
 	header http.Header,
@@ -50,29 +62,78 @@ func (h *TaskHandler) prepareDocumentSummarySources(
 	badRequest := func(message string) ([]service.SummaryWorkflowSource, bool, *documentSummaryCreateError) {
 		return nil, true, &documentSummaryCreateError{status: http.StatusBadRequest, code: 40001, message: message}
 	}
+	// Mixed document+chat is admitted unconditionally (the phase-1 gate was
+	// removed when the worker executor landed). This block detects whether the
+	// request is mixed so the pure-document-only boundaries (no participants,
+	// no time range, no origin channel) are enforced exactly when there are no
+	// chat sources.
+	mixedMode := false
+	hasChatSource := false
 	for _, source := range req.Sources {
 		if source.SourceType != model.SourceDocument {
-			return badRequest("文档总结不能混合聊天来源")
+			hasChatSource = true
+			break
 		}
 	}
-	if req.UID != "" && req.UID != userID {
-		return badRequest("文档总结仅支持当前用户创建")
+	if hasChatSource {
+		mixedMode = true
 	}
-	if len(req.Participants) != 0 {
-		return badRequest("文档总结暂不支持其他参与者")
-	}
-	if req.TimeRange != nil {
-		return badRequest("文档总结不支持时间范围")
-	}
-	if req.OriginChannelID != "" || req.OriginChannelType != 0 {
-		return badRequest("文档总结不支持来源会话")
+	if !mixedMode {
+		if req.UID != "" && req.UID != userID {
+			return badRequest("文档总结仅支持当前用户创建")
+		}
+		if len(req.Participants) != 0 {
+			return badRequest("文档总结暂不支持其他参与者")
+		}
+		if req.TimeRange != nil {
+			return badRequest("文档总结不支持时间范围")
+		}
+		if req.OriginChannelID != "" || req.OriginChannelType != 0 {
+			return badRequest("文档总结不支持来源会话")
+		}
+	} else {
+		// Reject permanent mixed-scope errors before the document fan-out below.
+		// The service validator repeats these checks as a persistence boundary,
+		// but running them only after FetchSummarySource can turn an invalid 400
+		// into a misleading 502 when the document service is degraded.
+		if req.UID != "" && req.UID != userID {
+			return badRequest("文档总结仅支持当前用户创建")
+		}
+		if len(req.Participants) != 0 {
+			return badRequest("混合来源总结暂不支持其他参与者")
+		}
+		if req.OriginChannelID != "" || req.OriginChannelType != 0 {
+			return badRequest("混合来源总结不支持来源会话")
+		}
+		if uniqueCreateSummarySourceCount(req.Sources) > service.MixedMaxTotalSources {
+			return badRequest(service.MixedSourceCountExceededError().Message)
+		}
+		for _, source := range req.Sources {
+			if source.SourceType == model.SourceDocument {
+				continue
+			}
+			validType := source.SourceType >= model.SourceGroup && source.SourceType <= model.SourceDirect
+			if strings.TrimSpace(source.SourceID) == "" || !validType {
+				return badRequest("每个来源需提供 source_id 与合法的 source_type")
+			}
+		}
 	}
 
 	refs := make([]documentRefReq, 0, len(req.Sources))
 	for _, source := range req.Sources {
+		if source.SourceType != model.SourceDocument {
+			continue
+		}
 		refs = append(refs, documentRefReq{DocumentID: strings.TrimSpace(source.SourceID)})
 	}
 	sources, err := prepareDocumentSummarySourcesFromRefs(requestContext, h.documentClient, header, spaceID, userID, refs)
+	// documentMode here means "document sources were fetched and must be
+	// merged into workflowInput.Sources". It is true for BOTH pure-document
+	// and mixed requests (the caller discriminates via the chat side later).
+	// Returning !mixedMode was the pre-PR bug: mixed requests came back
+	// documentMode=false, so CreateSummary dropped the fetched snapshots and
+	// rebuilt bare snapshot-less rows (mirroring mergeMixedWorkflowSources'
+	// skip of chat-side document rows was the fix in CreateSummary).
 	return sources, true, err
 }
 

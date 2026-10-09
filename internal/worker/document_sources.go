@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -35,8 +36,9 @@ func hasDocumentSource(sources []model.SummarySource) bool {
 	return false
 }
 
-func loadDocumentEvidence(db *gorm.DB, sources []model.SummarySource, tok tokenizer.Tokenizer, maxTokens int) ([]pipeline.Message, error) {
+func loadDocumentEvidence(ctx context.Context, db *gorm.DB, sources []model.SummarySource, tok tokenizer.Tokenizer, maxTokens int) ([]pipeline.Message, error) {
 	messages := make([]pipeline.Message, 0, len(sources))
+	db = db.WithContext(ctx)
 	for _, source := range sources {
 		var snapshot model.SummarySourceSnapshot
 		if err := db.Where("summary_source_id = ?", source.ID).First(&snapshot).Error; err != nil {

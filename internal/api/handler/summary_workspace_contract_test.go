@@ -202,13 +202,20 @@ func TestNormalizeSummaryWorkspaceContextPreservesDocuments(t *testing.T) {
 	}
 }
 
-func TestNormalizeSummaryWorkspaceContextRejectsMixedDocumentScope(t *testing.T) {
-	_, err := normalizeSummaryWorkspaceContext(summaryWorkspaceContext{
+// PR flip: mixed document+chat scope is ACCEPTED (admission is now
+// unconditional). This replaces the original RejectsMixedDocumentScope pin;
+// the mixed contract tests in summary_workspace_mixed_contract_test.go pin
+// the invariant boundaries.
+func TestNormalizeSummaryWorkspaceContextAcceptsMixedDocumentScope(t *testing.T) {
+	got, err := normalizeSummaryWorkspaceContext(summaryWorkspaceContext{
 		SelectedChannels: []summaryWorkspaceChannel{{ChatID: "group-1", ChatType: "group", Name: "项目群"}},
 		Documents:        []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}},
 	})
-	if err == nil {
-		t.Fatal("expected mixed document and chat scope to be rejected")
+	if err != nil {
+		t.Fatalf("normalize mixed document scope: %v", err)
+	}
+	if len(got.SelectedChannels) != 1 || len(got.Documents) != 1 {
+		t.Fatalf("mixed scope dropped a source class: %#v", got)
 	}
 }
 

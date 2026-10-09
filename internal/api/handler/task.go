@@ -377,9 +377,34 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 			End:   req.TimeRange.End,
 		}
 	}
+	// Collect the chat-side sources from the request body first (bare
+	// {SourceType, SourceID} rows — snapshots come from the worker, not the
+	// request). Document sources are fetched separately below and merged in.
+	chatSources := make([]service.SummaryWorkflowSource, 0, len(req.Sources))
+	for _, source := range req.Sources {
+		if source.SourceType == model.SourceDocument {
+			continue
+		}
+		chatSources = append(chatSources, service.SummaryWorkflowSource{
+			SourceType: source.SourceType,
+			SourceID:   source.SourceID,
+		})
+	}
 	workflowInput.Sources = make([]service.SummaryWorkflowSource, 0, len(req.Sources))
-	if createSummaryHasDocumentSource(req) {
-		releaseSlot, admitted := documentSummaryLimiterInstance.acquire(userID)
+	// Acquire the per-user in-flight slot BEFORE the document fetch, matching
+	// the sibling workspace path (agent_summary_workspace.go acquire→fetch).
+	// The limiter caps CONCURRENCY (see document_preview_limit.go): moving it
+	// to the far side of the fan-out would let one account fire N×(up to 10)
+	// upstream FetchSummarySource calls before any 429 — the amplifier this
+	// control exists to stop. Mixed admission is unconditional now, while the
+	// permanent mixed-scope rejections (self-only/participants/origin/caps)
+	// run inside prepareDocumentSummarySources before its upstream fetch. The
+	// service validator repeats them as a persistence boundary.
+	hasDocumentSource := createSummaryHasDocumentSource(req)
+	var releaseSlot func()
+	if hasDocumentSource {
+		var admitted bool
+		releaseSlot, admitted = documentSummaryLimiterInstance.acquire(userID)
 		if !admitted {
 			c.Header("Retry-After", "1")
 			c.JSON(http.StatusTooManyRequests, apiResponse{Code: 42902, Message: "文档总结请求过于频繁，请稍后重试"})
@@ -396,14 +421,14 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		return
 	}
 	if documentMode {
-		workflowInput.Sources = documentSources
+		// Documents were fetched. mergeMixedWorkflowSources keeps the chat
+		// rows in order and the fetched snapshot-carrying document rows, and
+		// correctly skips any chat-side document rows (there are none here —
+		// chatSources is built from non-document types already — but the
+		// shared helper guarantees the invariant both paths rely on).
+		workflowInput.Sources = mergeMixedWorkflowSources(chatSources, documentSources)
 	} else {
-		for _, source := range req.Sources {
-			workflowInput.Sources = append(workflowInput.Sources, service.SummaryWorkflowSource{
-				SourceType: source.SourceType,
-				SourceID:   source.SourceID,
-			})
-		}
+		workflowInput.Sources = chatSources
 	}
 	workflowInput.Participants = make([]service.SummaryWorkflowParticipant, 0, len(req.Participants))
 	for _, participant := range req.Participants {

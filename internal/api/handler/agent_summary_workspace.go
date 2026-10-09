@@ -205,6 +205,11 @@ func (h *AgentChatHandler) SummaryWorkspaceCapabilities(c *gin.Context) {
 		"contract_version":     summaryWorkspaceContractVersion,
 		"max_time_range_days":  pipeline.MaxTimeRangeDays,
 		"direct_team_workflow": enabled,
+		// Mixed document+chat creation is admitted unconditionally (the
+		// phase-1 gate was removed when the worker executor landed), so the
+		// frontend feature-detects on a constant-`true` signal that agrees
+		// with the normalizeSummaryWorkspaceContext admission decision.
+		"mixed_sources": true,
 	}})
 }
 
@@ -377,9 +382,11 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		snapshot, err = h.completeWorkspaceAgentTurn(c.Request.Context(), responder, key, begin.Turn.ID, begin.Turn.Attempt, req, contextValue, begin.Snapshot, route, openScopeAgent, inferredSource)
 	default:
 		reply := "请先选择一个你有权限的会话，再告诉我希望总结的内容。"
-		if len(contextValue.Documents) > 0 && len(contextValue.Participants) > 0 {
+		if len(contextValue.Documents) > 0 && len(contextValue.SelectedChannels) > 0 && !validation.sourcesValid {
+			reply = "部分所选会话不可用，请调整后重试。"
+		} else if len(contextValue.Documents) > 0 && len(contextValue.Participants) > 0 {
 			reply = "文档总结暂不支持多人协作，请移除参与者后再生成。"
-		} else if len(contextValue.Documents) > 0 {
+		} else if len(contextValue.Documents) > 0 && len(contextValue.SelectedChannels) == 0 {
 			reply = "文档问答/解释暂不支持，请输入总结要求后生成文档总结。"
 		} else if len(contextValue.ReferencedTaskIDs) > 0 && !validation.referencesValid {
 			reply = "部分引用总结不可用，请调整后重试。"
@@ -545,7 +552,16 @@ func (h *AgentChatHandler) completeWorkspaceWorkflow(
 		if documentErr != nil {
 			return WorkspaceSnapshot{}, summaryWorkspaceDocumentBizError(documentErr)
 		}
-		sources = documentSources
+		if len(contextValue.SelectedChannels) > 0 {
+			// Mixed document+chat: MERGE — chat sources keep their resolved
+			// channel entries (the pipeline fetches chat history at execution
+			// time), document sources carry their request-time snapshots.
+			// The old behavior REPLACED all sources, silently dropping the
+			// user's chats (plan §4.3 step 3).
+			sources = mergeMixedWorkflowSources(sources, documentSources)
+		} else {
+			sources = documentSources
+		}
 	}
 	input := service.AgentCreateSummaryWorkflowInput{
 		ActorID:           key.UserID,
@@ -1329,9 +1345,20 @@ func containsAny(value string, needles ...string) bool {
 
 func deriveWorkspaceRoute(context summaryWorkspaceContext, action service.SummaryAction, intent service.SummaryIntent, hasExplicitRunIntent, selectedSourceExplicit, hasRequirement, openScopeAgent bool, state WorkspaceSnapshot, participantsValid, sourcesValid, referencesValid bool) service.SummaryRoute {
 	if len(context.Documents) > 0 {
+		mixedChat := len(context.SelectedChannels) > 0
 		switch {
 		case len(context.Participants) > 0:
 			return service.SummaryRouteClarification
+		case mixedChat && !sourcesValid:
+			// Mixed scope with an unauthorized/unresolvable chat: clarify
+			// instead of silently dropping the chat or skipping the workflow.
+			// The permission result must gate workflow creation (plan §4.3).
+			return service.SummaryRouteClarification
+		case mixedChat:
+			// Mixed scopes run the personal workflow; the docs-only
+			// explain-clarification does not apply once chats are present,
+			// regardless of intent or explicit run flag.
+			return service.SummaryRoutePersonalWorkflow
 		case intent == service.SummaryIntentExplain && !hasExplicitRunIntent:
 			return service.SummaryRouteClarification
 		default:
@@ -1502,7 +1529,11 @@ func (w *summaryWorkspaceCoordinator) materializeWorkspaceAgentContext(
 		return contextValue, false, err
 	}
 	contextValue = effective
-	if len(contextValue.Documents) > 0 {
+	if len(contextValue.Documents) > 0 && len(contextValue.SelectedChannels) == 0 {
+		// Documents-only keeps the old semantics (no chat window applies).
+		// Mixed document+chat MUST keep the time range: it scopes the chat
+		// side of the summary and document snapshots are version-frozen at
+		// fetch time regardless (plan §3.3).
 		contextValue.TimeRange = nil
 	}
 
@@ -1531,7 +1562,10 @@ func (w *summaryWorkspaceCoordinator) materializeWorkspaceAgentContext(
 		return contextValue, true, nil
 	}
 
-	if len(contextValue.Documents) == 0 {
+	if len(contextValue.Documents) == 0 || len(contextValue.SelectedChannels) > 0 {
+		// Chat-bearing scopes (pure chat AND mixed document+chat) get the
+		// default chat window when none was chosen; documents-only skips it
+		// because there is no chat side to scope (plan §3.3).
 		contextValue = materializeSummaryWorkspaceDefaultTimeRange(contextValue, now)
 	}
 	return contextValue, false, nil
@@ -1829,6 +1863,19 @@ func summaryWorkspaceTitle(context summaryWorkspaceContext) string {
 	if context.Template != nil && strings.TrimSpace(context.Template.Label) != "" {
 		return strings.TrimSpace(context.Template.Label)
 	}
+	if len(context.Documents) > 0 && len(context.SelectedChannels) > 0 {
+		// Mixed title names both sides so the list view distinguishes a mixed
+		// task from a documents-only one at a glance.
+		title := strings.TrimSpace(context.Documents[0].Title)
+		if title == "" {
+			title = context.Documents[0].DocumentID
+		}
+		chatName := strings.TrimSpace(context.SelectedChannels[0].Name)
+		if chatName == "" {
+			chatName = context.SelectedChannels[0].ChatID
+		}
+		return title + "与" + chatName + "总结"
+	}
 	if len(context.Documents) > 0 {
 		if title := strings.TrimSpace(context.Documents[0].Title); title != "" {
 			return title + "总结"
@@ -1875,6 +1922,50 @@ func summaryWorkspaceDocumentRefs(context summaryWorkspaceContext) []documentRef
 	return refs
 }
 
+// mergeMixedWorkflowSources merges chat sources with the fetched document
+// sources for a mixed scope. Chat sources come from summaryWorkspaceSources
+// (which ALSO emits SourceDocument rows WITHOUT snapshots, since the snapshot
+// must be fetched at request time); document sources come from
+// prepareDocumentSummarySourcesFromRefs and DO carry SnapshotContent +
+// SourceHash. A naive (source_type, source_id) dedup keeps the chat-side
+// snapshot-less document row and drops the fetched one, which then fails
+// validateDocumentWorkflowInput ("文档来源缺少正文快照").
+//
+// The fix: document-class rows are taken from documentSources (the fetched,
+// snapshot-carrying set); chat-class rows are taken from chatSources. This
+// preserves the chat-then-document order while guaranteeing every persisted
+// document source carries its snapshot.
+func mergeMixedWorkflowSources(chatSources, documentSources []service.SummaryWorkflowSource) []service.SummaryWorkflowSource {
+	merged := make([]service.SummaryWorkflowSource, 0, len(chatSources)+len(documentSources))
+	seen := make(map[string]struct{}, len(chatSources)+len(documentSources))
+	for _, source := range chatSources {
+		if source.SourceType == model.SourceDocument {
+			// The snapshot-less document row from summaryWorkspaceSources is
+			// superseded by the fetched document source below.
+			continue
+		}
+		key := summaryWorkflowSourceKey(source)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		merged = append(merged, source)
+	}
+	for _, source := range documentSources {
+		key := summaryWorkflowSourceKey(source)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		merged = append(merged, source)
+	}
+	return merged
+}
+
+func summaryWorkflowSourceKey(source service.SummaryWorkflowSource) string {
+	return fmt.Sprintf("%d:%s", source.SourceType, source.SourceID)
+}
+
 func summaryWorkspaceDocumentBizError(err *documentSummaryCreateError) error {
 	if err == nil {
 		return nil
@@ -1911,6 +2002,15 @@ func workspaceWorkflowTimeRange(context summaryWorkspaceContext) (*service.Summa
 }
 
 func summaryWorkspaceOrigin(context summaryWorkspaceContext) (string, int) {
+	// Document-bearing tasks never derive an origin channel (plan §1.3/A17):
+	// a mixed document+chat scope must not auto-reply into the first chat's
+	// channel, whose members were never authorized on the document. The mixed
+	// branch of validateDocumentWorkflowInput enforces the same invariant at
+	// the service boundary; guarding here keeps the workspace creator from
+	// producing the forbidden value in the first place.
+	if len(context.Documents) > 0 {
+		return "", 0
+	}
 	if len(context.SelectedChannels) == 0 {
 		return "", 0
 	}
@@ -1930,13 +2030,27 @@ func summaryWorkspaceOrigin(context summaryWorkspaceContext) (string, int) {
 func (w *summaryWorkspaceCoordinator) validateWorkspaceScope(ctx context.Context, spaceID, actorID string, value summaryWorkspaceContext) (summaryWorkspaceScopeValidation, *summaryWorkspaceScopeLookupError) {
 	validation := summaryWorkspaceScopeValidation{teamScopeReason: teamScopeReasonNone}
 	var err error
-	if len(value.Documents) > 0 {
-		validation.sourcesValid = true
-	} else {
+	if len(value.SelectedChannels) > 0 {
+		// Chat sources are permission-checked in EVERY scope shape, including
+		// mixed document+chat (plan §4.3: "权限结果必须真正参与路由和创建决
+		// 策"). The old documents-only short-circuit skipped this check
+		// because documents authorize per-request via the Docs client; with
+		// mixed scopes a skipped chat check would let an unauthorized chat
+		// ride along under a legitimate document.
 		validation.sourcesValid, err = w.validateSources(ctx, spaceID, actorID, value.SelectedChannels)
 		if err != nil {
 			return validation, &summaryWorkspaceScopeLookupError{turnCode: "SOURCE_LOOKUP_FAILED", message: "读取会话权限失败", cause: err}
 		}
+	} else if len(value.Documents) > 0 {
+		// Documents-only scope: no chat sources to validate. The per-document
+		// authorization happens in prepareDocumentSummarySources at fetch time.
+		validation.sourcesValid = true
+	} else {
+		// Empty scope (no chats AND no documents): preserve pre-PR routing —
+		// an empty scope is NOT a valid source set, so sourcesValid stays
+		// false and routing falls through to clarification instead of firing
+		// an agent preview on a scope routing already knew was unsummarizable.
+		validation.sourcesValid = false
 	}
 	validation.participantsValid, err = w.validateParticipants(ctx, spaceID, actorID, value.Participants)
 	if err != nil {

@@ -43,7 +43,7 @@ func TestLoadDocumentEvidenceUsesPersistedSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	messages, err := loadDocumentEvidence(db, []model.SummarySource{source}, runeCountTokenizer{}, 1000)
+	messages, err := loadDocumentEvidence(context.Background(), db, []model.SummarySource{source}, runeCountTokenizer{}, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestLoadDocumentEvidenceSurfacesSnapshotTruncation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	messages, err := loadDocumentEvidence(db, []model.SummarySource{source}, runeCountTokenizer{}, 1000)
+	messages, err := loadDocumentEvidence(context.Background(), db, []model.SummarySource{source}, runeCountTokenizer{}, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestLoadDocumentEvidenceRejectsChangedSnapshot(t *testing.T) {
 	if err := db.Create(&model.SummarySourceSnapshot{SummarySourceID: source.ID, Content: "changed", ContentBytes: 7, ContentHash: strings.Repeat("0", 64)}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadDocumentEvidence(db, []model.SummarySource{source}, runeCountTokenizer{}, 1000); err == nil {
+	if _, err := loadDocumentEvidence(context.Background(), db, []model.SummarySource{source}, runeCountTokenizer{}, 1000); err == nil {
 		t.Fatal("loadDocumentEvidence accepted a snapshot whose content hash changed")
 	}
 }
@@ -179,7 +179,11 @@ func TestExecutePersonalPipelineUsesDocumentSnapshotsAndKeepsCoordinates(t *test
 	}
 }
 
-func TestExecutePersonalPipelineRejectsMixedDocumentAndChatSources(t *testing.T) {
+// PR2 flip: mixed document+chat sources NO LONGER reject. executePersonalPipeline
+// takes the mixed orchestration — chat fetch runs, then document snapshot
+// loading. This fixture has no snapshot rows, so the run fails at the
+// snapshot stage with a snapshot error, NOT the old "cannot be mixed" one.
+func TestExecutePersonalPipelineMixedSourcesEnterMixedOrchestration(t *testing.T) {
 	db := setupProcessorTestDB(t)
 	task := model.SummaryTask{TaskNo: "DOC-MIXED", CreatorID: "u1"}
 	if err := db.Create(&task).Error; err != nil {
@@ -194,8 +198,12 @@ func TestExecutePersonalPipelineRejectsMixedDocumentAndChatSources(t *testing.T)
 		}
 	}
 	p := &Processor{db: db, cfg: &config.Config{}}
-	if _, _, _, _, _, err := p.executePersonalPipeline(context.Background(), task, "u1", nil, nil); err == nil || !strings.Contains(err.Error(), "cannot be mixed") {
-		t.Fatalf("mixed document/chat error=%v", err)
+	_, _, _, _, _, err := p.executePersonalPipeline(context.Background(), task, "u1", nil, nil)
+	if err == nil {
+		t.Fatal("expected failure (no snapshot rows seeded), but the run completed")
+	}
+	if strings.Contains(err.Error(), "cannot be mixed") {
+		t.Fatalf("mixed orchestration must not reject mixed sources: %v", err)
 	}
 }
 
