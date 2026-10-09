@@ -538,6 +538,27 @@ func TestDeriveWorkspaceRouteDocumentExplainClarifies(t *testing.T) {
 	}
 }
 
+func TestDeriveWorkspaceRouteMixedExplainClarifiesUnlessExplicitRun(t *testing.T) {
+	context := summaryWorkspaceContext{
+		Documents:        []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}},
+		SelectedChannels: []summaryWorkspaceChannel{{ChatID: "group-1", ChatType: "group", Name: "项目群"}},
+	}
+	for _, message := range []string{"先不要生成总结，我还要补充要求", "不要总结这些内容", "这些内容有什么区别？"} {
+		intent := classifySummaryWorkspaceIntent(message, false)
+		if intent != service.SummaryIntentExplain {
+			t.Fatalf("message %q classified as %q, want explain", message, intent)
+		}
+		got := deriveWorkspaceRoute(context, service.SummaryActionChat, intent, false, true, true, false, WorkspaceSnapshot{}, true, true, true)
+		if got != service.SummaryRouteClarification {
+			t.Fatalf("mixed explain route for %q = %q, want clarification", message, got)
+		}
+	}
+	got := deriveWorkspaceRoute(context, service.SummaryActionChat, service.SummaryIntentGenerate, true, true, true, false, WorkspaceSnapshot{}, true, true, true)
+	if got != service.SummaryRoutePersonalWorkflow {
+		t.Fatalf("mixed explicit generate route = %q, want personal workflow", got)
+	}
+}
+
 func TestOpenScopeAgentOverrideDoesNotDemoteDocumentWorkflow(t *testing.T) {
 	context := summaryWorkspaceContext{Documents: []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}}}
 	got := workspaceRouteAfterOpenScopeAgentOverride(context, service.SummaryRoutePersonalWorkflow, true, WorkspaceSnapshot{})
