@@ -1,7 +1,9 @@
 package llmclient
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -12,8 +14,11 @@ import (
 const (
 	DefaultMaxResponseBytes int64 = 16 << 20
 	MaxErrorBodyBytes       int64 = 4 << 10
+	MaxRequestBodyBytes           = 16 << 20
 	TruncationNotice              = "\n\n> 输出因长度限制被截断，请缩小范围或降低详细程度后重试。"
 )
+
+var ErrRequestTooLarge = errors.New("LLM request body exceeds the size guard")
 
 type Message struct {
 	Role       string     `json:"role"`
@@ -165,5 +170,11 @@ func (e *requestBuildError) Unwrap() error { return e.err }
 // calls use the same builder immediately before every primary/fallback attempt.
 func MarshalRequest(model string, req Request, stream bool) ([]byte, error) {
 	body := buildRequest(model, req, stream)
-	return json.Marshal(body)
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(body); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte{'\n'}), nil
 }

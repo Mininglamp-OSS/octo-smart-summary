@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 )
 
 func TestClassifyToolError(t *testing.T) {
@@ -501,4 +503,21 @@ func TestFatalIsNotSelfSealing(t *testing.T) {
 			t.Errorf("run-scoped identity failure must stay fatal: %+v", env)
 		}
 	})
+}
+
+// TestClassifyToolError_SizeGuardsAreNotRetryable pins that the #241 pre-send
+// guard classifies as NOT retryable (retrying the same oversized input cannot
+// help) and fatal for a critical tool — identity-matched, never falling through
+// to the retryable default.
+func TestClassifyToolError_SizeGuardsAreNotRetryable(t *testing.T) {
+	env := classifyToolError("summarize_chunk", fmt.Errorf("wrap: %w", service.ErrRequestTooLarge))
+	if env.Retryable {
+		t.Errorf("Retryable = true, want false")
+	}
+	if !env.Fatal {
+		t.Errorf("Fatal = false, want true for a critical tool")
+	}
+	if env.ErrorCode != "REQUEST_TOO_LARGE" {
+		t.Errorf("ErrorCode = %q, want REQUEST_TOO_LARGE", env.ErrorCode)
+	}
 }
