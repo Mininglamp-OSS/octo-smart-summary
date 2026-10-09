@@ -19,6 +19,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 )
 
@@ -32,6 +33,35 @@ type handlerSequencePlanner struct {
 	turns []agent.AssistantTurn
 	errs  []error
 	call  int
+}
+
+func TestMaybePersistSummaryRunCanonicalizesDMChannelID(t *testing.T) {
+	db := newFinalizeTestDB(t)
+	if db == nil {
+		return
+	}
+	store := summaryrun.NewStore(db)
+	h := &AgentChatHandler{runStore: store}
+	ctx := context.Background()
+	const uid = "self-uid"
+	req := agentChatRequest{
+		Message:   "总结私聊",
+		SessionID: "dm-spec-session",
+		RequestID: "dm-spec-request",
+		SelectedChannels: []selectedChannel{{
+			ChannelID: "peer-uid", ChannelType: "direct", Name: "同事",
+		}},
+	}
+
+	runID := h.maybePersistSummaryRun(ctx, uid, req, true)
+	spec, found, err := store.GetLatestSpec(ctx, uid, runID)
+	if err != nil || !found || len(spec.Channels) != 1 {
+		t.Fatalf("load persisted spec: found=%t channels=%v err=%v", found, spec.Channels, err)
+	}
+	want := pipeline.NormalizeDMChannelID("peer-uid", uid, model.ChannelTypeDM)
+	if spec.Channels[0].ChannelID != want {
+		t.Fatalf("persisted DM channel_id = %q, want canonical %q", spec.Channels[0].ChannelID, want)
+	}
 }
 
 func (p *handlerSequencePlanner) Chat(context.Context, []agent.Message, []agent.Tool) (agent.AssistantTurn, error) {

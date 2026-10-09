@@ -25,11 +25,12 @@ type ToolErrorEnvelope struct {
 // criticalTools are the tools whose failure compromises data completeness; a
 // fatal error from them must block a COMPLETE verdict.
 var criticalTools = map[string]bool{
-	"fetch_channel":   true,
-	"search_messages": true,
-	"filter_relevant": true,
-	"summarize_chunk": true,
-	"merge_summaries": true,
+	"fetch_channel":       true,
+	"fetch_summary_scope": true,
+	"search_messages":     true,
+	"filter_relevant":     true,
+	"summarize_chunk":     true,
+	"merge_summaries":     true,
 }
 
 // classifyToolError maps a tool failure to a structured envelope. The rules are
@@ -97,6 +98,12 @@ func classifyToolError(toolName string, err error) ToolErrorEnvelope {
 	switch {
 	case strings.Contains(low, "panicked"):
 		env.ErrorCode, env.Retryable, env.Fatal = "INTERNAL_ERROR", false, true
+	case strings.Contains(low, "unknown tool:"):
+		// An unregistered tool call is a planner/schema mismatch, not evidence
+		// that a critical data operation failed. This must precede the
+		// critical-tool default because the model-supplied name may itself be in
+		// criticalTools even though no handler ran and no coverage was lost.
+		env.ErrorCode, env.Retryable, env.Fatal = "INVALID_ARGUMENT", true, false
 	case errors.Is(err, context.DeadlineExceeded) || strings.Contains(low, "deadline") || strings.Contains(low, "timeout"):
 		env.ErrorCode, env.Retryable, env.Fatal = "TIMEOUT", true, false
 	case errors.Is(err, context.Canceled) || strings.Contains(low, "canceled") || strings.Contains(low, "cancelled"):
@@ -173,7 +180,10 @@ func classifyToolError(toolName string, err error) ToolErrorEnvelope {
 		// is a retryable blip.
 		env.ErrorCode, env.Retryable, env.Fatal = "TRANSIENT_TOOL_ERROR", true, false
 	case strings.Contains(low, "parse args") || strings.Contains(low, "cannot parse") ||
-		strings.Contains(low, "parsing time") || strings.Contains(low, "channel_type is required"):
+		strings.Contains(low, "parsing time") || strings.Contains(low, "channel_type is required") ||
+		strings.Contains(low, "requires an empty json object") ||
+		strings.Contains(low, "summary scope has no channels") ||
+		strings.Contains(low, "summary scope has no valid authoritative time range"):
 		// A bad tool argument (e.g. the model sent an empty time_start, so
 		// time.Parse fails with "cannot parse ...") is the agent's own mistake,
 		// not a fatal system failure. Retryable so the agent fixes and re-calls;
@@ -240,13 +250,10 @@ func isTransientIdentityOutage(msg string) bool {
 // scoped to a single channel (→ non-fatal, disclosed by the finish gate as
 // PARTIAL + GapChannel) rather than to the whole run.
 //
-// It is keyed on a FACT, not on error wording: fetch_channel is the only critical
-// tool with a coverage recorder behind it, and EVERY fetch_channel error path
-// calls recordFetch(false, …) (tool_fetch_channel.go), so a denied channel is
+// It is keyed on a FACT, not on error wording: fetch_channel and its scope-batch
+// wrapper both have coverage recorders behind them, so a denied channel is
 // always captured as a failed target. The tool identity is therefore the sound
-// signal — `channel X not accessible`, `get user channels: permission denied`, and
-// `fetch messages: forbidden` are all one denied channel, and keying on the tool
-// covers them all without chasing each spelling.
+// signal without chasing every permission-error spelling.
 //
 // search_messages is deliberately excluded: it has NO coverage recorder, so a
 // non-fatal-and-unrecorded classification would let the gate report COMPLETE —
@@ -255,7 +262,7 @@ func isTransientIdentityOutage(msg string) bool {
 // A genuine RUN-scoped auth failure stays fatal: "missing user identity in
 // context" is the whole run's identity, not one channel, so it is excluded.
 func isChannelScopedPermissionDenial(toolName, msg string) bool {
-	return toolName == "fetch_channel" && !strings.Contains(msg, "identity")
+	return (toolName == "fetch_channel" || toolName == fetchSummaryScopeTool) && !strings.Contains(msg, "identity")
 }
 
 func containsHTTP5xx(msg string) bool {

@@ -69,28 +69,36 @@ func (c *msgCache) Store(messages []pipeline.Message, uid, sessionID string) str
 // Retrieve fetches messages by handle, validating the exact owner and session
 // identity. Returns nil for a missing, expired, or cross-session handle.
 func (c *msgCache) Retrieve(handle, uid, sessionID string) []pipeline.Message {
+	messages, _ := c.RetrieveOK(handle, uid, sessionID)
+	return messages
+}
+
+// RetrieveOK fetches messages and reports whether the handle exists for the
+// exact owner/session. The boolean distinguishes a valid empty result (whose
+// message slice may be nil) from a missing, expired, or foreign handle.
+func (c *msgCache) RetrieveOK(handle, uid, sessionID string) ([]pipeline.Message, bool) {
 	if handle == "" || uid == "" || sessionID == "" {
-		return nil
+		return nil, false
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	entry, ok := c.store[handle]
 	if !ok {
-		return nil
+		return nil, false
 	}
 
 	// Ownership validation
 	if entry.uid != uid || entry.sessionID != sessionID {
-		return nil
+		return nil, false
 	}
 
 	// TTL check
 	if time.Since(entry.createdAt) > c.ttl {
-		return nil
+		return nil, false
 	}
 
-	return entry.messages
+	return entry.messages, true
 }
 
 // evictExpired removes entries older than TTL. Must be called with lock held.

@@ -9,8 +9,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	sqlite3 "github.com/mattn/go-sqlite3"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -341,6 +343,52 @@ func TestSelectedArchivedChannelsBridge(t *testing.T) {
 	secretResult, secretErr := fetch(ctx, json.RawMessage(`{"channel_id":"grp2____secret","channel_type":5,"time_start":"2024-01-01T00:00:00Z","time_end":"2024-01-02T00:00:00Z"}`))
 	if secretErr == nil || !strings.Contains(secretResult, "channel not accessible") {
 		t.Fatalf("non-member selected ID bypassed access: result=%s err=%v", secretResult, secretErr)
+	}
+}
+
+func TestFetchSummaryScopeBridgesDiscoveredArchivedThread(t *testing.T) {
+	ResetForTest()
+	db := setupAgentImDB(t)
+	db.Exec(`CREATE TABLE message (message_seq INTEGER, from_uid TEXT, channel_id TEXT, channel_type INTEGER, timestamp INTEGER, payload BLOB, is_deleted INTEGER DEFAULT 0)`)
+	db.Exec(`INSERT INTO "group" (group_no, name, space_id, status, creator) VALUES ('grp1', 'Group 1', 'space', 1, 'user-1'), ('grp2', 'Group 2', 'space', 1, 'user-2')`)
+	db.Exec(`INSERT INTO group_member (group_no, uid, is_deleted, role) VALUES ('grp1', 'user-1', 0, 0), ('grp2', 'user-2', 0, 0)`)
+	db.Exec(`INSERT INTO thread (id, short_id, name, group_no, status, creator_uid) VALUES (1, 'arch', 'Archived', 'grp1', 2, 'user-1'), (2, 'secret', 'Secret', 'grp2', 2, 'user-2')`)
+	db.Exec(`INSERT INTO thread_member (thread_id, uid) VALUES (1, 'user-1'), (2, 'user-2')`)
+
+	SetSummaryDeps(nil, db, nil, config.Config{MsgTableCount: 1, MaxMessagesPerChannel: 10})
+	defer SetSummaryDeps(nil, nil, nil, config.Config{})
+
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	base := context.WithValue(context.Background(), ContextKeyUID, "user-1")
+	base = context.WithValue(base, ContextKeySessionID, "archived-scope-session")
+	base = WithAllowedTimeRange(base, start, start.Add(24*time.Hour))
+	ctx := WithDiscoverableChannelScope(base)
+
+	_, list := ListChannelsTool()
+	listed, err := list(ctx, json.RawMessage(`{"include_archived":true}`))
+	if err != nil || !strings.Contains(listed, "grp1____arch") || strings.Contains(listed, "grp2____secret") {
+		t.Fatalf("archived discovery mismatch: result=%s err=%v", listed, err)
+	}
+	if err := DeclareWorkspaceScopeChange(ctx, WorkspaceScopeChange{
+		SourceMode: WorkspaceSourceReplace,
+		Channels: []ChannelScope{{
+			ChannelID: "grp1____arch", ChannelType: model.ChannelTypeThread, IsArchived: true,
+		}},
+	}); err != nil {
+		t.Fatalf("declare archived scope: %v", err)
+	}
+	_, fetchScope := FetchSummaryScopeTool()
+	result := runScopeFetch(t, withSummaryScopeFetchState(ctx), fetchScope)
+	if result.SuccessCount != 1 || result.FailureCount != 0 || result.MessagesHandle == "" {
+		t.Fatalf("archived scope fetch = %+v", result)
+	}
+
+	denied := WithAllowedChannelScope(base, []ChannelScope{{
+		ChannelID: "grp2____secret", ChannelType: model.ChannelTypeThread, IsArchived: true,
+	}})
+	_, err = fetchScope(withSummaryScopeFetchState(denied), json.RawMessage(`{}`))
+	if err == nil || !strings.Contains(err.Error(), "not accessible") {
+		t.Fatalf("non-member archived thread bypassed access: %v", err)
 	}
 }
 

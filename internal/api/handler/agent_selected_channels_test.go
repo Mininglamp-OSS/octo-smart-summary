@@ -13,7 +13,7 @@ import (
 
 func TestApplySelectedChannelContext_EmptyIsBackwardCompatible(t *testing.T) {
 	ctx := context.Background()
-	gotCtx, gotSystem := applySelectedChannelContext(ctx, "base", nil)
+	gotCtx, gotSystem := applySelectedChannelContext(ctx, "base", nil, "u1", "summary")
 	if gotCtx != ctx || gotSystem != "base" {
 		t.Fatalf("empty selection changed request: ctx=%v system=%q", gotCtx != ctx, gotSystem)
 	}
@@ -24,7 +24,7 @@ func TestApplySelectedChannelContext_AddsPromptAndArchivedAllowlist(t *testing.T
 		{ChannelID: "group-1", ChannelType: "group", Name: "品牌群"},
 		{ChannelID: "group-1____thread-1", ChannelType: "thread", Name: "复盘区", IsArchived: true},
 		{ChannelID: "group-1____thread-1", ChannelType: "thread", Name: "重复项", IsArchived: true},
-	})
+	}, "u1", "summary")
 
 	for _, want := range []string{"品牌群", "group-1____thread-1", "tool_channel_type=5", "跳过 list_channels", "范围或能力澄清问题"} {
 		if !strings.Contains(system, want) {
@@ -50,7 +50,7 @@ func TestApplySelectedChannelContext_DropsUnknownChannelTypes(t *testing.T) {
 		{ChannelID: "bad-1", ChannelType: "chatroom", Name: "非法类型-A"},
 		{ChannelID: "bad-2", ChannelType: "", Name: "空类型"},
 		{ChannelID: "group-1", ChannelType: "group", Name: "正常群"},
-	})
+	}, "u1", "summary")
 
 	if strings.Contains(system, "非法类型-A") || strings.Contains(system, "空类型") {
 		t.Errorf("unknown-type entries leaked into system prompt: %s", system)
@@ -65,6 +65,36 @@ func TestApplySelectedChannelContext_DropsUnknownChannelTypes(t *testing.T) {
 	ids := agent.SelectedArchivedChannelIDs(ctx)
 	if len(ids) != 0 {
 		t.Fatalf("unexpected archived allowlist entries: %v", ids)
+	}
+}
+
+func TestSelectedDMUsesSameCanonicalIDForPromptAndSpec(t *testing.T) {
+	const uid = "u-gate"
+	selected := []selectedChannel{{ChannelID: "peer-uid@u-gate", ChannelType: "direct", Name: "同事"}}
+	canonical := normalizeSelectedChannelsForUser(selected, uid)
+	if len(canonical) != 1 || canonical[0].ChannelID == selected[0].ChannelID {
+		t.Fatalf("canonical channels = %#v, want one reordered DM id", canonical)
+	}
+
+	_, prompt := applySelectedChannelContext(context.Background(), "base", selected, uid, "summary")
+	if !strings.Contains(prompt, `chat_id="`+canonical[0].ChannelID+`"`) {
+		t.Fatalf("prompt does not use persisted-spec canonical id %q: %s", canonical[0].ChannelID, prompt)
+	}
+	if strings.Contains(prompt, `chat_id="`+selected[0].ChannelID+`"`) {
+		t.Fatalf("raw client DM id leaked into prompt: %s", prompt)
+	}
+}
+
+func TestWorkspaceSelectedChannelsPromptUsesBatchToolOnly(t *testing.T) {
+	_, system := applySelectedChannelContext(context.Background(), "base", []selectedChannel{
+		{ChannelID: "group-1", ChannelType: "group", Name: "项目群"},
+	}, "u1", summaryWorkspaceProfile)
+
+	if !strings.Contains(system, "fetch_summary_scope({})") {
+		t.Fatalf("workspace prompt missing batch fetch instruction: %s", system)
+	}
+	if strings.Contains(system, "fetch_channel") || strings.Contains(system, "peek_channel") {
+		t.Fatalf("workspace prompt names unavailable per-channel tools: %s", system)
 	}
 }
 
