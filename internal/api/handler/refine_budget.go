@@ -12,39 +12,35 @@ import (
 // Refine LLM budget.
 //
 // The four refine entry points (personal_refine.go x2, edit.go x2) each had a
-// hardcoded 90s context. That number is not independently meaningful: it is the
-// PARENT deadline for an llmfallback.Run whose per-attempt timeout is
-// LLM_TIMEOUT (default 180s). A parent smaller than a single attempt means a
-// hanging primary consumes the whole budget and no fallback attempt can start,
-// so LLM_FALLBACK_MODELS is effectively inert on refine.
+// hardcoded 90s context. That number is the PARENT deadline for an
+// llmfallback.Run. Refine derives a per-attempt budget estimate from that
+// parent, which can skip same-model retries after returned transient failures,
+// but it is not itself a request timeout: a stalled primary can still consume
+// the whole parent budget before fallback starts.
 //
-// Sizing this correctly requires the runner's ACTUAL retry semantics, which are
-// harsher than they look. Run gives the primary all MaxAttempts (3) attempts
-// before it considers another model, and the early-escalation guard that would
-// cut that short is deliberately not armed here (see service/llm.go). A hanging
-// attempt is cut by http.Client.Timeout and classified RetrySameModel, so it
-// costs a full LLM_TIMEOUT and the loop continues; only when the PARENT deadline
-// fires inside an attempt does it classify Terminal, at which point Run returns
-// without ever trying a fallback. So:
+// Sizing this correctly requires the runner's ACTUAL retry semantics. Refine now
+// derives `PerModelTimeout` from the remaining parent deadline (see service/llm.go),
+// which arms the deadline-aware early-escalation guard between attempts. That
+// lets a transient error returned before the parent deadline skip remaining
+// same-model retries when the remaining budget should be saved for fallback.
 //
-//	fallback gets one complete attempt  <=>  REFINE_TIMEOUT >= (MaxAttempts+1)*LLM_TIMEOUT + backoffs
-//	                                                        =  4*180s + 3s = 723s at defaults
-//	fallback cannot start at all         <=  REFINE_TIMEOUT <  MaxAttempts*LLM_TIMEOUT + backoffs
-//	                                                        =  3*180s + 3s = 543s at defaults
+// Important limitation: `PerModelTimeout` is an accounting estimate, not the
+// request deadline. A stalled primary attempt is still bounded by the parent
+// `REFINE_TIMEOUT` (or by `LLM_TIMEOUT` if smaller), so the common "hung primary"
+// case can still consume the whole 90s default before any fallback starts.
+// Enforcing a proportional per-attempt request timeout is a separate latency
+// tradeoff that belongs with the measured-percentile work.
 //
-// An earlier revision of this comment stated 2*LLM_TIMEOUT + backoff, which was
-// only true under a budget-guard behaviour that was reverted. Following that
-// number would have put an operator squarely in the second regime while
-// believing they were in the first.
+// An earlier revision of this comment assumed the early-escalation guard was not
+// armed for refine at all and therefore required (MaxAttempts+1)*LLM_TIMEOUT +
+// backoffs (723s at defaults) for a fallback to get one full 180s attempt. The
+// shipped runtime is now in between: the guard is armed for returned transient
+// failures, but hung attempts are not sliced by this PR.
 //
-// This file deliberately does NOT raise the default to reach 723s: 90s is the
-// latency users experience today on a path that currently errors at 90s, and an
-// eightfold increase in worst-case refine latency is not a change to make
-// blind. The right value depends on the refine percentiles that
-// llm_run_duration_seconds now exposes (#220 defers the number to measured
-// P95/P99). What changes here is only that the value stops being welded into
-// four call sites.
-//
+// This file deliberately keeps the 90s default: it is the latency users
+// experience today, and raising it is an explicit latency tradeoff best made
+// against measured refine percentiles (`llm_run_duration_seconds`). What changes
+// here is only that the value stops being welded into four call sites.
 // Note also that on the two STREAMING refine handlers this bounds the LLM run,
 // not the request: both clear the response write deadline before streaming, so
 // a connected-but-not-reading client is bounded by neither this value nor a
@@ -64,11 +60,10 @@ const defaultRefineTimeout = 90 * time.Second
 //     already-expired context — all four handlers would fail instantly, and
 //     silently.
 //
-// The ceiling comfortably clears the worst-case reachable run
-// ((MaxAttempts+1)*LLM_TIMEOUT + backoffs = 723s at defaults) so it never
-// silently truncates a legitimately-sized budget. There is no floor constant:
-// the <= 0 rejection below already guarantees at least 1s, so a floor clamp
-// would be unreachable code.
+// The ceiling comfortably clears any realistic parent budget an operator may set
+// while still preventing effectively-forever stuck connections. There is no
+// floor constant: the <= 0 rejection below already guarantees at least 1s, so a
+// floor clamp would be unreachable code.
 const maxRefineTimeout = 30 * time.Minute
 
 // refineTimeoutEnvVar overrides the refine budget, in seconds.
