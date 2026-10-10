@@ -1354,13 +1354,14 @@ func deriveWorkspaceRoute(context summaryWorkspaceContext, action service.Summar
 			// instead of silently dropping the chat or skipping the workflow.
 			// The permission result must gate workflow creation (plan §4.3).
 			return service.SummaryRouteClarification
-		case mixedChat:
-			// Mixed scopes run the personal workflow; the docs-only
-			// explain-clarification does not apply once chats are present,
-			// regardless of intent or explicit run flag.
-			return service.SummaryRoutePersonalWorkflow
 		case intent == service.SummaryIntentExplain && !hasExplicitRunIntent:
+			// Explanation/negated-run turns are non-executing for every document
+			// scope shape, including mixed document+chat. Chats make the generated
+			// summary possible; they do not override an explicit "do not generate"
+			// or ordinary explanation question into a worker side effect.
 			return service.SummaryRouteClarification
+		case mixedChat:
+			return service.SummaryRoutePersonalWorkflow
 		default:
 			return service.SummaryRoutePersonalWorkflow
 		}
