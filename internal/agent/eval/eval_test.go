@@ -33,7 +33,7 @@ func TestGoldenSet(t *testing.T) {
 			// Coverage: the P0 invariant — no snapshot message is silently lost.
 			if !rep.Coverage.NoSilentLoss {
 				t.Errorf("silent loss: input=%d processed=%d dropped=%d",
-					rep.Coverage.InputCount, rep.Coverage.ProcessedCount, rep.Coverage.DroppedCount)
+					rep.Coverage.InputCount, rep.Coverage.ProcessedCount, rep.Coverage.TotalDroppedCount)
 			}
 			if rep.Coverage.ProcessedCount != gc.Expected.MessageCount {
 				t.Errorf("processed=%d, want %d", rep.Coverage.ProcessedCount, gc.Expected.MessageCount)
@@ -80,8 +80,33 @@ func TestCoverageRegressionGuard(t *testing.T) {
 	// 500 input at default chunk_size must feed all 500 to the model.
 	fake := GoldenCase{Messages: make([]GoldenMessage, 500)}
 	cov := Coverage(fake)
-	if cov.DroppedCount != 0 || cov.ProcessedCount != 500 {
+	if cov.TotalDroppedCount != 0 || cov.ProcessedCount != 500 {
 		t.Fatalf("coverage regressed: processed=%d dropped=%d (chunk defaults likely back to 500)",
-			cov.ProcessedCount, cov.DroppedCount)
+			cov.ProcessedCount, cov.TotalDroppedCount)
+	}
+}
+
+// TestCoverageGateExemptsDisclosedCap pins the coverage gate over a huge default
+// input. Post-floor-fix (B-1a, Jerry-Xin 5338024667 §3): floorMsgsPerChunk
+// raises the per-chunk count to ceil(n/256) whenever the model-chosen size would
+// fan out past the cap, so at the DEFAULT configuration the cap can no longer
+// fire at any input size — 52000 messages split into ~255 chunks with zero drop.
+// The gate's disclosed-cap exemption (NoSilentLoss = dropped−capped == 0) remains
+// pinned by construction here and by the cap-classification unit pins
+// (TestCapChunks) for the residual huge-input/token-budget-forced route.
+func TestCoverageGateExemptsDisclosedCap(t *testing.T) {
+	const n = 52000
+	cov := Coverage(GoldenCase{Messages: make([]GoldenMessage, n)})
+	if cov.Chunks > 256 {
+		t.Fatalf("chunks = %d exceeds the fan-out cap", cov.Chunks)
+	}
+	if cov.TotalDroppedCount != 0 || cov.CappedDroppedCount != 0 {
+		t.Fatalf("default config must not drop anything post-floor-fix, got dropped=%d capped=%d", cov.TotalDroppedCount, cov.CappedDroppedCount)
+	}
+	if cov.ProcessedCount != n {
+		t.Fatalf("processed=%d, want %d", cov.ProcessedCount, n)
+	}
+	if !cov.NoSilentLoss {
+		t.Fatal("no-silent-loss gate must hold on a clean huge input")
 	}
 }

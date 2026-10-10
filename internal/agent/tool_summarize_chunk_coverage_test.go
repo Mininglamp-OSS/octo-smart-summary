@@ -96,13 +96,17 @@ func TestFormatChunkForLLM_OversizedCountedNotTruncated(t *testing.T) {
 func aggregateCoverage(t *testing.T, inputCount, requestedChunkSize int) chunkCoverage {
 	t.Helper()
 	msgMaps := makeMsgMaps(inputCount)
-	size := clampChunkSize(requestedChunkSize)
-	processed, dropped, _ := ProbeChunkCoverageDefault(msgMaps, requestedChunkSize)
+	size := floorMsgsPerChunk(requestedChunkSize, inputCount)
+	processed, dropped, _, capped := ProbeChunkCoverageDefault(msgMaps, requestedChunkSize)
 
+	// Mirror finalizeDropCounts semantics: cap-removed messages land in
+	// CappedDroppedCount (NOT DroppedCount) and Truncated flags any real gap
+	// (Jerry-Xin 5338024667 §8.7 — the helper previously conflated the two).
 	cov := chunkCoverage{InputCount: inputCount, ChunkSize: size}
 	cov.ProcessedCount = processed
-	cov.DroppedCount = dropped
-	cov.Truncated = dropped > 0
+	cov.DroppedCount = dropped - capped
+	cov.CappedDroppedCount = capped
+	cov.Truncated = cov.DroppedCount > 0 || cov.CappedDroppedCount > 0
 	return cov
 }
 
