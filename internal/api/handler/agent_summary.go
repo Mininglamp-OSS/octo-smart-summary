@@ -11,6 +11,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/finishgate"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
@@ -505,6 +506,10 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		}
 		content = stripped
 	}
+	// Neutralize setext headings before validation/citation processing: a
+	// model-emitted "text\n---\n" lead-in renders as a broken H2 on the web
+	// (see citationtext.NormalizeSetextHeadings).
+	content = citationtext.NormalizeSetextHeadings(content)
 
 	// SUM-BE1 (revised per SUM-9): real agent_save gate. Run the shared
 	// validator with the server-trusted content (post-strip) so a caller
@@ -615,6 +620,12 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			workspaceCandidate = lockedCandidate
 			draftMsg = lockedCandidate.Message
 			content = lockedCandidate.Content
+			// The pre-transaction normalization at the top of this handler is
+			// discarded when the locked workspace payload replaces `content`
+			// here (PR#268 round-1 B-2 / M-P2 dead store). Re-neutralize so
+			// the persisted PersonalResult.Content carries the fix on the
+			// workspace-save branch too.
+			content = citationtext.NormalizeSetextHeadings(content)
 			lockedBinding, bindingErr := resolveAgentMessageRunBinding(
 				c.Request.Context(), tx, userID, req.SessionID, req.RequestID, draftMsg,
 			)

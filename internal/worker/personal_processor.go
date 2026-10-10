@@ -422,6 +422,19 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 	if strings.TrimSpace(content) == "" {
 		content = noRelevantContentMessage
 	}
+	// Neutralize setext headings before persistence: a model-emitted "text\n---\n"
+	// lead-in renders as a broken H2 on the web (see citationtext.NormalizeSetextHeadings).
+	// After normalizing, publish the normalized bytes as an EventSnapshot so
+	// the done frame re-stamps THIS content (hub.go EventSnapshot replaces the
+	// raw delta accumulation) and the wire matches the persisted row
+	// byte-for-byte. The split previously broke edit.go's
+	// req.Content == summaryResult.Content no-change guard (mochashanyao
+	// round-3 P1: a no-op team edit could overwrite normalized content and
+	// auto-pause a scheduled task).
+	content = citationtext.NormalizeSetextHeadings(content)
+	if streamSender != nil {
+		streamSender.Send(streaming.Event{Type: streaming.EventSnapshot, Content: content})
+	}
 	isScheduledEmptyWindow := shouldSkipScheduledPlaceholderResult(task.TriggerType, content)
 
 	// Best-effort check: abort early if task is no longer Processing.

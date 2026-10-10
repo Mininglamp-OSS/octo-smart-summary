@@ -10,6 +10,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmfallback"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -285,15 +286,22 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "调整失败，请稍后重试"})
 		return
 	}
-	newContent = strings.TrimSpace(stripMarkdownFence(newContent))
-	if newContent == "" {
+	// Size gate on the STRIPPED, PRE-NORMALIZE length (A-13, PR#268 r4 §5):
+	// one gate, one basis — the post-citation re-check below measures the
+	// same quantity for bodies without citation churn, so near-cap bodies
+	// keep the pr-base accept boundary. (Supersedes the r3 raw-length gate,
+	// whose basis was executably refuted at the exactly-at-cap boundary.)
+	stripped, strippedLen := splitRefineContent(newContent)
+	if stripped == "" {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "调整结果为空"})
 		return
 	}
-	if len(newContent) > maxContentBytes {
+	if strippedLen > maxContentBytes {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "调整结果超过 500KB 限制"})
 		return
 	}
+	newContent = citationtext.NormalizeSetextHeadings(stripped)
+	normalizeGrowth := len(newContent) - len(stripped)
 
 	basePlainCitations := baseResult.GetCitations()
 	if !callerPlainCitationsVisible(h.db, &task, userID, &baseResult) {
@@ -304,7 +312,10 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "调整结果包含无效引用，请修改要求后重试"})
 		return
 	}
-	if len(newContent) > maxContentBytes {
+	// A-13: gate 2 measures the SAME strip basis, netting out the known
+	// normalize growth (inserted blank lines), so it still bounds citation
+	// churn growth without tripping on the normalizer's own inserts.
+	if len(newContent)-normalizeGrowth > maxContentBytes {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "调整结果超过 500KB 限制"})
 		return
 	}
@@ -470,15 +481,19 @@ func (h *EditHandler) RefineSummaryStream(c *gin.Context) {
 		writeStreamError("调整失败，请稍后重试")
 		return
 	}
-	newContent = strings.TrimSpace(stripMarkdownFence(newContent))
-	if newContent == "" {
+	// Size gate on the STRIPPED, PRE-NORMALIZE length (A-13, see the
+	// non-stream twin above for the full rationale).
+	stripped, strippedLen := splitRefineContent(newContent)
+	if stripped == "" {
 		writeStreamError("调整结果为空")
 		return
 	}
-	if len(newContent) > maxContentBytes {
+	if strippedLen > maxContentBytes {
 		writeStreamError("调整结果超过 500KB 限制")
 		return
 	}
+	newContent = citationtext.NormalizeSetextHeadings(stripped)
+	normalizeGrowth := len(newContent) - len(stripped)
 
 	basePlainCitations := baseResult.GetCitations()
 	if !callerPlainCitationsVisible(h.db, &task, userID, &baseResult) {
@@ -489,7 +504,9 @@ func (h *EditHandler) RefineSummaryStream(c *gin.Context) {
 		writeStreamError("调整结果包含无效引用，请修改要求后重试")
 		return
 	}
-	if len(newContent) > maxContentBytes {
+	// A-13: gate 2 measures the SAME strip basis, netting out the known
+	// normalize growth (see the non-stream twin).
+	if len(newContent)-normalizeGrowth > maxContentBytes {
 		writeStreamError("调整结果超过 500KB 限制")
 		return
 	}
@@ -809,4 +826,24 @@ func stripMarkdownFence(s string) string {
 		return strings.Join(lines[1:len(lines)-1], "\n")
 	}
 	return trimmed
+}
+
+// splitRefineContent returns the fence-stripped, trimmed model output and its
+// byte length. The length is the SINGLE size-gate basis (A-13, PR#268 r4 §5,
+// prescription by yujiawei): measured after the strip and before the
+// normalize, so gate 1 and the post-citation gate 2 measure the same quantity
+// for bodies without citation churn. This preserves both pr-base behaviors:
+// a stripped body at exactly maxContentBytes is accepted (a normalize insert
+// of k bytes no longer trips the boundary), and a fence wrapper whose raw
+// length exceeds the cap only by fence overhead is accepted.
+//
+// This function is the shared strip step for every refine transport (edit.go
+// non-stream + stream, personal_refine.go non-stream + stream); its callers
+// then apply citationtext.NormalizeSetextHeadings and the two size gates in
+// the same shape. PR#268 round-1 B-2 was that two of the four structural-twin
+// refine handlers missed the setext-neutralization call because the sequence
+// was copy-pasted; grep for splitRefineContent to enumerate all sites.
+func splitRefineContent(raw string) (string, int) {
+	newContent := strings.TrimSpace(stripMarkdownFence(raw))
+	return newContent, len(newContent)
 }
