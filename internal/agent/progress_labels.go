@@ -21,6 +21,7 @@ var ToolLabels = map[string]struct {
 	"extract_time_range":       {Phase: "understand", Label: "解析时间范围"},
 	"set_summary_scope":        {Phase: "understand", Label: "确认总结范围"},
 	"fetch_channel":            {Phase: "retrieve", Label: "抓取消息"},
+	"fetch_summary_scope":      {Phase: "retrieve", Label: "批量抓取消息"},
 	"search_messages":          {Phase: "retrieve", Label: "搜索消息"},
 	"filter_relevant":          {Phase: "filter", Label: "筛选相关消息"},
 	"summarize_chunk":          {Phase: "distill", Label: "分块总结"},

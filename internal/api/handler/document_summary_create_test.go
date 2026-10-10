@@ -5,6 +5,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -371,12 +372,11 @@ func TestCreateDocumentSummaryRequiresAllFetchesBeforeWriting(t *testing.T) {
 	}
 }
 
-func TestCreateDocumentSummaryRejectsMixedOrTeamRequests(t *testing.T) {
+func TestCreateDocumentSummaryRejectsTeamOrTimedDocumentRequests(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		body map[string]interface{}
 	}{
-		{"mixed", map[string]interface{}{"sources": []map[string]interface{}{{"source_type": model.SourceDocument, "source_id": "d_1"}, {"source_type": model.SourceGroup, "source_id": "g_1"}}}},
 		{"participant", map[string]interface{}{"sources": []map[string]interface{}{{"source_type": model.SourceDocument, "source_id": "d_1"}}, "participants": []map[string]interface{}{{"user_id": "u2"}}}},
 		{"time range", map[string]interface{}{"sources": []map[string]interface{}{{"source_type": model.SourceDocument, "source_id": "d_1"}}, "time_range": map[string]interface{}{"start": "2026-09-01T00:00:00Z", "end": "2026-09-02T00:00:00Z"}}},
 	} {
@@ -392,42 +392,7 @@ func TestCreateDocumentSummaryRejectsMixedOrTeamRequests(t *testing.T) {
 	}
 }
 
-// enableMixedAdmission flips the process-wide gate on for the duration of a
-// test and restores the PREVIOUS value afterward (not a hardcoded false), so
-// tests are order-independent and never clobber a gate another test relies on.
-func enableMixedAdmission(t *testing.T) {
-	t.Helper()
-	prev := service.MixedSourcesAdmissionEnabled()
-	service.SetMixedSourcesAdmission(true)
-	t.Cleanup(func() { service.SetMixedSourcesAdmission(prev) })
-}
-
-func TestCreateDocumentSummaryMixedGateOffRejectsBeforeFetchingDocs(t *testing.T) {
-	db, imDB := setupTestDBs(t)
-	client := &recordingDocumentSourceClient{docs: map[string]*documentSummarySource{"d_1": {Content: "正文"}}}
-	h := NewTaskHandler(db, imDB, "")
-	h.documentClient = client
-
-	// Gate OFF (default): a mixed request must be rejected at the HTTP entry,
-	// BEFORE any document fetch, so it costs no upstream call or limiter slot.
-	w := doCreateSummary(setupCreateRouter(h), map[string]interface{}{
-		"sources": []map[string]interface{}{
-			{"source_type": model.SourceDocument, "source_id": "d_1"},
-			{"source_type": model.SourceGroup, "source_id": "g_1"},
-		},
-	}, "creator1")
-	if w.Code != http.StatusBadRequest || respCode(t, w) != 40001 {
-		t.Fatalf("response = %d %s", w.Code, w.Body.String())
-	}
-	client.mu.Lock()
-	defer client.mu.Unlock()
-	if len(client.versions) != 0 {
-		t.Fatalf("document fetch ran %d times, want 0 (gate-off must reject before fetch)", len(client.versions))
-	}
-}
-
-func TestCreateDocumentSummaryMixedGateOnPersistsDocumentSnapshot(t *testing.T) {
-	enableMixedAdmission(t)
+func TestCreateDocumentSummaryMixedPersistsDocumentSnapshot(t *testing.T) {
 	db, imDB := setupTestDBs(t)
 	client := &recordingDocumentSourceClient{docs: map[string]*documentSummarySource{
 		"d_1": {DocumentID: "d_1", Title: "方案", Version: "v1", Content: "文档正文"},
@@ -435,7 +400,7 @@ func TestCreateDocumentSummaryMixedGateOnPersistsDocumentSnapshot(t *testing.T) 
 	h := NewTaskHandler(db, imDB, "")
 	h.documentClient = client
 
-	// Gate ON: the legacy HTTP mixed path must persist BOTH classes, with the
+	// The legacy HTTP mixed path must persist BOTH classes, with the
 	// document row carrying a non-empty source_hash (its fetched snapshot).
 	w := doCreateSummary(setupCreateRouter(h), map[string]interface{}{
 		"title": "混合总结",
@@ -475,8 +440,81 @@ func TestCreateDocumentSummaryMixedGateOnPersistsDocumentSnapshot(t *testing.T) 
 	}
 }
 
-func TestCreateDocumentSummaryMixedGateOnRejectsBogusSourceType(t *testing.T) {
-	enableMixedAdmission(t)
+func TestCreateDocumentSummaryMixedRejectsInvalidRequestsBeforeFetch(t *testing.T) {
+	overLimitSources := make([]map[string]interface{}, 0, service.MixedMaxTotalSources+1)
+	for i := 0; i < service.MixedMaxTotalSources; i++ {
+		overLimitSources = append(overLimitSources, map[string]interface{}{
+			"source_type": model.SourceGroup,
+			"source_id":   fmt.Sprintf("g_%d", i),
+		})
+	}
+	overLimitSources = append(overLimitSources, map[string]interface{}{
+		"source_type": model.SourceDocument,
+		"source_id":   "d_1",
+	})
+
+	tests := []struct {
+		name string
+		body map[string]interface{}
+	}{
+		{
+			name: "non-self creator",
+			body: map[string]interface{}{
+				"uid": "other-user",
+				"sources": []map[string]interface{}{
+					{"source_type": model.SourceGroup, "source_id": "g_1"},
+					{"source_type": model.SourceDocument, "source_id": "d_1"},
+				},
+			},
+		},
+		{
+			name: "participants",
+			body: map[string]interface{}{
+				"participants": []map[string]interface{}{{"user_id": "u2"}},
+				"sources": []map[string]interface{}{
+					{"source_type": model.SourceGroup, "source_id": "g_1"},
+					{"source_type": model.SourceDocument, "source_id": "d_1"},
+				},
+			},
+		},
+		{
+			name: "origin channel",
+			body: map[string]interface{}{
+				"origin_channel_id":   "g_1",
+				"origin_channel_type": 1,
+				"sources": []map[string]interface{}{
+					{"source_type": model.SourceGroup, "source_id": "g_1"},
+					{"source_type": model.SourceDocument, "source_id": "d_1"},
+				},
+			},
+		},
+		{name: "combined cap", body: map[string]interface{}{"sources": overLimitSources}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db, imDB := setupTestDBs(t)
+			client := &recordingDocumentSourceClient{
+				docs: map[string]*documentSummarySource{},
+				errs: map[string]error{"d_1": errors.New("document fetch must not run")},
+			}
+			h := NewTaskHandler(db, imDB, "")
+			h.documentClient = client
+
+			w := doCreateSummary(setupCreateRouter(h), test.body, "creator1")
+			if w.Code != http.StatusBadRequest || respCode(t, w) != 40001 {
+				t.Fatalf("response = %d %s", w.Code, w.Body.String())
+			}
+			client.mu.Lock()
+			defer client.mu.Unlock()
+			if len(client.versions) != 0 {
+				t.Fatalf("document fetch ran before mixed validation: %#v", client.versions)
+			}
+		})
+	}
+}
+
+func TestCreateDocumentSummaryRejectsBogusSourceType(t *testing.T) {
 	db, imDB := setupTestDBs(t)
 	client := &recordingDocumentSourceClient{docs: map[string]*documentSummarySource{
 		"d_1": {DocumentID: "d_1", Title: "方案", Version: "v1", Content: "文档正文"},
@@ -484,7 +522,7 @@ func TestCreateDocumentSummaryMixedGateOnRejectsBogusSourceType(t *testing.T) {
 	h := NewTaskHandler(db, imDB, "")
 	h.documentClient = client
 
-	// Gate ON but source_type 99 is not a valid chat enum: the mixed branch's
+	// source_type 99 is not a valid chat enum: the mixed branch's
 	// whitelist must reject it rather than persisting an arbitrary type.
 	w := doCreateSummary(setupCreateRouter(h), map[string]interface{}{
 		"sources": []map[string]interface{}{
@@ -502,6 +540,11 @@ func TestCreateDocumentSummaryMixedGateOnRejectsBogusSourceType(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("persisted %d sources, want 0 (bogus type must be rejected before persist)", count)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.versions) != 0 {
+		t.Fatalf("document fetch ran before bogus mixed source rejection: %#v", client.versions)
 	}
 }
 

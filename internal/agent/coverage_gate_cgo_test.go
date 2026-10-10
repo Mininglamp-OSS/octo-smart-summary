@@ -612,6 +612,35 @@ func TestCoverageGate_OpenScopeNeverFires(t *testing.T) {
 	}
 }
 
+func TestCoverageGateInvalidatesBatchCacheForDurablyMissingChannel(t *testing.T) {
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+	f := newCoverageGateFixture(t, true, twoChannelSpec)
+	if f == nil {
+		return
+	}
+	if err := f.runStore.RecordChannelFetch(context.Background(), f.uid, f.runID, "ch-A", true, false); err != nil {
+		t.Fatalf("record fetched channel: %v", err)
+	}
+	llm := newEchoLLM(t)
+	SetSummaryDeps(f.db, nil, nil, llm.cfg())
+	t.Cleanup(func() { SetSummaryDeps(nil, nil, nil, config.Config{}) })
+
+	ctx := withSummaryScopeFetchState(f.toolCtx())
+	state := summaryScopeFetchStateFromContext(ctx)
+	state.records["a"] = summaryScopeFetchRecord{channelID: "ch-A", succeeded: true}
+	state.records["b"] = summaryScopeFetchRecord{channelID: "ch-B", succeeded: true}
+
+	if err := checkCoverageBeforeFreeze(ctx, f.uid, f.sessionID, f.runID); err == nil {
+		t.Fatal("coverage gate did not report durably missing channel")
+	}
+	if _, ok := state.records["a"]; !ok {
+		t.Fatal("coverage gate invalidated a durably attempted channel")
+	}
+	if _, ok := state.records["b"]; ok {
+		t.Fatal("coverage gate kept an in-memory success missing from durable coverage")
+	}
+}
+
 // SUMMARY_REPAIR_MAX_ROUNDS=0 is the kill switch: the gate must not fire at all.
 func TestCoverageGate_ZeroRoundsDisablesTheGate(t *testing.T) {
 	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")

@@ -205,11 +205,11 @@ func (h *AgentChatHandler) SummaryWorkspaceCapabilities(c *gin.Context) {
 		"contract_version":     summaryWorkspaceContractVersion,
 		"max_time_range_days":  pipeline.MaxTimeRangeDays,
 		"direct_team_workflow": enabled,
-		// Mixed document+chat creation is admitted only when the worker
-		// executor half has landed (SUMMARY_MIXED_SOURCES_ENABLED). The
-		// frontend feature-detects on this field, so it must agree with the
-		// admission decision made in normalizeSummaryWorkspaceContext.
-		"mixed_sources": service.MixedSourcesAdmissionEnabled(),
+		// Mixed document+chat creation is admitted unconditionally (the
+		// phase-1 gate was removed when the worker executor landed), so the
+		// frontend feature-detects on a constant-`true` signal that agrees
+		// with the normalizeSummaryWorkspaceContext admission decision.
+		"mixed_sources": true,
 	}})
 }
 
@@ -692,7 +692,7 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 			IsArchived:  channel.IsArchived,
 		})
 	}
-	ctx, system = applySelectedChannelContext(ctx, system, selected)
+	ctx, system = applySelectedChannelContext(ctx, system, selected, key.UserID, summaryWorkspaceProfile)
 	ctx = agent.WithWorkspaceSpaceID(ctx, key.SpaceID)
 	if openScopeAgent {
 		ctx = agent.WithDiscoverableChannelScopeForUser(ctx, key.UserID, allowedChannels)

@@ -11,8 +11,8 @@ import (
 )
 
 // PR1: mixed-scope persistence + idempotency (plan §4.3 steps 4-5 and the
-// "no fake conflicts on retry" rule). Mixed admission is gated behind
-// MixedSourcesAdmissionEnabled (default OFF); these tests turn it on.
+// "no fake conflicts on retry" rule). Mixed admission is now unconditional
+// (the phase-1 gate was removed when the worker executor landed).
 
 func mixedSourcesForTest() []SummaryWorkflowSource {
 	return []SummaryWorkflowSource{
@@ -22,7 +22,6 @@ func mixedSourcesForTest() []SummaryWorkflowSource {
 }
 
 func TestMixedWorkflowPersistsBothSourceClassesAndSnapshot(t *testing.T) {
-	enableMixedAdmission(t)
 	svc, db := newSummaryWorkflowTestService(t)
 
 	in := baseSummaryWorkflowInput()
@@ -55,7 +54,6 @@ func TestMixedWorkflowPersistsBothSourceClassesAndSnapshot(t *testing.T) {
 }
 
 func TestMixedWorkflowIdempotentReplayKeepsOriginalSnapshot(t *testing.T) {
-	enableMixedAdmission(t)
 	svc, db := newSummaryWorkflowTestService(t)
 
 	in := baseSummaryWorkflowInput()
@@ -84,7 +82,6 @@ func TestMixedWorkflowIdempotentReplayKeepsOriginalSnapshot(t *testing.T) {
 }
 
 func TestMixedWorkflowSourceChangeWithSameKeyIsMismatch(t *testing.T) {
-	enableMixedAdmission(t)
 	svc, _ := newSummaryWorkflowTestService(t)
 
 	in := baseSummaryWorkflowInput()
@@ -110,32 +107,18 @@ func TestMixedWorkflowSourceChangeWithSameKeyIsMismatch(t *testing.T) {
 	}
 }
 
-// Mixed create is admitted only when the gate is ON (worker executor landed).
-func TestMixedWorkflowAdmittedWhenGateOn(t *testing.T) {
-	enableMixedAdmission(t)
+// Mixed create is now admitted unconditionally.
+func TestMixedWorkflowAdmitted(t *testing.T) {
 	svc, _ := newSummaryWorkflowTestService(t)
 
 	in := baseSummaryWorkflowInput()
 	in.Sources = mixedSourcesForTest()
 	created, err := svc.CreateFromLegacyHTTP(context.Background(), in)
 	if err != nil {
-		t.Fatalf("mixed create must be admitted with the gate on: %v", err)
+		t.Fatalf("mixed create must be admitted: %v", err)
 	}
 	if created.Task.ID == 0 {
 		t.Fatal("mixed create returned no task")
-	}
-}
-
-// The gate defaults OFF: a mixed create must be rejected with the clear
-// contract error, not silently admitted into a worker that can't run it.
-func TestMixedWorkflowRejectedWhenGateOff(t *testing.T) {
-	// No enableMixedAdmission call — exercise the default-OFF path.
-	svc, _ := newSummaryWorkflowTestService(t)
-
-	in := baseSummaryWorkflowInput()
-	in.Sources = mixedSourcesForTest()
-	if _, err := svc.CreateFromLegacyHTTP(context.Background(), in); err == nil {
-		t.Fatal("mixed create must be rejected when the admission gate is OFF")
 	}
 }
 
@@ -144,7 +127,6 @@ func TestMixedWorkflowRejectedWhenGateOff(t *testing.T) {
 // the document). The mixed branch enforces this at the service boundary; the
 // pure-document branch already did. A caller-supplied origin must be rejected.
 func TestMixedWorkflowRejectsOriginChannel(t *testing.T) {
-	enableMixedAdmission(t)
 	svc, _ := newSummaryWorkflowTestService(t)
 
 	in := baseSummaryWorkflowInput()
@@ -160,7 +142,6 @@ func TestMixedWorkflowRejectsOriginChannel(t *testing.T) {
 // document cap of MaxDocumentSummarySourceCount), not just the combined cap —
 // 11 documents + 1 chat is below the combined 30 but above the document cap.
 func TestMixedWorkflowRejectsOverDocumentCap(t *testing.T) {
-	enableMixedAdmission(t)
 	svc, _ := newSummaryWorkflowTestService(t)
 
 	in := baseSummaryWorkflowInput()

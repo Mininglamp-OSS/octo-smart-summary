@@ -36,6 +36,18 @@ func createSummaryHasDocumentSource(req createSummaryReq) bool {
 	return false
 }
 
+func uniqueCreateSummarySourceCount(sources []sourceReq) int {
+	type sourceKey struct {
+		sourceType int
+		sourceID   string
+	}
+	seen := make(map[sourceKey]struct{}, len(sources))
+	for _, source := range sources {
+		seen[sourceKey{sourceType: source.SourceType, sourceID: strings.TrimSpace(source.SourceID)}] = struct{}{}
+	}
+	return len(seen)
+}
+
 func (h *TaskHandler) prepareDocumentSummarySources(
 	requestContext context.Context,
 	header http.Header,
@@ -50,12 +62,11 @@ func (h *TaskHandler) prepareDocumentSummarySources(
 	badRequest := func(message string) ([]service.SummaryWorkflowSource, bool, *documentSummaryCreateError) {
 		return nil, true, &documentSummaryCreateError{status: http.StatusBadRequest, code: 40001, message: message}
 	}
-	// Mixed document+chat is admitted only when service.MixedSourcesAdmissionEnabled();
-	// the gate is checked HERE (before any fetch) for the mixed case, and again
-	// at validateDocumentWorkflowInput as the service-boundary backstop. This
-	// block also detects whether the request is mixed so the pure-document-only
-	// boundaries (no participants, no time range, no origin channel) are
-	// enforced exactly when there are no chat sources.
+	// Mixed document+chat is admitted unconditionally (the phase-1 gate was
+	// removed when the worker executor landed). This block detects whether the
+	// request is mixed so the pure-document-only boundaries (no participants,
+	// no time range, no origin channel) are enforced exactly when there are no
+	// chat sources.
 	mixedMode := false
 	hasChatSource := false
 	for _, source := range req.Sources {
@@ -80,18 +91,32 @@ func (h *TaskHandler) prepareDocumentSummarySources(
 		if req.OriginChannelID != "" || req.OriginChannelType != 0 {
 			return badRequest("文档总结不支持来源会话")
 		}
-	} else if !service.MixedSourcesAdmissionEnabled() {
-		// Gate OFF (default until the worker executor lands): reject the mixed
-		// request HERE, before the per-document fetch, so a request that was
-		// never going to be admitted does not burn upstream Docs calls (and
-		// does not surface a 502 when Docs is down instead of the clean
-		// contract 400). This mirrors the service-layer gate in
-		// validateDocumentWorkflowInput, but at the HTTP entry where the fetch
-		// would otherwise already have happened. (The limiter slot is already
-		// held at this point — acquired ahead of the fetch in CreateSummary —
-		// and is released by its defer; the point of the early reject is to
-		// skip the fetch itself, not the slot.)
-		return badRequest("文档总结不能混合聊天来源")
+	} else {
+		// Reject permanent mixed-scope errors before the document fan-out below.
+		// The service validator repeats these checks as a persistence boundary,
+		// but running them only after FetchSummarySource can turn an invalid 400
+		// into a misleading 502 when the document service is degraded.
+		if req.UID != "" && req.UID != userID {
+			return badRequest("文档总结仅支持当前用户创建")
+		}
+		if len(req.Participants) != 0 {
+			return badRequest("混合来源总结暂不支持其他参与者")
+		}
+		if req.OriginChannelID != "" || req.OriginChannelType != 0 {
+			return badRequest("混合来源总结不支持来源会话")
+		}
+		if uniqueCreateSummarySourceCount(req.Sources) > service.MixedMaxTotalSources {
+			return badRequest(service.MixedSourceCountExceededError().Message)
+		}
+		for _, source := range req.Sources {
+			if source.SourceType == model.SourceDocument {
+				continue
+			}
+			validType := source.SourceType >= model.SourceGroup && source.SourceType <= model.SourceDirect
+			if strings.TrimSpace(source.SourceID) == "" || !validType {
+				return badRequest("每个来源需提供 source_id 与合法的 source_type")
+			}
+		}
 	}
 
 	refs := make([]documentRefReq, 0, len(req.Sources))

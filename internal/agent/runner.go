@@ -111,6 +111,9 @@ func (r *Runner) RunWithHistoryOutcome(ctx context.Context, system string, histo
 	// a reused context cannot leak handles or pending state across runner calls.
 	ctx = withSummaryHandleStore(ctx)
 	ctx, truncationTracker := withOutputTruncationTracker(ctx)
+	if r.reg.Has("fetch_summary_scope") {
+		ctx = withSummaryScopeFetchState(ctx)
+	}
 
 	// A replay can see an already-persisted answer from an earlier attempt in
 	// session history. If that answer belongs to this same run and was truncated,
@@ -836,7 +839,7 @@ func (r *Runner) reportToolHookOutcomes(outcomes []toolHookOutcome) {
 // no message count (its per-chunk index is intentionally not exposed), so it returns 0.
 func extractToolCount(toolName, result string, idx, total int) int {
 	switch toolName {
-	case "fetch_channel", "search_messages":
+	case "fetch_channel", "fetch_summary_scope", "search_messages":
 		var data map[string]interface{}
 		if err := json.Unmarshal([]byte(result), &data); err != nil {
 			return 0

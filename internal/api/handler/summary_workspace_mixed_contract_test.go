@@ -3,31 +3,28 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
-
-	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 
 	"github.com/gin-gonic/gin"
 )
 
-// PR1 contract for MIXED document+chat sources. Admission is gated behind
-// service.MixedSourcesAdmissionEnabled (default OFF until the worker executor
-// lands). The frozen contract
+// PR1 contract for MIXED document+chat sources. Mixed admission is now
+// unconditional (the phase-1 gate was removed when the worker executor
+// landed). The frozen contract
 // (docs/mixed-document-chat-summary-development-plan.md §4.2):
-//   - capabilities broadcast the additive mixed_sources field (== gate state);
-//   - with the gate ON, a mixed context (channels + documents, no extra
-//     participants) normalizes cleanly and keeps the chat time range;
+//   - capabilities broadcast the additive mixed_sources field (always true);
+//   - a mixed context (channels + documents, no extra participants)
+//     normalizes cleanly and keeps the chat time range;
 //   - participants and referenced tasks combined with documents stay rejected;
 //   - raw request arrays stay bounded: documents ≤
 //     MaxDocumentSummarySourceCount, chat+documents combined ≤
 //     mixedMaxTotalSources.
 
 func TestSummaryWorkspaceCapabilitiesAdvertisesMixedSources(t *testing.T) {
-	service.SetMixedSourcesAdmission(true)
-	t.Cleanup(func() { service.SetMixedSourcesAdmission(false) })
-
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(recorder)
@@ -48,34 +45,7 @@ func TestSummaryWorkspaceCapabilitiesAdvertisesMixedSources(t *testing.T) {
 		t.Fatalf("decode capabilities: %v", err)
 	}
 	if !payload.Data.MixedSources {
-		t.Fatal("mixed_sources = false, want true (gate on)")
-	}
-}
-
-// When the gate is OFF (default), the capabilities payload must report
-// mixed_sources=false so the frontend never offers a flow the worker rejects.
-func TestSummaryWorkspaceCapabilitiesOmitsMixedSourcesWhenGateOff(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	recorder := httptest.NewRecorder()
-	context, _ := gin.CreateTestContext(recorder)
-	handler := &AgentChatHandler{
-		workspaceEntryEnabled: true,
-		workspace:             &summaryWorkspaceCoordinator{store: &AgentWorkspaceStore{}},
-		documentClient:        &capabilityDocumentSourceClient{},
-	}
-
-	handler.SummaryWorkspaceCapabilities(context)
-
-	var payload struct {
-		Data struct {
-			MixedSources bool `json:"mixed_sources"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("decode capabilities: %v", err)
-	}
-	if payload.Data.MixedSources {
-		t.Fatal("mixed_sources = true, want false (gate off by default)")
+		t.Fatal("mixed_sources = false, want true (admission unconditional)")
 	}
 }
 
@@ -107,9 +77,6 @@ func mixedContext() summaryWorkspaceContext {
 }
 
 func TestNormalizeSummaryWorkspaceContextAcceptsMixed(t *testing.T) {
-	service.SetMixedSourcesAdmission(true)
-	t.Cleanup(func() { service.SetMixedSourcesAdmission(false) })
-
 	got, err := normalizeSummaryWorkspaceContext(mixedContext())
 	if err != nil {
 		t.Fatalf("normalize mixed context: %v", err)
@@ -124,9 +91,6 @@ func TestNormalizeSummaryWorkspaceContextAcceptsMixed(t *testing.T) {
 
 // Participants × documents stay rejected — phase 1 is personal-only.
 func TestNormalizeSummaryWorkspaceContextRejectsMixedWithParticipants(t *testing.T) {
-	service.SetMixedSourcesAdmission(true)
-	t.Cleanup(func() { service.SetMixedSourcesAdmission(false) })
-
 	context := mixedContext()
 	context.Participants = []summaryWorkspaceParticipant{
 		{UserID: "user-2", UserName: "同事"},
@@ -140,9 +104,6 @@ func TestNormalizeSummaryWorkspaceContextRejectsMixedWithParticipants(t *testing
 // Referenced tasks × documents stay rejected in phase 1: the mixed entry does
 // not stack the reference-summary combination (plan §1.3 item 5).
 func TestNormalizeSummaryWorkspaceContextRejectsMixedWithReferences(t *testing.T) {
-	service.SetMixedSourcesAdmission(true)
-	t.Cleanup(func() { service.SetMixedSourcesAdmission(false) })
-
 	context := mixedContext()
 	context.ReferencedTaskIDs = []int64{101}
 	_, err := normalizeSummaryWorkspaceContext(context)
@@ -154,9 +115,6 @@ func TestNormalizeSummaryWorkspaceContextRejectsMixedWithReferences(t *testing.T
 // Deduplication must not become a request-body amplifier: the RAW array is
 // bounded before dedup (plan §1.2).
 func TestNormalizeSummaryWorkspaceContextCapsRawMixedArrays(t *testing.T) {
-	service.SetMixedSourcesAdmission(true)
-	t.Cleanup(func() { service.SetMixedSourcesAdmission(false) })
-
 	context := mixedContext()
 	rawDocuments := make([]summaryWorkspaceDocument, 0, maxSummaryWorkspaceDocuments+1)
 	for i := 0; i <= maxSummaryWorkspaceDocuments; i++ {
@@ -176,5 +134,54 @@ func TestMixedSourceCountLimit(t *testing.T) {
 	if mixedMaxTotalSources < maxSummaryWorkspaceDocuments {
 		t.Fatalf("mixedMaxTotalSources = %d must allow the pure-document maximum %d",
 			mixedMaxTotalSources, maxSummaryWorkspaceDocuments)
+	}
+}
+
+// The combined cap must be reachable in isolation on the workspace surface
+// too: documents stay at the per-document cap while chat sources cross the
+// combined bound, so the rejection message is the combined-cap one (A05).
+// The channel cap (30) equals the combined cap (30), so the isolating shape
+// is 30 chats + 1 doc: the channel cap passes (30 ≤ 30) and the combined cap
+// rejects (31 > 30). The admitted boundary (29 chats + 1 doc = 30) pins the
+// other end.
+func TestNormalizeSummaryWorkspaceContextCombinedCapBoundary(t *testing.T) {
+	context := mixedContext()
+	channels := make([]summaryWorkspaceChannel, 0, mixedMaxTotalSources)
+	for i := 0; i < mixedMaxTotalSources-maxSummaryWorkspaceDocuments+2; i++ {
+		channels = append(channels, summaryWorkspaceChannel{ChatID: fmt.Sprintf("group-%d", i), ChatType: "group", Name: fmt.Sprintf("群%d", i)})
+	}
+	context.SelectedChannels = channels[:mixedMaxTotalSources-maxSummaryWorkspaceDocuments+1] // 21 chats
+	context.Documents = []summaryWorkspaceDocument{
+		{DocumentID: "doc-1", Title: "产品方案"},
+		{DocumentID: "doc-2", Title: "设计稿"},
+	} // 21 chats + 2 docs = 23 total, under the combined cap
+	if _, err := normalizeSummaryWorkspaceContext(context); err != nil {
+		t.Fatalf("23 sources (21 chats + 2 docs) must normalize: %v", err)
+	}
+
+	thirtyChats := make([]summaryWorkspaceChannel, 0, maxSummaryWorkspaceSelectedChannels)
+	for i := 0; i < maxSummaryWorkspaceSelectedChannels; i++ {
+		thirtyChats = append(thirtyChats, summaryWorkspaceChannel{ChatID: fmt.Sprintf("chat-%d", i), ChatType: "group", Name: fmt.Sprintf("群%d", i)})
+	}
+	boundary := mixedContext()
+	boundary.SelectedChannels = thirtyChats[:maxSummaryWorkspaceSelectedChannels-1] // 29 chats
+	boundary.Documents = []summaryWorkspaceDocument{
+		{DocumentID: "doc-1", Title: "产品方案"},
+	} // 29 chats + 1 doc = 30: admitted
+	if _, err := normalizeSummaryWorkspaceContext(boundary); err != nil {
+		t.Fatalf("30 sources (29 chats + 1 doc) must normalize: %v", err)
+	}
+
+	over := mixedContext()
+	over.SelectedChannels = thirtyChats // exactly 30 chats: channel cap passes
+	over.Documents = []summaryWorkspaceDocument{
+		{DocumentID: "doc-1", Title: "产品方案"},
+	} // 30 chats + 1 doc = 31: combined cap rejects
+	_, err := normalizeSummaryWorkspaceContext(over)
+	if err == nil {
+		t.Fatal("23 sources (22 chats + 1 doc) must be rejected by the combined cap")
+	}
+	if !strings.Contains(err.Error(), "混合来源总数不能超过") {
+		t.Fatalf("rejection must come from the combined cap, got: %v", err)
 	}
 }

@@ -19,12 +19,10 @@ returns `enabled: true` and `contract_version: "2"`.
 
 - `mixed_sources: true` means the server admits a document+chat source scope
   (both the workspace and legacy HTTP create paths) and the client may offer
-  mixed selection. Absent or `false` means the client must keep the pre-mixed
-  mutual-exclusion behavior: selecting documents clears chats and vice versa.
-- The field tracks the `SUMMARY_MIXED_SOURCES_ENABLED` rollout gate (default
-  `false`) and flips on in lockstep with the worker executor follow-up; the
-  client must feature-detect on this field rather than on `contract_version`,
-  which is intentionally not bumped for this additive optional field.
+  mixed selection. Mixed admission is unconditional (the phase-1 roll-out gate
+  was removed when the worker executor landed), so the field is always `true`;
+  the client feature-detects on it rather than on `contract_version`, which is
+  intentionally not bumped for this additive optional field.
 - A mixed scope is personal-only (no participants, no origin auto-reply) and
   does not support stacking a referenced summary.
 

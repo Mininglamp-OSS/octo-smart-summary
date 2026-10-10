@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 )
 
 func TestClassifyToolError(t *testing.T) {
@@ -97,6 +99,24 @@ func TestClassifyToolError(t *testing.T) {
 				t.Fatalf("envelope JSON invalid or ok!=false: %s (err %v)", env.JSON(), err)
 			}
 		})
+	}
+}
+
+func TestClassifyFetchSummaryScopeErrors(t *testing.T) {
+	for _, msg := range []string{
+		"fetch_summary_scope requires an empty JSON object",
+		"summary scope has no channels",
+		"summary scope has no valid authoritative time range",
+	} {
+		env := classifyToolError(fetchSummaryScopeTool, errors.New(msg))
+		if env.ErrorCode != "INVALID_ARGUMENT" || !env.Retryable || env.Fatal {
+			t.Errorf("classifyToolError(%q) = %+v, want retryable non-fatal INVALID_ARGUMENT", msg, env)
+		}
+	}
+
+	env := classifyToolError(fetchSummaryScopeTool, errors.New("fetch_summary_scope failed for every channel: channel g1: channel g1 not accessible by user u1"))
+	if env.ErrorCode != "PERMISSION_DENIED" || env.Retryable || env.Fatal {
+		t.Fatalf("batch permission classification = %+v, want non-fatal PERMISSION_DENIED", env)
 	}
 }
 
@@ -256,6 +276,14 @@ func TestClassifyToolErrorStaleHandleIsNotFatalPermission(t *testing.T) {
 					tool, msg, env.ErrorCode, env.Retryable, env.Fatal)
 			}
 		}
+	}
+}
+
+func TestClassifyToolErrorUnknownCriticalToolIsNonFatal(t *testing.T) {
+	env := classifyToolError("fetch_channel", errors.New("unknown tool: fetch_channel"))
+	if env.ErrorCode != "INVALID_ARGUMENT" || env.Fatal || !env.Retryable {
+		t.Fatalf("unknown critical tool = %s retryable=%t fatal=%t, want retryable non-fatal INVALID_ARGUMENT",
+			env.ErrorCode, env.Retryable, env.Fatal)
 	}
 }
 
@@ -501,4 +529,21 @@ func TestFatalIsNotSelfSealing(t *testing.T) {
 			t.Errorf("run-scoped identity failure must stay fatal: %+v", env)
 		}
 	})
+}
+
+// TestClassifyToolError_SizeGuardsAreNotRetryable pins that the #241 pre-send
+// guard classifies as NOT retryable (retrying the same oversized input cannot
+// help) and fatal for a critical tool — identity-matched, never falling through
+// to the retryable default.
+func TestClassifyToolError_SizeGuardsAreNotRetryable(t *testing.T) {
+	env := classifyToolError("summarize_chunk", fmt.Errorf("wrap: %w", service.ErrRequestTooLarge))
+	if env.Retryable {
+		t.Errorf("Retryable = true, want false")
+	}
+	if !env.Fatal {
+		t.Errorf("Fatal = false, want true for a critical tool")
+	}
+	if env.ErrorCode != "REQUEST_TOO_LARGE" {
+		t.Errorf("ErrorCode = %q, want REQUEST_TOO_LARGE", env.ErrorCode)
+	}
 }

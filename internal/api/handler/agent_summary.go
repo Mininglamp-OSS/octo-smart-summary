@@ -1054,7 +1054,7 @@ func (h *AgentSummaryHandler) buildSnapshotV1(
 			},
 		},
 		ToolSummary:           toolSummary,
-		DataFreshnessNote:     "tool_summary 记录本次生成时的调用轨迹,不代表数据边界,涉及新数据源必须调 fetch_channel 验证",
+		DataFreshnessNote:     "tool_summary 记录本次生成时的调用轨迹,不代表数据边界,涉及新数据源必须使用当前可用的数据抓取工具验证",
 		ParentSnapshotVersion: nil,
 		UserInstruction:       nil,
 	}

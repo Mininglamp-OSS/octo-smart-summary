@@ -11,7 +11,7 @@ import (
 func TestWorkspaceScopeSchemasHidePlanningToolsForClosedScope(t *testing.T) {
 	reg, err := BuildRegistry([]string{
 		"get_current_time", "list_channels", "set_summary_scope",
-		"fetch_channel", "summarize_chunk", "emit_summary_response",
+		"fetch_summary_scope", "summarize_chunk", "emit_summary_response",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -23,7 +23,7 @@ func TestWorkspaceScopeSchemasHidePlanningToolsForClosedScope(t *testing.T) {
 			t.Fatalf("locked scope still exposes %q: %#v", hidden, got)
 		}
 	}
-	for _, visible := range []string{"fetch_channel", "summarize_chunk", "emit_summary_response"} {
+	for _, visible := range []string{"fetch_summary_scope", "summarize_chunk", "emit_summary_response"} {
 		if !got[visible] {
 			t.Fatalf("locked scope hid execution tool %q: %#v", visible, got)
 		}
@@ -31,7 +31,7 @@ func TestWorkspaceScopeSchemasHidePlanningToolsForClosedScope(t *testing.T) {
 }
 
 func TestWorkspaceScopeSchemasLockAfterDeclaration(t *testing.T) {
-	reg, err := BuildRegistry([]string{"list_channels", "set_summary_scope", "fetch_channel"})
+	reg, err := BuildRegistry([]string{"list_channels", "set_summary_scope", "fetch_summary_scope"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestWorkspaceScopeSchemasLockAfterDeclaration(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := schemaNames(workspaceScopeSchemas(ctx, reg.Schemas(), reg))
-	if got["set_summary_scope"] || got["list_channels"] || !got["fetch_channel"] {
+	if got["set_summary_scope"] || got["list_channels"] || !got["fetch_summary_scope"] {
 		t.Fatalf("declared scope schemas = %#v", got)
 	}
 }

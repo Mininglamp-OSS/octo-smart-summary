@@ -202,14 +202,11 @@ func TestNormalizeSummaryWorkspaceContextPreservesDocuments(t *testing.T) {
 	}
 }
 
-// PR flip: mixed document+chat scope is ACCEPTED when the admission gate is
-// ON. This replaces the original RejectsMixedDocumentScope pin; the mixed
-// contract tests in summary_workspace_mixed_contract_test.go pin the new
-// gated semantics.
+// PR flip: mixed document+chat scope is ACCEPTED (admission is now
+// unconditional). This replaces the original RejectsMixedDocumentScope pin;
+// the mixed contract tests in summary_workspace_mixed_contract_test.go pin
+// the invariant boundaries.
 func TestNormalizeSummaryWorkspaceContextAcceptsMixedDocumentScope(t *testing.T) {
-	service.SetMixedSourcesAdmission(true)
-	t.Cleanup(func() { service.SetMixedSourcesAdmission(false) })
-
 	got, err := normalizeSummaryWorkspaceContext(summaryWorkspaceContext{
 		SelectedChannels: []summaryWorkspaceChannel{{ChatID: "group-1", ChatType: "group", Name: "项目群"}},
 		Documents:        []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}},
@@ -537,6 +534,7 @@ func TestDeriveWorkspaceRouteDocumentExplainClarifies(t *testing.T) {
 		t.Fatalf("document explain route with user text requirement = %q, want clarification", got)
 	}
 }
+
 
 func TestDeriveWorkspaceRouteMixedExplainClarifiesUnlessExplicitRun(t *testing.T) {
 	context := summaryWorkspaceContext{

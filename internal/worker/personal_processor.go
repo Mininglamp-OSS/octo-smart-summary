@@ -826,13 +826,24 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		return "", nil, 0, 0, "", fmt.Errorf("load sources: %w", err)
 	}
 	documentMode := documentSourcesOnly(sources)
-	if !documentMode {
+	mixedMode := mixedHasDocumentSource(sources)
+	if !documentMode && !mixedMode {
 		for _, source := range sources {
 			if source.SourceType == model.SourceDocument {
 				return "", nil, 0, 0, "", fmt.Errorf("document sources cannot be mixed with chat sources")
 			}
 		}
 	}
+	chatSources, documentSources := splitMixedSources(sources)
+	if mixedMode && (len(chatSources) == 0 || len(documentSources) == 0) {
+		// Mixed orchestration is only for a true mixture; an empty side means
+		// the persisted rows are inconsistent with mixedHasDocumentSource.
+		return "", nil, 0, 0, "", fmt.Errorf("mixed task persisted without both source classes")
+	}
+	// Document snapshot evidence for mixed mode, loaded once and appended
+	// after the chat-side citation numbering below.
+	var mixedDocumentEvidence []pipeline.Message
+	var mixedChatEvidenceCount int
 
 	// Resolve the tokenizer and Map budget before loading document snapshots so
 	// each generated evidence message is guaranteed to fit the same budget used
@@ -848,7 +859,14 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	mapInputTokenBudget := p.cfg.ResolveMapInputBudget()
 	documentContentTokenBudget := mapInputTokenBudget - personalMapMessageFormattingTokens - documentEvidenceHeaderTokenReserve
 
-	specifiedSources := explicitSpecifiedSources(sources)
+	// Chat-side fetch constraints carry ONLY chat sources: document IDs are
+	// not channels and must never enter channel discovery/coverage validation
+	// (plan §4.4 来源分流). In mixed mode the workspace coverage check would
+	// reject a document id as "unavailable channel" and abort the task.
+	fetchSpecifiedSources := explicitSpecifiedSources(sources)
+	if mixedMode {
+		fetchSpecifiedSources = explicitSpecifiedSources(chatSources)
+	}
 
 	// Unified LLM tool-call callback (shared by all Function Call sites).
 	// purpose is derived from forceFn so the report says what each call did
@@ -882,12 +900,12 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	var intentResult *pipeline.IntentResult
 	var err error
 	if documentMode {
-		messages, err = loadDocumentEvidence(p.db, sources, tok, documentContentTokenBudget)
+		messages, err = loadDocumentEvidence(ctx, p.db, sources, tok, documentContentTokenBudget)
 	} else if p.fetchPersonalMessagesFn != nil {
 		messages, intentResult, err = p.fetchPersonalMessagesFn(ctx, task, userID)
 	} else {
 		messages, intentResult, err = pipeline.ResolveAndFetchMessagesForPersonal(
-			ctx, userID, nil, nil, specifiedSources, task.EffectiveTopic(),
+			ctx, userID, nil, nil, fetchSpecifiedSources, task.EffectiveTopic(),
 			task.TimeRangeStart, task.TimeRangeEnd,
 			p.imDB, p.octoClient, p.cfg.MessageFetchBackend, toolCallFn, llmFn,
 			p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency, p.cfg.OctoSearchPollSec,
@@ -897,6 +915,20 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	timing.Observe(taskNo, "fetch_messages", fetchStart)
 	if err != nil {
 		return "", nil, 0, 0, "", fmt.Errorf("fetch messages: %w", err)
+	}
+
+	if mixedMode {
+		// Mixed orchestration: load document snapshot evidence NOW (chat
+		// numbering happens later, after the context-window filter), then
+		// append with continuing citation indexes so both evidence classes
+		// share one numbering pool across Map/Reduce (plan §4.4). Snapshot
+		// load failure is hard: creation already verified snapshot presence,
+		// so a missing snapshot at execution time is corruption (plan §3.4).
+		loaded, loadErr := loadDocumentEvidence(ctx, p.db, documentSources, tok, documentContentTokenBudget)
+		if loadErr != nil {
+			return "", nil, 0, 0, "", fmt.Errorf("load mixed document evidence: %w", loadErr)
+		}
+		mixedDocumentEvidence = loaded
 	}
 
 	// Record message retrieval stats
@@ -987,9 +1019,12 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 			c.FilteredCount = len(filtered)
 		})
 		userMessages, earlyMsg = decidePersonalMessages(targetUIDs, userID, messages, filtered)
-		if earlyMsg != "" {
-			// True first-person query and the creator has no messages in the selected
-			// source(s): tell the user plainly instead of falling back to the whole source.
+		if earlyMsg != "" && !mixedMode {
+			// True first-person query and the creator has no messages in the
+			// selected source(s): tell the user plainly instead of falling back
+			// to the whole source. Mixed mode skips this return: loaded document
+			// snapshots must not be discarded just because the chat side is
+			// quiet (plan §3.4 合法会话无消息 → 其他来源有内容时允许完成).
 			log.Printf("[personal-worker] creator %s had no messages in selected source(s), returning self-empty notice", userID)
 			return earlyMsg, nil, 0, 0, p.llm.ModelVersion(), nil
 		}
@@ -1003,7 +1038,10 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		log.Printf("[personal-worker] no specific target, using all %d messages (took %dms)",
 			len(messages), time.Since(filterStart).Milliseconds())
 	}
-	if len(userMessages) == 0 {
+	if len(userMessages) == 0 && !mixedMode {
+		// Mixed mode skips this return: the document evidence is still pending
+		// append below, and documents alone are enough to complete the task
+		// (plan §3.4 / A08 — only ALL sources empty may return "no content").
 		return noRelevantContentMessage, nil, 0, 0, p.llm.ModelVersion(), nil
 	}
 
@@ -1051,6 +1089,29 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	}
 	if documentMode {
 		targetMsgCount = len(sources)
+	}
+	if mixedMode {
+		mixedChatEvidenceCount = len(userMessages)
+		// Mixed: append document evidence after the chat numbering so the two
+		// classes share ONE citation pool (plan §4.4 证据编号). Chat messages
+		// keep their just-assigned indexes; document chunks continue from the
+		// next free index. Chat-side cleaning/filtering above has already run
+		// and must not touch document rows (they carry no user sender).
+		//
+		// An empty chat side is NOT an error here (plan §3.4 / A08): the
+		// empty-chat early returns above were skipped in mixed mode, so a
+		// quiet chat window falls through to a document-only summary and the
+		// generated body must note the chat gap (covered by the
+		// EmptyChatFallsBackToDocuments regression test).
+		documentStartIndex := citIdx // next free index after chat messages
+		appended, appendErr := appendDocumentEvidence(userMessages, documentSources,
+			func(sources []model.SummarySource) ([]pipeline.Message, error) {
+				return mixedDocumentEvidence, nil
+			}, documentStartIndex)
+		if appendErr != nil {
+			return "", nil, 0, 0, "", fmt.Errorf("append mixed document evidence: %w", appendErr)
+		}
+		userMessages = appended
 	}
 
 	if reportStage != nil {
@@ -1139,6 +1200,19 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		endTime = ""
 	}
 	sourceName := sourceNameForGeneration(sources)
+	mixedTaskScope := service.MixedTaskScope{}
+	if mixedMode {
+		// Mixed keeps the chat-side time window (startTime/endTime above stay
+		// populated): documents are version-frozen but the chat half must
+		// state which window it covers (plan §3.4 显式展示覆盖范围限制 / A01).
+		sourceName = mixedSourceLabel(chatSources, documentSources)
+		mixedTaskScope = service.MixedTaskScope{
+			ChatEvidenceCount:     mixedChatEvidenceCount,
+			DocumentEvidenceCount: len(mixedDocumentEvidence),
+			TimeStart:             startTime,
+			TimeEnd:               endTime,
+		}
+	}
 
 	// Determine userName: use target's name when topic points to someone else
 	var userName string
@@ -1164,6 +1238,8 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		for _, m := range userMessages {
 			if documentMode {
 				formatted = append(formatted, formatDocumentEvidence(m))
+			} else if mixedMode {
+				formatted = append(formatted, formatMixedEvidence(m))
 			} else {
 				formatted = append(formatted, fmt.Sprintf("[%d][%s] %s: %s",
 					m.CitationIndex, m.SendTime, m.SenderName,
@@ -1181,6 +1257,10 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		if documentMode {
 			finalContent, totalTokens, modelVer, err = p.llm.CallDocumentMapStreamWithModel(ctx,
 				joinStrings(formatted), sourceName, 0, len(userMessages), generationTopic, streamDelta)
+		} else if mixedMode {
+			finalContent, totalTokens, modelVer, err = p.llm.CallMixedMapStreamWithModel(ctx,
+				joinStrings(formatted), sourceName, 0,
+				mixedMapScope(mixedTaskScope, userMessages), generationTopic, userName, streamDelta)
 		} else {
 			finalContent, totalTokens, modelVer, err = p.llm.CallMapStreamWithModel(ctx,
 				joinStrings(formatted), sourceName, 0, len(userMessages),
@@ -1241,6 +1321,8 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 				for _, m := range c {
 					if documentMode {
 						formatted = append(formatted, formatDocumentEvidence(m))
+					} else if mixedMode {
+						formatted = append(formatted, formatMixedEvidence(m))
 					} else {
 						formatted = append(formatted, fmt.Sprintf("[%d][%s] %s: %s",
 							m.CitationIndex, m.SendTime, m.SenderName,
@@ -1256,6 +1338,10 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 				if len(chunks) == 1 && documentMode {
 					summary, tokens, usedModel, err = p.llm.CallDocumentMapStreamWithModel(ctx,
 						joinStrings(formatted), sourceName, idx, len(c), generationTopic, streamDelta)
+				} else if len(chunks) == 1 && mixedMode {
+					summary, tokens, usedModel, err = p.llm.CallMixedMapStreamWithModel(ctx,
+						joinStrings(formatted), sourceName, idx,
+						mixedMapScope(mixedTaskScope, c), generationTopic, userName, streamDelta)
 				} else if len(chunks) == 1 {
 					summary, tokens, usedModel, err = p.llm.CallMapStreamWithModel(ctx,
 						joinStrings(formatted), sourceName, idx, len(c),
@@ -1264,6 +1350,10 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 				} else if documentMode {
 					summary, tokens, usedModel, err = p.llm.CallDocumentMapWithModel(ctx,
 						joinStrings(formatted), sourceName, idx, len(c), generationTopic)
+				} else if mixedMode {
+					summary, tokens, usedModel, err = p.llm.CallMixedMapWithModel(ctx,
+						joinStrings(formatted), sourceName, idx,
+						mixedMapScope(mixedTaskScope, c), generationTopic, userName)
 				} else {
 					summary, tokens, usedModel, err = p.llm.CallMapWithModel(ctx,
 						joinStrings(formatted), sourceName, idx, len(c),
@@ -1301,11 +1391,29 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 
 		var chunkSummaries []string
 		var chunkModels []string
-		for _, r := range results {
-			if !r.failed && !strings.Contains(r.summary, service.MapFailedMarker) {
+		if mixedMode {
+			// Mixed tasks must not present a partial result as complete: the
+			// plan mandates that any final Map chunk failure fails the whole
+			// mixed task, because the surviving chunks may cover only one
+			// evidence class (e.g. the chunk holding all document evidence
+			// fails → a chat-only summary would masquerade as the mixed
+			// result). Chat/document keep the marker-and-continue contract.
+			for i, r := range results {
+				if r.failed || strings.Contains(r.summary, service.MapFailedMarker) {
+					return "", nil, 0, 0, "", fmt.Errorf(
+						"mixed Map phase failed: chunk %d did not complete; mixed tasks are not reduced from partial coverage", i)
+				}
 				chunkSummaries = append(chunkSummaries, r.summary)
 				chunkModels = append(chunkModels, r.model)
 				totalTokens += r.tokens
+			}
+		} else {
+			for _, r := range results {
+				if !r.failed && !strings.Contains(r.summary, service.MapFailedMarker) {
+					chunkSummaries = append(chunkSummaries, r.summary)
+					chunkModels = append(chunkModels, r.model)
+					totalTokens += r.tokens
+				}
 			}
 		}
 		if len(chunkSummaries) == 0 && len(results) > 0 {
@@ -1333,6 +1441,9 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 			if documentMode {
 				finalContent, reduceTokens, modelVer, err = p.llm.CallDocumentReduceStreamWithModel(ctx,
 					chunkSummaries, sourceName, len(userMessages), generationTopic, streamDelta)
+			} else if mixedMode {
+				finalContent, reduceTokens, modelVer, err = p.llm.CallMixedReduceStreamWithModel(ctx,
+					chunkSummaries, sourceName, mixedTaskScope, generationTopic, streamDelta)
 			} else {
 				finalContent, reduceTokens, modelVer, err = p.llm.CallReduceStreamWithModel(ctx,
 					chunkSummaries, sourceName, startTime, endTime, targetMsgCount, generationTopic, streamDelta,

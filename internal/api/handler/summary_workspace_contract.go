@@ -193,10 +193,10 @@ func emptySummaryWorkspaceContext() summaryWorkspaceContext {
 	}
 }
 
-// Mixed document+chat scope is admitted behind service.MixedSourcesAdmissionEnabled
-// (default OFF until the worker executor lands). normalizeSummaryWorkspaceContext
-// enforces the phase-1 boundaries: personal-only (no participants), no
-// reference-summary stacking, and the combined source cap.
+// normalizeSummaryWorkspaceContext enforces the phase-1 boundaries for a mixed
+// document+chat scope (personal-only, no reference-summary stacking, combined
+// source cap). Mixed admission is now unconditional (the phase-1 gate was
+// removed when the worker executor landed).
 func normalizeSummaryWorkspaceContext(in summaryWorkspaceContext) (summaryWorkspaceContext, error) {
 	out := emptySummaryWorkspaceContext()
 	if len(in.SelectedChannels) > maxSummaryWorkspaceSelectedChannels {
@@ -248,13 +248,8 @@ func normalizeSummaryWorkspaceContext(in summaryWorkspaceContext) (summaryWorksp
 		if mixedChat {
 			// Mixed document+chat: personal-only (no extra participants), no
 			// reference-summary stacking, and the chat time range stays.
-			// Admission is gated until the worker executor lands (default
-			// OFF); when OFF, a mixed scope is rejected with the pre-PR
-			// contract error. Phase-1 contract, see
+			// Phase-1 contract, see
 			// docs/mixed-document-chat-summary-development-plan.md §4.2.
-			if !service.MixedSourcesAdmissionEnabled() {
-				return out, fmt.Errorf("%w: 文档总结不能混合聊天、参与者或时间范围", errInvalidSummaryWorkspaceContext)
-			}
 			if mixedParticipants {
 				return out, fmt.Errorf("%w: 混合来源总结暂不支持协作参与者，请移除参与者后再生成", errInvalidSummaryWorkspaceContext)
 			}

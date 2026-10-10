@@ -105,6 +105,9 @@ func (c *Client) Complete(ctx context.Context, req Request, opts CallOptions) (R
 		if err != nil {
 			return Response{}, llmfallback.Terminal, fmt.Errorf("marshal request: %w", err)
 		}
+		if len(payload) > MaxRequestBodyBytes {
+			return Response{}, llmfallback.Terminal, fmt.Errorf("%w: %d bytes > %d", ErrRequestTooLarge, len(payload), MaxRequestBodyBytes)
+		}
 		resp, cancel, err := c.do(ctx, payload, opts.AttemptTimeout, false)
 		if cancel != nil {
 			defer cancel()
@@ -161,6 +164,9 @@ func (c *Client) Stream(ctx context.Context, req Request, opts CallOptions, onDe
 		payload, err := MarshalRequest(model, req, true)
 		if err != nil {
 			return StreamResult{}, llmfallback.Terminal, fmt.Errorf("marshal request: %w", err)
+		}
+		if len(payload) > MaxRequestBodyBytes {
+			return StreamResult{}, llmfallback.Terminal, fmt.Errorf("%w: %d bytes > %d", ErrRequestTooLarge, len(payload), MaxRequestBodyBytes)
 		}
 		resp, cancel, err := c.do(ctx, payload, opts.AttemptTimeout, true)
 		if cancel != nil {
