@@ -515,7 +515,11 @@ func TestDeriveWorkspaceRouteFinalMatrix(t *testing.T) {
 			if action == "" {
 				action = service.SummaryActionChat
 			}
-			got := deriveWorkspaceRoute(tt.context, action, service.SummaryIntentGenerate, true, false, false, tt.selectedSourceExplicit, tt.hasRequirement, tt.openScopeAgent, WorkspaceSnapshot{}, true, tt.sourcesValid, true)
+			got := deriveWorkspaceRoute(workspaceRouteInput{
+				Context: tt.context, Action: action, Intent: service.SummaryIntentGenerate,
+				SelectedSourceExplicit: tt.selectedSourceExplicit, HasRequirement: tt.hasRequirement,
+				OpenScopeAgent: tt.openScopeAgent, ParticipantsValid: true, SourcesValid: tt.sourcesValid, ReferencesValid: true,
+			})
 			if got != tt.want {
 				t.Fatalf("route = %q, want %q", got, tt.want)
 			}
@@ -525,11 +529,16 @@ func TestDeriveWorkspaceRouteFinalMatrix(t *testing.T) {
 
 func TestDeriveWorkspaceRouteDocumentExplainClarifies(t *testing.T) {
 	context := summaryWorkspaceContext{Documents: []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}}}
-	got := deriveWorkspaceRoute(context, service.SummaryActionChat, service.SummaryIntentExplain, false, false, false, true, false, false, WorkspaceSnapshot{}, true, true, true)
+	in := workspaceRouteInput{
+		Context: context, Action: service.SummaryActionChat, Intent: service.SummaryIntentExplain,
+		SelectedSourceExplicit: true, ParticipantsValid: true, SourcesValid: true, ReferencesValid: true,
+	}
+	got := deriveWorkspaceRoute(in)
 	if got != service.SummaryRouteClarification {
 		t.Fatalf("document explain route = %q, want clarification", got)
 	}
-	got = deriveWorkspaceRoute(context, service.SummaryActionChat, service.SummaryIntentExplain, false, false, false, true, true, false, WorkspaceSnapshot{}, true, true, true)
+	in.HasRequirement = true
+	got = deriveWorkspaceRoute(in)
 	if got != service.SummaryRouteClarification {
 		t.Fatalf("document explain route with user text requirement = %q, want clarification", got)
 	}

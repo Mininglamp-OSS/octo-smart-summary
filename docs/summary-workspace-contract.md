@@ -25,6 +25,8 @@ returns `enabled: true` and `contract_version: "2"`.
   intentionally not bumped for this additive optional field.
 - A mixed scope is personal-only (no participants, no origin auto-reply) and
   does not support stacking a referenced summary.
+- Document-only scopes also reject referenced summaries before creating a turn:
+  the document executor does not consume them. Remove references before submitting.
 
 ## Input origin and routing
 
@@ -32,19 +34,36 @@ returns `enabled: true` and `contract_version: "2"`.
   explanation-only turns, it always runs through the Agent and returns an
   `agent_preview` or `agent_revision`; it does not directly start a personal
   Workflow or create a team proposal.
-- `input_origin: "template"` must match the selected template requirement;
-  `input_origin: "system_intent"` must match a supported generated execution
-  message. Declared origins are validated as well as inferred origins.
-  Mismatches return HTTP 400 before retrieval or task creation. A verified
-  system message is retained as the document-summary requirement when no
-  template is selected. When the remaining route requirements are satisfied, they may enter
-  the deterministic personal or team Workflow paths directly.
+- `input_origin: "template"` is inferred or retained when the message matches
+  the selected template requirement (trimmed, case-insensitive).
+  An explicit `input_origin: "system_intent"` is retained for a complete
+  supported execution command, using the same command list as the execute path.
+  With no origin declaration, only the four legacy Chinese/English button
+  labels infer `system_intent`; typed aliases such as `start summary` retain
+  their existing conversational behavior in chat-only scopes.
+  Known origin/content mismatches downgrade to `user`, rather than rejecting
+  localized copy changes with HTTP 400. Unknown origin enum values still return
+  HTTP 400. Origin metadata alone is not proof of a registered template.
+  A recognized system message is retained as the document-summary requirement
+  when no template is selected; chat-only requirement handling is unchanged.
+  When the remaining route requirements are satisfied, recognized origins may
+  enter deterministic personal or team Workflow paths directly.
 - **Document-bearing scopes:** participants are unsupported, unavailable
-  selected chats block execution, and explicit negation clarifies. Otherwise,
+  selected chats block execution, and explicit execution negation clarifies.
+  The conservative negation grammar recognizes a clause negating the summary
+  act (including leading polite/temporal words), not negation of a content
+  object: `先不要生成总结` clarifies, while `总结一下，不要生成表格` and
+  `帮我总结文档和会话，不需要总结附件内容` execute. A suspected cancellation
+  asks whether the user wants to proceed, without asserting what they intended.
+  This is not general-purpose natural-language cancellation detection. Otherwise,
   document+chat submissions start a personal Workflow even when phrased as
   questions. This mixed-question execution behavior is retained for compatibility.
-  Documents-only `Explain` input clarifies unless submitted through a verified
-  template/system origin; other document-only input keeps its existing route.
+  Documents-only `Explain` input clarifies unless the template submission is
+  verified against the server registry: the built-in pattern or the current
+  actor/space's non-deleted custom/overridden pattern must match the submitted
+  requirement case-insensitively. A fabricated ID, forged content, another
+  actor's template, or stale override cannot widen this route. Registry lookup
+  errors fail before turn creation; other document-only input keeps its existing route.
   A run phrase's position in user text does not override this rule.
 - Mixed conversational question-answering is not implemented by this contract.
   Separating it from execution would require a future structured personal

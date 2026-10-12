@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
@@ -15,9 +16,10 @@ func TestDocumentSubmissionOriginValidation(t *testing.T) {
 	}{
 		{name: "inferred template", message: template.Requirement, template: template, want: summaryWorkspaceInputTemplate},
 		{name: "declared template", origin: summaryWorkspaceInputTemplate, message: template.Requirement, template: template, want: summaryWorkspaceInputTemplate},
-		{name: "missing template", origin: summaryWorkspaceInputTemplate, message: template.Requirement, reject: true},
-		{name: "mismatched template", origin: summaryWorkspaceInputTemplate, message: "不同的要求", template: template, reject: true},
-		{name: "unverified system", origin: summaryWorkspaceInputSystemIntent, message: template.Requirement, reject: true},
+		{name: "missing template", origin: summaryWorkspaceInputTemplate, message: template.Requirement, want: summaryWorkspaceInputUser},
+		{name: "mismatched template", origin: summaryWorkspaceInputTemplate, message: "不同的要求", template: template, want: summaryWorkspaceInputUser},
+		{name: "unverified system", origin: summaryWorkspaceInputSystemIntent, message: template.Requirement, want: summaryWorkspaceInputUser},
+		{name: "unknown origin", origin: "model", message: "总结", reject: true},
 		{name: "verified system", origin: summaryWorkspaceInputSystemIntent, message: "请根据当前选择生成总结", want: summaryWorkspaceInputSystemIntent},
 		{name: "inferred system", message: "请根据当前选择生成总结", want: summaryWorkspaceInputSystemIntent},
 		{name: "ordinary user", message: "这些内容有什么区别？", want: summaryWorkspaceInputUser},
@@ -34,10 +36,95 @@ func TestDocumentSubmissionOriginValidation(t *testing.T) {
 			if err != nil || origin != tc.want {
 				t.Fatalf("origin=%s err=%v want=%s", origin, err, tc.want)
 			}
-			if got := summaryWorkspaceExecutionRequirement(scope, tc.message, origin); got != tc.message {
+			wantRequirement := tc.message
+			if tc.template != nil && origin == summaryWorkspaceInputUser {
+				wantRequirement = tc.template.Requirement + "\n\n" + tc.message
+			}
+			if got := summaryWorkspaceExecutionRequirement(scope, tc.message, origin); got != wantRequirement {
 				t.Fatalf("requirement lost or duplicated: %q", got)
 			}
 		})
+	}
+}
+
+func TestDocumentOriginCaseAndCommandCompatibility(t *testing.T) {
+	template := &summaryWorkspaceTemplate{TemplateID: "weekly", Requirement: "Weekly Risk Review"}
+	for _, raw := range []string{"", summaryWorkspaceInputTemplate} {
+		for _, message := range []string{"Weekly Risk Review", "weekly risk review", "WEEKLY RISK REVIEW"} {
+			got, err := normalizeSummaryWorkspaceInputOrigin(raw, summaryWorkspaceContext{Template: template}, message)
+			if err != nil || got != summaryWorkspaceInputTemplate {
+				t.Fatalf("raw=%q message=%q got=%q err=%v", raw, message, got, err)
+			}
+			if requirement := summaryWorkspaceExecutionRequirement(summaryWorkspaceContext{Template: template}, message, got); requirement != template.Requirement {
+				t.Fatalf("case-normalized template duplicated: %q", requirement)
+			}
+		}
+	}
+	for _, command := range summaryWorkspaceExecutionCommands {
+		for _, raw := range []string{"", summaryWorkspaceInputSystemIntent} {
+			got, err := normalizeSummaryWorkspaceInputOrigin(raw, summaryWorkspaceContext{}, strings.ToUpper(command))
+			want := summaryWorkspaceInputSystemIntent
+			if raw == "" && !isSummaryWorkspaceLegacyButtonMessage(command) {
+				want = summaryWorkspaceInputUser
+			}
+			if err != nil || got != want {
+				t.Fatalf("command=%q raw=%q got=%q err=%v", command, raw, got, err)
+			}
+		}
+	}
+	for _, message := range []string{"新文案：总结选中内容", "Résumez les documents sélectionnés", "開始總結所選內容"} {
+		got, err := normalizeSummaryWorkspaceInputOrigin(summaryWorkspaceInputSystemIntent, summaryWorkspaceContext{}, message)
+		if err != nil || got != summaryWorkspaceInputUser {
+			t.Fatalf("copy drift must downgrade, not reject: message=%q got=%q err=%v", message, got, err)
+		}
+	}
+}
+
+func TestTypedChatExecutionCommandRemainsConversational(t *testing.T) {
+	for _, message := range []string{"开始总结", "start summary", "generate summary now"} {
+		origin, err := normalizeSummaryWorkspaceInputOrigin("", summaryWorkspaceContext{}, message)
+		if err != nil || origin != summaryWorkspaceInputUser ||
+			!summaryWorkspaceShouldOpenScopeAgent(service.SummaryActionChat, origin, classifySummaryWorkspaceIntent(message, false)) {
+			t.Fatalf("typed chat command changed route: message=%q origin=%q err=%v", message, origin, err)
+		}
+	}
+}
+
+var documentScopedNegationRequests = []string{
+	"总结一下这些文档和群聊的风险，不要生成行动项",
+	"帮我总结文档和会话，不需要总结附件内容",
+	"请总结本周进展，无需总结已关闭的任务",
+	"总结一下，不要生成表格",
+	"summarize the docs and chat, but do not generate action items",
+	"不要生成表格，请总结本周进展",
+	"请总结，不要总结附件内容",
+	"please summarize the docs without generating a table",
+	"请总结，不要生成总结表格",
+	"summarize the docs, don't generate a summary table",
+	"不要生成总结是什么意思？",
+	"文档里写着“不要生成总结”，请总结文档",
+}
+
+var documentExecutionNegations = []string{
+	"先不要生成总结", "开始总结：先不要生成，先说明一下来源",
+	"请先不要生成总结", "暂时不要总结", "现在别生成总结了",
+	"总结一下，不要生成总结", "请总结，但现在先不生成",
+	"无需总结", "不需要生成总结", "请不要总结。",
+	"do not summarize", "please don't generate a summary yet",
+	"start summary: please do not generate a summary",
+	"summarize the docs, but do not generate a summary",
+}
+
+func TestDocumentNegationDistinguishesExecutionFromContent(t *testing.T) {
+	for _, tc := range []struct {
+		messages []string
+		want     bool
+	}{{documentScopedNegationRequests, false}, {documentExecutionNegations, true}} {
+		for _, message := range tc.messages {
+			if got := hasNegatedSummaryRunIntent(message); got != tc.want {
+				t.Errorf("message=%q negated=%t want=%t", message, got, tc.want)
+			}
+		}
 	}
 }
 
@@ -62,7 +149,7 @@ func TestDocumentInputRoutingCompatibility(t *testing.T) {
 		if mixed {
 			scope.SelectedChannels = []summaryWorkspaceChannel{{ChatID: "g1", ChatType: "group"}}
 		}
-		for _, message := range append(questions, affirmatives...) {
+		for _, message := range append(append(questions, affirmatives...), documentScopedNegationRequests...) {
 			intent := classifySummaryWorkspaceIntent(message, false)
 			// Documents-only Explain semantics stay unchanged; mixed selection
 			// is the compatibility execution surface, regardless of word order.
@@ -70,14 +157,22 @@ func TestDocumentInputRoutingCompatibility(t *testing.T) {
 			if mixed || intent != service.SummaryIntentExplain {
 				want = service.SummaryRoutePersonalWorkflow
 			}
-			got := deriveWorkspaceRoute(scope, service.SummaryActionChat, intent, false, false, hasNegatedSummaryRunIntent(message), true, true, false, WorkspaceSnapshot{}, true, true, true)
+			got := deriveWorkspaceRoute(workspaceRouteInput{
+				Context: scope, Action: service.SummaryActionChat, Intent: intent,
+				NegatedRun: hasNegatedSummaryRunIntent(message), SelectedSourceExplicit: true,
+				HasRequirement: true, ParticipantsValid: true, SourcesValid: true, ReferencesValid: true,
+			})
 			if got != want {
 				t.Fatalf("mixed=%t message=%q route=%s want=%s", mixed, message, got, want)
 			}
 		}
 		for _, structured := range []bool{false, true} {
 			for _, intent := range []service.SummaryIntent{service.SummaryIntentGenerate, service.SummaryIntentExplain, service.SummaryIntentRevise} {
-				got := deriveWorkspaceRoute(scope, service.SummaryActionChat, intent, true, structured, true, true, true, false, WorkspaceSnapshot{}, true, true, true)
+				got := deriveWorkspaceRoute(workspaceRouteInput{
+					Context: scope, Action: service.SummaryActionChat, Intent: intent,
+					VerifiedDocumentTemplate: structured, NegatedRun: true, SelectedSourceExplicit: true,
+					HasRequirement: true, ParticipantsValid: true, SourcesValid: true, ReferencesValid: true,
+				})
 				if got != service.SummaryRouteClarification {
 					t.Fatalf("negation bypassed: mixed=%t structured=%t intent=%s", mixed, structured, intent)
 				}
@@ -92,14 +187,12 @@ func TestDocumentClarificationReportsHardBlockersFirst(t *testing.T) {
 		SelectedChannels: []summaryWorkspaceChannel{{ChatID: "g1", ChatType: "group"}},
 	}
 	const message = "开始总结：先不要生成，先说明一下来源"
-	if got := summaryWorkspaceClarificationReply(scope, message, false, true, true, "", true); got != "部分所选会话不可用，请调整后重试。" {
+	in := workspaceRouteInput{Context: scope, NegatedRun: hasNegatedSummaryRunIntent(message), ReferencesValid: true, ParticipantsValid: true, HasRequirement: true}
+	if got := summaryWorkspaceClarificationReply(in, ""); got != "部分所选会话不可用，请调整后重试。" {
 		t.Fatalf("permission blocker masked: %s", got)
 	}
-	if got := summaryWorkspaceClarificationReply(scope, message, true, true, true, "", true); got != "已按你的要求暂不生成总结。你可以继续调整所选文档、会话或总结要求。" {
+	in.SourcesValid = true
+	if got := summaryWorkspaceClarificationReply(in, ""); got != "要现在生成总结吗？如果要继续，请移除暂停生成的要求后重新提交。" {
 		t.Fatalf("negation reply: %s", got)
-	}
-	scope.Participants = []summaryWorkspaceParticipant{{UserID: "other"}}
-	if got := summaryWorkspaceClarificationReply(scope, message, true, true, false, "", true); got != "文档总结暂不支持多人协作，请移除参与者后再生成。" {
-		t.Fatalf("participant blocker masked: %s", got)
 	}
 }

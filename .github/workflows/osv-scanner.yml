@@ -33,8 +33,9 @@ jobs:
       scan-args: |-
         -r
         ./
-      # Avoid GitHub's 1 MiB job-output ceiling without disabling scanning,
-      # vulnerability enforcement, or JSON/SARIF artifact uploads.
+      # v2.7.0 defaults to these values. Pin that intent explicitly: upgrading
+      # from v2.3.8 avoids its unconditional JSON job-output export (>1 MiB),
+      # while keeping vulnerability enforcement and JSON/SARIF artifacts.
       export-results: false
       fail-on-vuln: true
       # Skip SARIF upload when GITHUB_TOKEN is read-only:
