@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
@@ -1283,12 +1284,40 @@ func hasExplicitSummaryRunIntent(message string) bool {
 	if message == "" || hasNegatedSummaryRunIntent(message) {
 		return false
 	}
-	return containsAny(message,
-		"帮我总结", "请总结", "总结一下", "总结下", "生成总结", "生成周报", "生成日报", "生成月报",
-		"开始总结", "开始生成", "直接生成", "立即生成", "发起总结", "发起多人总结", "准备多人总结任务",
-		"创建总结", "输出总结", "整理成总结", "整理成周报", "整理成日报", "整理成月报",
-		"generate a summary", "create a summary", "produce a summary", "draft a summary", "start summary",
-		"prepare a team summary", "run the summary", "summarize")
+	return containsAny(message, summaryWorkspaceRunIntentPhrases...)
+}
+
+var summaryWorkspaceRunIntentPhrases = []string{
+	"帮我总结", "请总结", "总结一下", "总结下", "生成总结", "生成周报", "生成日报", "生成月报",
+	"开始总结", "开始生成", "直接生成", "立即生成", "发起总结", "发起多人总结", "准备多人总结任务",
+	"创建总结", "输出总结", "整理成总结", "整理成周报", "整理成日报", "整理成月报",
+	"generate a summary", "create a summary", "produce a summary", "draft a summary", "start summary",
+	"prepare a team summary", "run the summary", "summarize",
+}
+
+// hasLeadingExplicitSummaryRunIntent keeps the broad run-intent vocabulary but
+// anchors it at the beginning of user-authored text. Chinese phrases can flow
+// directly into their object ("帮我总结这份文档"); ASCII phrases require a word
+// boundary so unrelated words such as "summarizer" do not authorize execution.
+func hasLeadingExplicitSummaryRunIntent(message string) bool {
+	message = strings.ToLower(strings.TrimSpace(message))
+	for _, phrase := range summaryWorkspaceRunIntentPhrases {
+		if !strings.HasPrefix(message, phrase) {
+			continue
+		}
+		if len(message) == len(phrase) {
+			return true
+		}
+		last, _ := utf8.DecodeLastRuneInString(phrase)
+		if last > unicode.MaxASCII {
+			return true
+		}
+		next, _ := utf8.DecodeRuneInString(message[len(phrase):])
+		if unicode.IsSpace(next) || strings.ContainsRune("：:，,。.!！?？\n\t", next) {
+			return true
+		}
+	}
+	return false
 }
 
 var summaryWorkspaceExecutionCommands = []string{
@@ -1341,7 +1370,7 @@ func containsAny(value string, needles ...string) bool {
 // consistent with the plan's mixed flow (§4.2).
 func summaryWorkspaceClarificationReply(context summaryWorkspaceContext, message string, sourcesValid, referencesValid, participantsValid bool, teamScopeReason string, hasRequirement bool) string {
 	reply := "请先选择一个你有权限的会话，再告诉我希望总结的内容。"
-	if len(context.Documents) > 0 && len(context.SelectedChannels) > 0 && sourcesValid && hasNegatedSummaryRunIntent(message) {
+	if len(context.Documents) > 0 && hasNegatedSummaryRunIntent(message) {
 		reply = "已按你的要求暂不生成总结。你可以继续调整所选文档、会话或总结要求。"
 	} else if len(context.Documents) > 0 && len(context.SelectedChannels) > 0 && sourcesValid {
 		// Mixed explain/clarification with every source authorized (P1-2 fix,
@@ -1349,7 +1378,11 @@ func summaryWorkspaceClarificationReply(context summaryWorkspaceContext, message
 		// to select a chat they had already selected — the response payload
 		// echoed the authorized chat back while the copy denied it. Name the
 		// actual state and the way out instead (plan §4.2).
-		reply = "已收到你对所选文档和会话的说明请求。混合来源暂不支持问答式解读，请直接输入总结要求（如：开始总结 + 要求），我会基于所选文档和会话生成总结。"
+		if hasRequirement {
+			reply = "已收到你的输入，但当前内容被识别为说明或问答请求。混合来源暂不支持问答式解读；如需生成总结，请以“开始总结：”开头确认执行。"
+		} else {
+			reply = "混合来源暂不支持问答式解读。请输入总结要求，并以“开始总结：”开头确认执行。"
+		}
 	} else if len(context.Documents) > 0 && len(context.SelectedChannels) > 0 && !sourcesValid {
 		reply = "部分所选会话不可用，请调整后重试。"
 	} else if len(context.Documents) > 0 && len(context.Participants) > 0 {
@@ -1381,16 +1414,17 @@ func workspaceMessageHasExplicitRun(message, inputOrigin string) bool {
 	if inputOrigin != summaryWorkspaceInputUser {
 		return true
 	}
-	return hasExplicitSummaryExecutionCommand(message)
+	return hasExplicitSummaryExecutionCommand(message) || hasLeadingExplicitSummaryRunIntent(message)
 }
 
 // deriveWorkspaceRoute takes hasExplicitRunMessage — an origin-aware,
 // message-level signal — NOT the derived hasExplicitRunIntent flag: that flag
 // is `intent == Generate && authorized(origin)`, which inside the Explain arm
 // is tautologically false (review 5479094697 P1-1 / 5478721451 P1). Trusted
-// template/system_intent submissions with explain keywords keep executing
-// (plan §3.1/§4.3); user free text executes only with a recognized command and
-// never when it contains an explicit negation.
+// template/system_intent submissions with explain keywords execute as explicit
+// submit actions (including documents-only, which expands the base behavior;
+// plan §3.1/§4.3). User free text executes only when a run phrase is leading,
+// and never when it contains an explicit negation.
 func deriveWorkspaceRoute(context summaryWorkspaceContext, action service.SummaryAction, intent service.SummaryIntent, hasExplicitRunIntent, hasExplicitRunMessage, selectedSourceExplicit, hasRequirement, openScopeAgent bool, state WorkspaceSnapshot, participantsValid, sourcesValid, referencesValid bool) service.SummaryRoute {
 	if len(context.Documents) > 0 {
 		mixedChat := len(context.SelectedChannels) > 0

@@ -598,6 +598,19 @@ func TestDeriveWorkspaceRouteMixedExplain(t *testing.T) {
 			t.Fatalf("mixed template explain route for %q = %q, want personal workflow", message, got)
 		}
 	}
+	for _, message := range []string{
+		"帮我总结一下群里有什么重要决定",
+		"请总结一下文档和会话的主要区别",
+		"生成总结，说明一下关键依据",
+		"summarize what is in these documents and the chat",
+	} {
+		if intent := classifySummaryWorkspaceIntent(message, false); intent != service.SummaryIntentExplain {
+			t.Fatalf("affirmative run message %q classified as %q, want explain precondition", message, intent)
+		}
+		if got := route(message, summaryWorkspaceInputUser); got != service.SummaryRoutePersonalWorkflow {
+			t.Fatalf("mixed leading-run explain route for %q = %q, want personal workflow", message, got)
+		}
+	}
 	// (Generate, explicit run) → workflow stays.
 	if got := deriveWorkspaceRoute(context, service.SummaryActionChat, service.SummaryIntentGenerate, true, true, true, true, false, WorkspaceSnapshot{}, true, true, true); got != service.SummaryRoutePersonalWorkflow {
 		t.Fatalf("mixed explicit generate route = %q, want personal workflow", got)
@@ -629,7 +642,7 @@ func TestSummaryWorkspaceClarificationReplyMixedSource(t *testing.T) {
 		SelectedChannels: []summaryWorkspaceChannel{{ChatID: "group-1", ChatType: "group", Name: "项目群"}},
 	}
 	got := summaryWorkspaceClarificationReply(mixed, "这些内容有什么区别？", true, true, true, "", true)
-	want := "已收到你对所选文档和会话的说明请求。混合来源暂不支持问答式解读，请直接输入总结要求（如：开始总结 + 要求），我会基于所选文档和会话生成总结。"
+	want := "已收到你的输入，但当前内容被识别为说明或问答请求。混合来源暂不支持问答式解读；如需生成总结，请以“开始总结：”开头确认执行。"
 	if got != want {
 		t.Fatalf("mixed valid-source clarification reply = %q, want %q", got, want)
 	}
@@ -643,8 +656,14 @@ func TestSummaryWorkspaceClarificationReplyMixedSource(t *testing.T) {
 	if got := summaryWorkspaceClarificationReply(mixed, "不要总结这些内容", true, true, true, "", true); got != "已按你的要求暂不生成总结。你可以继续调整所选文档、会话或总结要求。" {
 		t.Fatalf("mixed negated-run reply = %q", got)
 	}
+	if got := summaryWorkspaceClarificationReply(mixed, "这些内容有什么区别？", true, true, true, "", false); got != "混合来源暂不支持问答式解读。请输入总结要求，并以“开始总结：”开头确认执行。" {
+		t.Fatalf("mixed missing-requirement reply = %q", got)
+	}
 	// Documents-only explain keeps its dedicated copy.
 	docsOnly := summaryWorkspaceContext{Documents: mixed.Documents}
+	if got := summaryWorkspaceClarificationReply(docsOnly, "先不要生成总结，我还要补充要求", true, true, true, "", true); got != "已按你的要求暂不生成总结。你可以继续调整所选文档、会话或总结要求。" {
+		t.Fatalf("documents-only negated-run reply = %q", got)
+	}
 	if got := summaryWorkspaceClarificationReply(docsOnly, "解释一下", true, true, true, "", true); got != "文档问答/解释暂不支持，请输入总结要求后生成文档总结。" {
 		t.Fatalf("docs-only explain reply = %q", got)
 	}
@@ -665,8 +684,12 @@ func TestWorkspaceMessageHasExplicitRun(t *testing.T) {
 		{name: "user command", message: "开始总结：本周风险的来源是什么？", origin: summaryWorkspaceInputUser, want: true},
 		{name: "template explain requirement", message: "请说明一下本周风险", origin: summaryWorkspaceInputTemplate, want: true},
 		{name: "system intent", message: "请根据当前选择生成总结", origin: summaryWorkspaceInputSystemIntent, want: true},
+		{name: "leading chinese run with explain keyword", message: "帮我总结一下群里有什么重要决定", origin: summaryWorkspaceInputUser, want: true},
+		{name: "leading english run with explain keyword", message: "summarize what is in these documents and the chat", origin: summaryWorkspaceInputUser, want: true},
 		{name: "pure question", message: "这些内容有什么区别？", origin: summaryWorkspaceInputUser, want: false},
 		{name: "loose summary substring", message: "为什么要 generate a summary?", origin: summaryWorkspaceInputUser, want: false},
+		{name: "embedded chinese run phrase", message: "这些内容有什么区别，请总结一下", origin: summaryWorkspaceInputUser, want: false},
+		{name: "ascii prefix without boundary", message: "summarizer 有什么作用？", origin: summaryWorkspaceInputUser, want: false},
 		{name: "quoted command question", message: "“开始总结”是什么意思？", origin: summaryWorkspaceInputUser, want: false},
 		{name: "negation before command", message: "先不要生成总结，我还要补充要求", origin: summaryWorkspaceInputUser, want: false},
 		{name: "command-prefixed negation", message: "开始总结：不要生成总结，只解释来源", origin: summaryWorkspaceInputUser, want: false},
