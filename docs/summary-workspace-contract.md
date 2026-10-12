@@ -28,13 +28,27 @@ returns `enabled: true` and `contract_version: "2"`.
 
 ## Input origin and routing
 
-- `action: "chat"` with `input_origin: "user"` is conversational. Except for
+- For **chat-only scopes**, `action: "chat"` with `input_origin: "user"` is conversational. Except for
   explanation-only turns, it always runs through the Agent and returns an
   `agent_preview` or `agent_revision`; it does not directly start a personal
   Workflow or create a team proposal.
-- `input_origin: "template"` and `input_origin: "system_intent"` are trusted UI
-  inputs. When the remaining route requirements are satisfied, they may enter
+- `input_origin: "template"` must match the selected template requirement;
+  `input_origin: "system_intent"` must match a supported generated execution
+  message. Declared origins are validated as well as inferred origins.
+  Mismatches return HTTP 400 before retrieval or task creation. A verified
+  system message is retained as the document-summary requirement when no
+  template is selected. When the remaining route requirements are satisfied, they may enter
   the deterministic personal or team Workflow paths directly.
+- **Document-bearing scopes:** participants are unsupported, unavailable
+  selected chats block execution, and explicit negation clarifies. Otherwise,
+  document+chat submissions start a personal Workflow even when phrased as
+  questions. This mixed-question execution behavior is retained for compatibility.
+  Documents-only `Explain` input clarifies unless submitted through a verified
+  template/system origin; other document-only input keeps its existing route.
+  A run phrase's position in user text does not override this rule.
+- Mixed conversational question-answering is not implemented by this contract.
+  Separating it from execution would require a future structured personal
+  execution action, which is not currently exposed.
 - `action: "start_team_workflow"` remains the explicit trusted team execution
   entry point and is not changed by the conversational routing rule above.
 
@@ -59,7 +73,7 @@ message retrieval, `scope_json`, and `preview.effective_scope`. Ordinary edits,
 questions, negations, and historical references do not call the scope tool and
 therefore keep the picker scope. On a cold start, a preview without a successful
 source declaration becomes a clarification instead of an ungrounded preview or
-a retryable server error. Because every user-authored non-explanation chat turn
+a retryable server error. For chat-only scopes, every user-authored non-explanation chat turn
 is conversational, it cannot directly dispatch a Workflow. A trusted
 template/system intent or the explicit team start action may do so after the
 resolved scope is returned.
