@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/streaming"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
@@ -178,8 +179,11 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 		var teamCitations []model.TeamCitation
 
 		if len(submitted) == 1 {
-			// Single submission: copy content directly, no LLM call
-			finalContent = submitted[0].Content
+			// Single submission: copy content directly, no LLM call.
+			// Defense-in-depth normalize (A-1, PR#268 round-2): this row may
+			// predate the deploy (historical rows) or carry client-authored
+			// hand-edit bytes; the call is idempotent.
+			finalContent = citationtext.NormalizeSetextHeadings(submitted[0].Content)
 			totalTokens = 0
 			if submitted[0].ModelVersion != "" {
 				modelVersion = submitted[0].ModelVersion
@@ -245,6 +249,16 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 			finalContent = content
 			totalTokens = tokens
 			modelVersion = usedModel
+
+			// Neutralize setext headings before persistence and citation
+			// extraction (see citationtext.NormalizeSetextHeadings).
+			// Publish the normalized bytes as an EventSnapshot so the done
+			// frame matches the persisted row (mochashanyao round-3 P1:
+			// raw-on-wire vs normalized-in-DB broke edit.go's byte-equality
+			// no-change guard). The single-submission branch is already
+			// consistent — it normalizes before streaming.
+			finalContent = citationtext.NormalizeSetextHeadings(finalContent)
+			teamStream.Send(streaming.Event{Type: streaming.EventSnapshot, Content: finalContent})
 
 			teamCitations = extractTeamCitations(finalContent, indexed)
 		}
