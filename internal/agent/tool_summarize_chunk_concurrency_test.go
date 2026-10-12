@@ -223,11 +223,13 @@ func TestSummarizeChunksConcurrently_BlankSuccessCovered(t *testing.T) {
 // When no usable summary survives, the phase errors — and the error must be
 // keyed on the LOWEST-INDEX cause ALONE, never a union of every cause.
 // classifyToolError matches on both errors.Is and the error TEXT, so wrapping
-// errors.Join would let a single non-transient cause (a recovered panic, an
-// oversized chunk) anywhere in the set drag the whole Map phase to
-// fatal+non-retryable — a recoverable transient storm latching a FAILED run
-// (#256 round-7 P1-1). Pin: idx0 is a retryable 429, the later chunks panic
-// (fatal-shaped); classification must follow idx0 and stay retryable/non-fatal.
+// errors.Join would let a single non-transient cause anywhere in the set drag
+// the whole Map phase to fatal+non-retryable — a recoverable transient storm
+// latching a FAILED run (#256 round-7 P1-1). Pin: idx0 is a retryable 429, a
+// later chunk fails retryably too (a 503 — NOT a recovered panic: post-round-5
+// P2 a panic is typed fatal via recoveredPanicError and aborts the phase
+// regardless of index, so it can no longer play the tolerated-later-cause role);
+// classification must follow idx0 and stay retryable/non-fatal.
 func TestSummarizeChunksConcurrently_AllFailedClassifiesOnLowestIndex(t *testing.T) {
 	for _, concurrency := range []int{1, 3} {
 		t.Run(fmt.Sprintf("concurrency=%d", concurrency), func(t *testing.T) {
@@ -237,7 +239,7 @@ func TestSummarizeChunksConcurrently_AllFailedClassifiesOnLowestIndex(t *testing
 				if chunk[0]["content"].(string) == "chunk-0" {
 					return "", 0, 0, errRetryable
 				}
-				panic("boom in a later chunk") // recovered → tolerated per-chunk failure
+				return "", 0, 0, errors.New("upstream: status 503") // later retryable failure
 			})
 
 			var cov chunkCoverage
@@ -245,15 +247,15 @@ func TestSummarizeChunksConcurrently_AllFailedClassifiesOnLowestIndex(t *testing
 			if err == nil || got != nil {
 				t.Fatalf("expected an error and no summaries, got err=%v summaries=%d", err, len(got))
 			}
-			// Lowest-index cause drives errors.Is; the later panic must NOT be unioned in.
+			// Lowest-index cause drives errors.Is; the later cause must NOT be unioned in.
 			if !errors.Is(err, errRetryable) {
 				t.Fatalf("all-failed error must be keyed on the lowest-index cause, got %v", err)
 			}
-			if strings.Contains(err.Error(), "panicked") {
-				t.Fatalf("a later chunk's fatal cause leaked into the classified error text: %v", err)
+			if strings.Contains(err.Error(), "status 503") {
+				t.Fatalf("a later chunk's cause leaked into the classified error text: %v", err)
 			}
 			// The whole point: classification follows idx0 (429 → retryable), not the
-			// later panic (→ fatal+non-retryable). A union would fail this.
+			// later failure. A union would fail this.
 			env := classifyToolError("summarize_chunk", err)
 			if !env.Retryable || env.Fatal {
 				t.Fatalf("lowest-index 429 must classify retryable/non-fatal; got retryable=%v fatal=%v — a later cause poisoned it", env.Retryable, env.Fatal)
@@ -353,6 +355,11 @@ func TestSummarizeChunksConcurrently_PanicIsRecoveredThenAborts(t *testing.T) {
 
 			var cov chunkCoverage
 			// Must not panic out of here — a recovered panic becomes an error.
+			// Post-round-5-P2 the panic is ALSO fatal (contract §1: aborts
+			// like a fatal, fail-closed — a retry deterministically re-panics,
+			// and the lowest-index classifier masked it before), so the
+			// isFatalChunkError branch returns before FailedChunkCount is
+			// incremented, exactly like the truncation fatal path.
 			got, err := summarizeChunksConcurrently(context.Background(), makeChunks(3), "", &cov)
 			if err == nil {
 				t.Fatal("a recovered panic must abort the invocation (owes a retry), got nil error")
@@ -363,15 +370,15 @@ func TestSummarizeChunksConcurrently_PanicIsRecoveredThenAborts(t *testing.T) {
 			if got != nil {
 				t.Fatalf("no partial summaries may ship on a panicked invocation, got %d", len(got))
 			}
-			if cov.FailedChunkCount != 1 {
-				t.Errorf("FailedChunkCount = %d, want 1", cov.FailedChunkCount)
-			}
 		})
 	}
 }
 
-// Concurrency 1 must behave exactly like the previous serial loop: one call at
-// a time, in order. This is the documented rollback path.
+// Concurrency 1 must dispatch exactly like the previous serial loop: one call
+// at a time, in order. This is the documented rollback path. (The FAILURE
+// policy is deliberately not part of that guarantee: recovery-first changed
+// fail-fast-on-first-error to record-and-continue so the phase error can key on
+// the lowest-index cause — see the handler comment.)
 func TestSummarizeChunksConcurrently_ConcurrencyOneIsSerial(t *testing.T) {
 	withMapConcurrency(t, 1)
 
@@ -482,6 +489,42 @@ func TestSummarizeChunksConcurrently_FatalWinsOverLowerIndexTransient(t *testing
 	}
 }
 
+// TestSummarizeChunksConcurrently_PanicNotMaskedByLowerIndexTransient is the
+// round-5 P2 classification pin (Jerry-Xin 5478795037 / yujiawei 5478968340):
+// mapPhaseFailedErr classifies on the LOWEST-index cause, so before the
+// recoveredPanicError sentinel a 429 at index 0 masked a DETERMINISTIC panic at
+// index 1 as retryable — the planner retried the same handle, re-panicked, and
+// spun to MaxSteps. Contract §1 pins a recovered panic as "aborts like a fatal
+// (fail-closed)", so the phase must abort on the panic regardless of index.
+func TestSummarizeChunksConcurrently_PanicNotMaskedByLowerIndexTransient(t *testing.T) {
+	for _, concurrency := range []int{1, 3} {
+		t.Run(fmt.Sprintf("concurrency=%d", concurrency), func(t *testing.T) {
+			withMapConcurrency(t, concurrency)
+			withStubMapCall(t, func(_ context.Context, chunk []map[string]interface{}, _ string) (string, int, int, error) {
+				switch chunk[0]["content"].(string) {
+				case "chunk-0":
+					return "", 0, 0, errors.New("rate limited: status 429") // lower-index transient
+				case "chunk-1":
+					panic("boom") // higher-index deterministic panic
+				}
+				return "s", 1, 0, nil
+			})
+
+			var cov chunkCoverage
+			_, err := summarizeChunksConcurrently(context.Background(), makeChunks(3), "", &cov)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			// The panic must abort the phase (fatal), not classify as the
+			// lower-index 429's retryable RATE_LIMITED.
+			env := classifyToolError("summarize_chunk", err)
+			if env.Retryable || !env.Fatal || env.ErrorCode != "INTERNAL_ERROR" {
+				t.Fatalf("recovered panic must abort like a fatal regardless of index; got %+v (err %v)", env, err)
+			}
+		})
+	}
+}
+
 // TestFinalizeDropCounts pins the handler's coverage arithmetic (#256 round-7
 // P2-1/P2-5): DroppedCount is accidental loss only (input − processed − capped),
 // but Truncated — the loudest model-facing boolean — flags ANY real gap, so a
@@ -548,18 +591,15 @@ func TestCapChunks(t *testing.T) {
 // (N-R12-3 closure — no retry spin); a clean full-coverage run gets no notice.
 func TestAssembleMapOutput(t *testing.T) {
 	t.Run("drop with real content: notice appended", func(t *testing.T) {
-		out, err := assembleMapOutput([]string{"real summary"}, true)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		out := assembleMapOutput([]string{"real summary"}, true)
 		if !strings.Contains(out, "real summary") || !strings.Contains(out, mapCoverageGapNotice) {
 			t.Fatalf("want content + gap notice, got %q", out)
 		}
 	})
 	t.Run("capped with real content: notice appended", func(t *testing.T) {
-		out, err := assembleMapOutput([]string{"s"}, true)
-		if err != nil || !strings.Contains(out, mapCoverageGapNotice) {
-			t.Fatalf("want notice on cap, got %q err %v", out, err)
+		out := assembleMapOutput([]string{"s"}, true)
+		if !strings.Contains(out, mapCoverageGapNotice) {
+			t.Fatalf("want notice on cap, got %q", out)
 		}
 	})
 	t.Run("all-blank output completes as a fixed non-empty body (N-R12-3)", func(t *testing.T) {
@@ -568,10 +608,7 @@ func TestAssembleMapOutput(t *testing.T) {
 		// (same handle deterministically reproduces blanks → MaxSteps). It
 		// completes as a SUCCESS with the fixed non-empty allBlankMapBody; the
 		// blank breakdown travels in the coverage JSON instead.
-		out, err := assembleMapOutput([]string{"", "  "}, true)
-		if err != nil {
-			t.Fatalf("all-blank must complete, got error: %v", err)
-		}
+		out := assembleMapOutput([]string{"", "  "}, false)
 		if strings.TrimSpace(out) == "" {
 			t.Fatal("fixed body must be non-empty (store empty guard)")
 		}
@@ -579,10 +616,26 @@ func TestAssembleMapOutput(t *testing.T) {
 			t.Fatalf("got %q, want the fixed all-blank body (no notice-only ship)", out)
 		}
 	})
+	t.Run("all-blank with a real coverage gap still discloses the notice", func(t *testing.T) {
+		// Round-5 P1 (Jerry-Xin 5478795037 / yujiawei 5478968340): the
+		// all-blank branch previously dropped mapCoverageGapNotice even when
+		// coverageGap=true, so a firing cap + all-blank kept chunks shipped a
+		// bare "all noise" body — an affirmative completeness claim about
+		// messages the cap never let reach a model. At V2=off the in-text
+		// notice is the ONLY disclosure channel (contract §6), so it must be
+		// present whenever a real gap exists.
+		out := assembleMapOutput([]string{"", "   ", "	"}, true)
+		if out != allBlankMapBody+mapCoverageGapNotice {
+			t.Fatalf("got %q, want body + gap notice (cap/manifest-miss must surface on the all-blank path)", out)
+		}
+		if !strings.Contains(out, "未能纳入本次总结") {
+			t.Fatal("gap notice text missing from the all-blank+gap output")
+		}
+	})
 	t.Run("full coverage: no notice", func(t *testing.T) {
-		out, err := assembleMapOutput([]string{"a", "b"}, false)
-		if err != nil || strings.Contains(out, mapCoverageGapNotice) {
-			t.Fatalf("clean run must not carry a gap notice, got %q err %v", out, err)
+		out := assembleMapOutput([]string{"a", "b"}, false)
+		if strings.Contains(out, mapCoverageGapNotice) {
+			t.Fatalf("clean run must not carry a gap notice, got %q", out)
 		}
 	})
 }

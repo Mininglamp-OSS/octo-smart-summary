@@ -804,6 +804,14 @@ func isFatalMapError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// ErrRequestTooLarge (#241 item 1) is fatal on the agent path
+	// (isFatalChunkError); the mirrors claim alignment, so the worker must
+	// abort on it too rather than drop the chunk as a tolerated failure — an
+	// oversized request cannot shrink on retry, and dropping it silently
+	// loses coverage (round-5 P2, yujiawei 5478968340).
+	if errors.Is(err, service.ErrRequestTooLarge) {
+		return true
+	}
 	if errors.Is(err, service.ErrOutputTruncated) || errors.Is(err, service.ErrStreamOutputTruncated) {
 		return true
 	}

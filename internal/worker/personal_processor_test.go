@@ -48,6 +48,16 @@ func TestIsFatalMapError(t *testing.T) {
 		// The raw sentinel arriving unwrapped still counts: it is the same
 		// irrecoverable finish_reason=length, just not yet labelled with a chunk.
 		{name: "unwrapped truncation sentinel", err: service.ErrOutputTruncated, want: true},
+		// ErrRequestTooLarge (#241 item 1) is fatal on the agent path
+		// (isFatalChunkError); the mirrors claim tolerance-class alignment, so
+		// the worker aborts on it too instead of dropping the chunk — an
+		// oversized request cannot shrink on retry (round-5 P2).
+		{name: "request too large", err: fmt.Errorf("pre-send guard: %w", service.ErrRequestTooLarge), want: true},
+		{name: "unwrapped request-too-large sentinel", err: service.ErrRequestTooLarge, want: true},
+		// A wrapped request-too-large whose text mentions truncation must not
+		// hit the truncation arm first — errors.Is on the typed sentinel is
+		// checked before the substring fallback either way; this pins order
+		// independence for the drop-a-chunk outcome (want fatal either way).
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := isFatalMapError(tc.err); got != tc.want {

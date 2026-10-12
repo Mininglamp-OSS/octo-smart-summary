@@ -437,3 +437,44 @@ func TestProbeChunkCoverageReflectsFanOutCap(t *testing.T) {
 		t.Fatalf("chunks = %d exceeds the cap", chunks)
 	}
 }
+
+// TestProbeChunkCoverageDefaultReportsFiringCap is the round-5 P2 regression
+// (Jerry-Xin 5478795037): ProbeChunkCoverageDefault seeded both accumulators at
+// 0 and updated them only when `residual > dropped-capped`, so a CLEAN cap
+// firing (dropped == capped, residual == 0, `0 > 0` false) returned
+// dropped=0 capped=0 while the cap discarded a third of the input — the eval
+// harness then reported total_dropped=0 capped=0, contradicting
+// TotalDroppedCount's own doc. The cap must fire here via the TOKEN budget
+// alone (oversized ASCII messages, no chunk_size cooperation — the route the
+// floor fix leaves open), and the default probe must surface BOTH counters.
+func TestProbeChunkCoverageDefaultReportsFiringCap(t *testing.T) {
+	// 300 messages of 240,000 ASCII runes each (~60k tokens billed per message
+	// at the ASCII ratio). The ceil(300/256)=2 floor puts two per chunk, but
+	// ~120k tokens per chunk exceeds the ~97k default input budget, so the
+	// token budget alone forces one message per chunk = 300 chunks > 256 and
+	// capChunks must fire and drop the oldest head (the residual route the
+	// floor fix leaves open).
+	const n = 300
+	msgs := make([]map[string]interface{}, n)
+	for i := range msgs {
+		msgs[i] = map[string]interface{}{
+			"sender_name":    fmt.Sprintf("user%d", i),
+			"content":        strings.Repeat("x", 240000),
+			"citation_index": i + 1,
+		}
+	}
+	processed, dropped, chunks, capped := ProbeChunkCoverageDefault(msgs, 0)
+	// chunks reports POST-cap, so == maxChunkCalls is itself the cap-fired signal.
+	if chunks != maxChunkCalls {
+		t.Fatalf("precondition: token budget must force the cap to fire (%d kept chunks), got %d (fixture too small)", maxChunkCalls, chunks)
+	}
+	if capped == 0 {
+		t.Fatalf("capped = 0: the firing cap erased BOTH counters (aggregator regression); processed=%d dropped=%d chunks=%d", processed, dropped, chunks)
+	}
+	if dropped != capped {
+		t.Fatalf("clean cap firing must satisfy dropped==capped, got dropped=%d capped=%d (residual must stay 0)", dropped, capped)
+	}
+	if processed+capped != n {
+		t.Fatalf("processed %d + capped %d != input %d: probe funnel leaks messages", processed, capped, n)
+	}
+}

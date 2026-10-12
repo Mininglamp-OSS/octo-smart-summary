@@ -89,11 +89,15 @@ func TestCoverageRegressionGuard(t *testing.T) {
 // TestCoverageGateExemptsDisclosedCap pins the coverage gate over a huge default
 // input. Post-floor-fix (B-1a, Jerry-Xin 5338024667 §3): floorMsgsPerChunk
 // raises the per-chunk count to ceil(n/256) whenever the model-chosen size would
-// fan out past the cap, so at the DEFAULT configuration the cap can no longer
-// fire at any input size — 52000 messages split into ~255 chunks with zero drop.
-// The gate's disclosed-cap exemption (NoSilentLoss = dropped−capped == 0) remains
-// pinned by construction here and by the cap-classification unit pins
-// (TestCapChunks) for the residual huge-input/token-budget-forced route.
+// fan out past the cap, so the MODEL-MANUFACTURABLE route (chunk_size=1 at
+// ordinary sizes) is closed — 52000 small messages split into ~255 chunks with
+// zero drop. (Round-5 P2 correction, yujiawei 5478968340: an earlier version of
+// this comment claimed the cap "can no longer fire at ANY input size" — false.
+// The residual route stays real: messages large enough that even floor-sized
+// chunks bust the token budget force >256 chunks at ordinary sizes, e.g. 100k
+// × 300-rune CJK messages drop ~18% to the disclosed cap. That route is pinned
+// by TestProbeChunkCoverageDefaultReportsFiringCap; the fixtures here pin the
+// floor's small-message invariant.)
 func TestCoverageGateExemptsDisclosedCap(t *testing.T) {
 	const n = 52000
 	cov := Coverage(GoldenCase{Messages: make([]GoldenMessage, n)})
