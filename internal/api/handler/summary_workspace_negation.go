@@ -5,127 +5,140 @@ import (
 	"unicode"
 )
 
-// hasNegatedSummaryRunIntent recognizes cancellation of the summary act, not
-// negative content requirements. Keep this bounded grammar paired with the
-// literal request corpus: a wider substring match revives content false positives.
+type summaryWorkspaceNegation int
+
+const (
+	summaryWorkspaceNoNegation summaryWorkspaceNegation = iota
+	summaryWorkspaceCancelRun
+	summaryWorkspaceUncertainNegation
+)
+
+// Both cancellation and uncertain negative intent require clarification. An
+// unknown object must never silently authorize a document fetch or task.
 func hasNegatedSummaryRunIntent(message string) bool {
-	for _, clause := range summaryWorkspaceUnquotedClauses(strings.ToLower(message)) {
-		// Collapse spacing within English commands without splitting their words.
-		clause = strings.Join(strings.Fields(clause), " ")
-		if summaryWorkspaceCancellationClause(clause) {
-			return true
-		}
-		// Chinese users also separate an affirmative request and cancellation
-		// with a space. Only inspect such suffixes after an affirmative lead;
-		// arbitrary reported speech must not become a cancellation.
-		if startsWithAny(clause, "总结一下", "请总结", "帮我总结", "summarize ", "please summarize ") {
-			for i, r := range clause {
-				if r == ' ' && summaryWorkspaceCancellationClause(clause[i+1:]) {
-					return true
+	return summaryWorkspaceRunNegation(message) != summaryWorkspaceNoNegation
+}
+
+func summaryWorkspaceRunNegation(message string) summaryWorkspaceNegation {
+	for _, clause := range summaryWorkspaceNegationClauses(message) {
+		for _, verb := range []string{
+			"不要总结", "不要生成", "别总结", "别生成", "暂不总结", "暂不生成",
+			"不总结", "不生成", "无需总结", "无需生成", "不需要总结", "不需要生成",
+			"不用总结", "不用生成", "不要再总结", "不要再生成",
+			"do not summarize", "don't summarize", "do not generate", "don't generate", "without generating",
+		} {
+			for from := 0; from < len(clause.text); {
+				offset := strings.Index(clause.text[from:], verb)
+				if offset < 0 {
+					break
+				}
+				start := from + offset
+				end := start + len(verb)
+				from = end
+				if clause.hasQuotedBytes(start, end) {
+					continue // Reported words are data, not a cancellation verb.
+				}
+				if verb[0] < unicode.MaxASCII && start > 0 && isSummaryASCIIWord(clause.text[start-1]) {
+					continue // English verbs must start on a word boundary.
+				}
+				object := clause.text[end:]
+				if clause.isMeaningQuestion(start, end) {
+					continue // "不要生成总结是什么意思" is not cancellation.
+				}
+				switch summaryWorkspaceNegationObject(object) {
+				case summaryWorkspaceCancelRun:
+					return summaryWorkspaceCancelRun
+				case summaryWorkspaceUncertainNegation:
+					return summaryWorkspaceUncertainNegation
 				}
 			}
 		}
 	}
-	return false
+	return summaryWorkspaceNoNegation
 }
 
-func summaryWorkspaceCancellationClause(clause string) bool {
-	// Quoted spans are tracked structurally, never by a user-typable sentinel.
-	clause = strings.TrimLeftFunc(clause, func(r rune) bool {
-		return unicode.IsSpace(r) || unicode.IsSymbol(r) || unicode.IsPunct(r) || r == '\uFE0F' || r == '\u200D'
-	})
-	for {
-		before := clause
-		// Longest alternatives precede their prefixes (请你 before 请, etc.).
-		for _, prefix := range []string{
-			"这次的总结", "本周的总结", "文档总结", "the summary ", "the summary",
-			"请你", "请您", "能不能", "我希望", "麻烦", "帮我", "建议", "可否", "最好",
-			"劳驾", "拜托", "烦请", "眼下", "我的意思是", "结论是", "所以",
-			"但是", "不过", "请", "先", "暂时", "现在", "目前", "还是", "这次", "但",
-			"总结", "周报", "日报", "月报", "but ", "please ", "for now ",
-		} {
-			clause = strings.TrimSpace(strings.TrimPrefix(clause, prefix))
-		}
-		if clause == before {
-			break
-		}
-	}
-	for _, verb := range []string{
-		"不要总结", "不要生成", "别总结", "别生成", "暂不总结", "暂不生成",
-		"不总结", "不生成", "无需总结", "无需生成", "不需要总结", "不需要生成",
-		"不用总结", "不用生成", "不要再总结", "不要再生成",
-		"do not summarize", "don't summarize", "do not generate", "don't generate", "without generating",
+func isSummaryASCIIWord(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= '0' && b <= '9' || b == '_'
+}
+
+func (c summaryWorkspaceNegationClause) isMeaningQuestion(verbStart, verbEnd int) bool {
+	text := strings.TrimRightFunc(c.text, unicode.IsSpace)
+	for _, suffix := range []string{
+		"是什么意思", "是什么含义", "有什么含义", "的意思是什么",
+		" mean",
 	} {
-		if strings.HasPrefix(clause, verb) && summaryWorkspaceCancellationObject(strings.TrimSpace(strings.TrimPrefix(clause, verb))) {
-			return true
+		start := len(text) - len(suffix)
+		if start < verbEnd || !strings.HasSuffix(text, suffix) || c.hasQuotedBytes(start, len(text)) {
+			continue
 		}
+		if suffix == " mean" && !strings.HasPrefix(strings.TrimLeftFunc(c.text[:verbStart], unicode.IsSpace), "what does ") {
+			continue
+		}
+		return true
 	}
 	return false
 }
 
-func summaryWorkspaceCancellationObject(object string) bool {
-	// Normalize discourse tails before classifying the object. Do not invert
-	// this into an artifact denylist: unknown content constraints must not
-	// silently become cancellation.
+func summaryWorkspaceNegationObject(object string) summaryWorkspaceNegation {
+	// Strip discourse decoration, not semantic nouns. These transforms apply
+	// equally to cancellation objects and recognized content restrictions.
+	object = strings.TrimSpace(object)
 	for {
 		before := object
-		if object == "please" || object == "thanks" || object == "ok" {
-			object = ""
-		}
+		object = strings.Trim(object, " \t()（）[]【】")
 		object = strings.TrimRightFunc(object, func(r rune) bool {
 			return unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r) ||
 				strings.ContainsRune("了吧呢哦啦喔噢呀啊嘛哈呗咯", r)
 		})
+		if object == "please" || object == "thanks" || object == "ok" {
+			object = ""
+		}
 		for _, tail := range []string{"谢谢", "好吗", "行吗", "可以吗", "ok", " please", " thanks"} {
 			object = strings.TrimSpace(strings.TrimSuffix(object, tail))
 		}
-		if object == before {
+		if before == object {
 			break
 		}
 	}
-	// Modifiers qualify the summary itself, not an arbitrary artifact ending
-	// in similar text. "正式总结表格" must remain a content constraint.
-	for _, modifier := range []string{"正式", "完整", "最终"} {
-		if strings.HasPrefix(object, modifier) {
-			object = strings.TrimPrefix(object, modifier)
-			break
-		}
-	}
+	// Match the whole content object, never a substring: "表格和总结" must
+	// not become execution permission. Unknown objects deliberately clarify.
 	switch object {
-	case "", "总结", "总结了", "总结吧", "总结任务", "了", "吧",
-		"这些内容", "这些文档", "所选内容", "所选文档", "内容", "文档", "全部", "这些", "全部内容", "全部文档",
-		"这些内容的总结", "这些文档的总结", "所选内容的总结", "所选文档的总结",
-		"summary", "a summary", "the summary", "yet", "now",
-		"summary yet", "a summary yet", "the summary yet", "a summary now", "the summary now",
-		"these documents", "these docs", "this content", "the selected documents", "the selected content":
-		return true
+	case "表格", "行动项", "附件内容", "已关闭的任务", "图表", "总结表格",
+		"正式总结表格", "完整总结附件",
+		"table", "a table", "the table", "tables", "action items",
+		"a summary table", "summary table", "charts", "a chart", "chart",
+		"attachment content", "closed tasks":
+		return summaryWorkspaceNoNegation
+	case "", "总结", "总结任务", "summary", "a summary", "the summary":
+		return summaryWorkspaceCancelRun
 	default:
-		return false
+		return summaryWorkspaceUncertainNegation
 	}
 }
 
-func startsWithAny(value string, prefixes ...string) bool {
-	for _, prefix := range prefixes {
-		if strings.HasPrefix(value, prefix) {
+// text retains quoted object text, but the parallel byte mask prevents quoted
+// verbs from being interpreted as commands. Empty quotes erase neither text nor
+// intent. This is cancellation analysis, not affirmative-intent authorization.
+type summaryWorkspaceNegationClause struct {
+	text   string
+	quoted []bool
+}
+
+func (c summaryWorkspaceNegationClause) hasQuotedBytes(start, end int) bool {
+	for _, quoted := range c.quoted[start:end] {
+		if quoted {
 			return true
 		}
 	}
 	return false
 }
 
-// Exclude clauses containing quoted data from cancellation detection, so
-// punctuation INSIDE a quote cannot turn reported text into cancellation.
-// This does not change the separate affirmative-intent classifier.
-// A wholly quoted submission is treated as the user's own instruction.
-func summaryWorkspaceUnquotedClauses(message string) []string {
-	// Rich-text object placeholders are presentation, not internal parser state.
-	runes := []rune(strings.TrimSpace(strings.ReplaceAll(message, "\uFFFC", "")))
+func summaryWorkspaceNegationClauses(message string) []summaryWorkspaceNegationClause {
+	runes := normalizeSummaryWorkspaceNegationText(message)
 	ends := summaryWorkspaceQuoteEnds(runes)
 	start, limit := 0, len(runes)
-	for limit-start > 1 {
-		if ends[start] != limit-1 {
-			break
-		}
+	// An entirely quoted message is the user's own submission.
+	for limit-start > 1 && ends[start] == limit-1 {
 		start++
 		limit--
 		for start < limit && unicode.IsSpace(runes[start]) {
@@ -135,60 +148,90 @@ func summaryWorkspaceUnquotedClauses(message string) []string {
 			limit--
 		}
 	}
-	var clauses []string
-	var clause strings.Builder
-	quoted := false
-	flush := func() {
-		if !quoted && clause.Len() > 0 {
-			clauses = append(clauses, clause.String())
+	var clauses []summaryWorkspaceNegationClause
+	var text strings.Builder
+	var quoted []bool
+	appendRune := func(r rune, inQuote bool) {
+		n, _ := text.WriteRune(r)
+		for j := 0; j < n; j++ {
+			quoted = append(quoted, inQuote)
 		}
-		clause.Reset()
-		quoted = false
+	}
+	flush := func() {
+		if text.Len() > 0 {
+			clauses = append(clauses, summaryWorkspaceNegationClause{text.String(), quoted})
+		}
+		text.Reset()
+		quoted = nil
 	}
 	for i := start; i < limit; i++ {
 		if end := ends[i]; end > i && end < limit {
-			quoted = true
+			for j := i + 1; j < end; j++ {
+				appendRune(runes[j], true)
+			}
 			i = end
 		} else if strings.ContainsRune("，,、。.!！？?；;：:\n\r—–", runes[i]) {
 			flush()
 		} else {
-			clause.WriteRune(runes[i])
+			appendRune(runes[i], false)
 		}
 	}
 	flush()
 	return clauses
 }
 
-// Precompute nearest closing quotes in one reverse pass. Unlike searching the
-// remaining input at each opener, even 8192 unmatched CJK openers take O(n).
-func summaryWorkspaceQuoteEnds(runes []rune) []int {
-	escaped := make([]bool, len(runes))
-	for i := 0; i < len(runes); i++ {
-		if runes[i] == '\\' && i+1 < len(runes) {
-			i++
-			escaped[i] = true
+func normalizeSummaryWorkspaceNegationText(message string) []rune {
+	raw := []rune(strings.ToLower(strings.TrimSpace(strings.ReplaceAll(message, "\uFFFC", ""))))
+	out := make([]rune, 0, len(raw))
+	for i := 0; i < len(raw); i++ {
+		r := raw[i]
+		// Smart apostrophes inside English words are not quote boundaries.
+		if r == '’' && i > 0 && i+1 < len(raw) && isSummaryLatinLetter(raw[i-1]) && isSummaryLatinLetter(raw[i+1]) {
+			r = '\''
 		}
+		if unicode.IsSpace(r) && r != '\n' && r != '\r' {
+			j := i + 1
+			for j < len(raw) && unicode.IsSpace(raw[j]) && raw[j] != '\n' && raw[j] != '\r' {
+				j++
+			}
+			// CJK glyph spacing is presentation; English word spacing is syntax.
+			if len(out) == 0 || j == len(raw) || !unicode.Is(unicode.Han, out[len(out)-1]) || !unicode.Is(unicode.Han, raw[j]) {
+				out = append(out, ' ')
+			}
+			i = j - 1
+			continue
+		}
+		out = append(out, r)
 	}
+	return out
+}
+
+func isSummaryLatinLetter(r rune) bool {
+	return r >= 'a' && r <= 'z'
+}
+
+// Pair quotes with a stack so an unmatched outer opener cannot steal the
+// closer of a nested quoted object. Indexing and clause construction are O(n).
+func summaryWorkspaceQuoteEnds(runes []rune) []int {
 	ends := make([]int, len(runes))
-	next := make(map[rune]int, 10)
-	for i := len(runes) - 1; i >= 0; i-- {
+	for i := range ends {
 		ends[i] = -1
-		if escaped[i] {
+	}
+	var stack []int
+	for i := 0; i < len(runes); i++ {
+		if runes[i] == '\\' {
+			i++
 			continue
 		}
 		if runes[i] == '\'' && i > 0 && i+1 < len(runes) &&
-			runes[i-1] < unicode.MaxASCII && unicode.IsLetter(runes[i-1]) &&
-			runes[i+1] < unicode.MaxASCII && unicode.IsLetter(runes[i+1]) {
-			continue // apostrophe in don't
+			isSummaryLatinLetter(runes[i-1]) && isSummaryLatinLetter(runes[i+1]) {
+			continue
 		}
-		if close := summaryWorkspaceClosingQuote(runes[i]); close != 0 {
-			if end, ok := next[close]; ok {
-				ends[i] = end
-			}
-		}
-		switch runes[i] {
-		case '”', '’', '」', '』', '"', '`', '\'':
-			next[runes[i]] = i
+		if len(stack) > 0 && summaryWorkspaceClosingQuote(runes[stack[len(stack)-1]]) == runes[i] {
+			ends[stack[len(stack)-1]] = i
+			stack = stack[:len(stack)-1]
+		} else if summaryWorkspaceClosingQuote(runes[i]) != 0 {
+			stack = append(stack, i)
 		}
 	}
 	return ends

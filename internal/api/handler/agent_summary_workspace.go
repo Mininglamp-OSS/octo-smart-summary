@@ -321,8 +321,9 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		}
 	}
 
+	negatedRun := hasNegatedSummaryRunIntent(req.Message)
 	intent := classifySummaryWorkspaceIntent(req.Message, begin.Snapshot.CurrentPreview != nil)
-	if begin.Snapshot.CurrentPreview != nil && hasExplicitSummaryExecutionCommand(req.Message) {
+	if !negatedRun && begin.Snapshot.CurrentPreview != nil && hasExplicitSummaryExecutionCommand(req.Message) {
 		intent = service.SummaryIntentGenerate
 	}
 	selectedSourceExplicit := len(contextValue.SelectedChannels) > 0 || len(contextValue.Documents) > 0
@@ -370,7 +371,7 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 	routeInput := workspaceRouteInput{
 		Context: contextValue, Action: action, Intent: intent,
 		VerifiedDocumentTemplate: verifiedDocumentTemplate,
-		NegatedRun:               hasNegatedSummaryRunIntent(req.Message),
+		NegatedRun:               negatedRun,
 		SelectedSourceExplicit:   selectedSourceExplicit, HasRequirement: hasRequirement,
 		OpenScopeAgent: openScopeAgent, State: begin.Snapshot,
 		ParticipantsValid: validation.participantsValid, SourcesValid: validation.sourcesValid,
@@ -1264,6 +1265,11 @@ func classifySummaryWorkspaceIntent(message string, hasCurrentPreview bool) serv
 		"why", "explain", "source", "evidence", "what is", "what does", "how does") {
 		return service.SummaryIntentExplain
 	}
+	// Cancellation/uncertain negative intent must not become an Agent revision
+	// or gain discoverable scope merely because an earlier preview exists.
+	if hasNegatedSummaryRunIntent(message) {
+		return service.SummaryIntentExplain
+	}
 	if hasCurrentPreview {
 		// Once a preview exists, normal follow-up instructions are revisions.
 		// Scope changes invalidate the preview in the store before this classifier
@@ -1274,9 +1280,6 @@ func classifySummaryWorkspaceIntent(message string, hasCurrentPreview bool) serv
 		"先给预览", "先看预览", "生成草稿", "先出一版", "先给一版", "预览一下",
 		"preview first", "draft first", "generate a draft", "show me a preview") {
 		return service.SummaryIntentGenerate
-	}
-	if hasNegatedSummaryRunIntent(message) {
-		return service.SummaryIntentExplain
 	}
 	if hasExplicitSummaryRunIntent(message) {
 		return service.SummaryIntentGenerate
@@ -1360,7 +1363,7 @@ func summaryWorkspaceClarificationReply(in workspaceRouteInput, teamScopeReason 
 	case len(context.Participants) > 0 && !in.ParticipantsValid:
 		return summaryWorkspaceTeamScopeMessage(teamScopeReason)
 	case len(context.Documents) > 0 && in.NegatedRun:
-		return "要现在生成总结吗？如果要继续，请移除暂停生成的要求后重新提交。"
+		return "要现在生成总结吗？本轮先不执行。请确认是暂停生成，还是仅限制输出内容；如需继续，可用肯定表述重新说明总结要求。"
 	case len(context.Documents) > 0 && len(context.SelectedChannels) == 0:
 		return "文档问答/解释暂不支持，请输入总结要求后生成文档总结。"
 	case len(context.Participants) > 0 && !in.HasRequirement:

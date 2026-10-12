@@ -174,6 +174,7 @@ var documentNegationQuestions = []string{
 	"不要生成总结是什么意思？",
 	"“先不要总结”是什么意思？",
 	`what does "do not summarize" mean?`,
+	"what does do not summarize mean?",
 }
 
 var documentExecutionNegations = []string{
@@ -209,6 +210,62 @@ var documentExecutionNegations = []string{
 	"不要总结全部", "不要总结全部内容", "不要总结全部文档",
 	"不要总结嘛", "不要总结哈", "不要总结呗", "不要总结咯", "不要总结喔",
 	"don't summarize thanks", "don't summarize ok",
+	"那就不要总结了", "不然不要总结", "算了不要总结", "反正不要总结", "其实先不要总结",
+	"请“不要总结", "文档“不要总结", "不要总结所有内容", "不要总结所有文档",
+	"不要总结整个文档", "不要总结当前内容", "不要总结当前文档", "不要总结这份文档",
+	"不要总结这个文档", "不要总结这篇文档", "不要总结该文档", "不要总结本次内容",
+	"不要总结上面的内容", "不要总结文档内容", "不要总结全部会话", "不要总结了现在",
+	"不要总结“这些内容”", "do not summarize for now", "don't summarize for now",
+	"do not summarize right now", "do not summarize today", "do not summarize this time",
+	"do not summarize anything", "do not generate anything", "do not summarize it",
+	"do not generate a summary for now", "“”不要总结", `""不要总结`, "不要总结“”",
+	"“算了”不要总结", "不要 总结", "不要　总结", "不 要 总 结", "别 总结",
+	"don’t summarize", "don’t summarize please", "Don’t generate a summary",
+	"不要生成周报", "不要生成日报", "不要生成月报", "不要总结(thanks)",
+	"不要总结新出现的对象", // Unknown negative object now fails toward clarification.
+	"不要总结“是什么意思”", "don't summarize what I mean",
+	"不要生成表格和总结",
+	"不要生成正式总结，先给预览",
+}
+
+func TestDocumentNegationDecisionStates(t *testing.T) {
+	for _, tc := range []struct {
+		message string
+		want    summaryWorkspaceNegation
+	}{
+		{"请总结", summaryWorkspaceNoNegation},
+		{"请总结，不要生成表格", summaryWorkspaceNoNegation},
+		{"不要生成总结", summaryWorkspaceCancelRun},
+		{"不要生成未登记的输出形式", summaryWorkspaceUncertainNegation},
+		{"不要总结所有内容", summaryWorkspaceUncertainNegation},
+		{"不要生成表格和总结", summaryWorkspaceUncertainNegation},
+	} {
+		if got := summaryWorkspaceRunNegation(tc.message); got != tc.want {
+			t.Errorf("%q: got=%v want=%v", tc.message, got, tc.want)
+		}
+	}
+}
+
+func TestDocumentCancellationAcrossObjectAndPreview(t *testing.T) {
+	for _, prefix := range []string{"", "那就", "未枚举的话语前缀", "“算了”", "请“"} {
+		for _, verb := range []string{"不要总结", "不要生成", "别总结"} {
+			for _, object := range []string{"所有内容", "当前文档", "任意未收录对象", "“这些内容”", ""} {
+				for _, suffix := range []string{"", "哦", "谢谢"} {
+					message := prefix + verb + object + suffix
+					if !hasNegatedSummaryRunIntent(message) {
+						t.Errorf("negative candidate executed: %q", message)
+					}
+					for _, preview := range []bool{false, true} {
+						intent := classifySummaryWorkspaceIntent(message, preview)
+						if intent != service.SummaryIntentExplain ||
+							summaryWorkspaceShouldOpenScopeAgent(service.SummaryActionChat, summaryWorkspaceInputUser, intent) {
+							t.Errorf("cancellation opened scope/revision: preview=%t message=%q intent=%s", preview, message, intent)
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
 func TestDocumentCancellationDecorations(t *testing.T) {
@@ -335,7 +392,7 @@ func TestDocumentClarificationReportsHardBlockersFirst(t *testing.T) {
 		t.Fatalf("permission blocker masked: %s", got)
 	}
 	in.SourcesValid = true
-	if got := summaryWorkspaceClarificationReply(in, ""); got != "要现在生成总结吗？如果要继续，请移除暂停生成的要求后重新提交。" {
+	if got := summaryWorkspaceClarificationReply(in, ""); got != "要现在生成总结吗？本轮先不执行。请确认是暂停生成，还是仅限制输出内容；如需继续，可用肯定表述重新说明总结要求。" {
 		t.Fatalf("negation reply: %s", got)
 	}
 }

@@ -346,7 +346,12 @@ func TestClassifySummaryWorkspaceIntentKeepsQuestionsReadOnly(t *testing.T) {
 		{name: "explicit generation", message: "请根据当前选择生成总结", want: service.SummaryIntentGenerate},
 		{name: "polite generation question", message: "能帮我总结一下吗？", want: service.SummaryIntentGenerate},
 		{name: "negated generation", message: "先不要生成总结，我还要补充要求", want: service.SummaryIntentExplain},
-		{name: "explicit preview overrides formal negation", message: "不要生成正式总结，先给预览", want: service.SummaryIntentGenerate},
+		// Approved conservative policy: a preview request no longer overrides
+		// negative execution intent. Positive preview requests remain unchanged.
+		{name: "formal negation precedes preview request", message: "不要生成正式总结，先给预览", want: service.SummaryIntentExplain},
+		{name: "formal negation precedes existing preview", message: "不要生成正式总结，先给预览", hasPreview: true, want: service.SummaryIntentExplain},
+		{name: "positive preview request", message: "先给预览", want: service.SummaryIntentGenerate},
+		{name: "positive preview revision", message: "先给预览", hasPreview: true, want: service.SummaryIntentRevise},
 		{name: "free form requirement", message: "重点关注风险和行动项", want: service.SummaryIntentGenerate},
 		{name: "preview follow-up", message: "把行动项放到最前面", hasPreview: true, want: service.SummaryIntentRevise},
 		{name: "explicit regeneration updates preview", message: "请重新生成总结", hasPreview: true, want: service.SummaryIntentRevise},

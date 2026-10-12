@@ -53,31 +53,35 @@ returns `enabled: true` and `contract_version: "2"`.
   When the remaining route requirements are satisfied, recognized origins may
   enter deterministic personal or team Workflow paths directly.
 - **Document-bearing scopes:** participants are unsupported, unavailable
-  selected chats block execution, and explicit execution negation clarifies.
-  The conservative negation grammar recognizes a clause negating the summary
-  act, including common polite/temporal lead-ins, a fronted summary topic, and
-  whole-scope objects: `请你先不要总结`, `总结先不要生成`,
-  `不要总结这些内容` and `先不要生成正式总结` clarify.
-  It does not negate execution for content objects: `总结一下，不要生成表格` and
-  `帮我总结文档和会话，不需要总结附件内容` execute. A suspected cancellation
-  asks whether the user wants to proceed, without asserting what they intended.
-  Whitespace is normalized within commands; ideographic commas and dashes
-  separate clauses. Embedded quoted text is not interpreted as a cancellation,
-  including punctuation inside the quotation; a wholly quoted submission is
-  treated as the user's instruction. Clauses containing embedded quoted data
-  are excluded from cancellation matching, rather than substituting a text
-  sentinel. Rich-text U+FFFC placeholders are ignored. Quote boundaries are
-  indexed in linear time, including unmatched openers. This applies only to
-  cancellation: affirmative quoted-text classification retains its existing
-  behavior and is not a new execution-authorization guarantee.
-  Common trailing particles, politeness tails and presentation punctuation
-  are normalized before classifying the object (`不要总结哦`,
-  `不要总结了吧`, `don't summarize please`). The same decorations must not
-  turn `不要生成表格` into cancellation. Whole-scope ambiguity such as
-  `不要总结全部` / `不要总结全部内容` consistently asks for clarification;
-  it does not silently remove selected sources or guess a subset.
-  This bounded grammar is tested against
-  the literal request corpus, not general-purpose natural-language detection. Otherwise,
+  selected chats block execution. Negative-action analysis has three outcomes:
+  no blocking negation, recognized cancellation, and uncertain negative intent.
+  Both of the latter outcomes clarify before any task or document fetch.
+  A conflicting preview request does not override that decision:
+  `不要生成正式总结，先给预览` now clarifies rather than generating/revising
+  a preview. Positive preview requests and ordinary revisions are unchanged.
+  Known negative verbs are found anywhere outside embedded quotations; there
+  is no discourse-prefix or whole-scope-object allowlist. An unrecognized object
+  after such a verb defaults to clarification, not execution. Thus `算了不要总结`,
+  `不要总结所有内容`, `不要总结这份文档` and new unknown objects all stop.
+  This deliberate product trade-off may ask an extra question for an unfamiliar
+  content restriction; it is not a claim of complete natural-language understanding.
+  Recognized whole content/output objects (tables, action items, attachment
+  content, closed tasks and the tested variants) remain executable:
+  `总结一下，不要生成表格` and `不需要总结附件内容` do not cancel.
+  Matching is not a substring exemption: `不要生成表格和总结` clarifies.
+  Meaning questions such as `不要生成总结是什么意思` are not cancellation.
+  The reply asks whether the user means cancellation or a content restriction
+  and suggests restating the requirement positively; it does not assert intent.
+  Quote spans retain object text, while quoted verbs cannot cancel:
+  `不要总结“这些内容”` clarifies; `不要总结“附件内容”` is a known content
+  restriction; reported `文档写着“不要总结”` is not a cancellation instruction.
+  Empty quote pairs do not discard the surrounding clause. An entirely quoted
+  submission is the user's instruction. Stack-based quote pairing is linear,
+  including unmatched/nested openers. Rich-text U+FFFC placeholders are ignored.
+  CJK inter-character whitespace, English whitespace runs, in-word smart
+  apostrophes, common trailing particles and politeness tails are normalized.
+  This parser only analyzes negative intent; affirmative quoted-text behavior
+  remains unchanged and carries no new execution-authorization guarantee. Otherwise,
   document+chat submissions start a personal Workflow even when phrased as
   questions. This mixed-question execution behavior is retained for compatibility.
   Documents-only `Explain` input clarifies unless the template submission is
@@ -117,7 +121,9 @@ Discovery only creates candidates: a newly discovered chat cannot be read until
 the declaration succeeds. The declaration is single-use for the turn, freezes
 further discovery, and its complete final channel list is the one used for
 message retrieval, `scope_json`, and `preview.effective_scope`. Explanation-only
-questions and recognized execution cancellations do not request a scope change.
+questions, recognized cancellations and uncertain negative intent keep the
+Agent scope locked. Cancellation analysis precedes preview revision, and an
+execution-command prefix cannot override it when a preview exists.
 Content constraints such as "do not generate a table" may still enter the
 conversational Agent path; that permission is not evidence of a scope change.
 Only a separately authorized source/time-range declaration may change the picker
