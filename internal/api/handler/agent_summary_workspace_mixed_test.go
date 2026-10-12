@@ -186,7 +186,7 @@ func TestDeriveWorkspaceRouteMixedInvalidSourcesClarifies(t *testing.T) {
 		Documents:        []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}},
 	}
 	route := deriveWorkspaceRoute(context, service.SummaryActionChat, service.SummaryIntentGenerate,
-		true, true, true, false, WorkspaceSnapshot{}, true, false, true)
+		true, true, true, true, false, WorkspaceSnapshot{}, true, false, true)
 	if route != service.SummaryRouteClarification {
 		t.Fatalf("route = %v, want clarification for mixed scope with invalid sources", route)
 	}
@@ -198,7 +198,7 @@ func TestDeriveWorkspaceRouteMixedValidSourcesPersonalWorkflow(t *testing.T) {
 		Documents:        []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}},
 	}
 	route := deriveWorkspaceRoute(context, service.SummaryActionChat, service.SummaryIntentGenerate,
-		true, true, true, false, WorkspaceSnapshot{}, true, true, true)
+		true, true, true, true, false, WorkspaceSnapshot{}, true, true, true)
 	if route != service.SummaryRoutePersonalWorkflow {
 		t.Fatalf("route = %v, want personal workflow for valid mixed scope", route)
 	}

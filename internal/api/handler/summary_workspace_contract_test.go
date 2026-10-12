@@ -515,7 +515,7 @@ func TestDeriveWorkspaceRouteFinalMatrix(t *testing.T) {
 			if action == "" {
 				action = service.SummaryActionChat
 			}
-			got := deriveWorkspaceRoute(tt.context, action, service.SummaryIntentGenerate, true, tt.selectedSourceExplicit, tt.hasRequirement, tt.openScopeAgent, WorkspaceSnapshot{}, true, tt.sourcesValid, true)
+			got := deriveWorkspaceRoute(tt.context, action, service.SummaryIntentGenerate, true, true, tt.selectedSourceExplicit, tt.hasRequirement, tt.openScopeAgent, WorkspaceSnapshot{}, true, tt.sourcesValid, true)
 			if got != tt.want {
 				t.Fatalf("route = %q, want %q", got, tt.want)
 			}
@@ -525,34 +525,61 @@ func TestDeriveWorkspaceRouteFinalMatrix(t *testing.T) {
 
 func TestDeriveWorkspaceRouteDocumentExplainClarifies(t *testing.T) {
 	context := summaryWorkspaceContext{Documents: []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}}}
-	got := deriveWorkspaceRoute(context, service.SummaryActionChat, service.SummaryIntentExplain, false, true, false, false, WorkspaceSnapshot{}, true, true, true)
+	got := deriveWorkspaceRoute(context, service.SummaryActionChat, service.SummaryIntentExplain, false, false, true, false, false, WorkspaceSnapshot{}, true, true, true)
 	if got != service.SummaryRouteClarification {
 		t.Fatalf("document explain route = %q, want clarification", got)
 	}
-	got = deriveWorkspaceRoute(context, service.SummaryActionChat, service.SummaryIntentExplain, false, true, true, false, WorkspaceSnapshot{}, true, true, true)
+	got = deriveWorkspaceRoute(context, service.SummaryActionChat, service.SummaryIntentExplain, false, false, true, true, false, WorkspaceSnapshot{}, true, true, true)
 	if got != service.SummaryRouteClarification {
 		t.Fatalf("document explain route with user text requirement = %q, want clarification", got)
 	}
 }
 
-
-func TestDeriveWorkspaceRouteMixedExplainClarifiesUnlessExplicitRun(t *testing.T) {
+// TestDeriveWorkspaceRouteMixedExplain pins the four routing cells of the mixed
+// explain arm after the P1-1 fix (reviews 5479094697 / 5478721451): the demotion
+// keys on the MESSAGE-level explicit-run signal, not the derived hasExplicitRunIntent
+// flag (tautologically false inside the Explain arm). The sharpest cell is row 3:
+// "总结…依据…" classifies Explain via the keyword list yet is an explicit generate
+// request, and must keep the workflow route that pre-PR mixed scopes had.
+func TestDeriveWorkspaceRouteMixedExplain(t *testing.T) {
 	context := summaryWorkspaceContext{
 		Documents:        []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}},
 		SelectedChannels: []summaryWorkspaceChannel{{ChatID: "group-1", ChatType: "group", Name: "项目群"}},
 	}
-	for _, message := range []string{"先不要生成总结，我还要补充要求", "不要总结这些内容", "这些内容有什么区别？"} {
+	route := func(message string, explicitRunMessage bool) service.SummaryRoute {
 		intent := classifySummaryWorkspaceIntent(message, false)
-		if intent != service.SummaryIntentExplain {
+		return deriveWorkspaceRoute(context, service.SummaryActionChat, intent, false, explicitRunMessage, true, true, false, WorkspaceSnapshot{}, true, true, true)
+	}
+	// (Explain, no explicit run signal) → clarification.
+	for _, message := range []string{"先不要生成总结，我还要补充要求", "不要总结这些内容", "这些内容有什么区别？"} {
+		if intent := classifySummaryWorkspaceIntent(message, false); intent != service.SummaryIntentExplain {
 			t.Fatalf("message %q classified as %q, want explain", message, intent)
 		}
-		got := deriveWorkspaceRoute(context, service.SummaryActionChat, intent, false, true, true, false, WorkspaceSnapshot{}, true, true, true)
-		if got != service.SummaryRouteClarification {
+		if got := route(message, false); got != service.SummaryRouteClarification {
 			t.Fatalf("mixed explain route for %q = %q, want clarification", message, got)
 		}
 	}
-	got := deriveWorkspaceRoute(context, service.SummaryActionChat, service.SummaryIntentGenerate, true, true, true, false, WorkspaceSnapshot{}, true, true, true)
-	if got != service.SummaryRoutePersonalWorkflow {
+	// (Explain, explicit run command in the message) → workflow. The keyword
+	// classifier alone must not demote a genuine generate request. The command
+	// shape is the UI/typed execute command with a requirement suffix
+	// (summaryWorkspaceExecutionCommandRemainder parses it) — the exact
+	// template/system_intent path plan §3.1/§4.3 promises.
+	for _, message := range []string{
+		"开始总结：本周风险的来源是什么？", // execute command + requirement suffix → Explain class
+		"开始总结：请说明一下本周风险",   // execute command + explain keyword → Explain class
+	} {
+		if intent := classifySummaryWorkspaceIntent(message, false); intent != service.SummaryIntentExplain {
+			t.Fatalf("message %q classified as %q, want explain (precondition)", message, intent)
+		}
+		if !hasExplicitSummaryExecutionCommand(message) {
+			t.Fatalf("hasExplicitSummaryExecutionCommand(%q) = false, want true", message)
+		}
+		if got := route(message, true); got != service.SummaryRoutePersonalWorkflow {
+			t.Fatalf("mixed explain-with-explicit-run route for %q = %q, want personal workflow", message, got)
+		}
+	}
+	// (Generate, explicit run) → workflow stays.
+	if got := deriveWorkspaceRoute(context, service.SummaryActionChat, service.SummaryIntentGenerate, true, true, true, true, false, WorkspaceSnapshot{}, true, true, true); got != service.SummaryRoutePersonalWorkflow {
 		t.Fatalf("mixed explicit generate route = %q, want personal workflow", got)
 	}
 }
@@ -568,5 +595,60 @@ func TestOpenScopeAgentOverrideDoesNotDemoteDocumentWorkflow(t *testing.T) {
 	got = workspaceRouteAfterOpenScopeAgentOverride(chatContext, service.SummaryRoutePersonalWorkflow, true, WorkspaceSnapshot{})
 	if got != service.SummaryRouteAgentPreview {
 		t.Fatalf("chat route after open-scope override = %q, want agent preview", got)
+	}
+}
+
+// TestSummaryWorkspaceClarificationReplyMixedSource pins the mixed clarification
+// reply arm at reply level (P1-2, reviews 5479094697 / 5478721451): with every
+// source authorized the reply must NOT tell the user to select a chat (the
+// response payload echoes the authorized chat back), and must name the actual
+// state plus the way out. The other ladder arms keep their original copy.
+func TestSummaryWorkspaceClarificationReplyMixedSource(t *testing.T) {
+	mixed := summaryWorkspaceContext{
+		Documents:        []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}},
+		SelectedChannels: []summaryWorkspaceChannel{{ChatID: "group-1", ChatType: "group", Name: "项目群"}},
+	}
+	got := summaryWorkspaceClarificationReply(mixed, true, true, true, "", true)
+	want := "已收到你对所选文档和会话的说明请求。混合来源暂不支持问答式解读，请直接输入总结要求（如：开始总结 + 要求），我会基于所选文档和会话生成总结。"
+	if got != want {
+		t.Fatalf("mixed valid-source clarification reply = %q, want %q", got, want)
+	}
+	if got == "请先选择一个你有权限的会话，再告诉我希望总结的内容。" {
+		t.Fatal("mixed valid-source reply must not fall through to the generic select-a-chat copy")
+	}
+	// Invalid mixed sources keep the unavailable-source copy.
+	if got := summaryWorkspaceClarificationReply(mixed, false, true, true, "", true); got != "部分所选会话不可用，请调整后重试。" {
+		t.Fatalf("mixed invalid-source reply = %q", got)
+	}
+	// Documents-only explain keeps its dedicated copy.
+	docsOnly := summaryWorkspaceContext{Documents: mixed.Documents}
+	if got := summaryWorkspaceClarificationReply(docsOnly, true, true, true, "", true); got != "文档问答/解释暂不支持，请输入总结要求后生成文档总结。" {
+		t.Fatalf("docs-only explain reply = %q", got)
+	}
+	// No sources at all keeps the generic fallback.
+	if got := summaryWorkspaceClarificationReply(summaryWorkspaceContext{}, true, true, true, "", true); got != "请先选择一个你有权限的会话，再告诉我希望总结的内容。" {
+		t.Fatalf("empty-scope reply = %q", got)
+	}
+}
+
+// TestWorkspaceMessageHasExplicitRun pins the message-level explicit-run signal
+// (P1-1 wiring): explain-keyword/？ text with a run command stays true; pure
+// questions stay false; negations stay false even with command words.
+func TestWorkspaceMessageHasExplicitRun(t *testing.T) {
+	for _, m := range []string{
+		"开始总结：本周风险的来源是什么？", // execute command + requirement suffix
+		"总结一下这份文档的依据",      // run keyword + explain keyword
+	} {
+		if !workspaceMessageHasExplicitRun(m) {
+			t.Fatalf("workspaceMessageHasExplicitRun(%q) = false, want true", m)
+		}
+	}
+	for _, m := range []string{
+		"这些内容有什么区别？",      // pure question
+		"先不要生成总结，我还要补充要求", // negation
+	} {
+		if workspaceMessageHasExplicitRun(m) {
+			t.Fatalf("workspaceMessageHasExplicitRun(%q) = true, want false", m)
+		}
 	}
 }

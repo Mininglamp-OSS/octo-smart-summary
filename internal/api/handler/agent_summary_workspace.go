@@ -357,7 +357,12 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		return
 	}
 	explicitRunIntent := intent == service.SummaryIntentGenerate && summaryWorkspaceExecutionAuthorized(req.InputOrigin)
-	route := deriveWorkspaceRoute(contextValue, action, intent, explicitRunIntent, selectedSourceExplicit, hasRequirement, openScopeAgent, begin.Snapshot, validation.participantsValid, validation.sourcesValid, validation.referencesValid)
+	// Message-level explicit-run signal (P1-1 fix): independent of the derived
+	// intent, so an explain-classified message that still carries an explicit
+	// run instruction (typed command with requirement suffix, template /
+	// system_intent execute command) keeps its workflow route.
+	explicitRunMessage := workspaceMessageHasExplicitRun(req.Message)
+	route := deriveWorkspaceRoute(contextValue, action, intent, explicitRunIntent, explicitRunMessage, selectedSourceExplicit, hasRequirement, openScopeAgent, begin.Snapshot, validation.participantsValid, validation.sourcesValid, validation.referencesValid)
 	// A possible conversational scope change must pass through the Agent before
 	// any side-effecting workflow consumes it.
 	route = workspaceRouteAfterOpenScopeAgentOverride(contextValue, route, openScopeAgent, begin.Snapshot)
@@ -381,22 +386,7 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 	case service.SummaryRouteAgentPreview, service.SummaryRouteAgentRevision, service.SummaryRouteExplanation:
 		snapshot, err = h.completeWorkspaceAgentTurn(c.Request.Context(), responder, key, begin.Turn.ID, begin.Turn.Attempt, req, contextValue, begin.Snapshot, route, openScopeAgent, inferredSource)
 	default:
-		reply := "请先选择一个你有权限的会话，再告诉我希望总结的内容。"
-		if len(contextValue.Documents) > 0 && len(contextValue.SelectedChannels) > 0 && !validation.sourcesValid {
-			reply = "部分所选会话不可用，请调整后重试。"
-		} else if len(contextValue.Documents) > 0 && len(contextValue.Participants) > 0 {
-			reply = "文档总结暂不支持多人协作，请移除参与者后再生成。"
-		} else if len(contextValue.Documents) > 0 && len(contextValue.SelectedChannels) == 0 {
-			reply = "文档问答/解释暂不支持，请输入总结要求后生成文档总结。"
-		} else if len(contextValue.ReferencedTaskIDs) > 0 && !validation.referencesValid {
-			reply = "部分引用总结不可用，请调整后重试。"
-		} else if len(contextValue.Participants) > 0 && !validation.participantsValid {
-			reply = summaryWorkspaceTeamScopeMessage(validation.teamScopeReason)
-		} else if len(contextValue.Participants) > 0 && !hasRequirement {
-			reply = "请选择模板或输入总结要求后再开始多人总结。"
-		} else if len(contextValue.SelectedChannels) > 0 && !validation.sourcesValid {
-			reply = "当前会话不可访问，请重新选择会话。"
-		}
+		reply := summaryWorkspaceClarificationReply(contextValue, validation.sourcesValid, validation.referencesValid, validation.participantsValid, validation.teamScopeReason, hasRequirement)
 		snapshot, err = h.completeWorkspaceConversation(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, req, workspaceResultClarification, reply, &contextValue)
 	}
 	if err != nil {
@@ -1343,7 +1333,61 @@ func containsAny(value string, needles ...string) bool {
 	return false
 }
 
-func deriveWorkspaceRoute(context summaryWorkspaceContext, action service.SummaryAction, intent service.SummaryIntent, hasExplicitRunIntent, selectedSourceExplicit, hasRequirement, openScopeAgent bool, state WorkspaceSnapshot, participantsValid, sourcesValid, referencesValid bool) service.SummaryRoute {
+// summaryWorkspaceClarificationReply selects the clarification reply for a chat
+// turn routed to SummaryRouteClarification. Pure so the mixed-source arm is
+// directly pinnable at handler level (P1-2 fix, reviews 5479094697 /
+// 5478721451): the generic fallback told users to select a chat they had
+// already selected — the payload echoed the authorized chat back while the
+// copy denied it. The mixed arm names the actual state and the way out,
+// consistent with the plan's mixed flow (§4.2).
+func summaryWorkspaceClarificationReply(context summaryWorkspaceContext, sourcesValid, referencesValid, participantsValid bool, teamScopeReason string, hasRequirement bool) string {
+	reply := "请先选择一个你有权限的会话，再告诉我希望总结的内容。"
+	if len(context.Documents) > 0 && len(context.SelectedChannels) > 0 && sourcesValid {
+		// Mixed explain/clarification with every source authorized (P1-2 fix,
+		// reviews 5479094697 / 5478721451): the generic fallback told the user
+		// to select a chat they had already selected — the response payload
+		// echoed the authorized chat back while the copy denied it. Name the
+		// actual state and the way out instead (plan §4.2).
+		reply = "已收到你对所选文档和会话的说明请求。混合来源暂不支持问答式解读，请直接输入总结要求（如：开始总结 + 要求），我会基于所选文档和会话生成总结。"
+	} else if len(context.Documents) > 0 && len(context.SelectedChannels) > 0 && !sourcesValid {
+		reply = "部分所选会话不可用，请调整后重试。"
+	} else if len(context.Documents) > 0 && len(context.Participants) > 0 {
+		reply = "文档总结暂不支持多人协作，请移除参与者后再生成。"
+	} else if len(context.Documents) > 0 && len(context.SelectedChannels) == 0 {
+		reply = "文档问答/解释暂不支持，请输入总结要求后生成文档总结。"
+	} else if len(context.ReferencedTaskIDs) > 0 && !referencesValid {
+		reply = "部分引用总结不可用，请调整后重试。"
+	} else if len(context.Participants) > 0 && !participantsValid {
+		reply = summaryWorkspaceTeamScopeMessage(teamScopeReason)
+	} else if len(context.Participants) > 0 && !hasRequirement {
+		reply = "请选择模板或输入总结要求后再开始多人总结。"
+	} else if len(context.SelectedChannels) > 0 && !sourcesValid {
+		reply = "当前会话不可访问，请重新选择会话。"
+	}
+	return reply
+}
+
+// workspaceMessageHasExplicitRun is the message-level explicit-run signal the
+// mixed-explain demotion keys on (P1-1 fix). Extracted so the signal itself is
+// pinnable; the handler call site passes req.Message through this. A mutant
+// that hardcodes the signal false is killed by
+// TestWorkspaceMessageHasExplicitRun; the route-level rows in
+// TestDeriveWorkspaceRouteMixedExplain pin the parameter semantics.
+func workspaceMessageHasExplicitRun(message string) bool {
+	return hasExplicitSummaryRunIntent(message) || hasExplicitSummaryExecutionCommand(message)
+}
+
+// deriveWorkspaceRoute takes hasExplicitRunMessage — a message-level signal
+// (hasExplicitSummaryRunIntent || hasExplicitSummaryExecutionCommand) — NOT the
+// derived hasExplicitRunIntent flag: that flag is `intent == Generate &&
+// authorized(origin)`, which inside the Explain arm is tautologically false
+// (review 5479094697 P1-1 / 5478721451 P1). The message-level signal carries
+// real information: "总结这份文档和群聊的核心结论、依据和下一步" classifies
+// Explain (it contains 依据) yet is an explicit generate request, and template /
+// system_intent requirements with explain keywords must keep executing (plan
+// §3.1/§4.3). The demotion therefore only fires for explain-classified turns
+// that carry no explicit run instruction of their own.
+func deriveWorkspaceRoute(context summaryWorkspaceContext, action service.SummaryAction, intent service.SummaryIntent, hasExplicitRunIntent, hasExplicitRunMessage, selectedSourceExplicit, hasRequirement, openScopeAgent bool, state WorkspaceSnapshot, participantsValid, sourcesValid, referencesValid bool) service.SummaryRoute {
 	if len(context.Documents) > 0 {
 		mixedChat := len(context.SelectedChannels) > 0
 		switch {
@@ -1354,11 +1398,16 @@ func deriveWorkspaceRoute(context summaryWorkspaceContext, action service.Summar
 			// instead of silently dropping the chat or skipping the workflow.
 			// The permission result must gate workflow creation (plan §4.3).
 			return service.SummaryRouteClarification
-		case intent == service.SummaryIntentExplain && !hasExplicitRunIntent:
+		case intent == service.SummaryIntentExplain && !hasExplicitRunMessage:
 			// Explanation/negated-run turns are non-executing for every document
 			// scope shape, including mixed document+chat. Chats make the generated
 			// summary possible; they do not override an explicit "do not generate"
-			// or ordinary explanation question into a worker side effect.
+			// or ordinary explanation question into a worker side effect. A turn
+			// whose message itself carries an explicit run instruction (the UI
+			// execute command, or typed text like "开始总结：…来源是什么？") still
+			// executes — the keyword/？ classifier runs before the explicit-run
+			// check, so Explain classification alone proves nothing about intent
+			// (review 5479094697 P1-1 / 5478721451 P1 / 5478721451 R6 escalation).
 			return service.SummaryRouteClarification
 		case mixedChat:
 			return service.SummaryRoutePersonalWorkflow
