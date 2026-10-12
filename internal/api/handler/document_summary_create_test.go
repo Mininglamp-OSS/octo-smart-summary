@@ -4,15 +4,18 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/gin-gonic/gin"
 )
 
 type recordingDocumentSourceClient struct {
@@ -178,6 +181,69 @@ func TestSummaryWorkspaceDocumentWorkflowPersistsSnapshots(t *testing.T) {
 	defer client.mu.Unlock()
 	if client.tokens["d_1"] != "creator1" {
 		t.Fatalf("forwarded token = %q, want creator1", client.tokens["d_1"])
+	}
+}
+
+// Pin the handler wiring from normalized input_origin through the explicit-run
+// signal into route derivation. A template requirement may classify as Explain,
+// but clicking the template is a trusted submit action and must create the
+// mixed workflow promised by the contract instead of persisting clarification.
+func TestSummaryWorkspaceMixedExplainTemplateCreatesWorkflow(t *testing.T) {
+	db, _ := setupTestDBs(t)
+	imDB := newSummaryWorkspaceIMValidationDB(t)
+	if err := db.AutoMigrate(
+		&model.AgentMessage{},
+		&model.AgentSummarySession{},
+		&model.AgentSummaryTurn{},
+		&model.SummaryWorkflowIdempotency{},
+	); err != nil {
+		t.Fatalf("migrate workspace tables: %v", err)
+	}
+	client := &recordingDocumentSourceClient{docs: map[string]*documentSummarySource{
+		"d_1": {DocumentID: "d_1", Title: "Workbench方案", Version: "v1", Content: "文档正文"},
+	}}
+	store := NewAgentWorkspaceStore(db)
+	h := &AgentChatHandler{
+		workspaceEntryEnabled: true,
+		documentClient:        client,
+		workspace: &summaryWorkspaceCoordinator{
+			db: db, imDB: imDB, store: store,
+			workflow: service.NewSummaryWorkflowService(db, imDB, 31, 90),
+		},
+	}
+	requirement := "请说明一下本周风险"
+	req := agentChatRequest{
+		Message:      requirement,
+		SessionID:    "mixed-template-explain",
+		RequestID:    "mixed-template-explain-1",
+		Action:       string(service.SummaryActionChat),
+		ScopeVersion: 1,
+		SummaryContext: summaryWorkspaceContext{
+			SelectedChannels: []summaryWorkspaceChannel{{ChatID: "group-a", ChatType: "group", Name: "A群"}},
+			Documents:        []summaryWorkspaceDocument{{DocumentID: "d_1", Title: "Workbench方案"}},
+			Template:         &summaryWorkspaceTemplate{TemplateID: "risk", Label: "风险复盘", Requirement: requirement},
+		},
+	}
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/agent/summary-workspace/chat", nil)
+	c.Request.Header.Set("Token", "actor")
+	c.Set("user_id", "actor")
+	c.Set("space_id", "space-a")
+	h.handleSummaryWorkspaceChat(c, req, false)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	snapshot, err := store.LoadSnapshot(context.Background(), WorkspaceSessionKey{SpaceID: "space-a", UserID: "actor", SessionID: req.SessionID})
+	if err != nil {
+		t.Fatalf("load workspace snapshot: %v", err)
+	}
+	if snapshot.Session.WorkflowTaskID == 0 || snapshot.Session.State != workspaceResultWorkflowStarted {
+		payload, _ := json.Marshal(snapshot.Session)
+		t.Fatalf("template explain did not create workflow: %s", payload)
 	}
 }
 
