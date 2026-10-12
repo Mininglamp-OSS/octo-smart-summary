@@ -64,7 +64,19 @@ returns `enabled: true` and `contract_version: "2"`.
   Whitespace is normalized within commands; ideographic commas and dashes
   separate clauses. Embedded quoted text is not interpreted as a cancellation,
   including punctuation inside the quotation; a wholly quoted submission is
-  treated as the user's instruction. This bounded grammar is tested against
+  treated as the user's instruction. Clauses containing embedded quoted data
+  are excluded from cancellation matching, rather than substituting a text
+  sentinel. Rich-text U+FFFC placeholders are ignored. Quote boundaries are
+  indexed in linear time, including unmatched openers. This applies only to
+  cancellation: affirmative quoted-text classification retains its existing
+  behavior and is not a new execution-authorization guarantee.
+  Common trailing particles, politeness tails and presentation punctuation
+  are normalized before classifying the object (`不要总结哦`,
+  `不要总结了吧`, `don't summarize please`). The same decorations must not
+  turn `不要生成表格` into cancellation. Whole-scope ambiguity such as
+  `不要总结全部` / `不要总结全部内容` consistently asks for clarification;
+  it does not silently remove selected sources or guess a subset.
+  This bounded grammar is tested against
   the literal request corpus, not general-purpose natural-language detection. Otherwise,
   document+chat submissions start a personal Workflow even when phrased as
   questions. This mixed-question execution behavior is retained for compatibility.
@@ -78,6 +90,12 @@ returns `enabled: true` and `contract_version: "2"`.
 - Mixed conversational question-answering is not implemented by this contract.
   Separating it from execution would require a future structured personal
   execution action, which is not currently exposed.
+- The shared classifier also changes chat-only content constraints such as
+  `不要生成表格` from Explain to Generate. User-authored turns still use the
+  conversational Agent preview path; matching template submissions can execute
+  when the normal route requirements hold. A non-command `system_intent`
+  declaration downgrades to user. This is a classification compatibility
+  change, not additional dispatch authority, and is covered separately.
 - `action: "start_team_workflow"` remains the explicit trusted team execution
   entry point and is not changed by the conversational routing rule above.
 

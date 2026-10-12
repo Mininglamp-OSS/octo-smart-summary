@@ -25,6 +25,7 @@ func TestDocumentSubmissionHandler(t *testing.T) {
 		wantTopic                  string
 		template                   *summaryWorkspaceTemplate
 		documentsOnly, invalidChat bool
+		chatOnly                   bool
 		clarifies, rejects         bool
 		unregisteredTemplate       bool
 		participants, references   bool
@@ -58,6 +59,10 @@ func TestDocumentSubmissionHandler(t *testing.T) {
 		{name: "verified system", message: "请根据当前选择生成总结", origin: summaryWorkspaceInputSystemIntent, documentsOnly: true},
 		{name: "verified document template", message: template.Requirement, template: template, origin: summaryWorkspaceInputTemplate, documentsOnly: true},
 		{name: "inferred mixed template", message: template.Requirement, template: template},
+		{name: "chat template content constraint", chatOnly: true, message: "请总结会议要点，不要生成行动项",
+			origin: summaryWorkspaceInputTemplate, template: &summaryWorkspaceTemplate{TemplateID: "chat-content", Label: "会议", Requirement: "请总结会议要点，不要生成行动项"}},
+		{name: "chat inferred template content constraint", chatOnly: true, message: "不要生成表格",
+			template: &summaryWorkspaceTemplate{TemplateID: "chat-table", Label: "格式", Requirement: "不要生成表格"}},
 	}
 	// The reviewer examples must traverse normalization, authorization and
 	// task creation, not merely exercise the route helper with made-up flags.
@@ -129,6 +134,9 @@ func TestDocumentSubmissionHandler(t *testing.T) {
 				req.SummaryContext.SelectedChannels = nil
 			} else if tc.invalidChat {
 				req.SummaryContext.SelectedChannels[0].ChatID = "inaccessible-group"
+			}
+			if tc.chatOnly {
+				req.SummaryContext.Documents = nil
 			}
 			if tc.participants {
 				req.SummaryContext.Participants = []summaryWorkspaceParticipant{{UserID: "other"}}
@@ -237,7 +245,11 @@ func TestDocumentSubmissionHandler(t *testing.T) {
 			if wantTopic == "" {
 				wantTopic = tc.message
 			}
-			if task.Topic != wantTopic || task.OriginChannelID != "" {
+			wantOrigin := ""
+			if tc.chatOnly {
+				wantOrigin = "group-a" // Existing chat-only origin behavior.
+			}
+			if task.Topic != wantTopic || task.OriginChannelID != wantOrigin {
 				t.Fatalf("wrong requirement or automatic origin: %+v", task)
 			}
 			var sources []model.SummarySource
@@ -245,7 +257,7 @@ func TestDocumentSubmissionHandler(t *testing.T) {
 				t.Fatal(err)
 			}
 			wantSources := 2
-			if tc.documentsOnly {
+			if tc.documentsOnly || tc.chatOnly {
 				wantSources = 1
 			}
 			if len(sources) != wantSources {
@@ -266,8 +278,16 @@ func TestDocumentSubmissionHandler(t *testing.T) {
 					foundChat = true
 				}
 			}
-			if !foundDocument || (!tc.documentsOnly && !foundChat) {
+			if foundDocument != !tc.chatOnly || (!tc.documentsOnly && !foundChat) {
 				t.Fatalf("source class lost: %+v", sources)
+			}
+			if tc.chatOnly {
+				client.mu.Lock()
+				fetches := len(client.tokens)
+				client.mu.Unlock()
+				if fetches != 0 {
+					t.Fatalf("chat-only turn fetched %d documents", fetches)
+				}
 			}
 			// An identical request replays the existing result, not a new task.
 			if replay := call(); replay.Code != http.StatusOK {

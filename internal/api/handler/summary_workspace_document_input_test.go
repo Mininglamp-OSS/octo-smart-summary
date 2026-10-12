@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -91,6 +92,40 @@ func TestTypedChatExecutionCommandRemainsConversational(t *testing.T) {
 	}
 }
 
+func TestTypedChatContentConstraintOriginBoundary(t *testing.T) {
+	for _, message := range []string{"不要生成表格", "请总结会议要点，不要生成行动项"} {
+		for _, tc := range []struct {
+			origin string
+			want   service.SummaryRoute
+		}{
+			{summaryWorkspaceInputUser, service.SummaryRouteAgentPreview},
+			{summaryWorkspaceInputTemplate, service.SummaryRoutePersonalWorkflow},
+			// A non-command system declaration downgrades to conversational user.
+			{summaryWorkspaceInputSystemIntent, service.SummaryRouteAgentPreview},
+		} {
+			scope := summaryWorkspaceContext{
+				SelectedChannels: []summaryWorkspaceChannel{{ChatID: "group-a", ChatType: "group"}},
+				Template:         &summaryWorkspaceTemplate{TemplateID: "content", Requirement: message},
+			}
+			origin, err := normalizeSummaryWorkspaceInputOrigin(tc.origin, scope, message)
+			if err != nil {
+				t.Fatal(err)
+			}
+			intent := classifySummaryWorkspaceIntent(message, false)
+			open := summaryWorkspaceShouldOpenScopeAgent(service.SummaryActionChat, origin, intent)
+			route := deriveWorkspaceRoute(workspaceRouteInput{
+				Context: scope, Action: service.SummaryActionChat, Intent: intent,
+				SelectedSourceExplicit: true, HasRequirement: true, OpenScopeAgent: open,
+				ParticipantsValid: true, SourcesValid: true, ReferencesValid: true,
+			})
+			route = workspaceRouteAfterOpenScopeAgentOverride(scope, route, open, WorkspaceSnapshot{})
+			if route != tc.want {
+				t.Fatalf("message=%q origin=%s route=%s want=%s", message, tc.origin, route, tc.want)
+			}
+		}
+	}
+}
+
 var documentScopedNegationRequests = []string{
 	"总结一下这些文档和群聊的风险，不要生成行动项",
 	"帮我总结文档和会话，不需要总结附件内容",
@@ -163,6 +198,62 @@ var documentExecutionNegations = []string{
 	"先不要生成完整总结", "🙏 先不要总结", "“先不要总结”",
 	`"先不要总结"`, "'先不要总结'", "不用生成总结", "不要再生成总结",
 	"please do not summarize these documents",
+	"不要总结哦", "不要总结啦", "不要总结了吧", "请先不要总结哦",
+	"不要总结呢", "不要总结呀", "不要总结啊", "不要总结~", "不要总结……",
+	"不要生成总结哦", "别总结这些内容啦", "不要总结谢谢", "不要总结好吗",
+	"不要总结行吗", "不要总结可以吗", "不要总结ok", "don't summarize please",
+	"劳驾先不要总结", "拜托先别总结", "烦请不要生成总结", "眼下不要总结",
+	"我的意思是不要总结", "结论是不要生成总结", "所以不要总结这些文档",
+	"【先不要总结】", "-- 先不要总结",
+	"\uFFFC不要总结", "不要总结\uFFFC", "不要总结\uFFFC这些内容",
+	"不要总结全部", "不要总结全部内容", "不要总结全部文档",
+	"不要总结嘛", "不要总结哈", "不要总结呗", "不要总结咯", "不要总结喔",
+	"don't summarize thanks", "don't summarize ok",
+}
+
+func TestDocumentCancellationDecorations(t *testing.T) {
+	// Metamorphic checks: presentation/politeness must not change the object.
+	for _, tc := range []struct {
+		message string
+		want    bool
+	}{
+		{"不要总结", true}, {"不要生成总结", true}, {"别总结这些文档", true},
+		{"不要生成表格", false}, {"不要生成行动项", false}, {"不需要总结附件内容", false},
+		{"不要生成正式总结表格", false},
+	} {
+		for _, prefix := range []string{"", "请你先", "🙏 ", "-- ", "【", "\uFFFC"} {
+			for _, suffix := range []string{"", "哦", "了吧", "谢谢", "可以吗", "……", "】", "\uFFFC", "哦，谢谢！"} {
+				message := prefix + tc.message + suffix
+				if got := hasNegatedSummaryRunIntent(message); got != tc.want {
+					t.Errorf("%q: got %t want %t", message, got, tc.want)
+				}
+			}
+		}
+	}
+}
+
+func TestDocumentQuotedCancellationBoundaries(t *testing.T) {
+	for _, message := range []string{
+		`文档写着“说明。不要总结”，请总结`,
+		`文档写着“说明。不要总结。结束”，请总结`,
+		`不要总结“附件内容”，请总结正文`,
+		`请总结文档，内容是"说明。不要总结"`,
+	} {
+		if hasNegatedSummaryRunIntent(message) {
+			t.Errorf("quoted data became cancellation: %q", message)
+		}
+	}
+}
+
+func BenchmarkDocumentUnclosedQuotes(b *testing.B) {
+	for _, size := range []int{1024, 8192} {
+		message := strings.Repeat("“", size)
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				hasNegatedSummaryRunIntent(message)
+			}
+		})
+	}
 }
 
 func TestDocumentNegationDistinguishesExecutionFromContent(t *testing.T) {
