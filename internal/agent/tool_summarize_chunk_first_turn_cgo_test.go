@@ -268,16 +268,28 @@ func TestSummarizeChunkManifestMissesRecordedAsDropped(t *testing.T) {
 		t.Fatalf("summarize_chunk: %v", err)
 	}
 	var result struct {
-		InputCount     int  `json:"input_count"`
-		ProcessedCount int  `json:"processed_count"`
-		DroppedCount   int  `json:"dropped_count"`
-		Truncated      bool `json:"truncated"`
+		SummaryHandle  string `json:"summary_handle"`
+		InputCount     int    `json:"input_count"`
+		ProcessedCount int    `json:"processed_count"`
+		DroppedCount   int    `json:"dropped_count"`
+		Truncated      bool   `json:"truncated"`
 	}
 	if err := json.Unmarshal([]byte(out), &result); err != nil {
 		t.Fatalf("decode result: %v; out=%s", err, out)
 	}
 	if result.InputCount != 2 || result.ProcessedCount != 0 || result.DroppedCount != 2 || !result.Truncated {
 		t.Fatalf("coverage result = %+v, want input=2 processed=0 dropped=2 truncated=true", result)
+	}
+	store, err := summaryHandleStoreFromContext(toolCtx)
+	if err != nil {
+		t.Fatalf("load request-scoped summary store: %v", err)
+	}
+	resolved, err := store.ResolveAll([]string{result.SummaryHandle})
+	if err != nil {
+		t.Fatalf("resolve manifest-miss summary: %v", err)
+	}
+	if len(resolved.Entries) != 1 || resolved.Entries[0].Text != "无可总结内容"+mapCoverageGapNotice {
+		t.Fatalf("manifest-miss summary must disclose the coverage gap, got %+v", resolved.Entries)
 	}
 
 	reloaded, err := summaryrun.NewStore(db).GetByID(ctx, uid, run.RunID)

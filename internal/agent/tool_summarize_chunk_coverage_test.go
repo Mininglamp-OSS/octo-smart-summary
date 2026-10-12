@@ -141,8 +141,8 @@ func TestCoverage_NoSilentLoss(t *testing.T) {
 			if cov.Truncated {
 				t.Fatal("truncated = true, want false when nothing dropped")
 			}
-			// And every chunk the production splitter emitted respects the
-			// hard backstop — the bound the handler depends on.
+			// For these ordinary-size cases the fan-out floor does not need to
+			// exceed the model-facing backstop.
 			msgMaps := makeMsgMaps(c.input)
 			cfg := config.Config{}
 			for i, chunk := range splitMsgMapsByTokenBudget(msgMaps,

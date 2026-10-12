@@ -49,6 +49,10 @@ type Processor struct {
 	// Test-only retrieval seam: execute the real generation/finalization pipeline
 	// with deterministic already-authorized messages, without an external IM DB.
 	fetchPersonalMessagesFn func(context.Context, model.SummaryTask, string) ([]pipeline.Message, *pipeline.IntentResult, error)
+	// Test-only Map seam: drive the real chunk orchestration and fatal/partial
+	// policy without constructing an external LLM server. Production leaves it
+	// nil and uses the mode-specific service.LLMClient methods.
+	mapChunkFn func(context.Context, int, []string) (string, int, string, error)
 	// notifier delivers the terminal-state (Completed/Failed) IM-bot notification
 	// after a task's status is durably committed. nil = disabled (OnTaskTerminal
 	// is a no-op), so it is safe to call unconditionally.

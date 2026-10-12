@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -51,9 +52,16 @@ func TestMarshalRequest_NoHTMLEscapeInflation(t *testing.T) {
 		t.Errorf("MarshalRequest left a trailing newline: %q", gotStr)
 	}
 
-	// 3. Still valid JSON that round-trips the content.
-	if !strings.Contains(gotStr, "a<b>c&d") {
-		t.Errorf("round-trip lost the message content: %s", gotStr)
+	// 3. Still valid JSON that semantically round-trips the content.
+	var roundTrip struct {
+		Model    string              `json:"model"`
+		Messages []llmclient.Message `json:"messages"`
+	}
+	if err := json.Unmarshal(got, &roundTrip); err != nil {
+		t.Fatalf("MarshalRequest produced invalid JSON: %v; body=%s", err, gotStr)
+	}
+	if roundTrip.Model != "test-model" || len(roundTrip.Messages) != 1 || roundTrip.Messages[0].Content != "a<b>c&d" {
+		t.Errorf("round-trip mismatch: %+v", roundTrip)
 	}
 
 	// 4. Residual inflation is real: U+2028 / U+2029 are escaped

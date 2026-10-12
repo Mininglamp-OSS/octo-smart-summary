@@ -800,9 +800,17 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 // The truncation half is matched by errors.Is on the service sentinels rather
 // than by text, so it stays correct no matter how the wrapper's wording is
 // edited, and an unrelated error that merely quotes the word cannot satisfy it.
-func isFatalMapError(err error) bool {
+type fatalMapErrorKind string
+
+const (
+	fatalMapRequestTooLarge fatalMapErrorKind = "request too large"
+	fatalMapOutputTruncated fatalMapErrorKind = "output truncated"
+	fatalMapReasoningBudget fatalMapErrorKind = "reasoning budget exhausted"
+)
+
+func classifyFatalMapError(err error) fatalMapErrorKind {
 	if err == nil {
-		return false
+		return ""
 	}
 	// ErrRequestTooLarge (#241 item 1) is fatal on the agent path
 	// (isFatalChunkError); the mirrors claim alignment, so the worker must
@@ -810,12 +818,19 @@ func isFatalMapError(err error) bool {
 	// oversized request cannot shrink on retry, and dropping it silently
 	// loses coverage (round-5 P2, yujiawei 5478968340).
 	if errors.Is(err, service.ErrRequestTooLarge) {
-		return true
+		return fatalMapRequestTooLarge
 	}
 	if errors.Is(err, service.ErrOutputTruncated) || errors.Is(err, service.ErrStreamOutputTruncated) {
-		return true
+		return fatalMapOutputTruncated
 	}
-	return strings.Contains(err.Error(), "reasoning budget exhausted")
+	if strings.Contains(err.Error(), "reasoning budget exhausted") {
+		return fatalMapReasoningBudget
+	}
+	return ""
+}
+
+func isFatalMapError(err error) bool {
+	return classifyFatalMapError(err) != ""
 }
 
 func (p *Processor) executePersonalPipeline(ctx context.Context, task model.SummaryTask, userID string, reportStage func(string), streamDelta func(string) error) (string, []model.Citation, int, int, string, error) {
@@ -1289,11 +1304,11 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	} else {
 		// Normal Map-Reduce flow
 		type chunkResult struct {
-			summary string
-			tokens  int
-			model   string
-			failed  bool
-			fatal   bool
+			summary   string
+			tokens    int
+			model     string
+			failed    bool
+			fatalKind fatalMapErrorKind
 		}
 
 		concurrency := p.cfg.WorkerMapConcurrency
@@ -1343,7 +1358,9 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 				var tokens int
 				var usedModel string
 				var err error
-				if len(chunks) == 1 && documentMode {
+				if p.mapChunkFn != nil {
+					summary, tokens, usedModel, err = p.mapChunkFn(ctx, idx, formatted)
+				} else if len(chunks) == 1 && documentMode {
 					summary, tokens, usedModel, err = p.llm.CallDocumentMapStreamWithModel(ctx,
 						joinStrings(formatted), sourceName, idx, len(c), generationTopic, streamDelta)
 				} else if len(chunks) == 1 && mixedMode {
@@ -1371,7 +1388,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 				timing.RecordLLMSince(taskNo, fmt.Sprintf("Map: 分块总结 chunk#%d", idx), callStart, tokens)
 				if err != nil {
 					log.Printf("[personal-worker] Map chunk %d failed: %v", idx, err)
-					results[idx] = chunkResult{failed: true, fatal: isFatalMapError(err)}
+					results[idx] = chunkResult{failed: true, fatalKind: classifyFatalMapError(err)}
 				} else {
 					results[idx] = chunkResult{summary: summary, tokens: tokens, model: usedModel}
 				}
@@ -1386,15 +1403,20 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 			return "", nil, 0, 0, "", fmt.Errorf("map phase cancelled: %w", ctx.Err())
 		}
 
-		var fatalChunks []int
+		fatalChunks := map[fatalMapErrorKind][]int{}
 		for i, r := range results {
-			if r.fatal {
-				fatalChunks = append(fatalChunks, i)
+			if r.fatalKind != "" {
+				fatalChunks[r.fatalKind] = append(fatalChunks[r.fatalKind], i)
 			}
 		}
-		if len(fatalChunks) > 0 {
-			return "", nil, 0, 0, "", fmt.Errorf(
-				"Map phase aborted: output truncated or reasoning budget exhausted on chunk(s) %v", fatalChunks)
+		if len(fatalChunks) != 0 {
+			parts := make([]string, 0, len(fatalChunks))
+			for _, kind := range []fatalMapErrorKind{fatalMapRequestTooLarge, fatalMapOutputTruncated, fatalMapReasoningBudget} {
+				if chunks := fatalChunks[kind]; len(chunks) != 0 {
+					parts = append(parts, fmt.Sprintf("%s on chunk(s) %v", kind, chunks))
+				}
+			}
+			return "", nil, 0, 0, "", fmt.Errorf("Map phase aborted: %s", strings.Join(parts, "; "))
 		}
 
 		var chunkSummaries []string
@@ -1405,7 +1427,10 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 			// mixed task, because the surviving chunks may cover only one
 			// evidence class (e.g. the chunk holding all document evidence
 			// fails → a chat-only summary would masquerade as the mixed
-			// result). Chat/document keep the marker-and-continue contract.
+			// result). Chat/document keep the marker-and-continue contract for
+			// ordinary per-chunk failures, but irrecoverable fatal errors above
+			// (request too large, exhausted truncation/reasoning budget) abort every
+			// task shape because retrying or silently dropping them loses coverage.
 			for i, r := range results {
 				if r.failed || strings.Contains(r.summary, service.MapFailedMarker) {
 					return "", nil, 0, 0, "", fmt.Errorf(

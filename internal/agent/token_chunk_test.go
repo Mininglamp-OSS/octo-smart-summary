@@ -255,7 +255,9 @@ func TestSplitBackstopCapsMaxMsgs(t *testing.T) {
 	if dropped != 0 || capped != 0 {
 		t.Fatalf("model over-request must not drop: dropped=%d capped=%d", dropped, capped)
 	}
-	_ = chunksN
+	if chunksN < 1 {
+		t.Fatalf("model over-request produced %d chunks, want at least 1", chunksN)
+	}
 	// A modest explicit cap below the backstop still wins.
 	chunks = splitMsgMapsByTokenBudget(msgs, 10_000_000, 100, 2, 4)
 	if len(chunks) != 12 { // 1200 / 100
@@ -404,23 +406,19 @@ func TestProbeChunkCoverageDetectsCapRegression(t *testing.T) {
 	}
 }
 
-// TestProbeChunkCoverageReflectsFanOutCap is the golden case for the #256 fan-out
-// cap: the SS-02 probe must SEE the cap (chunks reported post-cap, the capped-out
-// tail surfaced) AND classify it as INTENTIONAL, not silent loss. With
-// chunk_size=1 every message is its own chunk, so maxChunkCalls+overflow messages
-// split into more chunks than capChunks keeps. The capped tail shows up in both
-// dropped and the dedicated capped count, so dropped-capped==0 — the SS-02 gate
-// (harness.NoSilentLoss) treats a disclosed cap as no loss, matching production
-// where CappedDroppedCount is kept out of the silent-loss signal (#256 P2). A
-// genuine splitter regression would instead push dropped above capped and fire.
-func TestProbeChunkCoverageReflectsFanOutCap(t *testing.T) {
+// TestProbeChunkCoverageFloorPreventsHintManufacturedCap pins the ordinary-size
+// route: a tiny chunk_size hint is raised before splitting, so it cannot by
+// itself manufacture a fan-out drop. TestProbeChunkCoverageDefaultReportsFiringCap
+// covers a genuine cap firing driven by the token budget.
+func TestProbeChunkCoverageFloorPreventsHintManufacturedCap(t *testing.T) {
 	// Post-floor-fix invariant (B-1a, Jerry-Xin 5338024667 §3 / yujiawei
 	// 5337380127 P1 / mochashanyao 5338040645 P1): chunk_size=1 no longer
 	// manufactures a cap drop at ordinary sizes — floorMsgsPerChunk raises
 	// the per-chunk message count to ceil(n/256), so 300 messages split into
 	// ~150 chunks and NOTHING is dropped. The cap classification path (capped
-	// surfaced separately, dropped-capped==0) is pinned by TestCapChunks and
-	// the eval gate, which still drive genuine cap firings via tiny budgets.
+	// surfaced separately, dropped-capped==0) is pinned by
+	// TestProbeChunkCoverageDefaultReportsFiringCap and the eval gate, which
+	// still drive genuine cap firings via tiny budgets.
 	const overflow = 44
 	msgs := makeMsgMaps(maxChunkCalls + overflow)
 	processed, dropped, chunks, capped := ProbeChunkCoverageDefault(msgs, 1)

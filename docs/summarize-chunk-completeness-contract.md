@@ -107,8 +107,9 @@ flag-independent retry gate (§3). It matters only for **cap / manifest-miss**
 3. **blank** — count blank-success as processed (covered); keep it out of
    `dropped_count`/`truncated`. Pin: an all-success run with one blank chunk has
    `truncated=false`.
-4. **eval** — the SS-02 gate label reflects disclosed-to-user loss; a gap must
-   survive Reduce + final answer.
+4. **eval** — the SS-02 gate label reflects disclosed-to-user loss at the Map
+   result. Model-proof survival through Reduce + final answer at `V2=off` is
+   intentionally deferred to #267 (see §8).
 5. **cap** — per-invocation scope stated explicitly (schema/PR); per-request
    budget is a follow-up.
 

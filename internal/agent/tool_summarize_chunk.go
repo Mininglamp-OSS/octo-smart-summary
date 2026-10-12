@@ -143,7 +143,6 @@ func clampChunkSize(requested int) int {
 	return requested
 }
 
-
 // floorMsgsPerChunk is the B-1a floor fix (Jerry-Xin 5338024667 §3 closure /
 // yujiawei 5337380127 P1 / mochashanyao 5338040645 P1): the effective per-chunk
 // message count never drops below ceil(len(msgMaps)/maxChunkCalls). Without the
@@ -388,7 +387,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 					},
 					"chunk_size": map[string]interface{}{
 						"type":        "integer",
-						"description": fmt.Sprintf("可选：每片最大消息数（叠加在 token 预算之上，取值收敛到 [1, %d]，<=0 按 %d）；分片同时受 token 预算与消息数双重约束，且单次调用最多 %d 个分片，超出时保留最近的分片、丢弃更早的（chunk_calls_capped=true）。输入超过 %d 条消息时系统可能自动上调每片消息数以保证不丢弃。返回值含 input_count/processed_count/dropped_count/capped_dropped_count/oversized_message_count/failed_chunk_count/blank_chunk_count/chunk_calls_capped/truncated/chunk_size；truncated 或 failed_chunk_count>0 或 chunk_calls_capped 时表示覆盖不完整。dropped_count 只计意外丢失（仅引用清单外；分块失败会整体报错重试、空结果已计入 processed，均不会进入此字段），capped_dropped_count 单列因分片上限有意丢弃的消息数。", hardMessageBackstop, defaultChunkSize, maxChunkCalls, maxChunkCalls*hardMessageBackstop),
+						"description": fmt.Sprintf("可选：每片最大消息数（叠加在 token 预算之上，取值收敛到 [1, %d]，<=0 按 %d）；分片同时受 token 预算与消息数双重约束，且单次调用最多 %d 个分片，超出时保留最近的分片、丢弃更早的（chunk_calls_capped=true）。输入超过 %d 条消息时系统可能自动上调每片消息数以保证不丢弃。返回值含 input_count/processed_count/dropped_count/capped_dropped_count/oversized_message_count/failed_chunk_count/blank_chunk_count/chunk_calls_capped/truncated/chunk_size；truncated 或 chunk_calls_capped 时表示返回结果覆盖不完整。分块失败会使整次调用报错并要求重试，因此成功返回时 failed_chunk_count 恒为 0。dropped_count 只计意外丢失（仅引用清单外；分块失败会整体报错重试、空结果已计入 processed，均不会进入此字段），capped_dropped_count 单列因分片上限有意丢弃的消息数。", hardMessageBackstop, defaultChunkSize, maxChunkCalls, maxChunkCalls*hardMessageBackstop),
 					},
 				},
 				"required": []string{"messages_handle"},
@@ -486,7 +485,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 		if len(messages) == 0 {
 			if manifestMisses > 0 {
 				recordDroppedMessages(ctx, uid, runID, manifestMisses)
-				return marshalSummarizeChunkResult(ctx, "无可总结内容", 0, chunkCoverage{
+				return marshalSummarizeChunkResult(ctx, "无可总结内容"+mapCoverageGapNotice, 0, chunkCoverage{
 					InputCount:   inputCount,
 					DroppedCount: manifestMisses,
 					Truncated:    true,
