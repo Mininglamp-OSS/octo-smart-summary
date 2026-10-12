@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
@@ -358,11 +357,11 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		return
 	}
 	explicitRunIntent := intent == service.SummaryIntentGenerate && summaryWorkspaceExecutionAuthorized(req.InputOrigin)
-	// Message-level explicit-run signal (P1-1 fix): independent of the derived
-	// intent, so an explain-classified trusted submission or user command keeps
-	// its workflow route. Negation still dominates every origin and command.
-	explicitRunMessage := workspaceMessageHasExplicitRun(req.Message, req.InputOrigin)
-	route := deriveWorkspaceRoute(contextValue, action, intent, explicitRunIntent, explicitRunMessage, selectedSourceExplicit, hasRequirement, openScopeAgent, begin.Snapshot, validation.participantsValid, validation.sourcesValid, validation.referencesValid)
+	// Document-bearing execution is decided from verified structured context,
+	// not from a growing natural-language allowlist. normalizeSummaryWorkspaceInputOrigin
+	// has already cross-checked non-user origins against the submitted context.
+	structuredSubmit := req.InputOrigin == summaryWorkspaceInputTemplate || req.InputOrigin == summaryWorkspaceInputSystemIntent
+	route := deriveWorkspaceRoute(contextValue, action, intent, explicitRunIntent, structuredSubmit, hasNegatedSummaryRunIntent(req.Message), selectedSourceExplicit, hasRequirement, openScopeAgent, begin.Snapshot, validation.participantsValid, validation.sourcesValid, validation.referencesValid)
 	// A possible conversational scope change must pass through the Agent before
 	// any side-effecting workflow consumes it.
 	route = workspaceRouteAfterOpenScopeAgentOverride(contextValue, route, openScopeAgent, begin.Snapshot)
@@ -1273,12 +1272,9 @@ func classifySummaryWorkspaceIntent(message string, hasCurrentPreview bool) serv
 	return service.SummaryIntentGenerate
 }
 
-// hasExplicitSummaryRunIntent is the side-effect boundary for a personal
-// Workflow. Structured selections make the request executable, but they do
-// not by themselves authorize creating a formal summary. The user must still
-// click the execute affordance (which sends one of these explicit phrases) or
-// type an equivalent instruction. Ambiguous free-form text remains an Agent
-// preview, where it can be corrected before saving.
+// hasExplicitSummaryRunIntent is an advisory input to intent classification,
+// not an authorization boundary. Execution also depends on the structured
+// scope and origin rules in deriveWorkspaceRoute.
 func hasExplicitSummaryRunIntent(message string) bool {
 	message = strings.ToLower(strings.TrimSpace(message))
 	if message == "" || hasNegatedSummaryRunIntent(message) {
@@ -1293,31 +1289,6 @@ var summaryWorkspaceRunIntentPhrases = []string{
 	"创建总结", "输出总结", "整理成总结", "整理成周报", "整理成日报", "整理成月报",
 	"generate a summary", "create a summary", "produce a summary", "draft a summary", "start summary",
 	"prepare a team summary", "run the summary", "summarize",
-}
-
-// hasLeadingExplicitSummaryRunIntent keeps the broad run-intent vocabulary but
-// anchors it at the beginning of user-authored text. Chinese phrases can flow
-// directly into their object ("帮我总结这份文档"); ASCII phrases require a word
-// boundary so unrelated words such as "summarizer" do not authorize execution.
-func hasLeadingExplicitSummaryRunIntent(message string) bool {
-	message = strings.ToLower(strings.TrimSpace(message))
-	for _, phrase := range summaryWorkspaceRunIntentPhrases {
-		if !strings.HasPrefix(message, phrase) {
-			continue
-		}
-		if len(message) == len(phrase) {
-			return true
-		}
-		last, _ := utf8.DecodeLastRuneInString(phrase)
-		if last > unicode.MaxASCII {
-			return true
-		}
-		next, _ := utf8.DecodeRuneInString(message[len(phrase):])
-		if unicode.IsSpace(next) || strings.ContainsRune("：:，,。.!！?？\n\t", next) {
-			return true
-		}
-	}
-	return false
 }
 
 var summaryWorkspaceExecutionCommands = []string{
@@ -1370,29 +1341,20 @@ func containsAny(value string, needles ...string) bool {
 // consistent with the plan's mixed flow (§4.2).
 func summaryWorkspaceClarificationReply(context summaryWorkspaceContext, message string, sourcesValid, referencesValid, participantsValid bool, teamScopeReason string, hasRequirement bool) string {
 	reply := "请先选择一个你有权限的会话，再告诉我希望总结的内容。"
-	if len(context.Documents) > 0 && hasNegatedSummaryRunIntent(message) {
-		reply = "已按你的要求暂不生成总结。你可以继续调整所选文档、会话或总结要求。"
-	} else if len(context.Documents) > 0 && len(context.SelectedChannels) > 0 && sourcesValid {
-		// Mixed explain/clarification with every source authorized (P1-2 fix,
-		// reviews 5479094697 / 5478721451): the generic fallback told the user
-		// to select a chat they had already selected — the response payload
-		// echoed the authorized chat back while the copy denied it. Name the
-		// actual state and the way out instead (plan §4.2).
-		if hasRequirement {
-			reply = "已收到你的输入，但当前内容被识别为说明或问答请求。混合来源暂不支持问答式解读；如需生成总结，请以“开始总结：”开头确认执行。"
-		} else {
-			reply = "混合来源暂不支持问答式解读。请输入总结要求，并以“开始总结：”开头确认执行。"
-		}
+	if len(context.Documents) > 0 && len(context.Participants) > 0 {
+		// Scope/permission blockers take precedence over conversational copy so
+		// the response tells the user what must actually be fixed.
+		reply = "文档总结暂不支持多人协作，请移除参与者后再生成。"
 	} else if len(context.Documents) > 0 && len(context.SelectedChannels) > 0 && !sourcesValid {
 		reply = "部分所选会话不可用，请调整后重试。"
-	} else if len(context.Documents) > 0 && len(context.Participants) > 0 {
-		reply = "文档总结暂不支持多人协作，请移除参与者后再生成。"
-	} else if len(context.Documents) > 0 && len(context.SelectedChannels) == 0 {
-		reply = "文档问答/解释暂不支持，请输入总结要求后生成文档总结。"
 	} else if len(context.ReferencedTaskIDs) > 0 && !referencesValid {
 		reply = "部分引用总结不可用，请调整后重试。"
 	} else if len(context.Participants) > 0 && !participantsValid {
 		reply = summaryWorkspaceTeamScopeMessage(teamScopeReason)
+	} else if len(context.Documents) > 0 && hasNegatedSummaryRunIntent(message) {
+		reply = "已按你的要求暂不生成总结。你可以继续调整所选文档、会话或总结要求。"
+	} else if len(context.Documents) > 0 && len(context.SelectedChannels) == 0 {
+		reply = "文档问答/解释暂不支持，请输入总结要求后生成文档总结。"
 	} else if len(context.Participants) > 0 && !hasRequirement {
 		reply = "请选择模板或输入总结要求后再开始多人总结。"
 	} else if len(context.SelectedChannels) > 0 && !sourcesValid {
@@ -1401,31 +1363,12 @@ func summaryWorkspaceClarificationReply(context summaryWorkspaceContext, message
 	return reply
 }
 
-// workspaceMessageHasExplicitRun is the message-level explicit-run signal the
-// document Explain demotion keys on. Negation dominates the complete decision:
-// an execution-command prefix must never turn "开始总结：先不要生成" into a
-// worker side effect. Template/system_intent submissions are trusted submit
-// actions, while user free text must start with a recognized execution command;
-// loose summary-keyword substring matches are not a side-effect boundary.
-func workspaceMessageHasExplicitRun(message, inputOrigin string) bool {
-	if hasNegatedSummaryRunIntent(message) {
-		return false
-	}
-	if inputOrigin != summaryWorkspaceInputUser {
-		return true
-	}
-	return hasExplicitSummaryExecutionCommand(message) || hasLeadingExplicitSummaryRunIntent(message)
-}
-
-// deriveWorkspaceRoute takes hasExplicitRunMessage — an origin-aware,
-// message-level signal — NOT the derived hasExplicitRunIntent flag: that flag
-// is `intent == Generate && authorized(origin)`, which inside the Explain arm
-// is tautologically false (review 5479094697 P1-1 / 5478721451 P1). Trusted
-// template/system_intent submissions with explain keywords execute as explicit
-// submit actions (including documents-only, which expands the base behavior;
-// plan §3.1/§4.3). User free text executes only when a run phrase is leading,
-// and never when it contains an explicit negation.
-func deriveWorkspaceRoute(context summaryWorkspaceContext, action service.SummaryAction, intent service.SummaryIntent, hasExplicitRunIntent, hasExplicitRunMessage, selectedSourceExplicit, hasRequirement, openScopeAgent bool, state WorkspaceSnapshot, participantsValid, sourcesValid, referencesValid bool) service.SummaryRoute {
+// deriveWorkspaceRoute keeps document-bearing compatibility deterministic.
+// Mixed source selection is itself the execute surface on main, so every valid,
+// non-negated mixed turn starts the personal workflow. Documents-only Explain
+// turns remain read-only unless they came from a verified structured submit.
+// Natural-language run-phrase position is deliberately not a side-effect gate.
+func deriveWorkspaceRoute(context summaryWorkspaceContext, action service.SummaryAction, intent service.SummaryIntent, hasExplicitRunIntent, structuredSubmit, negatedRun, selectedSourceExplicit, hasRequirement, openScopeAgent bool, state WorkspaceSnapshot, participantsValid, sourcesValid, referencesValid bool) service.SummaryRoute {
 	if len(context.Documents) > 0 {
 		mixedChat := len(context.SelectedChannels) > 0
 		switch {
@@ -1436,19 +1379,12 @@ func deriveWorkspaceRoute(context summaryWorkspaceContext, action service.Summar
 			// instead of silently dropping the chat or skipping the workflow.
 			// The permission result must gate workflow creation (plan §4.3).
 			return service.SummaryRouteClarification
-		case intent == service.SummaryIntentExplain && !hasExplicitRunMessage:
-			// Explanation/negated-run turns are non-executing for every document
-			// scope shape, including mixed document+chat. Chats make the generated
-			// summary possible; they do not override an explicit "do not generate"
-			// or ordinary explanation question into a worker side effect. A turn
-			// whose message itself carries an explicit run instruction (the UI
-			// execute command, or typed text like "开始总结：…来源是什么？") still
-			// executes — the keyword/？ classifier runs before the explicit-run
-			// check, so Explain classification alone proves nothing about intent
-			// (review 5479094697 P1-1 / 5478721451 P1 / 5478721451 R6 escalation).
+		case negatedRun:
 			return service.SummaryRouteClarification
 		case mixedChat:
 			return service.SummaryRoutePersonalWorkflow
+		case intent == service.SummaryIntentExplain && !structuredSubmit:
+			return service.SummaryRouteClarification
 		default:
 			return service.SummaryRoutePersonalWorkflow
 		}
@@ -1525,7 +1461,17 @@ func normalizeSummaryWorkspaceInputOrigin(raw string, contextValue summaryWorksp
 		return summaryWorkspaceInputUser, nil
 	}
 	switch origin {
-	case summaryWorkspaceInputUser, summaryWorkspaceInputTemplate, summaryWorkspaceInputSystemIntent:
+	case summaryWorkspaceInputUser:
+		return origin, nil
+	case summaryWorkspaceInputTemplate:
+		if contextValue.Template == nil || strings.TrimSpace(message) != strings.TrimSpace(contextValue.Template.Requirement) {
+			return "", fmt.Errorf("input_origin=template 与模板上下文不匹配")
+		}
+		return origin, nil
+	case summaryWorkspaceInputSystemIntent:
+		if !isSummaryWorkspaceGeneratedExecutionMessage(message) {
+			return "", fmt.Errorf("input_origin=system_intent 与系统执行指令不匹配")
+		}
 		return origin, nil
 	default:
 		return "", fmt.Errorf("input_origin 必须为 user、template 或 system_intent")
@@ -1561,7 +1507,8 @@ func summaryWorkspaceUserRequirement(message, inputOrigin string) string {
 }
 
 func summaryWorkspaceHasRequirement(contextValue summaryWorkspaceContext, message, inputOrigin string) bool {
-	return contextValue.Template != nil || summaryWorkspaceUserRequirement(message, inputOrigin) != ""
+	return contextValue.Template != nil || summaryWorkspaceUserRequirement(message, inputOrigin) != "" ||
+		(len(contextValue.Documents) > 0 && inputOrigin == summaryWorkspaceInputSystemIntent && isSummaryWorkspaceGeneratedExecutionMessage(message))
 }
 
 func summaryWorkspaceExecutionRequirement(contextValue summaryWorkspaceContext, message, inputOrigin string) string {
@@ -1571,6 +1518,9 @@ func summaryWorkspaceExecutionRequirement(contextValue summaryWorkspaceContext, 
 	}
 	if requirement := summaryWorkspaceUserRequirement(message, inputOrigin); requirement != "" {
 		parts = append(parts, requirement)
+	}
+	if len(parts) == 0 && len(contextValue.Documents) > 0 && inputOrigin == summaryWorkspaceInputSystemIntent && isSummaryWorkspaceGeneratedExecutionMessage(message) {
+		parts = append(parts, strings.TrimSpace(message))
 	}
 	return strings.Join(parts, "\n\n")
 }

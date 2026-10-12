@@ -184,13 +184,15 @@ func TestSummaryWorkspaceDocumentWorkflowPersistsSnapshots(t *testing.T) {
 	}
 }
 
-// Pin the handler wiring from normalized input_origin through the explicit-run
-// signal into route derivation. Trusted templates and leading user run phrases
-// must both create a mixed workflow even when Explain keywords classify them.
+// Pin source-first routing through the real handler, including persisted tasks
+// and document fetches (not just the route enum).
 func TestSummaryWorkspaceMixedExplainCreatesWorkflow(t *testing.T) {
 	tests := []struct {
 		name, message, inputOrigin string
 		template                   *summaryWorkspaceTemplate
+		documentsOnly              bool
+		clarifies                  bool
+		rejectsOrigin              bool
 	}{
 		{
 			name: "inferred template origin", message: "请说明一下本周风险",
@@ -199,6 +201,20 @@ func TestSummaryWorkspaceMixedExplainCreatesWorkflow(t *testing.T) {
 		{
 			name: "leading user run phrase", message: "帮我总结一下群里有什么重要决定",
 			inputOrigin: summaryWorkspaceInputUser,
+		},
+		{name: "polite prefix", message: "请帮我总结一下群里有什么重要决定"},
+		{name: "english polite prefix", message: "please summarize what is in these documents"},
+		{name: "mixed question keeps main compatibility", message: "这些内容有什么区别？"},
+		{name: "mixed negation", message: "开始总结：先不要生成，先说明一下来源", clarifies: true},
+		{name: "document command question", message: "开始总结是什么意思？", documentsOnly: true, clarifies: true},
+		{name: "document source question", message: "生成总结的来源是什么？", documentsOnly: true, clarifies: true},
+		{name: "document english question", message: "start summary? 来源是什么", documentsOnly: true, clarifies: true},
+		{name: "spoofed system origin", message: "请说明一下本周风险", inputOrigin: summaryWorkspaceInputSystemIntent, documentsOnly: true, rejectsOrigin: true},
+		{name: "template origin without template", message: "请说明一下本周风险", inputOrigin: summaryWorkspaceInputTemplate, documentsOnly: true, rejectsOrigin: true},
+		{name: "verified system origin", message: "请根据当前选择生成总结", inputOrigin: summaryWorkspaceInputSystemIntent, documentsOnly: true},
+		{
+			name: "verified document template", message: "请说明一下本周风险", inputOrigin: summaryWorkspaceInputTemplate, documentsOnly: true,
+			template: &summaryWorkspaceTemplate{TemplateID: "risk", Label: "风险", Requirement: "请说明一下本周风险"},
 		},
 	}
 	for _, tt := range tests {
@@ -235,6 +251,9 @@ func TestSummaryWorkspaceMixedExplainCreatesWorkflow(t *testing.T) {
 					Template:         tt.template,
 				},
 			}
+			if tt.documentsOnly {
+				req.SummaryContext.SelectedChannels = nil
+			}
 
 			gin.SetMode(gin.TestMode)
 			recorder := httptest.NewRecorder()
@@ -244,17 +263,49 @@ func TestSummaryWorkspaceMixedExplainCreatesWorkflow(t *testing.T) {
 			c.Set("user_id", "actor")
 			c.Set("space_id", "space-a")
 			h.handleSummaryWorkspaceChat(c, req, false)
-			if recorder.Code != http.StatusOK {
+			if tt.rejectsOrigin {
+				if recorder.Code != http.StatusBadRequest {
+					t.Fatalf("invalid origin status=%d body=%s", recorder.Code, recorder.Body.String())
+				}
+			} else if recorder.Code != http.StatusOK {
 				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			if tt.clarifies || tt.rejectsOrigin {
+				var count int64
+				if err := db.Model(&model.SummaryTask{}).Count(&count).Error; err != nil || count != 0 {
+					t.Fatalf("non-executing turn created tasks: count=%d err=%v", count, err)
+				}
+				client.mu.Lock()
+				fetches := len(client.tokens)
+				client.mu.Unlock()
+				if fetches != 0 {
+					t.Fatalf("non-executing turn fetched %d documents", fetches)
+				}
+				if tt.rejectsOrigin {
+					return
+				}
 			}
 
 			snapshot, err := store.LoadSnapshot(context.Background(), WorkspaceSessionKey{SpaceID: "space-a", UserID: "actor", SessionID: req.SessionID})
 			if err != nil {
 				t.Fatalf("load workspace snapshot: %v", err)
 			}
+			if tt.clarifies {
+				if snapshot.Session.State != workspaceResultClarification {
+					t.Fatalf("state=%s, want clarification", snapshot.Session.State)
+				}
+				return
+			}
 			if snapshot.Session.WorkflowTaskID == 0 || snapshot.Session.State != workspaceResultWorkflowStarted {
 				payload, _ := json.Marshal(snapshot.Session)
 				t.Fatalf("mixed Explain request did not create workflow: %s", payload)
+			}
+			var task model.SummaryTask
+			if err := db.First(&task, snapshot.Session.WorkflowTaskID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if strings.TrimSpace(task.Topic) == "" {
+				t.Fatal("verified submission lost its requirement/topic")
 			}
 		})
 	}
