@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -101,8 +102,43 @@ var documentScopedNegationRequests = []string{
 	"please summarize the docs without generating a table",
 	"请总结，不要生成总结表格",
 	"summarize the docs, don't generate a summary table",
-	"不要生成总结是什么意思？",
 	"文档里写着“不要生成总结”，请总结文档",
+	"文档里写着\"不要生成总结。先不要总结\"，请总结文档",
+	"文档里写着'不要总结这些内容'，请总结文档",
+	"文档里写着'不要总结。不要生成总结'，请总结文档",
+	"文档里写着「不要总结这些内容」，请总结文档",
+	"文档里写着`不要总结这些内容`，请总结文档",
+	"请总结，文档里写着“不要生成总结”",
+	"总结一下，不要生成正式总结表格",
+	"总结一下，不要生成完整总结附件",
+	"请你总结这些文档 不要生成行动项",
+	"summarize these docs, please do  not  generate  action items",
+}
+
+func TestDocumentRouteRejectsUnsupportedCombinations(t *testing.T) {
+	for _, scope := range []summaryWorkspaceContext{
+		{Documents: []summaryWorkspaceDocument{{DocumentID: "d1"}}, Participants: []summaryWorkspaceParticipant{{UserID: "other"}}},
+		{Documents: []summaryWorkspaceDocument{{DocumentID: "d1"}}, ReferencedTaskIDs: []int64{1}},
+	} {
+		for _, intent := range []service.SummaryIntent{service.SummaryIntentGenerate, service.SummaryIntentExplain} {
+			in := workspaceRouteInput{
+				Context: scope, Action: service.SummaryActionChat, Intent: intent,
+				VerifiedDocumentTemplate: true, SelectedSourceExplicit: true, HasRequirement: true,
+				ParticipantsValid: true, SourcesValid: true, ReferencesValid: true,
+			}
+			// Defensive helper contract, separate from the real-handler tests:
+			// even valid references/participants cannot widen document execution.
+			if got := deriveWorkspaceRoute(in); got != service.SummaryRouteClarification {
+				t.Fatalf("unsupported scope executed: %+v intent=%s got=%s", scope, intent, got)
+			}
+		}
+	}
+}
+
+var documentNegationQuestions = []string{
+	"不要生成总结是什么意思？",
+	"“先不要总结”是什么意思？",
+	`what does "do not summarize" mean?`,
 }
 
 var documentExecutionNegations = []string{
@@ -113,13 +149,27 @@ var documentExecutionNegations = []string{
 	"do not summarize", "please don't generate a summary yet",
 	"start summary: please do not generate a summary",
 	"summarize the docs, but do not generate a summary",
+	"不要总结这些内容", "不要总结这些文档", "别总结这些内容",
+	"不需要总结这些内容", "不要生成这些内容的总结",
+	"请不要总结这些内容", "先不要总结这些内容",
+	"总结先不要生成", "这次的总结不要生成", "文档总结不要生成",
+	"本周的总结暂不生成", "周报先不要总结", "the summary — do not generate",
+	"总结一下这些文档、不要生成总结", "总结一下这些文档 不要生成总结",
+	"总结一下这些文档　不要生成总结", "do  not  generate  a  summary",
+	"请你先不要总结", "请您先不要生成总结", "麻烦先别总结",
+	"帮我先别生成总结", "能不能先不要生成总结", "我希望暂时不要总结",
+	"建议先别总结", "可否先不要总结", "最好先不要生成总结",
+	"总结一下这些文档，麻烦别生成", "先不要生成正式总结",
+	"先不要生成完整总结", "🙏 先不要总结", "“先不要总结”",
+	`"先不要总结"`, "'先不要总结'", "不用生成总结", "不要再生成总结",
+	"please do not summarize these documents",
 }
 
 func TestDocumentNegationDistinguishesExecutionFromContent(t *testing.T) {
 	for _, tc := range []struct {
 		messages []string
 		want     bool
-	}{{documentScopedNegationRequests, false}, {documentExecutionNegations, true}} {
+	}{{documentScopedNegationRequests, false}, {documentNegationQuestions, false}, {documentExecutionNegations, true}} {
 		for _, message := range tc.messages {
 			if got := hasNegatedSummaryRunIntent(message); got != tc.want {
 				t.Errorf("message=%q negated=%t want=%t", message, got, tc.want)
@@ -149,12 +199,14 @@ func TestDocumentInputRoutingCompatibility(t *testing.T) {
 		if mixed {
 			scope.SelectedChannels = []summaryWorkspaceChannel{{ChatID: "g1", ChatType: "group"}}
 		}
-		for _, message := range append(append(questions, affirmatives...), documentScopedNegationRequests...) {
+		// These lists have literal expectations; do not use the production
+		// classifier to decide whether its own result is correct.
+		clarifying := append(append([]string{}, questions...), documentNegationQuestions...)
+		clarifying = append(clarifying, affirmatives...)
+		for _, message := range append(clarifying, documentScopedNegationRequests...) {
 			intent := classifySummaryWorkspaceIntent(message, false)
-			// Documents-only Explain semantics stay unchanged; mixed selection
-			// is the compatibility execution surface, regardless of word order.
 			want := service.SummaryRouteClarification
-			if mixed || intent != service.SummaryIntentExplain {
+			if mixed || slices.Contains(documentScopedNegationRequests, message) {
 				want = service.SummaryRoutePersonalWorkflow
 			}
 			got := deriveWorkspaceRoute(workspaceRouteInput{

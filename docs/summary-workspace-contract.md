@@ -25,8 +25,12 @@ returns `enabled: true` and `contract_version: "2"`.
   intentionally not bumped for this additive optional field.
 - A mixed scope is personal-only (no participants, no origin auto-reply) and
   does not support stacking a referenced summary.
-- Document-only scopes also reject referenced summaries before creating a turn:
-  the document executor does not consume them. Remove references before submitting.
+- The document executor does not consume referenced summaries. A document-only
+  scope containing references returns a recoverable clarification (HTTP 200),
+  retaining the reference chips and creating no task or document fetch. This
+  also lets older persisted scopes round-trip instead of getting stuck on 400.
+  Remove the reference chips before execution; mixed document+chat+reference
+  submissions retain their existing HTTP 400 validation.
 
 ## Input origin and routing
 
@@ -51,11 +55,17 @@ returns `enabled: true` and `contract_version: "2"`.
 - **Document-bearing scopes:** participants are unsupported, unavailable
   selected chats block execution, and explicit execution negation clarifies.
   The conservative negation grammar recognizes a clause negating the summary
-  act (including leading polite/temporal words), not negation of a content
-  object: `先不要生成总结` clarifies, while `总结一下，不要生成表格` and
+  act, including common polite/temporal lead-ins, a fronted summary topic, and
+  whole-scope objects: `请你先不要总结`, `总结先不要生成`,
+  `不要总结这些内容` and `先不要生成正式总结` clarify.
+  It does not negate execution for content objects: `总结一下，不要生成表格` and
   `帮我总结文档和会话，不需要总结附件内容` execute. A suspected cancellation
   asks whether the user wants to proceed, without asserting what they intended.
-  This is not general-purpose natural-language cancellation detection. Otherwise,
+  Whitespace is normalized within commands; ideographic commas and dashes
+  separate clauses. Embedded quoted text is not interpreted as a cancellation,
+  including punctuation inside the quotation; a wholly quoted submission is
+  treated as the user's instruction. This bounded grammar is tested against
+  the literal request corpus, not general-purpose natural-language detection. Otherwise,
   document+chat submissions start a personal Workflow even when phrased as
   questions. This mixed-question execution behavior is retained for compatibility.
   Documents-only `Explain` input clarifies unless the template submission is
@@ -88,9 +98,12 @@ membership, and team-scope checks before atomically replacing the stored scope.
 Discovery only creates candidates: a newly discovered chat cannot be read until
 the declaration succeeds. The declaration is single-use for the turn, freezes
 further discovery, and its complete final channel list is the one used for
-message retrieval, `scope_json`, and `preview.effective_scope`. Ordinary edits,
-questions, negations, and historical references do not call the scope tool and
-therefore keep the picker scope. On a cold start, a preview without a successful
+message retrieval, `scope_json`, and `preview.effective_scope`. Explanation-only
+questions and recognized execution cancellations do not request a scope change.
+Content constraints such as "do not generate a table" may still enter the
+conversational Agent path; that permission is not evidence of a scope change.
+Only a separately authorized source/time-range declaration may change the picker
+scope. On a cold start, a preview without a successful
 source declaration becomes a clarification instead of an ungrounded preview or
 a retryable server error. For chat-only scopes, every user-authored non-explanation chat turn
 is conversational, it cannot directly dispatch a Workflow. A trusted
@@ -134,3 +147,10 @@ additive `preview` object. It contains the immutable content and version
 metadata for that historical message. Only the artifact referenced by current
 state exposes actions; older previews are read-only. Clients that ignore
 unknown fields remain compatible with contract v1.
+
+## Regression validation
+
+Run both `CGO_ENABLED=0 go test ./...` and `CGO_ENABLED=1 go test ./...`.
+The real handler/document-source and template-registry tests require CGO;
+a green no-CGO suite alone does not exercise those guards. Include the
+handler race tests when changing routing or workflow creation.

@@ -249,13 +249,6 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: err.Error()})
 		return
 	}
-	// The document executor cannot consume references. Gate new submissions,
-	// but leave legacy stored document+reference scopes readable for history
-	// and the existing document-preview save rejection.
-	if len(contextValue.Documents) > 0 && len(contextValue.ReferencedTaskIDs) > 0 {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "文档来源总结暂不支持叠加引用总结，请移除引用总结后再生成"})
-		return
-	}
 	req.InputOrigin, err = normalizeSummaryWorkspaceInputOrigin(req.InputOrigin, contextValue, req.Message)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: err.Error()})
@@ -1342,43 +1335,6 @@ func isSummaryWorkspaceLegacyButtonMessage(message string) bool {
 	}
 }
 
-func hasNegatedSummaryRunIntent(message string) bool {
-	// This conservative grammar recognizes cancellation of the summary act,
-	// not arbitrary negative requirements. In particular, "不要生成表格" and
-	// "不需要总结附件内容" constrain output/content and must not cancel a turn.
-	clauses := strings.FieldsFunc(strings.ToLower(strings.TrimSpace(message)), func(r rune) bool {
-		return strings.ContainsRune("，,。.!！？?；;：:\n", r)
-	})
-	for _, clause := range clauses {
-		clause = strings.TrimSpace(clause)
-		for {
-			before := clause
-			for _, prefix := range []string{"但是", "不过", "请", "先", "暂时", "现在", "目前", "还是", "这次", "但", "but ", "please ", "for now "} {
-				clause = strings.TrimSpace(strings.TrimPrefix(clause, prefix))
-			}
-			if clause == before {
-				break
-			}
-		}
-		for _, verb := range []string{
-			"不要总结", "不要生成", "别总结", "别生成", "暂不总结", "暂不生成", "不总结", "不生成", "无需总结", "无需生成", "不需要总结", "不需要生成",
-			"do not summarize", "don't summarize", "do not generate", "don't generate", "without generating",
-		} {
-			if !strings.HasPrefix(clause, verb) {
-				continue
-			}
-			object := strings.TrimSpace(strings.TrimPrefix(clause, verb))
-			switch object {
-			case "", "总结", "总结了", "总结吧", "总结任务", "了", "吧",
-				"summary", "a summary", "the summary", "yet", "now",
-				"summary yet", "a summary yet", "the summary yet", "a summary now", "the summary now":
-				return true
-			}
-		}
-	}
-	return false
-}
-
 func containsAny(value string, needles ...string) bool {
 	for _, needle := range needles {
 		if strings.Contains(value, needle) {
@@ -1393,8 +1349,12 @@ func containsAny(value string, needles ...string) bool {
 func summaryWorkspaceClarificationReply(in workspaceRouteInput, teamScopeReason string) string {
 	context := in.Context
 	switch {
+	case len(context.Documents) > 0 && len(context.Participants) > 0:
+		return "文档总结暂不支持多人协作，请移除参与者后再生成。"
 	case len(context.Documents) > 0 && len(context.SelectedChannels) > 0 && !in.SourcesValid:
 		return "部分所选会话不可用，请调整后重试。"
+	case len(context.Documents) > 0 && len(context.ReferencedTaskIDs) > 0:
+		return "文档总结暂不支持叠加引用总结，请移除引用总结后再生成。本轮未读取文档或创建总结任务。"
 	case len(context.ReferencedTaskIDs) > 0 && !in.ReferencesValid:
 		return "部分引用总结不可用，请调整后重试。"
 	case len(context.Participants) > 0 && !in.ParticipantsValid:
@@ -1430,13 +1390,16 @@ type workspaceRouteInput struct {
 // deriveWorkspaceRoute preserves mixed-source submission compatibility:
 // valid, non-negated mixed turns execute even when phrased as questions.
 // Documents-only Explain turns require a server-verified template.
-// Context must have passed submission validation, which rejects document
-// scopes with participants or referenced summaries.
+// The handler normalizes the context before this call. Keep unsupported
+// document combinations fail-closed here too. Legacy documents-only scopes
+// may contain references: clarify so history-rehydrated sessions can recover.
 func deriveWorkspaceRoute(in workspaceRouteInput) service.SummaryRoute {
 	context := in.Context
 	if len(context.Documents) > 0 {
 		mixedChat := len(context.SelectedChannels) > 0
 		switch {
+		case len(context.Participants) > 0 || len(context.ReferencedTaskIDs) > 0:
+			return service.SummaryRouteClarification
 		case mixedChat && !in.SourcesValid:
 			// Mixed scope with an unauthorized/unresolvable chat: clarify
 			// instead of silently dropping the chat or skipping the workflow.

@@ -4,11 +4,14 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
@@ -49,8 +52,8 @@ func TestDocumentSubmissionHandler(t *testing.T) {
 		{name: "unknown origin", message: "总结", origin: "model", rejects: true},
 		{name: "document participants", message: "先不要总结", documentsOnly: true, participants: true, rejects: true},
 		{name: "mixed participants", message: "先不要总结", participants: true, rejects: true},
-		{name: "document references generate", message: "总结本周进展", documentsOnly: true, references: true, rejects: true},
-		{name: "document references explain", message: "来源是什么", documentsOnly: true, references: true, rejects: true},
+		{name: "document references generate", message: "总结本周进展", documentsOnly: true, references: true, clarifies: true},
+		{name: "document references explain", message: "来源是什么", documentsOnly: true, references: true, clarifies: true},
 		{name: "mixed references", message: "总结本周进展", references: true, rejects: true},
 		{name: "verified system", message: "请根据当前选择生成总结", origin: summaryWorkspaceInputSystemIntent, documentsOnly: true},
 		{name: "verified document template", message: template.Requirement, template: template, origin: summaryWorkspaceInputTemplate, documentsOnly: true},
@@ -63,7 +66,13 @@ func TestDocumentSubmissionHandler(t *testing.T) {
 		tc.name, tc.message = "scoped negation mixed "+message, message
 		cases = append(cases, tc)
 		tc.name, tc.documentsOnly = "scoped negation document "+message, true
-		tc.clarifies = classifySummaryWorkspaceIntent(message, false) == service.SummaryIntentExplain
+		cases = append(cases, tc)
+	}
+	for _, message := range documentNegationQuestions {
+		tc := cases[0]
+		tc.name, tc.message = "quoted question mixed "+message, message
+		cases = append(cases, tc)
+		tc.name, tc.documentsOnly, tc.clarifies = "quoted question document "+message, true, true
 		cases = append(cases, tc)
 	}
 	for _, message := range documentExecutionNegations {
@@ -73,8 +82,16 @@ func TestDocumentSubmissionHandler(t *testing.T) {
 		tc.name, tc.documentsOnly = "execution negation document "+message, true
 		cases = append(cases, tc)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for i, tc := range cases {
+		// setupTestDBs embeds t.Name in a SQLite URI. Keep punctuation (notably
+		// ? and the # suffix for duplicate whitespace-normalized names) out.
+		name := strings.Map(func(r rune) rune {
+			if unicode.IsLetter(r) || unicode.IsDigit(r) {
+				return r
+			}
+			return '_'
+		}, tc.name)
+		t.Run(fmt.Sprintf("%03d_%s", i, name), func(t *testing.T) {
 			db, _ := setupTestDBs(t)
 			imDB := newSummaryWorkspaceIMValidationDB(t)
 			if err := db.AutoMigrate(&model.AgentMessage{}, &model.AgentSummarySession{}, &model.AgentSummaryTurn{}, &model.SummaryWorkflowIdempotency{}, &model.SummaryUserTemplate{}); err != nil {
@@ -167,6 +184,45 @@ func TestDocumentSubmissionHandler(t *testing.T) {
 				}
 				if tc.invalidChat && !strings.Contains(rec.Body.String(), "部分所选会话不可用") {
 					t.Fatalf("permission failure masked: %s", rec.Body.String())
+				}
+				if tc.references {
+					var restored summaryWorkspaceContext
+					if err := json.Unmarshal([]byte(state.Session.ScopeJSON), &restored); err != nil {
+						t.Fatal(err)
+					}
+					if len(restored.ReferencedTaskIDs) != 1 || restored.ReferencedTaskIDs[0] != 999 {
+						t.Fatalf("reference silently discarded: %+v", restored)
+					}
+					// Rehydrate a persisted document+reference scope and ask a
+					// question: return recoverable clarification, not repeated 400s.
+					req.SummaryContext = restored
+					req.RequestID, req.Message = "document-input-2", "这些文档里有什么风险？"
+					question := call()
+					if question.Code != http.StatusOK || !strings.Contains(question.Body.String(), "请移除引用总结") {
+						t.Fatalf("persisted scope cannot recover: %s", question.Body.String())
+					}
+					var tasks int64
+					if err := db.Model(&model.SummaryTask{}).Count(&tasks).Error; err != nil || tasks != 0 {
+						t.Fatalf("reference turn executed: tasks=%d err=%v", tasks, err)
+					}
+					client.mu.Lock()
+					fetches := len(client.tokens)
+					client.mu.Unlock()
+					if fetches != 0 {
+						t.Fatalf("reference question fetched %d documents", fetches)
+					}
+					// Removing the chip is the advertised recovery action and
+					// must actually unblock execution without a new session.
+					req.SummaryContext.ReferencedTaskIDs = nil
+					req.ScopeVersion++
+					req.RequestID, req.Message = "document-input-3", "请总结这些文档"
+					recovered := call()
+					if recovered.Code != http.StatusOK {
+						t.Fatalf("scope recovery failed: %s", recovered.Body.String())
+					}
+					if err := db.Model(&model.SummaryTask{}).Count(&tasks).Error; err != nil || tasks != 1 {
+						t.Fatalf("recovered tasks=%d err=%v", tasks, err)
+					}
 				}
 				return
 			}
