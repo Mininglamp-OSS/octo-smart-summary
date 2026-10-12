@@ -4,15 +4,18 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/gin-gonic/gin"
 )
 
 type recordingDocumentSourceClient struct {
@@ -178,6 +181,133 @@ func TestSummaryWorkspaceDocumentWorkflowPersistsSnapshots(t *testing.T) {
 	defer client.mu.Unlock()
 	if client.tokens["d_1"] != "creator1" {
 		t.Fatalf("forwarded token = %q, want creator1", client.tokens["d_1"])
+	}
+}
+
+// Pin source-first routing through the real handler, including persisted tasks
+// and document fetches (not just the route enum).
+func TestSummaryWorkspaceMixedExplainCreatesWorkflow(t *testing.T) {
+	tests := []struct {
+		name, message, inputOrigin string
+		template                   *summaryWorkspaceTemplate
+		documentsOnly              bool
+		clarifies                  bool
+		rejectsOrigin              bool
+	}{
+		{
+			name: "inferred template origin", message: "请说明一下本周风险",
+			template: &summaryWorkspaceTemplate{TemplateID: "risk", Label: "风险复盘", Requirement: "请说明一下本周风险"},
+		},
+		{
+			name: "leading user run phrase", message: "帮我总结一下群里有什么重要决定",
+			inputOrigin: summaryWorkspaceInputUser,
+		},
+		{name: "polite prefix", message: "请帮我总结一下群里有什么重要决定"},
+		{name: "english polite prefix", message: "please summarize what is in these documents"},
+		{name: "mixed question keeps main compatibility", message: "这些内容有什么区别？"},
+		{name: "mixed negation", message: "开始总结：先不要生成，先说明一下来源", clarifies: true},
+		{name: "document command question", message: "开始总结是什么意思？", documentsOnly: true, clarifies: true},
+		{name: "document source question", message: "生成总结的来源是什么？", documentsOnly: true, clarifies: true},
+		{name: "document english question", message: "start summary? 来源是什么", documentsOnly: true, clarifies: true},
+		{name: "spoofed system origin", message: "请说明一下本周风险", inputOrigin: summaryWorkspaceInputSystemIntent, documentsOnly: true, rejectsOrigin: true},
+		{name: "template origin without template", message: "请说明一下本周风险", inputOrigin: summaryWorkspaceInputTemplate, documentsOnly: true, rejectsOrigin: true},
+		{name: "verified system origin", message: "请根据当前选择生成总结", inputOrigin: summaryWorkspaceInputSystemIntent, documentsOnly: true},
+		{
+			name: "verified document template", message: "请说明一下本周风险", inputOrigin: summaryWorkspaceInputTemplate, documentsOnly: true,
+			template: &summaryWorkspaceTemplate{TemplateID: "risk", Label: "风险", Requirement: "请说明一下本周风险"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, _ := setupTestDBs(t)
+			imDB := newSummaryWorkspaceIMValidationDB(t)
+			if err := db.AutoMigrate(
+				&model.AgentMessage{},
+				&model.AgentSummarySession{},
+				&model.AgentSummaryTurn{},
+				&model.SummaryWorkflowIdempotency{},
+			); err != nil {
+				t.Fatalf("migrate workspace tables: %v", err)
+			}
+			client := &recordingDocumentSourceClient{docs: map[string]*documentSummarySource{
+				"d_1": {DocumentID: "d_1", Title: "Workbench方案", Version: "v1", Content: "文档正文"},
+			}}
+			store := NewAgentWorkspaceStore(db)
+			h := &AgentChatHandler{
+				workspaceEntryEnabled: true,
+				documentClient:        client,
+				workspace: &summaryWorkspaceCoordinator{
+					db: db, imDB: imDB, store: store,
+					workflow: service.NewSummaryWorkflowService(db, imDB, 31, 90),
+				},
+			}
+			req := agentChatRequest{
+				Message: tt.message, InputOrigin: tt.inputOrigin,
+				SessionID: "mixed-explain", RequestID: "mixed-explain-1",
+				Action: string(service.SummaryActionChat), ScopeVersion: 1,
+				SummaryContext: summaryWorkspaceContext{
+					SelectedChannels: []summaryWorkspaceChannel{{ChatID: "group-a", ChatType: "group", Name: "A群"}},
+					Documents:        []summaryWorkspaceDocument{{DocumentID: "d_1", Title: "Workbench方案"}},
+					Template:         tt.template,
+				},
+			}
+			if tt.documentsOnly {
+				req.SummaryContext.SelectedChannels = nil
+			}
+
+			gin.SetMode(gin.TestMode)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/agent/summary-workspace/chat", nil)
+			c.Request.Header.Set("Token", "actor")
+			c.Set("user_id", "actor")
+			c.Set("space_id", "space-a")
+			h.handleSummaryWorkspaceChat(c, req, false)
+			if tt.rejectsOrigin {
+				if recorder.Code != http.StatusBadRequest {
+					t.Fatalf("invalid origin status=%d body=%s", recorder.Code, recorder.Body.String())
+				}
+			} else if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			if tt.clarifies || tt.rejectsOrigin {
+				var count int64
+				if err := db.Model(&model.SummaryTask{}).Count(&count).Error; err != nil || count != 0 {
+					t.Fatalf("non-executing turn created tasks: count=%d err=%v", count, err)
+				}
+				client.mu.Lock()
+				fetches := len(client.tokens)
+				client.mu.Unlock()
+				if fetches != 0 {
+					t.Fatalf("non-executing turn fetched %d documents", fetches)
+				}
+				if tt.rejectsOrigin {
+					return
+				}
+			}
+
+			snapshot, err := store.LoadSnapshot(context.Background(), WorkspaceSessionKey{SpaceID: "space-a", UserID: "actor", SessionID: req.SessionID})
+			if err != nil {
+				t.Fatalf("load workspace snapshot: %v", err)
+			}
+			if tt.clarifies {
+				if snapshot.Session.State != workspaceResultClarification {
+					t.Fatalf("state=%s, want clarification", snapshot.Session.State)
+				}
+				return
+			}
+			if snapshot.Session.WorkflowTaskID == 0 || snapshot.Session.State != workspaceResultWorkflowStarted {
+				payload, _ := json.Marshal(snapshot.Session)
+				t.Fatalf("mixed Explain request did not create workflow: %s", payload)
+			}
+			var task model.SummaryTask
+			if err := db.First(&task, snapshot.Session.WorkflowTaskID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if strings.TrimSpace(task.Topic) == "" {
+				t.Fatal("verified submission lost its requirement/topic")
+			}
+		})
 	}
 }
 
