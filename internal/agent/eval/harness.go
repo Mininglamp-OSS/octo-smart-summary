@@ -108,8 +108,12 @@ func Coverage(gc GoldenCase) CoverageMetric {
 		}
 	}
 	processed, dropped, chunks, capped := agent.ProbeChunkCoverageDefault(msgMaps, 0)
+	return coverageMetricFromCounts(len(gc.Messages), processed, dropped, chunks, capped)
+}
+
+func coverageMetricFromCounts(input, processed, dropped, chunks, capped int) CoverageMetric {
 	return CoverageMetric{
-		InputCount:         len(gc.Messages),
+		InputCount:         input,
 		ProcessedCount:     processed,
 		TotalDroppedCount:  dropped,
 		CappedDroppedCount: capped,

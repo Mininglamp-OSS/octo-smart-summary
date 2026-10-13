@@ -6,9 +6,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +25,13 @@ import (
 
 func TestExecutePersonalPipelineReportsRequestTooLargeFatalCause(t *testing.T) {
 	db := setupProcessorTestDB(t)
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"content":"covered"},"finish_reason":"stop"}],"usage":{"total_tokens":1}}`)
+	}))
+	defer srv.Close()
 	task := model.SummaryTask{
 		TaskNo: "fatal-request-too-large", CreatorID: "creator",
 		TimeRangeStart: time.Now().Add(-time.Hour), TimeRangeEnd: time.Now(),
@@ -31,22 +41,16 @@ func TestExecutePersonalPipelineReportsRequestTooLargeFatalCause(t *testing.T) {
 	}
 	p := &Processor{
 		db:  db,
-		llm: service.NewLLMClient("http://127.0.0.1:0", "", "test", 1, 4000, false, 1, nil),
+		llm: service.NewLLMClient(srv.URL, "", "test", 1, 4000, false, 1, nil),
 		cfg: &config.Config{
 			LLMModel: "test", MapMaxTokens: 4000, WorkerMapConcurrency: 2,
 			CharsPerTokenCJK: 1, CharsPerTokenASCII: 4,
 		},
 		fetchPersonalMessagesFn: func(context.Context, model.SummaryTask, string) ([]pipeline.Message, *pipeline.IntentResult, error) {
 			return []pipeline.Message{
-				{SenderUID: "creator", Content: strings.Repeat("文", 1100)},
+				{SenderUID: "creator", Content: strings.Repeat("x", service.MaxRequestBodyBytes+1)},
 				{SenderUID: "creator", Content: strings.Repeat("字", 1100)},
 			}, &pipeline.IntentResult{Skipped: true, SkipReason: "test"}, nil
-		},
-		mapChunkFn: func(_ context.Context, chunkIndex int, _ []string) (string, int, string, error) {
-			if chunkIndex == 0 {
-				return "", 0, "test", fmt.Errorf("pre-send guard: %w", service.ErrRequestTooLarge)
-			}
-			return "covered", 1, "test", nil
 		},
 	}
 
@@ -56,6 +60,9 @@ func TestExecutePersonalPipelineReportsRequestTooLargeFatalCause(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "request too large on chunk(s) [0]") {
 		t.Fatalf("fatal cause = %q, want request-too-large chunk", err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("HTTP requests=%d, want only the successful sibling Map (no oversized request or Reduce)", requests.Load())
 	}
 	if strings.Contains(err.Error(), "output truncated or reasoning budget exhausted") {
 		t.Fatalf("fatal cause reports the old unrelated reason: %q", err)
@@ -70,7 +77,10 @@ func TestIsFatalMapError(t *testing.T) {
 		wantKind fatalMapErrorKind
 	}{
 		{name: "nil", err: nil, want: false},
-		{name: "reasoning budget", err: errors.New("reasoning budget exhausted on chunk 2"), want: true, wantKind: fatalMapReasoningBudget},
+		{name: "reasoning budget", err: fmt.Errorf("reasoning budget exhausted on chunk 2: %w", service.ErrReasoningBudgetExhausted), want: true, wantKind: fatalMapReasoningBudget},
+		{name: "raw reasoning sentinel", err: service.ErrReasoningBudgetExhausted, want: true, wantKind: fatalMapReasoningBudget},
+		{name: "reworded reasoning wrapper", err: fmt.Errorf("chunk 2: %w", service.ErrReasoningBudgetExhausted), want: true, wantKind: fatalMapReasoningBudget},
+		{name: "reasoning text is not a sentinel", err: errors.New("upstream body: reasoning budget exhausted"), want: false},
 		{name: "non-stream truncation", err: fmt.Errorf("output truncated on chunk 3: %w", service.ErrOutputTruncated), want: true, wantKind: fatalMapOutputTruncated},
 		{name: "stream truncation", err: fmt.Errorf("output truncated on chunk 3: %w", service.ErrStreamOutputTruncated), want: true, wantKind: fatalMapOutputTruncated},
 		{name: "transient network", err: errors.New("connection reset by peer"), want: false},

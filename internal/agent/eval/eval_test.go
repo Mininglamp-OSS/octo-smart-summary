@@ -1,6 +1,7 @@
 package eval
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -86,7 +87,7 @@ func TestCoverageRegressionGuard(t *testing.T) {
 	}
 }
 
-// TestCoverageGateExemptsDisclosedCap pins the coverage gate over a huge default
+// TestCoverageFloorPreservesSmallMessages pins the coverage gate over a huge default
 // input. Post-floor-fix (B-1a, Jerry-Xin 5338024667 §3): floorMsgsPerChunk
 // raises the per-chunk count to ceil(n/256) whenever the model-chosen size would
 // fan out past the cap, so the MODEL-MANUFACTURABLE route (chunk_size=1 at
@@ -98,7 +99,7 @@ func TestCoverageRegressionGuard(t *testing.T) {
 // × 300-rune CJK messages drop ~18% to the disclosed cap. That route is pinned
 // by TestProbeChunkCoverageDefaultReportsFiringCap; the fixtures here pin the
 // floor's small-message invariant.)
-func TestCoverageGateExemptsDisclosedCap(t *testing.T) {
+func TestCoverageFloorPreservesSmallMessages(t *testing.T) {
 	const n = 52000
 	cov := Coverage(GoldenCase{Messages: make([]GoldenMessage, n)})
 	if cov.Chunks > 256 {
@@ -112,5 +113,40 @@ func TestCoverageGateExemptsDisclosedCap(t *testing.T) {
 	}
 	if !cov.NoSilentLoss {
 		t.Fatal("no-silent-loss gate must hold on a clean huge input")
+	}
+}
+
+// Exercise Coverage itself, including forwarding the probe's cap counters.
+func TestCoverageGateExemptsDisclosedCap(t *testing.T) {
+	messages := make([]GoldenMessage, 300)
+	content := strings.Repeat("x", 240000)
+	for i := range messages {
+		messages[i].Content = content
+	}
+	cov := Coverage(GoldenCase{Messages: messages})
+	if cov.InputCount != 300 || cov.ProcessedCount != 256 || cov.Chunks != 256 || cov.TotalDroppedCount != 44 || cov.CappedDroppedCount != 44 || !cov.NoSilentLoss {
+		t.Fatalf("cap coverage=%+v, want 256 processed + 44 disclosed drops and no silent loss", cov)
+	}
+}
+
+// A disclosed cap cannot excuse additional accidental loss. Current splitters
+// are lossless; inject counters at the metric boundary to pin the negative case.
+func TestCoverageMetricRejectsSilentLoss(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		processed, dropped, capped int
+		want                       bool
+	}{
+		{"clean", 300, 0, 0, true},
+		{"cap only", 256, 44, 44, true},
+		{"accidental only", 299, 1, 0, false},
+		{"cap plus accidental", 255, 45, 44, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cov := coverageMetricFromCounts(300, tc.processed, tc.dropped, 256, tc.capped)
+			if cov.NoSilentLoss != tc.want {
+				t.Fatalf("coverage=%+v, want no_silent_loss=%t", cov, tc.want)
+			}
+		})
 	}
 }

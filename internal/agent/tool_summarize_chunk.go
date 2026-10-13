@@ -54,14 +54,11 @@ const (
 	maxChunkCalls = 256
 )
 
-// allBlankMapBody is the fixed body shipped when every kept chunk returned a
-// blank summary and NO real coverage gap exists (N-R12-3 closure): non-empty so
-// it clears the handle store's guard, and phrased as a completed observation of
-// an all-noise batch — the coverage JSON (blank_chunk_count / input / processed)
-// carries the detail. When a real gap DOES exist the all-blank branch returns
-// this body PLUS mapCoverageGapNotice below (a dropped head never reached a
-// model, so the bare body alone would be an affirmative completeness claim).
-const allBlankMapBody = "本批次消息均为噪声或与主题无关，没有值得汇报的内容。"
+// allBlankMapBody reports the observed empty responses without judging the
+// input: an intentional blank and an empty upstream completion are ambiguous.
+// Keep the body non-empty for handle storage; append the gap notice separately
+// when messages were actually dropped.
+const allBlankMapBody = "本批次所有分片的模型调用均未返回摘要内容；无法确认这些消息是否包含值得汇报的信息。"
 
 // mapCoverageGapNotice is appended to the combined Map output whenever coverage
 // is incomplete for ANY reason — a manifest-miss (a message fetched after the
@@ -96,11 +93,9 @@ type chunkCoverage struct {
 	CappedDroppedCount    int `json:"capped_dropped_count"`
 	OversizedMessageCount int `json:"oversized_message_count"`
 	FailedChunkCount      int `json:"failed_chunk_count"`
-	// BlankChunkCount is chunks whose Map LLM call SUCCEEDED but returned an empty
-	// summary — the model considered the messages and found nothing worth
-	// reporting (it is told to skip off-topic chatter). Those messages are COVERED
-	// (counted in ProcessedCount), not lost; BlankChunkCount is observability only
-	// and must not assert incompleteness (contract §3/§4).
+	// BlankChunkCount counts successful calls with empty summaries. These messages
+	// remain processed for accounting, but emptiness does not establish that the
+	// input was noise. All-blank results must communicate that uncertainty.
 	BlankChunkCount  int  `json:"blank_chunk_count"`
 	ChunkCallsCapped bool `json:"chunk_calls_capped"`
 	Truncated        bool `json:"truncated"`
@@ -126,7 +121,7 @@ func (cov *chunkCoverage) finalizeDropCounts() {
 // clampChunkSize 把请求的 chunk_size 收敛到 [1, hardMessageBackstop]；<=0 取
 // defaultChunkSize，超过上限截到 hardMessageBackstop。chunk_size 是模型给的
 // 工具参数，未经验证的值不得原样影响出站请求规模（PR #196 review P1-1）；
-// 返回值即 splitMsgMapsByTokenBudget 的 maxMsgs，保证每片消息数有硬上限。
+// 返回值是消息数基准；floorMsgsPerChunk 随后可能上调实际每片消息数。
 //
 // 注意（round-5 P2, Jerry-Xin 5478795037）：floorMsgsPerChunk 可把 EFFECTIVE
 // 每片消息数上调到 ceil(n/maxChunkCalls)（如 n=100000 → 391），超过
@@ -387,7 +382,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 					},
 					"chunk_size": map[string]interface{}{
 						"type":        "integer",
-						"description": fmt.Sprintf("可选：每片最大消息数（叠加在 token 预算之上，取值收敛到 [1, %d]，<=0 按 %d）；分片同时受 token 预算与消息数双重约束，且单次调用最多 %d 个分片，超出时保留最近的分片、丢弃更早的（chunk_calls_capped=true）。输入超过 %d 条消息时系统可能自动上调每片消息数以保证不丢弃。返回值含 input_count/processed_count/dropped_count/capped_dropped_count/oversized_message_count/failed_chunk_count/blank_chunk_count/chunk_calls_capped/truncated/chunk_size；truncated 或 chunk_calls_capped 时表示返回结果覆盖不完整。分块失败会使整次调用报错并要求重试，因此成功返回时 failed_chunk_count 恒为 0。dropped_count 只计意外丢失（仅引用清单外；分块失败会整体报错重试、空结果已计入 processed，均不会进入此字段），capped_dropped_count 单列因分片上限有意丢弃的消息数。", hardMessageBackstop, defaultChunkSize, maxChunkCalls, maxChunkCalls*hardMessageBackstop),
+						"description": fmt.Sprintf("可选：每片最大消息数（叠加在 token 预算之上，取值收敛到 [1, %d]，<=0 按 %d）；分片同时受 token 预算与消息数双重约束，且单次调用最多 %d 个分片，超出时保留最近的分片、丢弃更早的（chunk_calls_capped=true）。输入条数超过 %d × 收敛后的 chunk_size 时，系统自动上调实际每片消息数以避免消息数限制触发截断；返回的 chunk_size 可超过 200，token 预算仍可能触发分片上限。返回值含 input_count/processed_count/dropped_count/capped_dropped_count/oversized_message_count/failed_chunk_count/blank_chunk_count/chunk_calls_capped/truncated/chunk_size；truncated 或 chunk_calls_capped 时表示返回结果覆盖不完整。分块失败会使整次调用报错并要求重试，因此成功返回时 failed_chunk_count 恒为 0。dropped_count 只计意外丢失（仅引用清单外；分块失败会整体报错重试、空结果已计入 processed，均不会进入此字段），capped_dropped_count 单列因分片上限有意丢弃的消息数。当 chunk_count == 0 且 blank_chunk_count > 0 时，应说明模型未返回摘要内容、无法确认是否有值得汇报的信息，不得断言消息全是噪声。", hardMessageBackstop, defaultChunkSize, maxChunkCalls, maxChunkCalls),
 					},
 				},
 				"required": []string{"messages_handle"},
@@ -562,9 +557,8 @@ func SummarizeChunkTool() (Tool, Handler) {
 			time.Since(mapStart).Milliseconds())
 		cov.finalizeDropCounts()
 
-		// The gap notice fires for ANY real coverage gap — accidental (a failed or
-		// blank chunk, or a manifest-miss, all folded into DroppedCount) OR the
-		// intentional cap — so the combined text discloses incompleteness whatever
+		// The gap notice fires for ANY real coverage gap — a manifest-miss
+		// (DroppedCount) OR the intentional cap — so the combined text discloses incompleteness whatever
 		// the cause (#256 P1). assembleMapOutput cannot fail (every path returns
 		// a shippable body: real content, or the fixed all-blank completion), so
 		// there is no error branch to keep coverage detail on.
@@ -572,14 +566,13 @@ func SummarizeChunkTool() (Tool, Handler) {
 		combinedSummary := assembleMapOutput(summaries, coverageGap)
 		// Persist the dropped-message count only once we have a usable Map output
 		// to return. recordDroppedMessages does `dropped_messages = dropped_messages
-		// + ?`, so recording it before the error return above would double-count on
-		// every retry of an all-blank Map (#256 P2). Record the TOTAL loss
+		// + ?`; failed Map attempts return before recording any loss. Record the TOTAL loss
 		// (accidental + capped) so the finish-gate PARTIAL disclosure still reflects
 		// every message the run did not cover, even though the two are tracked
 		// separately in the coverage result.
 		recordDroppedMessages(ctx, uid, runID, cov.DroppedCount+cov.CappedDroppedCount)
-		// chunk_count reports the summaries actually stored (successful chunks),
-		// not attempted, so it does not over-report by FailedChunkCount.
+		// chunk_count reports non-blank summaries. All-blank success reports zero
+		// here and a positive blank_chunk_count; the body explains the uncertainty.
 		return marshalSummarizeChunkResult(ctx, combinedSummary, len(summaries), cov)
 	}
 
@@ -762,9 +755,8 @@ type chunkMapOutcome struct {
 }
 
 // assembleMapOutput joins the kept chunk summaries into one Map document and,
-// when coverageGap is set (any message was dropped — a failed or blank chunk, a
-// manifest-miss, or the intentional fan-out cap), appends the V2-independent gap
-// notice so the incompleteness is visible IN the text, not only in the run row.
+// when coverageGap is set (a manifest-miss or intentional fan-out cap),
+// appends the V2-independent gap notice so the incompleteness is visible IN the text, not only in the run row.
 //
 // It appends the notice on EVERY real gap — including the all-blank branch (a
 // cap-dropped head never reached a model, so a bare "all noise" body would be
@@ -929,17 +921,16 @@ func mapPhaseFailedErr(totalChunks int, errs []error) error {
 //     contract as the old serial loop.
 //
 // Failure policy — recovery-first (see docs/summarize-chunk-completeness-contract.md):
-// a transient per-chunk failure (429/5xx/timeout/recovered panic) makes the whole
+// a transient per-chunk failure (429/5xx/timeout) makes the whole
 // invocation return an error, so the runner MarkMapFailed's it and the invocation
 // owes a successful retry (a flag-independent, request-scoped gate) rather than
 // shipping a partial. A single chunk's own per-attempt timeout is such a transient
 // failure. A fatal per-chunk error (truncation / reasoning-budget exhaustion /
-// ErrRequestTooLarge, see isFatalChunkError) and the RUN's own
-// cancellation/expiry likewise abort the phase. The ONLY non-complete outcome that
-// is shipped rather than retried is the intentional fan-out cap (handler level,
-// disclosed). A chunk that SUCCEEDS but returns a blank summary is COVERED, not
-// lost — the model found nothing worth reporting — so its messages count as
-// processed and it is recorded only in cov.BlankChunkCount (contract §2–§4).
+// ErrRequestTooLarge / recovered panic, see isFatalChunkError) and the RUN's own
+// cancellation/expiry likewise abort the phase. Intentional fan-out cap and
+// manifest-miss gaps are shipped with disclosure at the handler level. A chunk
+// that SUCCEEDS but returns a blank summary counts as processed rather than
+// dropped; an all-blank result reports uncertainty (contract §2–§4).
 //
 // Error reporting: the phase errors via mapPhaseFailedErr, which keys the wrap on
 // the LOWEST-INDEX cause alone. It deliberately does NOT join all causes:
@@ -994,7 +985,7 @@ func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]inte
 				// are COVERED, not lost — count them as processed so a noisy-but-fully-
 				// covered run does not assert incompleteness, and record BlankChunkCount
 				// for observability only (contract §3/§4; #256 r9 blank P2).
-				log.Printf("[summarize_chunk] chunk %d returned a blank summary; covered as noise, not appended", i)
+				log.Printf("[summarize_chunk] chunk %d returned a blank summary; counted as processed, empty response not appended", i)
 				cov.BlankChunkCount++
 				cov.ProcessedCount += processed
 				cov.OversizedMessageCount += oversized
@@ -1080,9 +1071,9 @@ func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]inte
 			continue
 		}
 		if strings.TrimSpace(o.summary) == "" {
-			// Blank-success: covered as noise, not lost — count as processed and
+			// Blank-success: count as processed, without judging the input, and
 			// record BlankChunkCount for observability only (contract §3/§4).
-			log.Printf("[summarize_chunk] chunk %d returned a blank summary; covered as noise, not appended", i)
+			log.Printf("[summarize_chunk] chunk %d returned a blank summary; counted as processed, empty response not appended", i)
 			cov.BlankChunkCount++
 			cov.ProcessedCount += o.processed
 			cov.OversizedMessageCount += o.oversized

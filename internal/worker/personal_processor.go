@@ -780,26 +780,9 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 	log.Printf("[personal-worker] task=%d marked failed (terminal), sanitizedMsg=%s", pr.TaskID, sanitized)
 }
 
-// isFatalMapError decides whether ONE chunk's Map failure should abort the whole
-// task instead of degrading that chunk.
-//
-// The match is deliberately narrow. It used to test the bare substring
-// "truncated", but internal/service/llm.go interpolates the upstream response
-// body verbatim into API errors ("LLM API error: status=400 body=..."), so any
-// upstream payload that merely CONTAINED the word — an error message, a field
-// name, a quoted snippet of the request — escalated one chunk's transient blip
-// into a task-wide abort. Only the two errors the Map wrapper itself produces
-// after exhausting its retries mean irrecoverable coverage loss:
-//
-//	service.ErrOutputTruncated / service.ErrStreamOutputTruncated, wrapped by
-//	  CallMap / CallMapStream as "output truncated on chunk N"
-//	"reasoning budget exhausted on chunk N"
-//
-// Everything else is a per-chunk failure the pipeline already handles.
-//
-// The truncation half is matched by errors.Is on the service sentinels rather
-// than by text, so it stays correct no matter how the wrapper's wording is
-// edited, and an unrelated error that merely quotes the word cannot satisfy it.
+// fatalMapErrorKind identifies irrecoverable Map failures propagated by the
+// service wrappers. Ordinary per-chunk failures retain marker-and-continue
+// behavior for chat/document tasks; mixed tasks reject any failed chunk.
 type fatalMapErrorKind string
 
 const (
@@ -808,6 +791,8 @@ const (
 	fatalMapReasoningBudget fatalMapErrorKind = "reasoning budget exhausted"
 )
 
+// classifyFatalMapError matches typed causes, including wrapped errors.
+// Upstream error text alone must not escalate a failure to a task-wide abort.
 func classifyFatalMapError(err error) fatalMapErrorKind {
 	if err == nil {
 		return ""
@@ -823,7 +808,7 @@ func classifyFatalMapError(err error) fatalMapErrorKind {
 	if errors.Is(err, service.ErrOutputTruncated) || errors.Is(err, service.ErrStreamOutputTruncated) {
 		return fatalMapOutputTruncated
 	}
-	if strings.Contains(err.Error(), "reasoning budget exhausted") {
+	if errors.Is(err, service.ErrReasoningBudgetExhausted) {
 		return fatalMapReasoningBudget
 	}
 	return ""
@@ -1358,9 +1343,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 				var tokens int
 				var usedModel string
 				var err error
-				if p.mapChunkFn != nil {
-					summary, tokens, usedModel, err = p.mapChunkFn(ctx, idx, formatted)
-				} else if len(chunks) == 1 && documentMode {
+				if len(chunks) == 1 && documentMode {
 					summary, tokens, usedModel, err = p.llm.CallDocumentMapStreamWithModel(ctx,
 						joinStrings(formatted), sourceName, idx, len(c), generationTopic, streamDelta)
 				} else if len(chunks) == 1 && mixedMode {

@@ -639,3 +639,28 @@ func TestAssembleMapOutput(t *testing.T) {
 		}
 	})
 }
+
+func TestAllBlankMapReportsUncertainty(t *testing.T) {
+	const want = "本批次所有分片的模型调用均未返回摘要内容；无法确认这些消息是否包含值得汇报的信息。"
+	if got := assembleMapOutput([]string{"", "  "}, false); got != want {
+		t.Fatalf("all-blank body=%q, want neutral observation %q", got, want)
+	}
+}
+
+func TestAllBlankGuidanceMatchesHandlerCounters(t *testing.T) {
+	schema, _ := SummarizeChunkTool()
+	props := schema.Function.Parameters.(map[string]interface{})["properties"].(map[string]interface{})
+	description := props["chunk_size"].(map[string]interface{})["description"].(string)
+	if !strings.Contains(description, "chunk_count == 0 且 blank_chunk_count > 0") || !strings.Contains(description, "无法确认") {
+		t.Fatal("schema must qualify all-blank results using the handler's non-blank chunk_count")
+	}
+	for _, name := range []string{"summary", "summary_refine", "summary_workspace"} {
+		content, err := embeddedPrompts.ReadFile("prompts/" + name + ".md")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(content), "`chunk_count == 0` 且 `blank_chunk_count > 0`") || !strings.Contains(string(content), "无法确认是否有值得汇报的信息") {
+			t.Errorf("%s must preserve uncertainty when every Map response is blank", name)
+		}
+	}
+}
