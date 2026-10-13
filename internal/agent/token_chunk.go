@@ -10,19 +10,20 @@ import (
 // chunks are balanced by content (defect #9: uneven-length messages caused wild
 // token imbalance) and the 200-message format cap can be removed without risking
 // context overflow — each chunk is bounded by a token budget that bills the
-// RENDERED prompt lines (fix-forward for PR #196 review P0-1), plus a hard
-// message-count backstop (P0-2) so no estimator bug can produce an unbounded
-// chunk.
+// RENDERED prompt lines (fix-forward for PR #196 review P0-1), plus a default
+// message-count backstop (P0-2). For inputs large enough to exceed the fan-out
+// limit, floorMsgsPerChunk may raise that count cap; the token budget remains
+// the safety bound.
 const (
 	// minChunkTokenBudget is a defensive floor inside splitMsgMapsByTokenBudget
 	// for a non-positive budget argument. The normal Map budget is already
 	// floored by config.ResolveMapInputBudget (config.minMapInputBudget, same
 	// value), so this only guards a direct caller passing budget < 1.
 	minChunkTokenBudget = 2000
-	// hardMessageBackstop caps messages per chunk regardless of the token
-	// budget and the chunk_size hint, so degenerate estimates (e.g. empty
-	// content, which renders to a cheap framing-only line) can never pack an
-	// unbounded number of messages into one chunk (PR #196 review P0-2).
+	// hardMessageBackstop caps the model-supplied chunk_size and supplies the
+	// default when no explicit effective cap is present. floorMsgsPerChunk may
+	// raise the effective cap above it to keep very large inputs within the
+	// fan-out limit; the token budget still bounds each chunk.
 	//
 	// 200 restores EXACTLY the bound main relied on: the pre-SS-06b formatter
 	// hard-capped every chunk at 200 messages unconditionally. Round-3 review
@@ -102,9 +103,8 @@ func chunkTokenBudget(cfg config.Config) int {
 // (renderMessageLine), not its raw content, so the framing the model actually
 // receives is what gets budgeted (PR #196 review P0-1). maxMsgs (>0)
 // additionally caps the message count per chunk (the optional chunk_size
-// hint); in every case the per-chunk message count is also capped by
-// hardMessageBackstop, so zero-cost messages can never form an unbounded
-// chunk (P0-2). A single message larger than the whole budget becomes its own
+// hint). A caller value above hardMessageBackstop is the fan-out floor and is
+// preserved deliberately. A single message larger than the whole budget becomes its own
 // chunk rather than being dropped or split mid-message. Never drops a message:
 // every input ends up in exactly one chunk.
 func splitMsgMapsByTokenBudget(msgMaps []map[string]interface{}, budget, maxMsgs, cjkRatio, asciiRatio int) [][]map[string]interface{} {
@@ -120,8 +120,15 @@ func splitMsgMapsByTokenBudget(msgMaps []map[string]interface{}, budget, maxMsgs
 	if asciiRatio < 1 {
 		asciiRatio = 1
 	}
+	// maxMsgs is the EFFECTIVE per-chunk cap: clampChunkSize has already
+	// trimmed the model-supplied chunk_size to [1, hardMessageBackstop]
+	// (P1-1), so any value above the backstop arriving here was raised by the
+	// B-1a floor (floorMsgsPerChunk) — that raise is load-bearing (it keeps
+	// ceil(n/256) chunks inside the fan-out cap) and must survive. The
+	// splitter therefore only FILLS the zero case with the backstop; it never
+	// lowers an explicit caller value.
 	msgCap := maxMsgs
-	if msgCap <= 0 || msgCap > hardMessageBackstop {
+	if msgCap <= 0 {
 		msgCap = hardMessageBackstop
 	}
 	var chunks [][]map[string]interface{}

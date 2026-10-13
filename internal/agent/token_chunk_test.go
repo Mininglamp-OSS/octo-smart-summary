@@ -114,9 +114,12 @@ func TestSplitOversizedMessageOwnChunk(t *testing.T) {
 // any input size, zero drop.
 func TestProbeCoverageNoDrop(t *testing.T) {
 	for _, n := range []int{201, 500, 2000, 12345} {
-		p, d, chunks := ProbeChunkCoverageDefault(makeMsgMaps(n), 0)
+		p, d, chunks, capped := ProbeChunkCoverageDefault(makeMsgMaps(n), 0)
 		if p != n || d != 0 {
 			t.Fatalf("ProbeChunkCoverageDefault(%d) = processed %d dropped %d, want %d/0", n, p, d, n)
+		}
+		if capped != 0 {
+			t.Fatalf("ProbeChunkCoverageDefault(%d) = capped %d, want 0 (no fan-out cap at this size)", n, capped)
 		}
 		if chunks < 1 {
 			t.Fatalf("ProbeChunkCoverageDefault(%d) = %d chunks, want >= 1", n, chunks)
@@ -222,25 +225,41 @@ func TestSplitEmptyContentBackstop(t *testing.T) {
 	}
 }
 
-// TestSplitBackstopCapsMaxMsgs is the P1-1 regression at the splitter level:
-// a model-supplied chunk_size of 5000 must not be honoured verbatim, and
-// maxMsgs=0 (token-only) is still bounded by the backstop.
+// TestSplitBackstopCapsMaxMsgs is the P1-1 regression. Post-floor-fix the
+// enforcement points split cleanly: the MODEL's chunk_size is trimmed at
+// clampChunkSize (the [1,200] boundary pin lives there); the splitter only
+// fills maxMsgs=0 with the backstop and never lowers an explicit caller value
+// — because the only caller value above the backstop is the B-1a floor, whose
+// raise is load-bearing (it keeps ceil(n/256) chunks inside the fan-out cap).
 func TestSplitBackstopCapsMaxMsgs(t *testing.T) {
 	msgs := shortCJKMsgs(1200)
-	// Huge budget so only the message cap can bite.
-	for _, maxMsgs := range []int{0, 5000} {
-		chunks := splitMsgMapsByTokenBudget(msgs, 10_000_000, maxMsgs, 2, 4)
-		if len(chunks) != 6 { // 200 × 6 (backstop)
-			t.Fatalf("maxMsgs=%d: got %d chunks, want 6 (backstop must cap at %d)", maxMsgs, len(chunks), hardMessageBackstop)
-		}
-		for i, c := range chunks {
-			if len(c) > hardMessageBackstop {
-				t.Fatalf("maxMsgs=%d: chunk %d has %d messages > backstop", maxMsgs, i, len(c))
-			}
+	// maxMsgs=0 (token-only) is still bounded by the backstop.
+	chunks := splitMsgMapsByTokenBudget(msgs, 10_000_000, 0, 2, 4)
+	if len(chunks) != 6 { // 200 × 6 (backstop)
+		t.Fatalf("maxMsgs=0: got %d chunks, want 6 (backstop must cap at %d)", len(chunks), hardMessageBackstop)
+	}
+	for i, c := range chunks {
+		if len(c) > hardMessageBackstop {
+			t.Fatalf("maxMsgs=0: chunk %d has %d messages > backstop", i, len(c))
 		}
 	}
+	// The model's 5000 request is trimmed to the backstop at the boundary
+	// (clampChunkSize — P1-1), so the splitter never sees it verbatim.
+	if got := clampChunkSize(5000); got != hardMessageBackstop {
+		t.Fatalf("clampChunkSize(5000) = %d, want %d (P1-1 boundary)", got, hardMessageBackstop)
+	}
+	// The end-to-end handler path (ProbeChunkCoverage → floor → splitter) with
+	// a model over-request still lands at the backstop for ordinary inputs.
+	msgs5000 := makeMsgMaps(1000)
+	_, dropped, chunksN, capped := ProbeChunkCoverageDefault(msgs5000, 5000)
+	if dropped != 0 || capped != 0 {
+		t.Fatalf("model over-request must not drop: dropped=%d capped=%d", dropped, capped)
+	}
+	if chunksN < 1 {
+		t.Fatalf("model over-request produced %d chunks, want at least 1", chunksN)
+	}
 	// A modest explicit cap below the backstop still wins.
-	chunks := splitMsgMapsByTokenBudget(msgs, 10_000_000, 100, 2, 4)
+	chunks = splitMsgMapsByTokenBudget(msgs, 10_000_000, 100, 2, 4)
 	if len(chunks) != 12 { // 1200 / 100
 		t.Fatalf("maxMsgs=100: got %d chunks, want 12", len(chunks))
 	}
@@ -365,7 +384,7 @@ func TestFormatAndSplitShareOneWireFormat(t *testing.T) {
 // assert the probe counts chunks and lines honestly instead of by arithmetic.
 func TestProbeChunkCoverageDetectsCapRegression(t *testing.T) {
 	msgs := makeMsgMaps(500)
-	processed, dropped, chunks := ProbeChunkCoverageDefault(msgs, 0)
+	processed, dropped, chunks, _ := ProbeChunkCoverageDefault(msgs, 0)
 	if processed != 500 || dropped != 0 {
 		t.Fatalf("ProbeChunkCoverageDefault(500 msgs) = processed %d dropped %d, want 500/0", processed, dropped)
 	}
@@ -375,7 +394,7 @@ func TestProbeChunkCoverageDetectsCapRegression(t *testing.T) {
 
 	// Tighten the count cap via the requested chunk_size: still zero loss, but
 	// the probe must reflect the real (more numerous) chunking, not a formula.
-	processed, dropped, chunksTight := ProbeChunkCoverageDefault(msgs, 50)
+	processed, dropped, chunksTight, _ := ProbeChunkCoverageDefault(msgs, 50)
 	if processed != 500 || dropped != 0 {
 		t.Fatalf("chunk_size=50: processed %d dropped %d, want 500/0", processed, dropped)
 	}
@@ -384,5 +403,76 @@ func TestProbeChunkCoverageDetectsCapRegression(t *testing.T) {
 	}
 	if chunksTight <= chunks && chunks > 1 {
 		t.Fatalf("tighter chunk_size should not reduce chunk count: %d vs %d", chunksTight, chunks)
+	}
+}
+
+// TestProbeChunkCoverageFloorPreventsHintManufacturedCap pins the ordinary-size
+// route: a tiny chunk_size hint is raised before splitting, so it cannot by
+// itself manufacture a fan-out drop. TestProbeChunkCoverageDefaultReportsFiringCap
+// covers a genuine cap firing driven by the token budget.
+func TestProbeChunkCoverageFloorPreventsHintManufacturedCap(t *testing.T) {
+	// Post-floor-fix invariant (B-1a, Jerry-Xin 5338024667 §3 / yujiawei
+	// 5337380127 P1 / mochashanyao 5338040645 P1): chunk_size=1 no longer
+	// manufactures a cap drop at ordinary sizes — floorMsgsPerChunk raises
+	// the per-chunk message count to ceil(n/256), so 300 messages split into
+	// ~150 chunks and NOTHING is dropped. The cap classification path (capped
+	// surfaced separately, dropped-capped==0) is pinned by
+	// TestProbeChunkCoverageDefaultReportsFiringCap and the eval gate, which
+	// still drive genuine cap firings via tiny budgets.
+	const overflow = 44
+	msgs := makeMsgMaps(maxChunkCalls + overflow)
+	processed, dropped, chunks, capped := ProbeChunkCoverageDefault(msgs, 1)
+	if capped != 0 {
+		t.Fatalf("capped = %d, want 0 — the floor must close the chunk_size=1 route", capped)
+	}
+	if dropped != 0 {
+		t.Fatalf("dropped = %d, want 0", dropped)
+	}
+	if processed != len(msgs) {
+		t.Fatalf("processed = %d, want %d", processed, len(msgs))
+	}
+	if chunks > maxChunkCalls {
+		t.Fatalf("chunks = %d exceeds the cap", chunks)
+	}
+}
+
+// TestProbeChunkCoverageDefaultReportsFiringCap is the round-5 P2 regression
+// (Jerry-Xin 5478795037): ProbeChunkCoverageDefault seeded both accumulators at
+// 0 and updated them only when `residual > dropped-capped`, so a CLEAN cap
+// firing (dropped == capped, residual == 0, `0 > 0` false) returned
+// dropped=0 capped=0 while the cap discarded a third of the input — the eval
+// harness then reported total_dropped=0 capped=0, contradicting
+// TotalDroppedCount's own doc. The cap must fire here via the TOKEN budget
+// alone (oversized ASCII messages, no chunk_size cooperation — the route the
+// floor fix leaves open), and the default probe must surface BOTH counters.
+func TestProbeChunkCoverageDefaultReportsFiringCap(t *testing.T) {
+	// 300 messages of 240,000 ASCII runes each (~60k tokens billed per message
+	// at the ASCII ratio). The ceil(300/256)=2 floor puts two per chunk, but
+	// ~120k tokens per chunk exceeds the ~97k default input budget, so the
+	// token budget alone forces one message per chunk = 300 chunks > 256 and
+	// capChunks must fire and drop the oldest head (the residual route the
+	// floor fix leaves open).
+	const n = 300
+	msgs := make([]map[string]interface{}, n)
+	for i := range msgs {
+		msgs[i] = map[string]interface{}{
+			"sender_name":    fmt.Sprintf("user%d", i),
+			"content":        strings.Repeat("x", 240000),
+			"citation_index": i + 1,
+		}
+	}
+	processed, dropped, chunks, capped := ProbeChunkCoverageDefault(msgs, 0)
+	// chunks reports POST-cap, so == maxChunkCalls is itself the cap-fired signal.
+	if chunks != maxChunkCalls {
+		t.Fatalf("precondition: token budget must force the cap to fire (%d kept chunks), got %d (fixture too small)", maxChunkCalls, chunks)
+	}
+	if capped == 0 {
+		t.Fatalf("capped = 0: the firing cap erased BOTH counters (aggregator regression); processed=%d dropped=%d chunks=%d", processed, dropped, chunks)
+	}
+	if dropped != capped {
+		t.Fatalf("clean cap firing must satisfy dropped==capped, got dropped=%d capped=%d (residual must stay 0)", dropped, capped)
+	}
+	if processed+capped != n {
+		t.Fatalf("processed %d + capped %d != input %d: probe funnel leaks messages", processed, capped, n)
 	}
 }

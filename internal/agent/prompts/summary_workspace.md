@@ -23,6 +23,8 @@
 - `summarize_chunk` 只返回本次请求有效的 `summary_handle`。只要调用过 Map，就必须在全部 Map 成功后调用一次覆盖全部 handle 的 `merge_summaries`。
 - 不复制 Map 正文，不复用历史 handle，不在同一批工具调用中同时执行 Map 和 Reduce。
 - 不编造聊天记录中无法确认的信息；关键数据获取失败时如实说明缺口。
+- `summarize_chunk` 成功返回时，`truncated=true` 或 `chunk_calls_capped=true` 表示本次 Map 覆盖不完整（引用清单外消息被丢弃，或因分块过多截断了较早的消息）；据此在最终产物中如实说明结论可能不完整，不要当作已覆盖全部内容。分块失败会使工具调用直接报错并要求重试，不会以部分结果返回。
+- 当 `summarize_chunk` 返回 `chunk_count == 0` 且 `blank_chunk_count > 0` 时，最终答案必须说明“模型未返回摘要内容，无法确认是否有值得汇报的信息”，不得断言消息全是噪声或与主题无关；如同时存在覆盖缺口，也必须保留不完整提示。
 
 ## 引用规则
 

@@ -1,9 +1,7 @@
 package service
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -24,18 +22,6 @@ const MapFailedMarker = "总结失败"
 const MaxRequestBodyBytes = llmclient.MaxRequestBodyBytes
 
 var ErrRequestTooLarge = llmclient.ErrRequestTooLarge
-
-// MarshalRequestBody preserves the legacy package API while routing all
-// production serialization through llmclient.MarshalRequest.
-func MarshalRequestBody(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return nil, err
-	}
-	return bytes.TrimSuffix(buf.Bytes(), []byte{'\n'}), nil
-}
 
 const maxLLMErrorBodyBytes = int(llmclient.MaxErrorBodyBytes)
 
@@ -520,6 +506,9 @@ func (c *LLMClient) CallDocumentMapWithModel(ctx context.Context, formattedDocum
 	if errors.Is(err, ErrReasoningBudgetExhausted) {
 		return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d: %w", chunkIndex, err)
 	}
+	if errors.Is(err, ErrRequestTooLarge) {
+		return "", tokens, usedModel, fmt.Errorf("request too large on chunk %d: %w", chunkIndex, err)
+	}
 	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, c.model, nil
 }
 
@@ -554,6 +543,9 @@ func (c *LLMClient) CallDocumentMapStreamWithModel(ctx context.Context, formatte
 	}
 	if errors.Is(err, ErrReasoningBudgetExhausted) {
 		return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d: %w", chunkIndex, err)
+	}
+	if errors.Is(err, ErrRequestTooLarge) {
+		return "", tokens, usedModel, fmt.Errorf("request too large on chunk %d: %w", chunkIndex, err)
 	}
 	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, c.model, nil
 }
@@ -611,6 +603,9 @@ func (c *LLMClient) CallMapWithModel(ctx context.Context, formattedMessages stri
 	}
 	if errors.Is(err, ErrReasoningBudgetExhausted) {
 		return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d: %w", chunkIndex, err)
+	}
+	if errors.Is(err, ErrRequestTooLarge) {
+		return "", tokens, usedModel, fmt.Errorf("request too large on chunk %d: %w", chunkIndex, err)
 	}
 	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, c.model, nil
 }
@@ -696,6 +691,9 @@ func (c *LLMClient) CallMapStreamWithModel(ctx context.Context, formattedMessage
 	}
 	if errors.Is(err, ErrReasoningBudgetExhausted) {
 		return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d: %w", chunkIndex, err)
+	}
+	if errors.Is(err, ErrRequestTooLarge) {
+		return "", tokens, usedModel, fmt.Errorf("request too large on chunk %d: %w", chunkIndex, err)
 	}
 	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, c.model, nil
 }

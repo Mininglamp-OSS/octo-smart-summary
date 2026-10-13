@@ -164,6 +164,9 @@ func (c *LLMClient) CallMixedMapWithModel(ctx context.Context, formattedEvidence
 	if errors.Is(err, ErrReasoningBudgetExhausted) {
 		return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d: %w", chunkIndex, err)
 	}
+	if errors.Is(err, ErrRequestTooLarge) {
+		return "", tokens, usedModel, fmt.Errorf("request too large on chunk %d: %w", chunkIndex, err)
+	}
 	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, c.model, nil
 }
 
@@ -198,6 +201,9 @@ func (c *LLMClient) CallMixedMapStreamWithModel(ctx context.Context, formattedEv
 	}
 	if errors.Is(err, ErrReasoningBudgetExhausted) {
 		return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d: %w", chunkIndex, err)
+	}
+	if errors.Is(err, ErrRequestTooLarge) {
+		return "", tokens, usedModel, fmt.Errorf("request too large on chunk %d: %w", chunkIndex, err)
 	}
 	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, c.model, nil
 }

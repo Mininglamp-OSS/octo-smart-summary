@@ -96,13 +96,17 @@ func TestFormatChunkForLLM_OversizedCountedNotTruncated(t *testing.T) {
 func aggregateCoverage(t *testing.T, inputCount, requestedChunkSize int) chunkCoverage {
 	t.Helper()
 	msgMaps := makeMsgMaps(inputCount)
-	size := clampChunkSize(requestedChunkSize)
-	processed, dropped, _ := ProbeChunkCoverageDefault(msgMaps, requestedChunkSize)
+	size := floorMsgsPerChunk(requestedChunkSize, inputCount)
+	processed, dropped, _, capped := ProbeChunkCoverageDefault(msgMaps, requestedChunkSize)
 
+	// Mirror finalizeDropCounts semantics: cap-removed messages land in
+	// CappedDroppedCount (NOT DroppedCount) and Truncated flags any real gap
+	// (Jerry-Xin 5338024667 §8.7 — the helper previously conflated the two).
 	cov := chunkCoverage{InputCount: inputCount, ChunkSize: size}
 	cov.ProcessedCount = processed
-	cov.DroppedCount = dropped
-	cov.Truncated = dropped > 0
+	cov.DroppedCount = dropped - capped
+	cov.CappedDroppedCount = capped
+	cov.Truncated = cov.DroppedCount > 0 || cov.CappedDroppedCount > 0
 	return cov
 }
 
@@ -137,8 +141,8 @@ func TestCoverage_NoSilentLoss(t *testing.T) {
 			if cov.Truncated {
 				t.Fatal("truncated = true, want false when nothing dropped")
 			}
-			// And every chunk the production splitter emitted respects the
-			// hard backstop — the bound the handler depends on.
+			// For these ordinary-size cases the fan-out floor does not need to
+			// exceed the model-facing backstop.
 			msgMaps := makeMsgMaps(c.input)
 			cfg := config.Config{}
 			for i, chunk := range splitMsgMapsByTokenBudget(msgMaps,
