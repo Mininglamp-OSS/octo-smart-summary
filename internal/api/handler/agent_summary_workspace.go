@@ -259,6 +259,17 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		c.JSON(http.StatusUnauthorized, apiResponse{Code: 40100, Message: "missing auth context"})
 		return
 	}
+	// Origin is client metadata, not proof of a registered template. Only a
+	// server-resolved template may widen the documents-only Explain route.
+	verifiedDocumentTemplate := false
+	if len(contextValue.Documents) > 0 && len(contextValue.SelectedChannels) == 0 && req.InputOrigin == summaryWorkspaceInputTemplate {
+		verifiedDocumentTemplate, err = h.workspace.verifyDocumentTemplate(c.Request.Context(), spaceID, uid, contextValue.Template)
+		if err != nil {
+			log.Printf("[summary-workspace] verify document template failed: %v", err)
+			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "模板校验失败，请重试"})
+			return
+		}
+	}
 	contextValue = canonicalizeSummaryWorkspaceContextForActor(contextValue, uid)
 	scopeJSON, scopeHash, err := marshalSummaryWorkspaceContext(contextValue)
 	if err != nil {
@@ -310,8 +321,9 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		}
 	}
 
-	intent := classifySummaryWorkspaceIntent(req.Message, begin.Snapshot.CurrentPreview != nil)
-	if begin.Snapshot.CurrentPreview != nil && hasExplicitSummaryExecutionCommand(req.Message) {
+	negatedRun := hasNegatedSummaryRunIntent(req.Message)
+	intent := classifySummaryWorkspaceIntentWithNegation(req.Message, begin.Snapshot.CurrentPreview != nil, negatedRun)
+	if !negatedRun && begin.Snapshot.CurrentPreview != nil && hasExplicitSummaryExecutionCommand(req.Message) {
 		intent = service.SummaryIntentGenerate
 	}
 	selectedSourceExplicit := len(contextValue.SelectedChannels) > 0 || len(contextValue.Documents) > 0
@@ -356,8 +368,17 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		responder.fail(http.StatusInternalServerError, 50000, lookupErr.message, true)
 		return
 	}
-	explicitRunIntent := intent == service.SummaryIntentGenerate && summaryWorkspaceExecutionAuthorized(req.InputOrigin)
-	route := deriveWorkspaceRoute(contextValue, action, intent, explicitRunIntent, selectedSourceExplicit, hasRequirement, openScopeAgent, begin.Snapshot, validation.participantsValid, validation.sourcesValid, validation.referencesValid)
+	routeInput := workspaceRouteInput{
+		Context: contextValue, Action: action, Intent: intent,
+		VerifiedDocumentTemplate: verifiedDocumentTemplate,
+		NegatedRun:               negatedRun,
+		BareContentRestriction:   len(contextValue.Documents) > 0 && len(contextValue.SelectedChannels) == 0 && summaryWorkspaceBareContentRestriction(req.Message),
+		SelectedSourceExplicit:   selectedSourceExplicit, HasRequirement: hasRequirement,
+		OpenScopeAgent: openScopeAgent, State: begin.Snapshot,
+		ParticipantsValid: validation.participantsValid, SourcesValid: validation.sourcesValid,
+		ReferencesValid: validation.referencesValid,
+	}
+	route := deriveWorkspaceRoute(routeInput)
 	// A possible conversational scope change must pass through the Agent before
 	// any side-effecting workflow consumes it.
 	route = workspaceRouteAfterOpenScopeAgentOverride(contextValue, route, openScopeAgent, begin.Snapshot)
@@ -381,22 +402,7 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 	case service.SummaryRouteAgentPreview, service.SummaryRouteAgentRevision, service.SummaryRouteExplanation:
 		snapshot, err = h.completeWorkspaceAgentTurn(c.Request.Context(), responder, key, begin.Turn.ID, begin.Turn.Attempt, req, contextValue, begin.Snapshot, route, openScopeAgent, inferredSource)
 	default:
-		reply := "请先选择一个你有权限的会话，再告诉我希望总结的内容。"
-		if len(contextValue.Documents) > 0 && len(contextValue.SelectedChannels) > 0 && !validation.sourcesValid {
-			reply = "部分所选会话不可用，请调整后重试。"
-		} else if len(contextValue.Documents) > 0 && len(contextValue.Participants) > 0 {
-			reply = "文档总结暂不支持多人协作，请移除参与者后再生成。"
-		} else if len(contextValue.Documents) > 0 && len(contextValue.SelectedChannels) == 0 {
-			reply = "文档问答/解释暂不支持，请输入总结要求后生成文档总结。"
-		} else if len(contextValue.ReferencedTaskIDs) > 0 && !validation.referencesValid {
-			reply = "部分引用总结不可用，请调整后重试。"
-		} else if len(contextValue.Participants) > 0 && !validation.participantsValid {
-			reply = summaryWorkspaceTeamScopeMessage(validation.teamScopeReason)
-		} else if len(contextValue.Participants) > 0 && !hasRequirement {
-			reply = "请选择模板或输入总结要求后再开始多人总结。"
-		} else if len(contextValue.SelectedChannels) > 0 && !validation.sourcesValid {
-			reply = "当前会话不可访问，请重新选择会话。"
-		}
+		reply := summaryWorkspaceClarificationReply(routeInput, validation.teamScopeReason)
 		snapshot, err = h.completeWorkspaceConversation(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, req, workspaceResultClarification, reply, &contextValue)
 	}
 	if err != nil {
@@ -1250,6 +1256,12 @@ func workspaceWorkflowTerminalState(task model.SummaryTask, err error) (resultTy
 }
 
 func classifySummaryWorkspaceIntent(message string, hasCurrentPreview bool) service.SummaryIntent {
+	return classifySummaryWorkspaceIntentWithNegation(message, hasCurrentPreview, hasNegatedSummaryRunIntent(message))
+}
+
+// The handler has already analyzed negative intent for routing. Reuse that
+// result rather than scanning the same request again during classification.
+func classifySummaryWorkspaceIntentWithNegation(message string, hasCurrentPreview, negatedRun bool) service.SummaryIntent {
 	message = strings.ToLower(strings.TrimSpace(message))
 	if message == "" {
 		return service.SummaryIntentUnknown
@@ -1258,6 +1270,11 @@ func classifySummaryWorkspaceIntent(message string, hasCurrentPreview bool) serv
 		"为什么", "为何", "依据", "来源", "怎么得出", "解释", "说明一下",
 		"是什么", "有什么", "包含什么", "哪些内容", "区别",
 		"why", "explain", "source", "evidence", "what is", "what does", "how does") {
+		return service.SummaryIntentExplain
+	}
+	// Cancellation/uncertain negative intent must not become an Agent revision
+	// or gain discoverable scope merely because an earlier preview exists.
+	if negatedRun {
 		return service.SummaryIntentExplain
 	}
 	if hasCurrentPreview {
@@ -1271,10 +1288,7 @@ func classifySummaryWorkspaceIntent(message string, hasCurrentPreview bool) serv
 		"preview first", "draft first", "generate a draft", "show me a preview") {
 		return service.SummaryIntentGenerate
 	}
-	if hasNegatedSummaryRunIntent(message) {
-		return service.SummaryIntentExplain
-	}
-	if hasExplicitSummaryRunIntent(message) {
+	if hasExplicitSummaryRunPhrase(message) {
 		return service.SummaryIntentGenerate
 	}
 	if strings.ContainsAny(message, "？?") {
@@ -1283,17 +1297,18 @@ func classifySummaryWorkspaceIntent(message string, hasCurrentPreview bool) serv
 	return service.SummaryIntentGenerate
 }
 
-// hasExplicitSummaryRunIntent is the side-effect boundary for a personal
-// Workflow. Structured selections make the request executable, but they do
-// not by themselves authorize creating a formal summary. The user must still
-// click the execute affordance (which sends one of these explicit phrases) or
-// type an equivalent instruction. Ambiguous free-form text remains an Agent
-// preview, where it can be corrected before saving.
+// hasExplicitSummaryRunIntent is advisory input to intent classification.
+// Execution also depends on the structured scope and verified input origin;
+// finding a run phrase is not sufficient to authorize a workflow.
 func hasExplicitSummaryRunIntent(message string) bool {
 	message = strings.ToLower(strings.TrimSpace(message))
 	if message == "" || hasNegatedSummaryRunIntent(message) {
 		return false
 	}
+	return hasExplicitSummaryRunPhrase(message)
+}
+
+func hasExplicitSummaryRunPhrase(message string) bool {
 	return containsAny(message,
 		"帮我总结", "请总结", "总结一下", "总结下", "生成总结", "生成周报", "生成日报", "生成月报",
 		"开始总结", "开始生成", "直接生成", "立即生成", "发起总结", "发起多人总结", "准备多人总结任务",
@@ -1316,22 +1331,22 @@ func hasExplicitSummaryExecutionCommand(message string) bool {
 }
 
 func isSummaryWorkspaceGeneratedExecutionMessage(message string) bool {
+	remainder, matched := summaryWorkspaceExecutionCommandRemainder(message)
+	return matched && remainder == ""
+}
+
+// Legacy clients omitted input_origin for these four button labels. Keep this
+// inference narrow: expanding it to every command would turn typed chat-only
+// "start summary" into a system submission instead of an Agent conversation.
+// Explicit system origins accept the full execution command list above.
+func isSummaryWorkspaceLegacyButtonMessage(message string) bool {
 	switch strings.ToLower(strings.TrimSpace(message)) {
-	case "请根据当前选择生成总结",
-		"请根据当前选择准备多人总结任务",
-		"generate a summary from the current selection",
-		"prepare a team summary task from the current selection":
+	case "请根据当前选择生成总结", "请根据当前选择准备多人总结任务",
+		"generate a summary from the current selection", "prepare a team summary task from the current selection":
 		return true
 	default:
 		return false
 	}
-}
-
-func hasNegatedSummaryRunIntent(message string) bool {
-	message = strings.ToLower(strings.TrimSpace(message))
-	return containsAny(message,
-		"不要总结", "不要生成", "别总结", "别生成", "暂不总结", "暂不生成", "先不总结", "先不生成", "无需总结", "不需要总结",
-		"do not summarize", "don't summarize", "do not generate", "don't generate", "without generating")
 }
 
 func containsAny(value string, needles ...string) bool {
@@ -1343,45 +1358,98 @@ func containsAny(value string, needles ...string) bool {
 	return false
 }
 
-func deriveWorkspaceRoute(context summaryWorkspaceContext, action service.SummaryAction, intent service.SummaryIntent, hasExplicitRunIntent, selectedSourceExplicit, hasRequirement, openScopeAgent bool, state WorkspaceSnapshot, participantsValid, sourcesValid, referencesValid bool) service.SummaryRoute {
+// summaryWorkspaceClarificationReply reports hard scope/permission blockers
+// before acknowledging a negation, so the user sees what must be corrected.
+func summaryWorkspaceClarificationReply(in workspaceRouteInput, teamScopeReason string) string {
+	context := in.Context
+	switch {
+	case len(context.Documents) > 0 && len(context.Participants) > 0:
+		return "文档总结暂不支持多人协作，请移除参与者后再生成。"
+	case len(context.Documents) > 0 && len(context.SelectedChannels) > 0 && !in.SourcesValid:
+		return "部分所选会话不可用，请调整后重试。"
+	case len(context.Documents) > 0 && len(context.ReferencedTaskIDs) > 0:
+		return "文档总结暂不支持叠加引用总结，请移除引用总结后再生成。本轮未读取文档或创建总结任务。"
+	case len(context.ReferencedTaskIDs) > 0 && !in.ReferencesValid:
+		return "部分引用总结不可用，请调整后重试。"
+	case len(context.Participants) > 0 && !in.ParticipantsValid:
+		return summaryWorkspaceTeamScopeMessage(teamScopeReason)
+	case len(context.Documents) > 0 && in.NegatedRun:
+		return "要现在生成总结吗？本轮先不执行。请确认是暂停生成，还是仅限制输出内容；如需继续，可用肯定表述重新说明总结要求。"
+	case len(context.Documents) > 0 && len(context.SelectedChannels) == 0:
+		return "文档问答/解释暂不支持，请输入总结要求后生成文档总结。"
+	case len(context.Participants) > 0 && !in.HasRequirement:
+		return "请选择模板或输入总结要求后再开始多人总结。"
+	case len(context.SelectedChannels) > 0 && !in.SourcesValid:
+		return "当前会话不可访问，请重新选择会话。"
+	default:
+		return "请先选择一个你有权限的会话，再告诉我希望总结的内容。"
+	}
+}
+
+type workspaceRouteInput struct {
+	Context                  summaryWorkspaceContext
+	Action                   service.SummaryAction
+	Intent                   service.SummaryIntent
+	VerifiedDocumentTemplate bool
+	NegatedRun               bool
+	BareContentRestriction   bool
+	SelectedSourceExplicit   bool
+	HasRequirement           bool
+	OpenScopeAgent           bool
+	State                    WorkspaceSnapshot
+	ParticipantsValid        bool
+	SourcesValid             bool
+	ReferencesValid          bool
+}
+
+// deriveWorkspaceRoute preserves mixed-source submission compatibility:
+// valid, non-negated mixed turns execute even when phrased as questions.
+// Documents-only Explain turns require a server-verified template.
+// The handler normalizes the context before this call. Keep unsupported
+// document combinations fail-closed here too. Legacy documents-only scopes
+// may contain references: clarify so history-rehydrated sessions can recover.
+func deriveWorkspaceRoute(in workspaceRouteInput) service.SummaryRoute {
+	context := in.Context
 	if len(context.Documents) > 0 {
 		mixedChat := len(context.SelectedChannels) > 0
 		switch {
-		case len(context.Participants) > 0:
+		case len(context.Participants) > 0 || len(context.ReferencedTaskIDs) > 0:
 			return service.SummaryRouteClarification
-		case mixedChat && !sourcesValid:
+		case mixedChat && !in.SourcesValid:
 			// Mixed scope with an unauthorized/unresolvable chat: clarify
 			// instead of silently dropping the chat or skipping the workflow.
 			// The permission result must gate workflow creation (plan §4.3).
 			return service.SummaryRouteClarification
+		case in.NegatedRun:
+			return service.SummaryRouteClarification
 		case mixedChat:
-			// Mixed scopes run the personal workflow; the docs-only
-			// explain-clarification does not apply once chats are present,
-			// regardless of intent or explicit run flag.
 			return service.SummaryRoutePersonalWorkflow
-		case intent == service.SummaryIntentExplain && !hasExplicitRunIntent:
+		case in.BareContentRestriction && !in.VerifiedDocumentTemplate:
+			return service.SummaryRouteClarification
+		case in.Intent == service.SummaryIntentExplain && !in.VerifiedDocumentTemplate:
 			return service.SummaryRouteClarification
 		default:
 			return service.SummaryRoutePersonalWorkflow
 		}
 	}
+	state := in.State
 	hasPreview := state.CurrentPreview != nil
 	return service.DeriveSummaryRoute(service.SummaryRouteInput{
-		Action:                     action,
-		Intent:                     intent,
-		HasExplicitRunIntent:       hasExplicitRunIntent,
-		HasSelectedSource:          selectedSourceExplicit,
-		HasValidSource:             sourcesValid,
+		Action:                     in.Action,
+		Intent:                     in.Intent,
+		HasExplicitRunIntent:       in.Intent == service.SummaryIntentGenerate,
+		HasSelectedSource:          in.SelectedSourceExplicit,
+		HasValidSource:             in.SourcesValid,
 		HasSelectedTemplate:        context.Template != nil,
-		HasRequirement:             hasRequirement,
+		HasRequirement:             in.HasRequirement,
 		HasOtherParticipants:       len(context.Participants) > 0,
-		ParticipantsValid:          participantsValid,
+		ParticipantsValid:          in.ParticipantsValid,
 		HasCurrentPreview:          hasPreview,
 		PreviewScopeMatches:        hasPreview && state.CurrentPreview.ScopeVersion == state.Session.ScopeVersion,
 		HasTeamProposal:            state.Session.PendingProposalStatus == "pending",
 		TeamProposalScopeMatches:   state.Session.PendingProposalStatus == "pending" && state.Session.PendingProposalScopeVersion == state.Session.ScopeVersion,
-		HasEnoughContextForPreview: referencesValid && (sourcesValid || len(context.ReferencedTaskIDs) > 0 || openScopeAgent),
-		HasHardMissingData:         !referencesValid,
+		HasEnoughContextForPreview: in.ReferencesValid && (in.SourcesValid || len(context.ReferencedTaskIDs) > 0 || in.OpenScopeAgent),
+		HasHardMissingData:         !in.ReferencesValid,
 	})
 }
 
@@ -1425,31 +1493,58 @@ func canonicalizeSummaryWorkspaceContextForActor(contextValue summaryWorkspaceCo
 
 var errSummaryWorkspaceNoRecentChannel = errors.New("no recent authorised channel")
 
+// verifyDocumentTemplate resolves the same actor/space-specific registry as
+// GET /summary-templates. Matching two client-controlled strings is not proof.
+func (w *summaryWorkspaceCoordinator) verifyDocumentTemplate(ctx context.Context, spaceID, userID string, selected *summaryWorkspaceTemplate) (bool, error) {
+	if selected == nil {
+		return false, nil
+	}
+	builtin, found := findBuiltinTopicTemplate(selected.TemplateID)
+	var record model.SummaryUserTemplate
+	err := w.db.WithContext(ctx).
+		Where("space_id = ? AND user_id = ? AND template_id = ? AND deleted_at IS NULL", spaceID, userID, selected.TemplateID).
+		Take(&record).Error
+	switch {
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		// No override: only an existing built-in template can match.
+	case err != nil:
+		return false, err
+	case record.IsCustom:
+		return strings.EqualFold(strings.TrimSpace(record.Pattern), strings.TrimSpace(selected.Requirement)), nil
+	case found:
+		builtin = applyTemplateOverride(builtin, record)
+	}
+	return found && strings.EqualFold(strings.TrimSpace(builtin.Pattern), strings.TrimSpace(selected.Requirement)), nil
+}
+
 func normalizeSummaryWorkspaceInputOrigin(raw string, contextValue summaryWorkspaceContext, message string) (string, error) {
 	origin := strings.ToLower(strings.TrimSpace(raw))
 	if origin == "" {
-		if contextValue.Template != nil && strings.TrimSpace(message) == strings.TrimSpace(contextValue.Template.Requirement) {
+		if contextValue.Template != nil && strings.EqualFold(strings.TrimSpace(message), strings.TrimSpace(contextValue.Template.Requirement)) {
 			return summaryWorkspaceInputTemplate, nil
 		}
-		if isSummaryWorkspaceGeneratedExecutionMessage(message) {
+		if isSummaryWorkspaceLegacyButtonMessage(message) {
 			return summaryWorkspaceInputSystemIntent, nil
 		}
 		return summaryWorkspaceInputUser, nil
 	}
 	switch origin {
-	case summaryWorkspaceInputUser, summaryWorkspaceInputTemplate, summaryWorkspaceInputSystemIntent:
+	case summaryWorkspaceInputUser:
+		return origin, nil
+	case summaryWorkspaceInputTemplate:
+		if contextValue.Template == nil || !strings.EqualFold(strings.TrimSpace(message), strings.TrimSpace(contextValue.Template.Requirement)) {
+			return summaryWorkspaceInputUser, nil
+		}
+		return origin, nil
+	case summaryWorkspaceInputSystemIntent:
+		if !isSummaryWorkspaceGeneratedExecutionMessage(message) {
+			// Copy/locale drift loses deterministic-origin treatment, not the
+			// entire submission. Ordinary scope and routing guards still apply.
+			return summaryWorkspaceInputUser, nil
+		}
 		return origin, nil
 	default:
 		return "", fmt.Errorf("input_origin 必须为 user、template 或 system_intent")
-	}
-}
-
-func summaryWorkspaceExecutionAuthorized(inputOrigin string) bool {
-	switch inputOrigin {
-	case summaryWorkspaceInputUser, summaryWorkspaceInputTemplate, summaryWorkspaceInputSystemIntent:
-		return true
-	default:
-		return false
 	}
 }
 
@@ -1483,6 +1578,12 @@ func summaryWorkspaceExecutionRequirement(contextValue summaryWorkspaceContext, 
 	}
 	if requirement := summaryWorkspaceUserRequirement(message, inputOrigin); requirement != "" {
 		parts = append(parts, requirement)
+	}
+	// Preserve a generic document-summary requirement for verified execute
+	// submissions without a template; never replace a concrete template.
+	// Chat-only requirement handling deliberately retains its existing behavior.
+	if len(parts) == 0 && len(contextValue.Documents) > 0 && inputOrigin == summaryWorkspaceInputSystemIntent && isSummaryWorkspaceGeneratedExecutionMessage(message) {
+		parts = append(parts, strings.TrimSpace(message))
 	}
 	return strings.Join(parts, "\n\n")
 }

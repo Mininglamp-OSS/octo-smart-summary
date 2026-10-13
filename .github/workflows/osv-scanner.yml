@@ -17,20 +17,27 @@ permissions:
 jobs:
   scan-scheduled:
     if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
     with:
       scan-args: |-
         -r
         ./
       fail-on-vuln: false
+      # Reports remain downloadable artifacts; no caller consumes JSON outputs.
+      export-results: false
 
   scan-pr:
     if: github.event_name == 'pull_request'
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
     with:
       scan-args: |-
         -r
         ./
+      # v2.7.0 defaults to these values. Pin that intent explicitly: upgrading
+      # from v2.3.8 avoids its unconditional JSON job-output export (>1 MiB),
+      # while keeping vulnerability enforcement and JSON/SARIF artifacts.
+      export-results: false
+      fail-on-vuln: true
       # Skip SARIF upload when GITHUB_TOKEN is read-only:
       # - Fork PRs: token is inherently read-only
       # - Dependabot PRs: GitHub enforces read-only token for dependabot[bot]

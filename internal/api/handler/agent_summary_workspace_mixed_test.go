@@ -185,8 +185,10 @@ func TestDeriveWorkspaceRouteMixedInvalidSourcesClarifies(t *testing.T) {
 		SelectedChannels: []summaryWorkspaceChannel{{ChatID: "group-1", ChatType: "group", Name: "群"}},
 		Documents:        []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}},
 	}
-	route := deriveWorkspaceRoute(context, service.SummaryActionChat, service.SummaryIntentGenerate,
-		true, true, true, false, WorkspaceSnapshot{}, true, false, true)
+	route := deriveWorkspaceRoute(workspaceRouteInput{
+		Context: context, Action: service.SummaryActionChat, Intent: service.SummaryIntentGenerate,
+		SelectedSourceExplicit: true, HasRequirement: true, ParticipantsValid: true, ReferencesValid: true,
+	})
 	if route != service.SummaryRouteClarification {
 		t.Fatalf("route = %v, want clarification for mixed scope with invalid sources", route)
 	}
@@ -197,8 +199,10 @@ func TestDeriveWorkspaceRouteMixedValidSourcesPersonalWorkflow(t *testing.T) {
 		SelectedChannels: []summaryWorkspaceChannel{{ChatID: "group-1", ChatType: "group", Name: "群"}},
 		Documents:        []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}},
 	}
-	route := deriveWorkspaceRoute(context, service.SummaryActionChat, service.SummaryIntentGenerate,
-		true, true, true, false, WorkspaceSnapshot{}, true, true, true)
+	route := deriveWorkspaceRoute(workspaceRouteInput{
+		Context: context, Action: service.SummaryActionChat, Intent: service.SummaryIntentGenerate,
+		SelectedSourceExplicit: true, HasRequirement: true, ParticipantsValid: true, SourcesValid: true, ReferencesValid: true,
+	})
 	if route != service.SummaryRoutePersonalWorkflow {
 		t.Fatalf("route = %v, want personal workflow for valid mixed scope", route)
 	}

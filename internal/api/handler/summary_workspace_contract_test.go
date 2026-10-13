@@ -346,7 +346,12 @@ func TestClassifySummaryWorkspaceIntentKeepsQuestionsReadOnly(t *testing.T) {
 		{name: "explicit generation", message: "请根据当前选择生成总结", want: service.SummaryIntentGenerate},
 		{name: "polite generation question", message: "能帮我总结一下吗？", want: service.SummaryIntentGenerate},
 		{name: "negated generation", message: "先不要生成总结，我还要补充要求", want: service.SummaryIntentExplain},
-		{name: "explicit preview overrides formal negation", message: "不要生成正式总结，先给预览", want: service.SummaryIntentGenerate},
+		// Approved conservative policy: a preview request no longer overrides
+		// negative execution intent. Positive preview requests remain unchanged.
+		{name: "formal negation precedes preview request", message: "不要生成正式总结，先给预览", want: service.SummaryIntentExplain},
+		{name: "formal negation precedes existing preview", message: "不要生成正式总结，先给预览", hasPreview: true, want: service.SummaryIntentExplain},
+		{name: "positive preview request", message: "先给预览", want: service.SummaryIntentGenerate},
+		{name: "positive preview revision", message: "先给预览", hasPreview: true, want: service.SummaryIntentRevise},
 		{name: "free form requirement", message: "重点关注风险和行动项", want: service.SummaryIntentGenerate},
 		{name: "preview follow-up", message: "把行动项放到最前面", hasPreview: true, want: service.SummaryIntentRevise},
 		{name: "explicit regeneration updates preview", message: "请重新生成总结", hasPreview: true, want: service.SummaryIntentRevise},
@@ -515,7 +520,11 @@ func TestDeriveWorkspaceRouteFinalMatrix(t *testing.T) {
 			if action == "" {
 				action = service.SummaryActionChat
 			}
-			got := deriveWorkspaceRoute(tt.context, action, service.SummaryIntentGenerate, true, tt.selectedSourceExplicit, tt.hasRequirement, tt.openScopeAgent, WorkspaceSnapshot{}, true, tt.sourcesValid, true)
+			got := deriveWorkspaceRoute(workspaceRouteInput{
+				Context: tt.context, Action: action, Intent: service.SummaryIntentGenerate,
+				SelectedSourceExplicit: tt.selectedSourceExplicit, HasRequirement: tt.hasRequirement,
+				OpenScopeAgent: tt.openScopeAgent, ParticipantsValid: true, SourcesValid: tt.sourcesValid, ReferencesValid: true,
+			})
 			if got != tt.want {
 				t.Fatalf("route = %q, want %q", got, tt.want)
 			}
@@ -525,11 +534,16 @@ func TestDeriveWorkspaceRouteFinalMatrix(t *testing.T) {
 
 func TestDeriveWorkspaceRouteDocumentExplainClarifies(t *testing.T) {
 	context := summaryWorkspaceContext{Documents: []summaryWorkspaceDocument{{DocumentID: "doc-1", Title: "方案"}}}
-	got := deriveWorkspaceRoute(context, service.SummaryActionChat, service.SummaryIntentExplain, false, true, false, false, WorkspaceSnapshot{}, true, true, true)
+	in := workspaceRouteInput{
+		Context: context, Action: service.SummaryActionChat, Intent: service.SummaryIntentExplain,
+		SelectedSourceExplicit: true, ParticipantsValid: true, SourcesValid: true, ReferencesValid: true,
+	}
+	got := deriveWorkspaceRoute(in)
 	if got != service.SummaryRouteClarification {
 		t.Fatalf("document explain route = %q, want clarification", got)
 	}
-	got = deriveWorkspaceRoute(context, service.SummaryActionChat, service.SummaryIntentExplain, false, true, true, false, WorkspaceSnapshot{}, true, true, true)
+	in.HasRequirement = true
+	got = deriveWorkspaceRoute(in)
 	if got != service.SummaryRouteClarification {
 		t.Fatalf("document explain route with user text requirement = %q, want clarification", got)
 	}
