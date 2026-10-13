@@ -14,21 +14,56 @@ const (
 	summaryWorkspaceUncertainNegation
 )
 
+var summaryWorkspaceNegationVerbs = []string{
+	"不要总结", "不要生成", "别总结", "别生成", "暂不总结", "暂不生成",
+	"不总结", "不生成", "无需总结", "无需生成", "不需要总结", "不需要生成",
+	"不用总结", "不用生成", "不要再总结", "不要再生成",
+	"do not summarize", "don't summarize", "do not generate", "don't generate", "without generating",
+}
+
 // Both cancellation and uncertain negative intent require clarification. An
 // unknown object must never silently authorize a document fetch or task.
 func hasNegatedSummaryRunIntent(message string) bool {
 	return summaryWorkspaceRunNegation(message) != summaryWorkspaceNoNegation
 }
 
+// A content restriction by itself is not a request to start a document task.
+// This check is deliberately narrower than negative-intent analysis: it only
+// recognizes clauses made entirely of an already known restriction. A message
+// with any other clause keeps its existing route.
+func summaryWorkspaceBareContentRestriction(message string) bool {
+	clauses := summaryWorkspaceNegationClauses(message)
+	if len(clauses) == 0 {
+		return false
+	}
+	for _, clause := range clauses {
+		matched := false
+		for _, verb := range summaryWorkspaceNegationVerbs {
+			start := strings.Index(clause.text, verb)
+			if start < 0 || clause.hasReportedBytes(start, start+len(verb)) {
+				continue
+			}
+			if verb[0] < unicode.MaxASCII && start > 0 && isSummaryASCIIWord(clause.text[start-1]) {
+				continue
+			}
+			prefix, object := strings.TrimSpace(clause.text[:start]), clause.text[start+len(verb):]
+			if (prefix == "" && summaryWorkspaceNegationObject(object) == summaryWorkspaceNoNegation) ||
+				(summaryWorkspaceNegationObject(prefix) == summaryWorkspaceNoNegation && normalizeSummaryWorkspaceNegationObject(object) == "") {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
+}
+
 func summaryWorkspaceRunNegation(message string) summaryWorkspaceNegation {
 	result := summaryWorkspaceNoNegation
 	for _, clause := range summaryWorkspaceNegationClauses(message) {
-		for _, verb := range []string{
-			"不要总结", "不要生成", "别总结", "别生成", "暂不总结", "暂不生成",
-			"不总结", "不生成", "无需总结", "无需生成", "不需要总结", "不需要生成",
-			"不用总结", "不用生成", "不要再总结", "不要再生成",
-			"do not summarize", "don't summarize", "do not generate", "don't generate", "without generating",
-		} {
+		for _, verb := range summaryWorkspaceNegationVerbs {
 			for from := 0; from < len(clause.text); {
 				offset := strings.Index(clause.text[from:], verb)
 				if offset < 0 {

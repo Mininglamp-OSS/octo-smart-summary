@@ -372,6 +372,7 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		Context: contextValue, Action: action, Intent: intent,
 		VerifiedDocumentTemplate: verifiedDocumentTemplate,
 		NegatedRun:               negatedRun,
+		BareContentRestriction:   len(contextValue.Documents) > 0 && len(contextValue.SelectedChannels) == 0 && summaryWorkspaceBareContentRestriction(req.Message),
 		SelectedSourceExplicit:   selectedSourceExplicit, HasRequirement: hasRequirement,
 		OpenScopeAgent: openScopeAgent, State: begin.Snapshot,
 		ParticipantsValid: validation.participantsValid, SourcesValid: validation.sourcesValid,
@@ -1391,6 +1392,7 @@ type workspaceRouteInput struct {
 	Intent                   service.SummaryIntent
 	VerifiedDocumentTemplate bool
 	NegatedRun               bool
+	BareContentRestriction   bool
 	SelectedSourceExplicit   bool
 	HasRequirement           bool
 	OpenScopeAgent           bool
@@ -1422,6 +1424,8 @@ func deriveWorkspaceRoute(in workspaceRouteInput) service.SummaryRoute {
 			return service.SummaryRouteClarification
 		case mixedChat:
 			return service.SummaryRoutePersonalWorkflow
+		case in.BareContentRestriction && !in.VerifiedDocumentTemplate:
+			return service.SummaryRouteClarification
 		case in.Intent == service.SummaryIntentExplain && !in.VerifiedDocumentTemplate:
 			return service.SummaryRouteClarification
 		default:

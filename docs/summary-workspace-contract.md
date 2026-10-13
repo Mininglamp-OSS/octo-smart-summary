@@ -68,7 +68,7 @@ returns `enabled: true` and `contract_version: "2"`.
   This deliberate product trade-off may ask an extra question for an unfamiliar
   content restriction; it is not a claim of complete natural-language understanding.
   Recognized whole content/output objects (tables, action items, attachment
-  content, closed tasks and the tested variants) remain executable:
+  content, closed tasks and the tested variants) do not by themselves cancel:
   `总结一下，不要生成表格`, `不需要总结附件内容` and
   `总结这份文档，表格不用生成` do not cancel. Pre- and post-verbal
   objects use the same whole-object classifier; conjunctions (`和`, `与`,
@@ -117,7 +117,18 @@ returns `enabled: true` and `contract_version: "2"`.
   actor/space's non-deleted custom/overridden pattern must match the submitted
   requirement case-insensitively. A fabricated ID, forged content, another
   actor's template, or stale override cannot widen this route. Registry lookup
-  errors fail before turn creation; other document-only input keeps its existing route.
+  errors fail before turn creation. On documents-only scopes, a submission
+  consisting entirely of recognized content restrictions (for example,
+  `不要生成表格`, `不需要总结附件内容`, or `表格不用生成`) also clarifies
+  unless it is a server-verified template submission. Not being a cancellation
+  is not by itself permission to start a document task. This narrow guard uses
+  the existing content-object vocabulary; it is not a new affirmative-phrase
+  requirement for all document requests. `总结一下，不要生成表格` executes:
+  this is an intentional widening from the base's substring cancellation guard,
+  not an unchanged document-only behavior. Free-text requirements retain their
+  existing route. Mixed-scope submissions retain the compatibility rule above,
+  including known content restrictions alone. Unknown negative objects still
+  hit the earlier clarification guard, even with a verified template.
   A run phrase's position in user text does not override this rule.
 - Mixed conversational question-answering is not implemented by this contract.
   Separating it from execution would require a future structured personal
