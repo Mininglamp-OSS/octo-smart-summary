@@ -81,6 +81,13 @@ returns `enabled: true` and `contract_version: "2"`.
   of the recognized forms in `hasFrontedContentObject` (for example,
   `总结这份文档 表格不用生成`). Unrecognized request/topic constructions
   remain conservative; no arbitrary noun-suffix extraction is performed.
+  A separator directly between a fronted object and a negative action is not
+  erased to authorize execution: `表格、不要总结` and `表格 不要总结`
+  clarify conservatively, while the established `表格不用生成` form remains
+  a content constraint. This is a regression guard, not additional grammar.
+  Content members are checked incrementally against the same finite object
+  set; an impossible member fails early without splitting every remaining
+  suffix. Long lists composed entirely of known members are not length-capped.
   Meaning questions such as `不要生成总结是什么意思` are not cancellation.
   The reply asks whether the user means cancellation or a content restriction
   and suggests restating the requirement positively; it does not assert intent.

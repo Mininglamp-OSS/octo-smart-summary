@@ -1,9 +1,9 @@
 package handler
 
 import (
-	"regexp"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 type summaryWorkspaceNegation int
@@ -125,33 +125,77 @@ func summaryWorkspaceNegationObject(object string) summaryWorkspaceNegation {
 	}
 }
 
-var summaryWorkspaceContentConjunction = regexp.MustCompile(`以及|和|与|、| and `)
+var summaryWorkspaceContentObjects = []string{
+	"表格", "行动项", "附件内容", "已关闭的任务", "图表", "总结表格",
+	"正式总结表格", "完整总结附件",
+	"table", "a table", "the table", "tables", "action items",
+	"a summary table", "summary table", "charts", "a chart", "chart",
+	"attachment content", "closed tasks",
+}
+
+var summaryWorkspaceContentMemberLimit = func() int {
+	limit := 0
+	for _, object := range summaryWorkspaceContentObjects {
+		limit = max(limit, len(object))
+	}
+	return limit
+}()
 
 func isSummaryWorkspaceContentObject(object string) bool {
-	// Every member must match in full. In particular, never authorize
-	// "表格和总结" or an unknown noun just because it ends in "表格".
-	for _, part := range summaryWorkspaceContentConjunction.Split(object, -1) {
-		if !isSummaryWorkspaceSingleContentObject(strings.TrimSpace(part)) {
+	// Scan one member at a time, rejecting an impossible member immediately.
+	// Splitting the entire suffix for every verb match is quadratic. This
+	// bounds each unknown candidate without imposing a total-list length cap.
+	for {
+		object = strings.TrimSpace(object)
+		split, separatorLength := -1, 0
+		for i, r := range object {
+			for _, separator := range []string{"以及", "和", "与", "、", " and "} {
+				if strings.HasPrefix(object[i:], separator) {
+					split, separatorLength = i, len(separator)
+					break
+				}
+			}
+			if split >= 0 {
+				break
+			}
+			if !unicode.IsSpace(r) && i+utf8.RuneLen(r) > summaryWorkspaceContentMemberLimit {
+				return false
+			}
+		}
+		if split < 0 {
+			return isSummaryWorkspaceSingleContentObject(object)
+		}
+		if !isSummaryWorkspaceSingleContentObject(strings.TrimSpace(object[:split])) {
 			return false
 		}
+		object = object[split+separatorLength:]
 	}
-	return true
 }
 
 func isSummaryWorkspaceSingleContentObject(object string) bool {
-	switch object {
-	case "表格", "行动项", "附件内容", "已关闭的任务", "图表", "总结表格",
-		"正式总结表格", "完整总结附件",
-		"table", "a table", "the table", "tables", "action items",
-		"a summary table", "summary table", "charts", "a chart", "chart",
-		"attachment content", "closed tasks":
-		return true
-	default:
-		return false
+	for _, candidate := range summaryWorkspaceContentObjects {
+		if object == candidate {
+			return true
+		}
 	}
+	return false
 }
 
 func (c summaryWorkspaceNegationClause) hasFrontedContentObject(verbStart int) bool {
+	// Do not normalize a separator away and reinterpret separated text as
+	// an attached content object. Whitespace removed during CJK normalization
+	// remains observable through boundaries. Ambiguous forms clarify.
+	if strings.HasSuffix(c.text[:verbStart], "、") {
+		return false
+	}
+	for _, boundary := range c.boundaries {
+		if boundary == verbStart {
+			return false
+		}
+		if boundary > verbStart {
+			break
+		}
+	}
 	prefix := strings.TrimSpace(c.text[:verbStart])
 	if summaryWorkspaceNegationObject(prefix) == summaryWorkspaceNoNegation {
 		return true

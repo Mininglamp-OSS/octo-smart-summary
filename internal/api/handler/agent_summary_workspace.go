@@ -322,7 +322,7 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 	}
 
 	negatedRun := hasNegatedSummaryRunIntent(req.Message)
-	intent := classifySummaryWorkspaceIntent(req.Message, begin.Snapshot.CurrentPreview != nil)
+	intent := classifySummaryWorkspaceIntentWithNegation(req.Message, begin.Snapshot.CurrentPreview != nil, negatedRun)
 	if !negatedRun && begin.Snapshot.CurrentPreview != nil && hasExplicitSummaryExecutionCommand(req.Message) {
 		intent = service.SummaryIntentGenerate
 	}
@@ -1255,6 +1255,12 @@ func workspaceWorkflowTerminalState(task model.SummaryTask, err error) (resultTy
 }
 
 func classifySummaryWorkspaceIntent(message string, hasCurrentPreview bool) service.SummaryIntent {
+	return classifySummaryWorkspaceIntentWithNegation(message, hasCurrentPreview, hasNegatedSummaryRunIntent(message))
+}
+
+// The handler has already analyzed negative intent for routing. Reuse that
+// result rather than scanning the same request again during classification.
+func classifySummaryWorkspaceIntentWithNegation(message string, hasCurrentPreview, negatedRun bool) service.SummaryIntent {
 	message = strings.ToLower(strings.TrimSpace(message))
 	if message == "" {
 		return service.SummaryIntentUnknown
@@ -1267,7 +1273,7 @@ func classifySummaryWorkspaceIntent(message string, hasCurrentPreview bool) serv
 	}
 	// Cancellation/uncertain negative intent must not become an Agent revision
 	// or gain discoverable scope merely because an earlier preview exists.
-	if hasNegatedSummaryRunIntent(message) {
+	if negatedRun {
 		return service.SummaryIntentExplain
 	}
 	if hasCurrentPreview {
@@ -1281,7 +1287,7 @@ func classifySummaryWorkspaceIntent(message string, hasCurrentPreview bool) serv
 		"preview first", "draft first", "generate a draft", "show me a preview") {
 		return service.SummaryIntentGenerate
 	}
-	if hasExplicitSummaryRunIntent(message) {
+	if hasExplicitSummaryRunPhrase(message) {
 		return service.SummaryIntentGenerate
 	}
 	if strings.ContainsAny(message, "？?") {
@@ -1298,6 +1304,10 @@ func hasExplicitSummaryRunIntent(message string) bool {
 	if message == "" || hasNegatedSummaryRunIntent(message) {
 		return false
 	}
+	return hasExplicitSummaryRunPhrase(message)
+}
+
+func hasExplicitSummaryRunPhrase(message string) bool {
 	return containsAny(message,
 		"帮我总结", "请总结", "总结一下", "总结下", "生成总结", "生成周报", "生成日报", "生成月报",
 		"开始总结", "开始生成", "直接生成", "立即生成", "发起总结", "发起多人总结", "准备多人总结任务",

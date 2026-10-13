@@ -40,6 +40,7 @@ func TestDocumentCancellationChatPreviewKeepsScopeLocked(t *testing.T) {
 		"不要生成正式总结，先给预览",
 		"“不要总结”。", "“不要总结”，谢谢", "（“不要总结”）",
 		"不要生成新对象，不要总结", "总结和表格不用生成",
+		"表格、不要总结", "表格 不要总结",
 	} {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
 			db, _ := setupTestDBs(t)
