@@ -69,6 +69,11 @@ func TestDocumentSubmissionHandler(t *testing.T) {
 	for _, message := range documentScopedNegationRequests {
 		tc := cases[0]
 		tc.name, tc.message = "scoped negation mixed "+message, message
+		if message == "开始总结，表格不用生成" {
+			// Existing command normalization strips the execution label but
+			// must retain the actual content restriction as the requirement.
+			tc.wantTopic = "表格不用生成"
+		}
 		cases = append(cases, tc)
 		tc.name, tc.documentsOnly = "scoped negation document "+message, true
 		cases = append(cases, tc)

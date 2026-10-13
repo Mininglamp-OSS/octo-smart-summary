@@ -127,6 +127,13 @@ func TestTypedChatContentConstraintOriginBoundary(t *testing.T) {
 }
 
 var documentScopedNegationRequests = []string{
+	"总结这份文档，表格不用生成", "请生成总结，行动项不用生成",
+	"帮我总结，附件内容不用总结", "开始总结，表格不用生成",
+	"总结一下，图表不用生成", "总结这份文档 表格不用生成",
+	"总结这份文档 表格和行动项不用生成",
+	"请总结，表格和行动项不用生成", "请总结，不要生成表格和行动项",
+	"请总结，不要生成图表与表格", "请总结，不要生成表格以及行动项",
+	"summarize the docs, do not generate tables and action items",
 	"总结一下这些文档和群聊的风险，不要生成行动项",
 	"帮我总结文档和会话，不需要总结附件内容",
 	"请总结本周进展，无需总结已关闭的任务",
@@ -178,6 +185,12 @@ var documentNegationQuestions = []string{
 }
 
 var documentExecutionNegations = []string{
+	"“不要总结”。", "“不要总结”，谢谢", "（“不要总结”）", "【“先不要总结”】",
+	"“”“不要总结”", "「不要总结」。", `"先不要总结"。`, "“不要总结”？",
+	"请“不要总结”", "“不要总结”，请总结", "未知上下文“不要总结”。",
+	"总结和表格不用生成", "未知表格不用生成", "不是表格不用生成",
+	"总结这份文档 总结和表格不用生成",
+	"不要生成表格以及总结", "不要生成表格、总结",
 	"先不要生成总结", "开始总结：先不要生成，先说明一下来源",
 	"请先不要生成总结", "暂时不要总结", "现在别生成总结了",
 	"总结一下，不要生成总结", "请总结，但现在先不生成",
@@ -239,9 +252,72 @@ func TestDocumentNegationDecisionStates(t *testing.T) {
 		{"不要生成未登记的输出形式", summaryWorkspaceUncertainNegation},
 		{"不要总结所有内容", summaryWorkspaceUncertainNegation},
 		{"不要生成表格和总结", summaryWorkspaceUncertainNegation},
+		{"不要生成新对象，不要总结", summaryWorkspaceCancelRun},
+		{"不要总结，不要生成新对象", summaryWorkspaceCancelRun},
 	} {
 		if got := summaryWorkspaceRunNegation(tc.message); got != tc.want {
 			t.Errorf("%q: got=%v want=%v", tc.message, got, tc.want)
+		}
+	}
+}
+
+func TestDocumentQuotedDecorationInvariants(t *testing.T) {
+	for _, pair := range [][2]string{{"“", "”"}, {"「", "」"}, {"『", "』"}, {"\"", "\""}, {"'", "'"}, {"`", "`"}} {
+		for _, prefix := range []string{"", "请", "🙏 ", "（", "【", "“”"} {
+			for _, suffix := range []string{"", "。", "！", "？", "，谢谢", "）", "】", "哦，谢谢！"} {
+				for _, message := range []string{"不要总结", "不要生成总结", "不要总结所有内容", "不要生成表格和行动项"} {
+					wrapped := prefix + pair[0] + message + pair[1] + suffix
+					want := message != "不要生成表格和行动项"
+					if got := hasNegatedSummaryRunIntent(wrapped); got != want {
+						t.Errorf("%q: negated=%t want=%t", wrapped, got, want)
+					}
+					if want {
+						for _, preview := range []bool{false, true} {
+							if got := classifySummaryWorkspaceIntent(wrapped, preview); got != service.SummaryIntentExplain {
+								t.Errorf("%q preview=%t: intent=%s", wrapped, preview, got)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	for _, message := range []string{
+		"文档写着“不要总结”。", "他说：“不要总结”。",
+		"“文档写着「不要总结」”。",
+		"请总结文档，内容是“不要总结”。", "“不要总结”是什么意思？",
+		`what does "do not summarize" mean?`,
+	} {
+		if hasNegatedSummaryRunIntent(message) {
+			t.Errorf("attribution/meaning question cancelled: %q", message)
+		}
+	}
+}
+
+func TestDocumentContentObjectPositionAndConjunction(t *testing.T) {
+	for _, object := range []string{"表格", "行动项", "附件内容", "图表", "表格和行动项", "图表与表格", "表格以及行动项", "表格、行动项"} {
+		for _, verb := range []string{"不用生成", "不生成", "不要生成", "别生成", "无需总结"} {
+			for _, message := range []string{
+				"请总结，" + verb + object,
+				"请总结，" + object + verb,
+				"总结这份文档 " + object + verb,
+			} {
+				if got := summaryWorkspaceRunNegation(message); got != summaryWorkspaceNoNegation {
+					t.Errorf("%q: negation=%v", message, got)
+				}
+				if got := classifySummaryWorkspaceIntent(message, true); got != service.SummaryIntentRevise {
+					t.Errorf("%q: known content revision became %s", message, got)
+				}
+			}
+		}
+	}
+	for _, message := range []string{
+		"未知 表格不用生成", "总结这份文档 总结和 表格不用生成",
+		"总结这份文档 未知表格不用生成", "总结与表格不用生成",
+		"表格和未知对象不用生成", "不要生成表格和", "不要生成表格\x00行动项",
+	} {
+		if !hasNegatedSummaryRunIntent(message) {
+			t.Errorf("unproven fronted/conjoined object executed: %q", message)
 		}
 	}
 }

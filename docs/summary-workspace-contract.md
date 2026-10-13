@@ -58,8 +58,10 @@ returns `enabled: true` and `contract_version: "2"`.
   Both of the latter outcomes clarify before any task or document fetch.
   A conflicting preview request does not override that decision:
   `不要生成正式总结，先给预览` now clarifies rather than generating/revising
-  a preview. Positive preview requests and ordinary revisions are unchanged.
-  Known negative verbs are found anywhere outside embedded quotations; there
+  a preview. Positive preview requests and revisions without blocking negative
+  intent are unchanged. Unknown negative content restrictions also clarify on
+  chat-only previews; they do not fall through to revision.
+  Known negative verbs are found anywhere except positively attributed quotations; there
   is no discourse-prefix or whole-scope-object allowlist. An unrecognized object
   after such a verb defaults to clarification, not execution. Thus `算了不要总结`,
   `不要总结所有内容`, `不要总结这份文档` and new unknown objects all stop.
@@ -67,16 +69,35 @@ returns `enabled: true` and `contract_version: "2"`.
   content restriction; it is not a claim of complete natural-language understanding.
   Recognized whole content/output objects (tables, action items, attachment
   content, closed tasks and the tested variants) remain executable:
-  `总结一下，不要生成表格` and `不需要总结附件内容` do not cancel.
-  Matching is not a substring exemption: `不要生成表格和总结` clarifies.
+  `总结一下，不要生成表格`, `不需要总结附件内容` and
+  `总结这份文档，表格不用生成` do not cancel. Pre- and post-verbal
+  objects use the same whole-object classifier; conjunctions (`和`, `与`,
+  `以及`, `、`, English `and`) are allowed only when every member is known.
+  `、` stays inside the object rather than hiding a later unknown member.
+  Matching is not a substring exemption: `不要生成表格和总结`,
+  `不要生成表格、总结` and `未知表格不用生成` clarify.
+  For a same-clause affirmative request followed by a fronted object, preserved
+  whitespace is required as a boundary, and the preceding request must be one
+  of the recognized forms in `hasFrontedContentObject` (for example,
+  `总结这份文档 表格不用生成`). Unrecognized request/topic constructions
+  remain conservative; no arbitrary noun-suffix extraction is performed.
   Meaning questions such as `不要生成总结是什么意思` are not cancellation.
   The reply asks whether the user means cancellation or a content restriction
   and suggests restating the requirement positively; it does not assert intent.
-  Quote spans retain object text, while quoted verbs cannot cancel:
+  Quote spans retain object text. Quotation alone does not suppress a negative verb:
   `不要总结“这些内容”` clarifies; `不要总结“附件内容”` is a known content
   restriction; reported `文档写着“不要总结”` is not a cancellation instruction.
+  Explicit local attribution markers (such as `写着`, `他说：`, `内容是`,
+  or English `said`) suppress reported negative verbs; meaning questions remain
+  independently exempt. Unattributed quoted negative instructions are analyzed
+  even with punctuation, brackets or politeness outside the quotes:
+  `“不要总结”。`, `“不要总结”，谢谢` and `（“不要总结”）` clarify.
+  An affirmative request elsewhere does not override a conflicting quoted
+  cancellation. Unknown attribution wording can ask for confirmation.
   Empty quote pairs do not discard the surrounding clause. An entirely quoted
-  submission is the user's instruction. Stack-based quote pairing is linear,
+  submission is the user's instruction. A definite cancellation takes precedence
+  over uncertain negation regardless of clause order; both still block execution.
+  Stack-based quote pairing is linear,
   including unmatched/nested openers. Rich-text U+FFFC placeholders are ignored.
   CJK inter-character whitespace, English whitespace runs, in-word smart
   apostrophes, common trailing particles and politeness tails are normalized.
@@ -102,6 +123,9 @@ returns `enabled: true` and `contract_version: "2"`.
   change, not additional dispatch authority, and is covered separately.
 - `action: "start_team_workflow"` remains the explicit trusted team execution
   entry point and is not changed by the conversational routing rule above.
+  Its existing chat-only route does not consult this negative-intent guard;
+  the zero-task cancellation guarantee above does not cover that explicit
+  action. Closing that pre-existing gap requires a separate scoped change.
 
 ## Effective scope
 

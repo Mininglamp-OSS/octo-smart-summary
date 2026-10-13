@@ -38,6 +38,8 @@ func TestDocumentCancellationChatPreviewKeepsScopeLocked(t *testing.T) {
 		"不要总结", "那就不要总结所有内容", "不要生成未登记对象",
 		"开始总结：先不要生成", // Must not reopen the explicit-command override.
 		"不要生成正式总结，先给预览",
+		"“不要总结”。", "“不要总结”，谢谢", "（“不要总结”）",
+		"不要生成新对象，不要总结", "总结和表格不用生成",
 	} {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
 			db, _ := setupTestDBs(t)
