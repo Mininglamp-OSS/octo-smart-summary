@@ -689,6 +689,10 @@ func (h *PersonalHandler) RestorePersonalVersion(c *gin.Context) {
 		if _, err := ensurePersonalVersionBaseline(tx, latestPR); err != nil {
 			return err
 		}
+		// Baseline normalization may have recovered this selected legacy row.
+		if err := tx.Where("id = ? AND task_id = ? AND user_id = ?", versionID, taskID, userID).First(&source).Error; err != nil {
+			return err
+		}
 		if source.SnapshotJSON == nil && latestPR.SnapshotJSON != nil {
 			source.SnapshotJSON = model.UnknownGenerationSnapshot(source.TaskID, source.Version)
 			if err := tx.Model(&source).Update("snapshot_json", source.SnapshotJSON).Error; err != nil {

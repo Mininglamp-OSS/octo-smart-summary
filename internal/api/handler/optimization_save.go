@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -24,6 +25,8 @@ import (
 // The target is independent of reference materials. Its revision covers in-place
 // edits as well as appended/restored versions; clients must capture it BEFORE
 // starting optimization, never refresh it silently at save time.
+var optimizationParticipantMarker = regexp.MustCompile(`\[P[0-9]+\]`)
+
 type optimizationTarget struct {
 	TaskID           int64  `json:"task_id"`
 	ResultKind       string `json:"result_kind"`
@@ -194,11 +197,17 @@ func (h *AgentSummaryHandler) replayOptimization(c *gin.Context, key, hash strin
 	}
 	response := gin.H{"task_id": task.ID, "task_no": task.TaskNo, "status": task.Status, "created_at": task.CreatedAt, "save_mode": "new_version", "version": binding.ResultVersion, "result_id": binding.ResultID, "result_kind": binding.ResultKind, "replayed": true}
 	if agent.SummaryV2Enabled() {
+		// A successful replay must disclose when its saved quality cannot be verified.
+		response["finish_status"] = string(finishgate.Partial)
+		response["gaps"] = []finishgate.Gap{{Kind: finishgate.GapToolError, Detail: "could not verify run completeness"}}
 		var message model.AgentMessage
 		var result model.SummaryResult
 		if err := h.db.Where("id = ? AND user_id = ? AND space_id = ? AND session_id = ?", req.AgentMessageID, user, space, req.SessionID).First(&message).Error; err == nil {
 			if run, err := resolveAgentMessageRunBinding(c.Request.Context(), h.db, user, req.SessionID, req.RequestID, message); err == nil {
 				if err := resultQuery.Select("content, citations_json").Where("id = ?", binding.ResultID).Scan(&result).Error; err == nil {
+					// Missing legacy run metadata is a normal no-op, unlike read failures.
+					delete(response, "finish_status")
+					delete(response, "gaps")
 					h.addOptimizationFinish(c, response, user, req.SessionID, run.RequestID, result.Content, result.GetCitations(), message)
 				}
 			}
@@ -272,6 +281,11 @@ func (h *AgentSummaryHandler) saveOptimizationVersion(c *gin.Context, req create
 			return err
 		}
 		content := citationtext.NormalizeSetextHeadings(candidate.Content)
+		// Participant indices belong to each reference's own namespace, even
+		// when numeric message evidence was resolved independently.
+		if len(candidate.Scope.ReferencedTaskIDs) > 1 && optimizationParticipantMarker.MatchString(content) {
+			return errWorkspacePreviewCitationUnresolved
+		}
 		cits, fallback, err := h.buildWorkspacePreviewCitations(c.Request.Context(), tx, user, req.SessionID, content, candidate, binding)
 		if err != nil {
 			return err

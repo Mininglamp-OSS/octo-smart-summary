@@ -192,3 +192,49 @@ func TestPersonalOldContentRemainsReferenceableWithoutVersionWrite(t *testing.T)
 		t.Fatalf("busy personal write advertised: %s", w.Body.String())
 	}
 }
+
+func TestRestoreRecoversSelectedLegacyProvenance(t *testing.T) {
+	for _, scenario := range []string{"pointer", "no-pointer", "null-citations"} {
+		t.Run(scenario, func(t *testing.T) {
+			db, h, _, b := seedOptimization(t, "personal")
+			raw := fmt.Sprintf(`{"snapshot_version":1,"task_id":%d,"content_version":1,"requirement":"original requirement","scope":{"channel_ids":["original-source"]},"tool_trace":[{"tool":"fetch"}]}`, b.Task.ID)
+			version := model.PersonalResultVersion{TaskID: b.Task.ID, UserID: "test-user", Version: 1, Content: b.Personal.Content, OperationType: "generate"}
+			if err := db.Create(&version).Error; err != nil {
+				t.Fatal(err)
+			}
+			updates := map[string]interface{}{"snapshot_json": raw}
+			if scenario != "no-pointer" {
+				updates["current_version_id"] = version.ID
+			}
+			if err := db.Model(&b.Personal).Updates(updates).Error; err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "null-citations" {
+				if err := db.Model(&version).Update("citations_json", nil).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+			router := setupAgentSummaryRouter(h)
+			router.POST("/api/v1/summaries/:id/personal-versions/:version_id/restore", NewPersonalHandler(db, "", nil).RestorePersonalVersion)
+			response := provenanceRequest(router, "POST", fmt.Sprintf("/api/v1/summaries/%d/personal-versions/%d/restore", b.Task.ID, version.ID), "{}", "test-user")
+			if response.Code != 200 {
+				t.Fatal(response.Body.String())
+			}
+			var current model.PersonalResult
+			if err := db.First(&current, b.Personal.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := db.First(&version, version.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if current.SnapshotJSON == nil || version.SnapshotJSON == nil || *current.SnapshotJSON != raw || *version.SnapshotJSON != raw {
+				t.Fatal("restore replaced recoverable provenance")
+			}
+			var count int64
+			db.Model(&model.PersonalResultVersion{}).Where("task_id = ?", b.Task.ID).Count(&count)
+			if count != 1 {
+				t.Fatalf("restore invented %d history rows", count)
+			}
+		})
+	}
+}

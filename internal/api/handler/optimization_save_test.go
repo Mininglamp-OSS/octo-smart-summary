@@ -363,72 +363,115 @@ func TestOptimizationMirrorFailureRollsBackTeamAndPreview(t *testing.T) {
 }
 
 func TestOptimizationRejectsAmbiguousReferenceFallback(t *testing.T) {
-	db, h, f, b := seedOptimization(t, "team")
-	other := model.SummaryTask{TaskNo: "OPT-B", SpaceID: "test-space", CreatorID: "test-user", Status: model.StatusCompleted, TriggerType: model.TriggerAgent}
-	if err := db.Create(&other).Error; err != nil {
-		t.Fatal(err)
-	}
-	result := model.SummaryResult{TaskID: other.ID, Content: "B [1]", Version: 1}
-	result.SetCitations([]model.Citation{{Index: 1, Content: "message-B"}})
-	if err := db.Create(&result).Error; err != nil {
-		t.Fatal(err)
-	}
-	b.Result.SetCitations([]model.Citation{{Index: 1, Content: "message-A"}})
-	if err := db.Model(&b.Result).Update("citations_json", b.Result.CitationsJSON).Error; err != nil {
-		t.Fatal(err)
-	}
-	var scope summaryWorkspaceContext
-	json.Unmarshal([]byte(f.Session.ScopeJSON), &scope)
-	scope.ReferencedTaskIDs = []int64{other.ID, b.Task.ID}
-	raw, _, _ := marshalSummaryWorkspaceContext(scope)
-	if err := db.Model(&f.Session).Update("scope_json", string(raw)).Error; err != nil {
-		t.Fatal(err)
-	}
-	payload, _ := json.Marshal(agent.SummaryResponsePayload{ResultType: agent.SummaryResultAgentPreview, Preview: &agent.SummaryResponsePreview{Content: "B [1]", Version: 3}})
-	if err := db.Model(&f.Message).Update("response_payload_json", string(payload)).Error; err != nil {
-		t.Fatal(err)
-	}
-	fresh, err := loadOptimizationBase(db, "test-space", "test-user", b.Task.ID, "team", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.Body["target"] = optimizationTarget{b.Task.ID, "team", fresh.revision()}
-	w := doAgentSave(t, setupAgentSummaryRouter(h), f.Body, map[string]string{"Idempotency-Key": "ambiguous"})
-	if w.Code != 409 {
-		t.Fatalf("ambiguous evidence saved: %d %s", w.Code, w.Body.String())
+	for _, marker := range []string{"[1]", "[P1]", "[P2]"} {
+		t.Run(marker, func(t *testing.T) {
+			db, h, f, b := seedOptimization(t, "team")
+			other := model.SummaryTask{TaskNo: "OPT-B", SpaceID: "test-space", CreatorID: "test-user", Status: model.StatusCompleted, TriggerType: model.TriggerAgent}
+			if err := db.Create(&other).Error; err != nil {
+				t.Fatal(err)
+			}
+			result := model.SummaryResult{TaskID: other.ID, Content: "B " + marker, Version: 1}
+			result.SetTeamCitations([]model.TeamCitation{{Index: 1, UserID: "bob"}, {Index: 2, UserID: "carol"}})
+			result.SetCitations([]model.Citation{{Index: 1, Content: "message-B"}})
+			if err := db.Create(&result).Error; err != nil {
+				t.Fatal(err)
+			}
+			b.Result.SetTeamCitations([]model.TeamCitation{{Index: 1, UserID: "alice"}})
+			b.Result.SetCitations([]model.Citation{{Index: 1, Content: "message-A"}})
+			if err := db.Model(&b.Result).Updates(map[string]interface{}{"citations_json": b.Result.CitationsJSON, "team_citations_json": b.Result.TeamCitationsJSON, "citation_owner_id": "test-user"}).Error; err != nil {
+				t.Fatal(err)
+			}
+			var scope summaryWorkspaceContext
+			json.Unmarshal([]byte(f.Session.ScopeJSON), &scope)
+			scope.ReferencedTaskIDs = []int64{other.ID, b.Task.ID}
+			raw, _, _ := marshalSummaryWorkspaceContext(scope)
+			if err := db.Model(&f.Session).Update("scope_json", string(raw)).Error; err != nil {
+				t.Fatal(err)
+			}
+			payload, _ := json.Marshal(agent.SummaryResponsePayload{ExecutionTarget: "agent_preview", ResultType: agent.SummaryResultAgentPreview, Preview: &agent.SummaryResponsePreview{Content: "B " + marker, Version: 3}})
+			if err := db.Model(&f.Message).Update("response_payload_json", string(payload)).Error; err != nil {
+				t.Fatal(err)
+			}
+			fresh, err := loadOptimizationBase(db, "test-space", "test-user", b.Task.ID, "team", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.Body["target"] = optimizationTarget{b.Task.ID, "team", fresh.revision()}
+			w := doAgentSave(t, setupAgentSummaryRouter(h), f.Body, map[string]string{"Idempotency-Key": "ambiguous"})
+			if w.Code != 409 || !strings.Contains(w.Body.String(), "workspace_citation_unresolved") {
+				t.Fatalf("ambiguous evidence saved: %d %s", w.Code, w.Body.String())
+			}
+
+			var count int64
+			db.Model(&model.SummaryAgentSaveIdempotency{}).Count(&count)
+			if count != 0 {
+				t.Fatal("rejection created a binding")
+			}
+			db.Model(&model.SummaryResult{}).Where("task_id = ?", b.Task.ID).Count(&count)
+			if count != 1 {
+				t.Fatal("rejection created a version")
+			}
+			var session model.AgentSummarySession
+			db.First(&session, f.Session.ID)
+			if session.LatestPreviewSavedTaskID != 0 {
+				t.Fatal("rejection consumed preview")
+			}
+			if _, err := loadWorkspacePreviewForSave(db, "test-space", "test-user", createAgentSummaryReq{
+				SessionID: f.Session.SessionID, AgentMessageID: f.Message.ID, SnapshotVersion: workspaceSnapshotVersion,
+				ScopeVersion: &f.Session.ScopeVersion, ExpectedArtifactVersion: &f.Session.ArtifactVersion}, false); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
 func TestOptimizationDisclosesPartialRunOnSaveAndReplay(t *testing.T) {
-	for _, truncated := range []bool{true, false} {
-		t.Run(fmt.Sprint(truncated), func(t *testing.T) {
-			db, h, f, _ := seedOptimization(t, "team")
-			t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
-			if err := db.AutoMigrate(&model.AgentSummaryRun{}, &model.AgentSummarySpec{}, &model.AgentSummaryTurn{}, &model.AgentEvidenceArtifact{}); err != nil {
-				t.Fatal(err)
-			}
-			store := summaryrun.NewStore(db)
-			ctx := context.Background()
-			run, _, err := store.CreateOrGetRun(ctx, "test-user", f.Session.AgentSessionID, "partial-run", model.ScopePolicyClosed)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := store.RecordChannelFetch(ctx, "test-user", run.RunID, "channel-workspace", truncated, truncated); err != nil {
-				t.Fatal(err)
-			}
-			turn := model.AgentSummaryTurn{SpaceID: "test-space", UserID: "test-user", SessionID: f.Session.SessionID, RequestID: run.RequestID, RequestHash: "partial-hash", ScopeVersion: f.Session.ScopeVersion, Status: "completed", Attempt: 1, RunID: run.RunID}
-			if err := db.Create(&turn).Error; err != nil {
-				t.Fatal(err)
-			}
-			if err := db.Model(&f.Message).Updates(map[string]interface{}{"run_id": run.RunID, "turn_id": turn.ID}).Error; err != nil {
-				t.Fatal(err)
-			}
-			f.Body["request_id"] = run.RequestID
-			for i := 0; i < 2; i++ {
-				w := doAgentSave(t, setupAgentSummaryRouter(h), f.Body, map[string]string{"Idempotency-Key": "partial"})
-				if w.Code != 200 || !strings.Contains(w.Body.String(), `"finish_status":"PARTIAL"`) {
-					t.Fatalf("missing disclosure: %d %s", w.Code, w.Body.String())
-				}
+	for _, kind := range []string{"team", "personal"} {
+		t.Run(kind, func(t *testing.T) {
+			for _, truncated := range []bool{true, false} {
+				t.Run(fmt.Sprint(truncated), func(t *testing.T) {
+					db, h, f, _ := seedOptimization(t, kind)
+					t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+					if err := db.AutoMigrate(&model.AgentSummaryRun{}, &model.AgentSummarySpec{}, &model.AgentSummaryTurn{}, &model.AgentEvidenceArtifact{}); err != nil {
+						t.Fatal(err)
+					}
+					store := summaryrun.NewStore(db)
+					ctx := context.Background()
+					run, _, err := store.CreateOrGetRun(ctx, "test-user", f.Session.AgentSessionID, "partial-run", model.ScopePolicyClosed)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := store.RecordChannelFetch(ctx, "test-user", run.RunID, "channel-workspace", truncated, truncated); err != nil {
+						t.Fatal(err)
+					}
+					turn := model.AgentSummaryTurn{SpaceID: "test-space", UserID: "test-user", SessionID: f.Session.SessionID, RequestID: run.RequestID, RequestHash: "partial-hash", ScopeVersion: f.Session.ScopeVersion, Status: "completed", Attempt: 1, RunID: run.RunID}
+					if err := db.Create(&turn).Error; err != nil {
+						t.Fatal(err)
+					}
+					if err := db.Model(&f.Message).Updates(map[string]interface{}{"run_id": run.RunID, "turn_id": turn.ID}).Error; err != nil {
+						t.Fatal(err)
+					}
+					f.Body["request_id"] = run.RequestID
+					for i := 0; i < 2; i++ {
+						w := doAgentSave(t, setupAgentSummaryRouter(h), f.Body, map[string]string{"Idempotency-Key": "partial"})
+						if w.Code != 200 || !strings.Contains(w.Body.String(), `"finish_status":"PARTIAL"`) {
+							t.Fatalf("missing disclosure: %d %s", w.Code, w.Body.String())
+						}
+					}
+					const callback = "fail-replay-run"
+					if err := db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+						if tx.Statement.Table == "agent_summary_run" {
+							tx.AddError(fmt.Errorf("injected run read failure"))
+						}
+					}); err != nil {
+						t.Fatal(err)
+					}
+					defer db.Callback().Query().Remove(callback)
+					w := doAgentSave(t, setupAgentSummaryRouter(h), f.Body, map[string]string{"Idempotency-Key": "partial"})
+					if w.Code != 200 || !strings.Contains(w.Body.String(), `"finish_status":"PARTIAL"`) || !strings.Contains(w.Body.String(), `"tool_error"`) {
+						t.Fatalf("replay hid verification failure: %d %s", w.Code, w.Body.String())
+					}
+				})
 			}
 		})
 	}
