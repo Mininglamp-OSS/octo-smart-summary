@@ -99,3 +99,8 @@ The following model identifiers are tested and supported:
 > port, the network-layer control is the only one available.
 
 The system automatically adjusts token budgets and tokenization ratios based on the selected model.
+
+A Worker that exhausts the gateway's model fallback and recognizes an explicit quota rejection logs
+`event=summary.gateway_quota_exhausted` with the affected task ID. Configure a log alert for one
+or more occurrences within five minutes and route it to the summary service operator to check the
+gateway credential's quota. A generic authorization rejection or request timeout does not match this alert.

@@ -520,6 +520,9 @@ func (c *LLMClient) CallDocumentMapWithModel(ctx context.Context, formattedDocum
 	if errors.Is(err, ErrReasoningBudgetExhausted) {
 		return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d: %w", chunkIndex, err)
 	}
+	if reason := llmfallback.ActionableGatewayFailure(err); reason != nil {
+		return "", tokens, usedModel, reason
+	}
 	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, c.model, nil
 }
 
@@ -554,6 +557,9 @@ func (c *LLMClient) CallDocumentMapStreamWithModel(ctx context.Context, formatte
 	}
 	if errors.Is(err, ErrReasoningBudgetExhausted) {
 		return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d: %w", chunkIndex, err)
+	}
+	if reason := llmfallback.ActionableGatewayFailure(err); reason != nil {
+		return "", tokens, usedModel, reason
 	}
 	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, c.model, nil
 }
@@ -611,6 +617,9 @@ func (c *LLMClient) CallMapWithModel(ctx context.Context, formattedMessages stri
 	}
 	if errors.Is(err, ErrReasoningBudgetExhausted) {
 		return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d: %w", chunkIndex, err)
+	}
+	if reason := llmfallback.ActionableGatewayFailure(err); reason != nil {
+		return "", tokens, usedModel, reason
 	}
 	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, c.model, nil
 }
@@ -696,6 +705,9 @@ func (c *LLMClient) CallMapStreamWithModel(ctx context.Context, formattedMessage
 	}
 	if errors.Is(err, ErrReasoningBudgetExhausted) {
 		return "", tokens, usedModel, fmt.Errorf("reasoning budget exhausted on chunk %d: %w", chunkIndex, err)
+	}
+	if reason := llmfallback.ActionableGatewayFailure(err); reason != nil {
+		return "", tokens, usedModel, reason
 	}
 	return fmt.Sprintf("(分片 %d %s)", chunkIndex, MapFailedMarker), 0, c.model, nil
 }

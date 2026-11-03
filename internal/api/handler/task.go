@@ -847,6 +847,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			"topic":            t.DisplayTopic(),
 			"summary_mode":     t.SummaryMode,
 			"status":           t.Status,
+			"failure_code":     model.TaskFailureCode(t.ErrorMessage),
 			"trigger_type":     t.TriggerType,
 			"schedule_id":      scheduleIDOut,
 			"creator_id":       t.CreatorID,
@@ -1122,6 +1123,7 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 		"participants":           partList,
 		"result":                 resultOut,
 		"error_message":          task.ErrorMessage,
+		"failure_code":           model.TaskFailureCode(task.ErrorMessage),
 		// R11 Q2: same wire mask as the list projection — a derived-inherited
 		// origin is never echoed (the viewer may not be a member of the
 		// backfilled channel). Server-side consumers read the DB directly.

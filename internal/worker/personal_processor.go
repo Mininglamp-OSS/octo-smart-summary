@@ -416,7 +416,12 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 	if err != nil {
 		log.Printf("[personal-worker] pipeline error task=%d user=%s: %v", taskID, participant.UserID, err)
 		finishStreamError("summary generation failed")
-		p.markPersonalFailed(&pr, &participant, err.Error())
+		reason := err.Error()
+		if errors.Is(err, llmfallback.ErrGatewayQuota) || errors.Is(llmfallback.ActionableGatewayFailure(err), llmfallback.ErrGatewayQuota) {
+			log.Printf("[personal-worker] event=summary.gateway_quota_exhausted task=%d", taskID)
+			reason = model.GatewayQuotaMessage
+		}
+		p.markPersonalFailed(&pr, &participant, reason)
 		return
 	}
 	if strings.TrimSpace(content) == "" {
@@ -650,7 +655,7 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 			return err
 		}
 		newRetry := current.RetryCount
-		willRetry = newRetry < maxRetry
+		willRetry = newRetry < maxRetry && sanitized != model.GatewayQuotaMessage
 
 		if willRetry {
 			// Transient failure: reset to Pending so the retry scanner re-runs it.
@@ -1294,6 +1299,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	} else {
 		// Normal Map-Reduce flow
 		type chunkResult struct {
+			failure error
 			summary string
 			tokens  int
 			model   string
@@ -1376,7 +1382,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 				timing.RecordLLMSince(taskNo, fmt.Sprintf("Map: 分块总结 chunk#%d", idx), callStart, tokens)
 				if err != nil {
 					log.Printf("[personal-worker] Map chunk %d failed: %v", idx, err)
-					results[idx] = chunkResult{failed: true, fatal: isFatalMapError(err)}
+					results[idx] = chunkResult{failed: true, fatal: isFatalMapError(err), failure: err}
 				} else {
 					results[idx] = chunkResult{summary: summary, tokens: tokens, model: usedModel}
 				}
@@ -1413,6 +1419,9 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 			// result). Chat/document keep the marker-and-continue contract.
 			for i, r := range results {
 				if r.failed || strings.Contains(r.summary, service.MapFailedMarker) {
+					if r.failure != nil {
+						return "", nil, 0, 0, "", fmt.Errorf("mixed Map phase failed: chunk %d: %w", i, r.failure)
+					}
 					return "", nil, 0, 0, "", fmt.Errorf(
 						"mixed Map phase failed: chunk %d did not complete; mixed tasks are not reduced from partial coverage", i)
 				}
@@ -1430,6 +1439,11 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 			}
 		}
 		if len(chunkSummaries) == 0 && len(results) > 0 {
+			for _, r := range results {
+				if errors.Is(r.failure, llmfallback.ErrGatewayQuota) || errors.Is(r.failure, context.DeadlineExceeded) {
+					return "", nil, 0, 0, "", r.failure
+				}
+			}
 			return "", nil, 0, 0, "", fmt.Errorf("all %d chunk(s) failed during Map phase (LLM unreachable)", len(results))
 		}
 
@@ -1517,10 +1531,12 @@ func SanitizeErrorForUser(errMsg string) string {
 
 func sanitizeErrorForUser(errMsg string) string {
 	switch {
+	case errMsg == model.GatewayQuotaMessage:
+		return model.GatewayQuotaMessage
 	case strings.Contains(errMsg, "LLM API error"):
 		return "AI 服务暂时不可用，请稍后重试"
-	case strings.Contains(errMsg, "context deadline exceeded"):
-		return "AI 处理超时，请稍后重试"
+	case errMsg == model.GatewayTimeoutMessage || strings.Contains(errMsg, "context deadline exceeded"):
+		return model.GatewayTimeoutMessage
 	case strings.Contains(errMsg, "all") && strings.Contains(errMsg, "chunk(s) failed"):
 		return "AI 服务暂时不可用，所有分片处理失败"
 	case strings.Contains(errMsg, "explicit summary source is unavailable in the current space"):

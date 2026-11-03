@@ -576,7 +576,7 @@ func (h *AgentChatHandler) completeWorkspaceWorkflow(
 		AgentSessionID:    summaryWorkspaceAgentSessionID(key.SpaceID, key.SessionID, scopeVersion),
 	}
 	workflowScope := "personal"
-	startedReply := "已开始生成总结，完成后会自动保存。"
+	startedReply := "总结任务已提交，完成后会自动保存。"
 	completedReply := "总结已生成并自动保存。"
 	var created service.CreateSummaryWorkflowResult
 	switch target {
@@ -1241,7 +1241,7 @@ func workspaceWorkflowTerminalState(task model.SummaryTask, err error) (resultTy
 	case model.StatusCompleted:
 		return workspaceResultWorkflowCompleted, "", true, false
 	case model.StatusFailed:
-		return workspaceResultError, "总结生成失败，请调整要求后重试。", true, true
+		return workspaceResultError, "本次总结生成失败。", true, true
 	case model.StatusCancelled:
 		return workspaceResultError, "总结任务已取消。", true, true
 	default:
@@ -2620,6 +2620,15 @@ func (w *summaryWorkspaceCoordinator) historyFromSnapshot(ctx context.Context, s
 		if message.Role == "assistant" && workspaceMessageMatchesState(&message, state) {
 			actions = workspaceActionsForResult(message.ResultType, message.SavedTaskID > 0)
 		}
+		// Reconciliation clears the active pointer on failure. Keep the original
+		// accepted task identifiable so a reopened client can show its current state.
+		var taskID int64
+		if message.Role == "assistant" && message.ResultType == workspaceResultWorkflowStarted && message.ResponsePayload != nil {
+			var payload agent.SummaryResponsePayload
+			if json.Unmarshal([]byte(*message.ResponsePayload), &payload) == nil && payload.Workflow != nil {
+				taskID = payload.Workflow.TaskID
+			}
+		}
 		preview := workspaceHistoryPreview(message, actions)
 		messages = append(messages, summaryWorkspaceHistoryMessage{
 			ID:               message.ID,
@@ -2629,6 +2638,7 @@ func (w *summaryWorkspaceCoordinator) historyFromSnapshot(ctx context.Context, s
 			ScopeVersion:     message.ScopeVersion,
 			ArtifactVersion:  message.ArtifactVersion,
 			AvailableActions: actions,
+			WorkflowTaskID:   taskID,
 			Preview:          preview,
 		})
 	}

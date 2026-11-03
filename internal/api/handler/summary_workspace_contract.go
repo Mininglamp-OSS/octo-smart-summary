@@ -161,6 +161,7 @@ type summaryWorkspaceTurn struct {
 }
 
 type summaryWorkspaceHistoryMessage struct {
+	WorkflowTaskID   int64                    `json:"workflow_task_id,omitempty"`
 	ID               int64                    `json:"id"`
 	Role             string                   `json:"role"`
 	Content          string                   `json:"content"`

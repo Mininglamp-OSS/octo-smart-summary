@@ -55,6 +55,25 @@ func (j *JSON) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// Persisted user-safe reason for a gateway quota rejection. Older rows need no migration.
+const (
+	GatewayQuotaMessage   = "AI 服务额度不足，请联系管理员"
+	GatewayTimeoutMessage = "AI 处理超时，请稍后重试"
+)
+
+func TaskFailureCode(message *string) string {
+	if message == nil {
+		return ""
+	}
+	switch *message {
+	case GatewayQuotaMessage:
+		return "gateway_quota"
+	case GatewayTimeoutMessage:
+		return "gateway_timeout"
+	}
+	return ""
+}
+
 // Task status constants.
 const (
 	StatusPending        = 0
