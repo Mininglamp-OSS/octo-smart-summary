@@ -508,6 +508,10 @@ func optimizationCitationNamespacesConflict(content string, fresh []model.Citati
 	for _, citation := range reference.Citations {
 		visible[citation.Index] = citation
 	}
+	currentByIndex := make(map[int]model.Citation, len(fresh))
+	for _, citation := range fresh {
+		currentByIndex[citation.Index] = citation
+	}
 	for index := range used {
 		if _, known := reference.CitationMarkers[strconv.Itoa(index)]; !known {
 			continue
@@ -516,20 +520,20 @@ func optimizationCitationNamespacesConflict(content string, fresh []model.Citati
 		if !ok {
 			return true
 		}
-		for _, current := range fresh {
-			if current.Index != index {
-				continue
-			}
-			if old.DocumentID != "" || current.DocumentID != "" {
-				if old.DocumentID == "" || old.DocumentVersion == "" ||
-					old.DocumentID != current.DocumentID || old.DocumentVersion != current.DocumentVersion || old.DocumentChunk != current.DocumentChunk {
-					return true
-				}
-			} else if old.ChannelID == "" || old.MessageSeq <= 0 ||
-				old.ChannelID != current.ChannelID || old.ChannelType != current.ChannelType || old.MessageSeq != current.MessageSeq {
+		current, found := currentByIndex[index]
+		if !found {
+			return true
+		}
+		if old.DocumentID != "" || current.DocumentID != "" {
+			if old.DocumentID == "" || old.DocumentVersion == "" ||
+				old.DocumentID != current.DocumentID || old.DocumentVersion != current.DocumentVersion || old.DocumentChunk != current.DocumentChunk {
 				return true
 			}
+		} else if old.ChannelID == "" || old.MessageSeq <= 0 ||
+			old.ChannelID != current.ChannelID || old.ChannelType != current.ChannelType || old.MessageSeq != current.MessageSeq {
+			return true
 		}
+
 	}
 	return false
 }

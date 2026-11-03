@@ -481,18 +481,20 @@ func TestOptimizationDisclosesPartialRunOnSaveAndReplay(t *testing.T) {
 
 func TestOptimizationFreshCitationIdentityCollision(t *testing.T) {
 	cases := []struct {
-		name, kind, marker string
-		same, redacted     bool
+		name, kind, marker      string
+		same, redacted, missing bool
 	}{
-		{"team collision", "team", "[1]", false, false},
-		{"personal collision", "personal", "[1]", false, false},
-		{"team leading zero collision", "team", "[01]", false, false},
-		{"personal leading zero collision", "personal", "[01]", false, false},
-		{"team same evidence", "team", "[01]", true, false},
-		{"personal same evidence", "personal", "[01]", true, false},
-		{"redacted reference", "team", "[1]", false, true},
-		{"redacted leading zero", "team", "[01]", false, true},
-		{"redacted identity unavailable", "team", "[1]", true, true},
+		{"team collision", "team", "[1]", false, false, false},
+		{"personal collision", "personal", "[1]", false, false, false},
+		{"team leading zero collision", "team", "[01]", false, false, false},
+		{"personal leading zero collision", "personal", "[01]", false, false, false},
+		{"team same evidence", "team", "[01]", true, false, false},
+		{"personal same evidence", "personal", "[01]", true, false, false},
+		{"redacted reference", "team", "[1]", false, true, false},
+		{"redacted leading zero", "team", "[01]", false, true, false},
+		{"redacted identity unavailable", "team", "[1]", true, true, false},
+		{"team missing reference index", "team", "[1]", true, false, true},
+		{"personal missing reference index", "personal", "[1]", true, false, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -507,8 +509,14 @@ func TestOptimizationFreshCitationIdentityCollision(t *testing.T) {
 				oldChannel, oldSeq = "new-channel", 202
 			}
 			b.Result.SetCitations([]model.Citation{{Index: 1, ChannelID: oldChannel, ChannelType: 2, MessageSeq: oldSeq}})
+			if tc.missing {
+				b.Result.SetCitations(append(b.Result.GetCitations(), model.Citation{Index: 2, ChannelID: "old-channel", ChannelType: 2, MessageSeq: 303}))
+			}
 			row := interface{}(&b.Result)
 			updates := map[string]interface{}{"content": "Budget approved [1]", "citations_json": b.Result.CitationsJSON, "citation_owner_id": "test-user"}
+			if tc.missing {
+				updates["content"] = "Budget approved [1]. Original approval [2]"
+			}
 			if redacted {
 				updates["citation_owner_id"] = "other-member"
 				if err := db.Create(&model.SummaryParticipant{TaskID: b.Task.ID, UserID: "other-member", Status: model.ParticipantAccepted}).Error; err != nil {
@@ -533,19 +541,32 @@ func TestOptimizationFreshCitationIdentityCollision(t *testing.T) {
 			}
 			message := f.Message
 			session := bindWorkspacePreviewRun(t, db, f, &message, "collision", agent.SummaryResultAgentPreview, 0, 3, "Budget approved "+marker)
+			if err := db.First(&message, message.ID).Error; err != nil {
+				t.Fatal(err)
+			}
 			pool := []pipeline.Message{{ChannelID: "new-channel", ChannelType: 2, MessageSeq: 202, Content: "Unrelated new evidence", SenderUID: "alice", Timestamp: 1}}
 			seedEvidenceRow(t, db, "test-user", session, "collision-evidence", pool)
 			if _, _, _, err := artifact.NewStore(db).FreezeFromPool(context.Background(), message.RunID, "test-user", session, pool, artifact.FreezeMeta{}); err != nil {
 				t.Fatal(err)
 			}
 			f.Body["request_id"] = "collision"
+			if tc.missing {
+				var revision model.AgentMessage
+				bindWorkspacePreviewRun(t, db, f, &revision, "revision", agent.SummaryResultAgentRevision, message.ID, 4, "Fresh statement [1]. Original approval [2]")
+				if err := db.Model(&f.Session).Updates(map[string]interface{}{"latest_preview_message_id": revision.ID, "artifact_version": 4}).Error; err != nil {
+					t.Fatal(err)
+				}
+				f.Body["request_id"] = "revision"
+				f.Body["agent_message_id"] = revision.ID
+				f.Body["expected_artifact_version"] = 4
+			}
 			fresh, err := loadOptimizationBase(db, "test-space", "test-user", b.Task.ID, kind, false)
 			if err != nil {
 				t.Fatal(err)
 			}
 			f.Body["target"] = optimizationTarget{b.Task.ID, kind, fresh.revision()}
 			w := doAgentSave(t, setupAgentSummaryRouter(h), f.Body, map[string]string{"Idempotency-Key": "collision-save"})
-			if same && !redacted {
+			if same && !redacted && !tc.missing {
 				if w.Code != 200 {
 					t.Fatal(w.Body.String())
 				}
@@ -584,5 +605,33 @@ func TestOptimizationReferenceContextUsesTypedSources(t *testing.T) {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("missing %s in %s", expected, text)
 		}
+	}
+}
+
+func TestOptimizationVersionRejectsDocumentScope(t *testing.T) {
+	db, h, f, _ := seedOptimization(t, "team")
+	var scope summaryWorkspaceContext
+	if err := json.Unmarshal([]byte(f.Session.ScopeJSON), &scope); err != nil {
+		t.Fatal(err)
+	}
+	scope = summaryWorkspaceContext{
+		Documents:         []summaryWorkspaceDocument{{DocumentID: "doc-123", Title: "Plan"}},
+		ReferencedTaskIDs: scope.ReferencedTaskIDs,
+	}
+	raw, _, err := marshalSummaryWorkspaceContext(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&f.Session).Update("scope_json", string(raw)).Error; err != nil {
+		t.Fatal(err)
+	}
+	w := doAgentSave(t, setupAgentSummaryRouter(h), f.Body, map[string]string{"Idempotency-Key": "document-version"})
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "文档总结请通过工作流自动保存") {
+		t.Fatal(w.Body.String())
+	}
+	var count int64
+	db.Model(&model.SummaryAgentSaveIdempotency{}).Count(&count)
+	if count != 0 {
+		t.Fatal("rejected document preview was bound")
 	}
 }
