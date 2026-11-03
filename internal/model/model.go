@@ -134,6 +134,8 @@ type SummaryTask struct {
 	CreatorBotID string `gorm:"column:creator_bot_id;type:varchar(64);not null;default:'';index:idx_summary_task_creator_bot_id" json:"creator_bot_id,omitempty"`
 	Title        string `gorm:"column:title;type:varchar(2300);not null;default:''" json:"title"`
 	Topic        string `gorm:"column:topic;type:varchar(2300);not null;default:''" json:"topic"`
+	SearchTitle  string `gorm:"column:search_title;type:text" json:"-"`
+	SearchTopic  string `gorm:"column:search_topic;type:text" json:"-"`
 	// Nullable for legacy Agent saves whose title was not the original request.
 	GenerationRequirement *string   `gorm:"column:generation_requirement;type:text" json:"generation_requirement,omitempty"`
 	SummaryMode           int       `gorm:"column:summary_mode;type:tinyint;not null" json:"summary_mode"`

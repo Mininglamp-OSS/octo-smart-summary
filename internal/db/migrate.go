@@ -45,7 +45,11 @@ func RunMigrations(db *sql.DB) (int, error) {
 		FileSystem: migrationsql.FS,
 		Root:       ".",
 	}
-	return runMigrationsCore(db, "mysql", source)
+	n, err := runMigrationsCore(db, "mysql", source)
+	if err != nil {
+		return n, err
+	}
+	return n, BackfillSummarySearch(ctx, db)
 }
 
 func runMigrationsCore(db *sql.DB, dialect string, source migrate.MigrationSource) (int, error) {
