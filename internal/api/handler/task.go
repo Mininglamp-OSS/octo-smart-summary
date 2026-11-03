@@ -519,6 +519,14 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	if h.db.Dialector.Name() == "mysql" {
 		args = append(args, userID)
 	}
+	visibleWhere := whereSQL
+	visibleArgs := append([]interface{}{}, args...)
+	rawKeyword := c.Query("keyword")
+	if utf8.RuneCountInString(rawKeyword) > maxSummarySearchRunes {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "keyword exceeds 100 Unicode characters"})
+		return
+	}
+	keyword := normalizedSummaryKeyword(rawKeyword)
 
 	if s := c.Query("status"); s != "" {
 		if v, err := strconv.Atoi(s); err == nil {
@@ -544,10 +552,6 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			args = append(args, v)
 		}
 	}
-	if s := c.Query("keyword"); s != "" {
-		whereSQL += " AND (title LIKE ? OR topic LIKE ?)"
-		args = append(args, "%"+s+"%", "%"+s+"%")
-	}
 	if s := c.Query("origin_channel_id"); s != "" {
 		// R11 Q2: the filter must not match a masked (derived-inherited)
 		// origin — otherwise it doubles as a membership oracle ("does some
@@ -569,15 +573,12 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 		}
 	}
 
-	sortBy := c.DefaultQuery("sort_by", "created_at")
-	sortOrder := c.DefaultQuery("sort_order", "desc")
-	if sortBy != "created_at" && sortBy != "updated_at" {
-		sortBy = "created_at"
+	// S14 F6 fixes the task order; legacy sort_by/sort_order parameters must
+	// not override the activity/creation tie-breakers or introduce relevance scores.
+	queryDB := h.db.WithContext(c.Request.Context())
+	if keyword != "" {
+		whereSQL, args = summarySearchFilter(queryDB, whereSQL, args, keyword)
 	}
-	if strings.ToLower(sortOrder) != "asc" {
-		sortOrder = "desc"
-	}
-	orderClause := "sub." + sortBy + " " + sortOrder
 
 	// Folding (1->N): scheduled tasks fold by schedule_id (only the latest run per
 	// schedule shows); manual tasks (schedule_id IS NULL) each form their own group.
@@ -589,15 +590,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	// namespaces fully separate. "Latest per group" uses id DESC (monotonic -> stable,
 	// unlike created_at which can tie at the same second). Pagination + total are
 	// computed AFTER folding (rn = 1).
-	innerSQL := "SELECT *, ROW_NUMBER() OVER (PARTITION BY (CASE WHEN schedule_id IS NULL THEN CONCAT('t', id) ELSE CONCAT('s', schedule_id) END) ORDER BY id DESC) AS rn FROM summary_task WHERE " + whereSQL
-
-	var total int64
-	countSQL := "SELECT COUNT(*) FROM (" + innerSQL + ") sub WHERE sub.rn = 1"
-	if err := h.db.Raw(countSQL, args...).Scan(&total).Error; err != nil {
-		log.Printf("list summaries count query failed: %v", err)
-		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "failed to list summaries"})
-		return
-	}
+	innerSQL := "SELECT id, ROW_NUMBER() OVER (PARTITION BY (CASE WHEN schedule_id IS NULL THEN CONCAT('t', id) ELSE CONCAT('s', schedule_id) END) ORDER BY id DESC) AS rn FROM summary_task WHERE " + whereSQL
 
 	// Attention is caller-specific. Compute it only after schedule folding, then
 	// sort before pagination. A pending invitation outranks a pending submission,
@@ -627,18 +620,33 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	 CASE WHEN cr.generated_at IS NOT NULL AND pv.generated_at IS NOT NULL
 	      THEN CASE WHEN cr.generated_at >= pv.generated_at THEN cr.generated_at ELSE pv.generated_at END
 	      ELSE COALESCE(cr.generated_at, pv.generated_at, sub.created_at) END AS activity_at`
-	pageSQL := "SELECT sub.*" + attentionSelect + " FROM (" + innerSQL + ") sub" + attentionJoins +
-		" WHERE sub.rn = 1 ORDER BY has_pending_invitation DESC, has_pending_submission DESC, is_unread DESC, activity_at DESC, " + orderClause + ", sub.id DESC LIMIT ? OFFSET ?"
-	pageArgs := []interface{}{model.ParticipantPending}
+	historicalSelect := ", 0 AS is_historical_match"
+	if keyword != "" {
+		historicalSelect = ", EXISTS (SELECT 1 FROM summary_task WHERE " + visibleWhere + " AND schedule_id = sub.schedule_id AND id > sub.id) AS is_historical_match"
+	}
+	// One statement observes one snapshot for matches, folded total, page and
+	// historical metadata. The materialized window carries only IDs/ranks, not
+	// task bodies or normalized text. LEFT JOIN preserves the total on an empty/out-of-range
+	// page. No application-side candidate scan or long repeatable-read transaction.
+	pageSQL := "WITH matched AS (" + innerSQL + "), folded AS (SELECT * FROM matched WHERE rn = 1) " +
+		"SELECT page.*, totals.folded_total FROM (SELECT COUNT(*) AS folded_total FROM folded) totals LEFT JOIN (SELECT sub.*" + attentionSelect + historicalSelect +
+		" FROM summary_task sub JOIN folded f ON f.id = sub.id" + attentionJoins +
+		" ORDER BY CASE WHEN has_pending_invitation=1 THEN 0 WHEN has_pending_submission=1 THEN 1 WHEN is_unread=1 THEN 2 ELSE 3 END ASC, activity_at DESC, sub.created_at DESC, sub.id DESC LIMIT ? OFFSET ?) page ON 1=1 ORDER BY CASE WHEN page.has_pending_invitation=1 THEN 0 WHEN page.has_pending_submission=1 THEN 1 WHEN page.is_unread=1 THEN 2 ELSE 3 END ASC, page.activity_at DESC, page.created_at DESC, page.id DESC"
+	pageArgs := append([]interface{}{}, args...)
+	pageArgs = append(pageArgs, model.ParticipantPending)
 	if h.db.Dialector.Name() == "mysql" {
 		pageArgs = append(pageArgs, userID)
 	}
 	pageArgs = append(pageArgs, model.PersonalStatusCompleted)
-	pageArgs = append(pageArgs, args...)
+	if keyword != "" {
+		pageArgs = append(pageArgs, visibleArgs...)
+	}
 	pageArgs = append(pageArgs, userID, userID, userID, userID, pageSize, (page-1)*pageSize)
 
 	type listTaskRow struct {
 		model.SummaryTask        `gorm:"embedded"`
+		FoldedTotal              int64  `gorm:"column:folded_total"`
+		IsHistoricalMatch        bool   `gorm:"column:is_historical_match"`
 		HasPendingInvitation     bool   `gorm:"column:has_pending_invitation"`
 		HasPendingSubmission     bool   `gorm:"column:has_pending_submission"`
 		IsUnread                 bool   `gorm:"column:is_unread"`
@@ -647,14 +655,19 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 		ActivityAt               string `gorm:"column:activity_at"`
 	}
 	var taskRows []listTaskRow
-	if err := h.db.Raw(pageSQL, pageArgs...).Scan(&taskRows).Error; err != nil {
+	if err := queryDB.Raw(pageSQL, pageArgs...).Scan(&taskRows).Error; err != nil {
 		log.Printf("list summaries page query failed: %v", err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "failed to list summaries"})
 		return
 	}
 	tasks := make([]model.SummaryTask, 0, len(taskRows))
 	rowByTask := make(map[int64]listTaskRow, len(taskRows))
+	var total int64
 	for _, row := range taskRows {
+		total = row.FoldedTotal
+		if row.ID == 0 {
+			continue
+		}
 		tasks = append(tasks, row.SummaryTask)
 		rowByTask[row.ID] = row
 	}
@@ -866,6 +879,11 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			"reference_artifact_type":      refType,
 			"reference_unavailable_reason": refReason,
 		})
+		if keyword != "" {
+			item := items[len(items)-1]
+			item["search_match"] = matchSummarySearch(t, keyword)
+			item["is_historical_match"] = attention.IsHistoricalMatch
+		}
 	}
 
 	// The badge numbers come from the shared helper (attention.go), which owns
