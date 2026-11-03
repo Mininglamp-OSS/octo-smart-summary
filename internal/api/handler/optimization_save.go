@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/finishgate"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -151,7 +153,7 @@ func optimizationSaveHash(req createAgentSummaryReq) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (h *AgentSummaryHandler) replayOptimization(c *gin.Context, key, hash string) bool {
+func (h *AgentSummaryHandler) replayOptimization(c *gin.Context, key, hash string, req createAgentSummaryReq) bool {
 	space, user := middleware.GetSpaceID(c), middleware.GetUserID(c)
 	var binding model.SummaryAgentSaveIdempotency
 	err := h.db.Where("space_id = ? AND user_id = ? AND idempotency_key = ?", space, user, key).First(&binding).Error
@@ -190,7 +192,19 @@ func (h *AgentSummaryHandler) replayOptimization(c *gin.Context, key, hash strin
 		c.JSON(409, apiResponse{Code: 40009, Message: "saved version unavailable"})
 		return true
 	}
-	ok(c, gin.H{"task_id": task.ID, "task_no": task.TaskNo, "status": task.Status, "created_at": task.CreatedAt, "save_mode": "new_version", "version": binding.ResultVersion, "result_id": binding.ResultID, "result_kind": binding.ResultKind, "replayed": true})
+	response := gin.H{"task_id": task.ID, "task_no": task.TaskNo, "status": task.Status, "created_at": task.CreatedAt, "save_mode": "new_version", "version": binding.ResultVersion, "result_id": binding.ResultID, "result_kind": binding.ResultKind, "replayed": true}
+	if agent.SummaryV2Enabled() {
+		var message model.AgentMessage
+		var result model.SummaryResult
+		if err := h.db.Where("id = ? AND user_id = ? AND space_id = ? AND session_id = ?", req.AgentMessageID, user, space, req.SessionID).First(&message).Error; err == nil {
+			if run, err := resolveAgentMessageRunBinding(c.Request.Context(), h.db, user, req.SessionID, req.RequestID, message); err == nil {
+				if err := resultQuery.Select("content, citations_json").Where("id = ?", binding.ResultID).Scan(&result).Error; err == nil {
+					h.addOptimizationFinish(c, response, user, req.SessionID, run.RequestID, result.Content, result.GetCitations(), message)
+				}
+			}
+		}
+	}
+	ok(c, response)
 	return true
 }
 
@@ -208,12 +222,15 @@ func (h *AgentSummaryHandler) saveOptimizationVersion(c *gin.Context, req create
 		return
 	}
 	hash := optimizationSaveHash(req)
-	if h.replayOptimization(c, key, hash) {
+	if h.replayOptimization(c, key, hash, req) {
 		return
 	}
 	space, user := middleware.GetSpaceID(c), middleware.GetUserID(c)
 	var saved model.SummaryAgentSaveIdempotency
 	var task model.SummaryTask
+	var finalContent, finalRequestID string
+	var finalCitations []model.Citation
+	var finalMessage model.AgentMessage
 	err := h.db.Transaction(func(tx *gorm.DB) error {
 		candidate, err := loadWorkspacePreviewForSave(tx, space, user, req, true)
 		if err != nil {
@@ -260,6 +277,10 @@ func (h *AgentSummaryHandler) saveOptimizationVersion(c *gin.Context, req create
 			return err
 		}
 		if len(cits) == 0 {
+			// Numeric markers have no source identity across multiple references.
+			if len(candidate.Scope.ReferencedTaskIDs) != 1 && contentHasCitationMarker(content) {
+				return errWorkspacePreviewCitationUnresolved
+			}
 			cits = artifact.Citations
 			fallback = false
 		}
@@ -383,16 +404,19 @@ func (h *AgentSummaryHandler) saveOptimizationVersion(c *gin.Context, req create
 		if err := createAgentSaveIdempotencyBinding(tx, &saved); err != nil {
 			return err
 		}
+		finalContent, finalRequestID, finalCitations, finalMessage = content, binding.RequestID, cits, candidate.Message
 		return markWorkspacePreviewSaved(tx, space, user, req.SessionID, candidate, task.ID)
 	})
 	if err != nil {
-		if h.replayOptimization(c, key, hash) {
+		if h.replayOptimization(c, key, hash, req) {
 			return
 		}
 		writeOptimizationError(c, err)
 		return
 	}
-	ok(c, gin.H{"task_id": task.ID, "task_no": task.TaskNo, "status": task.Status, "created_at": task.CreatedAt, "save_mode": "new_version", "version": saved.ResultVersion, "result_id": saved.ResultID, "result_kind": saved.ResultKind})
+	response := gin.H{"task_id": task.ID, "task_no": task.TaskNo, "status": task.Status, "created_at": task.CreatedAt, "save_mode": "new_version", "version": saved.ResultVersion, "result_id": saved.ResultID, "result_kind": saved.ResultKind}
+	h.addOptimizationFinish(c, response, user, req.SessionID, finalRequestID, finalContent, finalCitations, finalMessage)
+	ok(c, response)
 }
 
 // Keep the materialized personal result and its history in the same transaction.
@@ -428,4 +452,17 @@ func saveOptimizedPersonalVersion(tx *gorm.DB, personal model.PersonalResult, co
 		return result, err
 	}
 	return result, service.PrunePersonalResultVersions(tx, personal.TaskID, personal.UserID, service.PersonalResultVersionKeepLimit)
+}
+
+func (h *AgentSummaryHandler) addOptimizationFinish(c *gin.Context, response gin.H, user, session, request, content string, citations []model.Citation, message model.AgentMessage) {
+	if !agent.SummaryV2Enabled() {
+		return
+	}
+	if verdict, gaps := h.finalizeRunForMessage(c.Request.Context(), user, session, request, content, citations, message); verdict != "" {
+		response["finish_status"] = string(verdict)
+		if gaps == nil {
+			gaps = []finishgate.Gap{}
+		}
+		response["gaps"] = gaps
+	}
 }
