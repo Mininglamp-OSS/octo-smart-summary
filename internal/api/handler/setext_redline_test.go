@@ -184,7 +184,7 @@ func TestRefineTeamNeutralizesSetextHeadingsBothTransports(t *testing.T) {
 // die under the mutation.
 func TestCreateAgentSummary_LegacySavePersistsNeutralizedContent(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, newLegacySaveIMDB(t, "CH-SETEXT-LEGACY"), "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 	sessionID := "session-setext-legacy"
 	// The setext shape sits mid-document: stripAgentPreamble (owner decision
@@ -201,7 +201,7 @@ func TestCreateAgentSummary_LegacySavePersistsNeutralizedContent(t *testing.T) {
 	w := doAgentSave(t, r, map[string]interface{}{
 		"session_id":          sessionID,
 		"origin_channel_id":   "CH-SETEXT-LEGACY",
-		"origin_channel_type": 2,
+		"origin_channel_type": 1,
 		"title":               "Legacy Setext Save",
 	}, map[string]string{"Idempotency-Key": "legacy-setext-key"})
 	if w.Code != http.StatusOK {

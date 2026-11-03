@@ -67,7 +67,7 @@ func doAgentSave(t *testing.T, r http.Handler, body map[string]interface{}, head
 
 func TestCreateAgentSummary_BE2_MessageIDCrossUser_404(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, newLegacySaveIMDB(t, "chan-1"), "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	// Seed a message owned by SOMEONE ELSE on the same session id.
@@ -98,7 +98,7 @@ func TestCreateAgentSummary_BE2_MessageIDCrossUser_404(t *testing.T) {
 
 func TestCreateAgentSummary_BE2_LegacySaveDeletesOnlyLegacyMessages(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, newLegacySaveIMDB(t, "chan-1"), "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 	const sessionID = "sess-space-isolation"
 
@@ -140,7 +140,7 @@ func TestCreateAgentSummary_BE2_LegacySaveDeletesOnlyLegacyMessages(t *testing.T
 
 func TestCreateAgentSummary_BE2_MessageIDWrongSession_404(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, newLegacySaveIMDB(t, "chan-1"), "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	// Seed for this user but on a DIFFERENT session id.
@@ -161,7 +161,7 @@ func TestCreateAgentSummary_BE2_MessageIDWrongSession_404(t *testing.T) {
 
 func TestCreateAgentSummary_BE2_MessageIDUserRole_404(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, newLegacySaveIMDB(t, "chan-1"), "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	// Seed a role=user row (not an assistant reply).
@@ -188,7 +188,7 @@ func TestCreateAgentSummary_BE2_MessageIDUserRole_404(t *testing.T) {
 
 func TestCreateAgentSummary_BE2_MessageIDToolCall_404(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, newLegacySaveIMDB(t, "chan-1"), "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	// Assistant row that carries a tool_calls payload (intermediate "call
@@ -235,7 +235,7 @@ func TestCreateAgentSummary_BE2_MessageRunMismatchRejectedBeforeSave(t *testing.
 		t.Fatalf("bind message to run A: %v", err)
 	}
 
-	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, newLegacySaveIMDB(t, "chan-1"), "", "", "", 0, 0)
 	w := doAgentSave(t, setupAgentSummaryRouter(h), map[string]interface{}{
 		"session_id":          "sess-run-mismatch",
 		"request_id":          "req-b",
@@ -272,7 +272,7 @@ func TestCreateAgentSummary_BE2_MessageRunMismatchRejectedBeforeSave(t *testing.
 
 func TestCreateAgentSummary_BE2_SnapshotVersionConflict_409(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, newLegacySaveIMDB(t, "chan-1"), "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 	msg := seedAssistantMessage(t, db, "test-user", "sess-v", "final answer")
 
@@ -295,7 +295,7 @@ func TestCreateAgentSummary_BE2_SnapshotVersionConflict_409(t *testing.T) {
 
 func TestCreateAgentSummary_BE2_MessageIDWithoutVersion_400(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, newLegacySaveIMDB(t, "chan-1"), "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 	msg := seedAssistantMessage(t, db, "test-user", "sess-half", "final")
 
@@ -317,7 +317,7 @@ func TestCreateAgentSummary_BE2_MessageIDWithoutVersion_400(t *testing.T) {
 
 func TestCreateAgentSummary_BE2_IdempotencyReplaysSameTask(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, newLegacySaveIMDB(t, "chan-1"), "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	msg := seedAssistantMessage(t, db, "test-user", "sess-idem", "final answer")
@@ -405,7 +405,7 @@ func TestCreateAgentSaveIdempotencyBinding_DetectsConflictByReadBack(t *testing.
 
 func TestCreateAgentSummary_BE2_OverlappingRetryReplaysAfterDraftDisappears(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, newLegacySaveIMDB(t, "chan-1"), "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 	msg := seedAssistantMessage(t, db, "test-user", "sess-overlap", "final answer")
 
@@ -459,7 +459,7 @@ func TestCreateAgentSummary_BE2_OverlappingRetryReplaysAfterDraftDisappears(t *t
 
 func TestCreateAgentSummary_BE2_IdempotencyMismatch409(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, newLegacySaveIMDB(t, "chan-1"), "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	msg1 := seedAssistantMessage(t, db, "test-user", "sess-mismatch-A", "answer A")
@@ -514,7 +514,7 @@ func TestCreateAgentSummary_BE2_IdempotencyMismatch409(t *testing.T) {
 
 func TestCreateAgentSummary_BE2_ParticipantChangeConflictsBeforeDraftRead(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, newLegacySaveIMDB(t, "chan-1"), "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 	msg := seedAssistantMessage(t, db, "test-user", "sess-participants", "final answer")
 	body := map[string]interface{}{
@@ -538,7 +538,7 @@ func TestCreateAgentSummary_BE2_ParticipantChangeConflictsBeforeDraftRead(t *tes
 
 func TestCreateAgentSummary_BE2_DeletedTaskIsNotReplayed(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, newLegacySaveIMDB(t, "chan-1"), "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 	msg := seedAssistantMessage(t, db, "test-user", "sess-deleted", "final answer")
 	body := map[string]interface{}{
@@ -575,7 +575,7 @@ func TestCreateAgentSummary_BE2_DeletedTaskIsNotReplayed(t *testing.T) {
 
 func TestCreateAgentSummary_BE2_WhitespaceIdempotencyKeyRejected(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, newLegacySaveIMDB(t, "chan-1"), "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 	msg := seedAssistantMessage(t, db, "test-user", "sess-blank-key", "final answer")
 	w := doAgentSave(t, r, map[string]interface{}{
@@ -602,7 +602,7 @@ func TestCreateAgentSummary_BE2_AgentDraftDoesNotEnterPersonalProcessor(t *testi
 	// draft. Design section 2.2: "不能把 Agent 草稿交给 personal/meta Processor
 	// 再生成一次".
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, newLegacySaveIMDB(t, "chan-1"), "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	msg := seedAssistantMessage(t, db, "test-user", "sess-proc", "final content")
@@ -657,7 +657,7 @@ func TestCreateAgentSummary_BE2_AgentDraftDoesNotEnterPersonalProcessor(t *testi
 
 func TestCreateAgentSummary_BE2_LegacyPathStillWorksAndWritesAudit(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, newLegacySaveIMDB(t, "chan-1"), "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	msg := seedAssistantMessage(t, db, "test-user", "sess-legacy", "old client answer")
@@ -699,7 +699,7 @@ func TestCreateAgentSummary_BE2_ValidationFailureKeepsDraft(t *testing.T) {
 	// corrected snapshot_version and reach the same content. Design
 	// section 7.7: "保存失败时保留草稿,可安全重试".
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, newLegacySaveIMDB(t, "chan-1"), "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	// Seed two messages (a user turn + an assistant reply) so we can

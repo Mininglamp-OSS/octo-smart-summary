@@ -48,7 +48,7 @@ func TestAgentLongRequirementSaveAndRegenerate(t *testing.T) {
 		}
 	}
 	db.Model(&msg).Update("run_id", run.RunID)
-	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, newLegacySaveIMDB(t, "channel"), "", "", "", 0, 0)
 	w := doAgentSave(t, setupAgentSummaryRouter(h), map[string]interface{}{
 		"session_id": msg.SessionID, "agent_message_id": msg.ID, "snapshot_version": 1,
 		"origin_channel_id": "channel", "origin_channel_type": 1, "title": "Display title",

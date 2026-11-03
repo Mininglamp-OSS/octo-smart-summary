@@ -62,6 +62,7 @@ func (PersonalResult) TableName() string { return "summary_personal_result" }
 // PersonalResult. summary_personal_result remains the current materialized row
 // used by read paths; this table is only version history.
 type PersonalResultVersion struct {
+	SnapshotJSON     *string   `gorm:"column:snapshot_json;type:mediumtext" json:"-"`
 	ID               int64     `gorm:"primaryKey;autoIncrement" json:"id"`
 	TaskID           int64     `gorm:"column:task_id;not null;uniqueIndex:uk_personal_result_version_task_user_version" json:"task_id"`
 	ParticipantRefID int64     `gorm:"column:participant_ref_id;not null" json:"participant_ref_id"`

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -166,7 +167,7 @@ func resolveReferencedArtifact(
 			Citations:       plainCitations,
 			TeamCitations:   teamCitations,
 			CitationMarkers: newCitationMarkerSet(allPlainCitations, teamCitations),
-			Snapshot:        nil,
+			Snapshot:        projectResultSnapshot(db, nil, task, result.SnapshotJSON, userID, result.CitationOwnerID),
 			Sources:         sources,
 		}, nil
 	}
@@ -208,7 +209,7 @@ func resolveReferencedArtifact(
 			Citations:       plainCitations,
 			TeamCitations:   []model.TeamCitation{},
 			CitationMarkers: newCitationMarkerSet(plainCitations, nil),
-			Snapshot:        pr.GetSnapshot(),
+			Snapshot:        projectResultSnapshot(db.WithContext(ctx), nil, task, pr.SnapshotJSON, userID, pr.UserID),
 			Sources:         sources,
 		}, nil
 	}
@@ -336,4 +337,106 @@ func nonEmptyPersonalResultTaskIDs(db *gorm.DB, taskIDs []int64, userID string) 
 		out[id] = true
 	}
 	return out, nil
+}
+
+func decodeResultSnapshot(raw *string) *model.Snapshot {
+	if raw == nil {
+		return nil
+	}
+	var snapshot model.Snapshot
+	if err := json.Unmarshal([]byte(*raw), &snapshot); err != nil {
+		log.Printf("[summary] invalid generation snapshot: %v", err)
+		return nil
+	}
+	return &snapshot
+}
+
+// Preserve provenance when deriving a version without refetching sources.
+func refinedResultSnapshot(raw *string, version int, instruction string) *string {
+	snapshot := decodeResultSnapshot(raw)
+	if snapshot == nil {
+		return nil
+	}
+	parent := snapshot.ContentVersion
+	snapshot.ParentSnapshotVersion = &parent
+	snapshot.ContentVersion = version
+	snapshot.UserInstruction = nil
+	if instruction != "" {
+		snapshot.UserInstruction = &instruction
+	}
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		return nil
+	}
+	result := string(encoded)
+	return &result
+}
+
+// Project version provenance for a reader, including snapshots persisted before
+// this guard existed. Storage keeps unlisted selections; reads gate them by owner.
+func projectResultSnapshot(db, imDB *gorm.DB, task model.SummaryTask, raw *string, callerID, ownerID string) *model.Snapshot {
+	// Unlisted provenance belongs to the producing version, not every task reader.
+	// Match the existing explicit citation ownership policy; a legacy empty owner
+	// is never evidence that an unknown source is publishable.
+	return projectResultSnapshotValue(db, imDB, task, decodeResultSnapshot(raw), callerID != "" && callerID == ownerID)
+}
+
+func projectResultSnapshotValue(db, imDB *gorm.DB, task model.SummaryTask, snapshot *model.Snapshot, allowUnlisted bool) *model.Snapshot {
+	if snapshot == nil {
+		return nil
+	}
+	var sources []model.SummarySource
+	if err := db.Where("task_id = ?", task.ID).Find(&sources).Error; err != nil {
+		log.Printf("[summary] unable to project snapshot for task %d: %v", task.ID, err)
+		return nil
+	}
+	hidden := map[string]bool{}
+	known := map[string]model.SummarySource{}
+	for _, source := range sources {
+		if source.Derived {
+			hidden[source.SourceID] = true
+		} else {
+			known[source.SourceID] = source
+		}
+	}
+	// Work on fresh slices so projection cannot mutate an in-memory base artifact.
+	result := *snapshot
+	result.Scope.ChannelIDs = []string{}
+	result.Scope.ChannelNames = []string{}
+	result.Scope.Sources = nil
+	result.Scope.DocumentIDs = nil
+	for i, id := range snapshot.Scope.ChannelIDs {
+		_, shared := known[id]
+		if hidden[id] || (!shared && !allowUnlisted) {
+			continue
+		}
+		name := ""
+		if i < len(snapshot.Scope.ChannelNames) {
+			name = snapshot.Scope.ChannelNames[i]
+		}
+		if source, ok := known[id]; ok {
+			name = displaySourceName(source, task.CreatorID, imDB)
+		}
+		result.Scope.ChannelIDs = append(result.Scope.ChannelIDs, id)
+		result.Scope.ChannelNames = append(result.Scope.ChannelNames, name)
+	}
+	for _, source := range snapshot.Scope.Sources {
+		_, shared := known[source.SourceID]
+		if hidden[source.SourceID] || (!shared && !allowUnlisted) {
+			continue
+		}
+		stored := model.SummarySource{SourceID: source.SourceID, SourceType: source.SourceType, SourceName: source.SourceName}
+		if value, ok := known[source.SourceID]; ok {
+			stored = value
+		}
+		source.SourceName = displaySourceName(stored, task.CreatorID, imDB)
+		result.Scope.Sources = append(result.Scope.Sources, source)
+	}
+	for _, id := range snapshot.Scope.DocumentIDs {
+		_, shared := known[id]
+		if !hidden[id] && (shared || allowUnlisted) {
+			result.Scope.DocumentIDs = append(result.Scope.DocumentIDs, id)
+		}
+	}
+	return &result
 }

@@ -69,11 +69,11 @@ func main() {
 		log.Printf("[main] applied %d migration(s)", n)
 	}
 
-	// Init IM DB (for member candidates)
-	imDB, err := db.New(cfg.IMMySQLDSN)
+	// IM metadata is required to authorize source access. Never serve with a
+	// permanently nil handle after a transient startup connection failure.
+	imDB, err := openRequiredIMDB(cfg.IMMySQLDSN, db.New)
 	if err != nil {
-		log.Printf("[main] connect IM DB (non-fatal): %v", err)
-		imDB = nil
+		log.Fatalf("[main] connect required IM DB: %v", err)
 	}
 
 	// Init auth resolver
