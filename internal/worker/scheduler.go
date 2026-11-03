@@ -257,7 +257,12 @@ func preservePersonalResultVersionsBeforeRequeue(tx *gorm.DB, taskID int64) erro
 		var latest model.PersonalResultVersion
 		err := tx.Where("task_id = ? AND user_id = ?", pr.TaskID, pr.UserID).
 			Order("version DESC").Order("id DESC").First(&latest).Error
-		if err == nil && latest.Content == pr.Content && latest.CitationsJSON == pr.CitationsJSON {
+		if err == nil {
+			if normalizeErr := service.NormalizePersonalVersionSnapshot(tx, pr, &latest); normalizeErr != nil {
+				return normalizeErr
+			}
+		}
+		if err == nil && latest.Content == pr.Content && latest.CitationsJSON == pr.CitationsJSON && !service.PersonalSnapshotsDiffer(latest.SnapshotJSON, pr.SnapshotJSON) {
 			if pr.CurrentVersionID == nil {
 				if err := tx.Model(&model.PersonalResult{}).Where("id = ?", pr.ID).Update("current_version_id", latest.ID).Error; err != nil {
 					return err
@@ -287,7 +292,12 @@ func preservePersonalResultVersionsBeforeRequeue(tx *gorm.DB, taskID int64) erro
 		} else if !pr.CreatedAt.IsZero() {
 			generatedAt = pr.CreatedAt
 		}
+		var parentVersion *int
+		if latest.ID > 0 {
+			parentVersion = &latest.Version
+		}
 		snapshot := model.PersonalResultVersion{
+			SnapshotJSON:     service.RebasePersonalSnapshot(pr.SnapshotJSON, pr.TaskID, nextVer, parentVersion),
 			TaskID:           pr.TaskID,
 			ParticipantRefID: pr.ParticipantRefID,
 			UserID:           pr.UserID,
@@ -305,7 +315,7 @@ func preservePersonalResultVersionsBeforeRequeue(tx *gorm.DB, taskID int64) erro
 		if err := tx.Create(&snapshot).Error; err != nil {
 			return err
 		}
-		if err := tx.Model(&model.PersonalResult{}).Where("id = ?", pr.ID).Update("current_version_id", snapshot.ID).Error; err != nil {
+		if err := tx.Model(&model.PersonalResult{}).Where("id = ?", pr.ID).Updates(map[string]interface{}{"current_version_id": snapshot.ID, "snapshot_json": snapshot.SnapshotJSON}).Error; err != nil {
 			return err
 		}
 		if err := service.PrunePersonalResultVersions(tx, pr.TaskID, pr.UserID, service.PersonalResultVersionKeepLimit); err != nil {

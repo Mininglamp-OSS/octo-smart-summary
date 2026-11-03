@@ -253,6 +253,9 @@ func (h *TaskHandler) resolveSummaryTaskParam(c *gin.Context) (int64, bool) {
 // only be returned to the producing member -- if the displayed result's
 // contributor user_id != caller, redact.
 //
+// Explicit citation ownership on optimized versions takes precedence for all
+// modes. The following rules apply only to legacy artifacts without that record.
+//
 //   - BY_GROUP tasks (SummaryMode != ModeByPerson) have NO per-member privacy
 //     concern: their citations reference shared group chat visible to the whole
 //     group, and there are no per-person personal_result rows. Always visible.
@@ -272,6 +275,9 @@ func (h *TaskHandler) resolveSummaryTaskParam(c *gin.Context) (int64, bool) {
 //     single-person case (caller is the sole participant and producer) keeps
 //     plain citations so [n] source links still work.
 func callerPlainCitationsVisible(db *gorm.DB, task *model.SummaryTask, callerID string, result *model.SummaryResult) bool {
+	if result.CitationOwnerID != "" {
+		return callerID != "" && callerID == result.CitationOwnerID
+	}
 	if task.SummaryMode != model.ModeByPerson {
 		return true
 	}
@@ -1088,6 +1094,7 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 			"total_token_used": latestResult.TotalTokenUsed,
 			"model_version":    latestResult.ModelVersion,
 			"version":          latestResult.Version,
+			"snapshot":         projectResultSnapshot(h.db, h.imDB, task, latestResult.SnapshotJSON, callerID, latestResult.CitationOwnerID),
 			"operation_type":   latestResult.OperationType,
 			"operation_note":   latestResult.OperationNote,
 			"parent_result_id": latestResult.ParentResultID,

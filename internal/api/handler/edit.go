@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -138,6 +139,17 @@ func (h *EditHandler) EditSummary(c *gin.Context) {
 	now := timezone.Now()
 
 	err = h.db.Transaction(func(tx *gorm.DB) error {
+		var locked model.SummaryTask
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND deleted_at IS NULL", taskID).First(&locked).Error; err != nil {
+			return err
+		}
+		latest, err := queryDisplayResult(tx, taskID)
+		if err != nil {
+			return err
+		}
+		if latest.ID != req.BaseResultID || latest.Content != summaryResult.Content || latest.CitationsJSON != summaryResult.CitationsJSON {
+			return service.NewBizError(40009, "内容已更新，请刷新后重试", http.StatusConflict)
+		}
 		result := tx.Model(&model.SummaryResult{}).
 			Where("id = ?", req.BaseResultID).
 			Updates(map[string]interface{}{
@@ -164,12 +176,36 @@ func (h *EditHandler) EditSummary(c *gin.Context) {
 		// (hasPersonal already encodes participantCount<=1 && row exists). Multi-person
 		// team edits touch the team SummaryResult only, never a PersonalResult (R4).
 		if hasPersonal {
+			// The task lock serializes API writers; lock/reload the personal row
+			// as well before rebasing the display provenance into its history.
+			var currentPersonal model.PersonalResult
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND task_id = ? AND user_id = ?", personalResult.ID, taskID, task.CreatorID).First(&currentPersonal).Error; err != nil {
+				return err
+			}
+			personalVersion, err := currentPersonalVersion(tx, taskID, task.CreatorID, currentPersonal)
+			if err != nil {
+				return err
+			}
+			mirroredSnapshot := latest.SnapshotJSON
+			if snapshot := decodeResultSnapshot(mirroredSnapshot); snapshot != nil {
+				snapshot.ContentVersion = personalVersion
+				snapshot.ParentSnapshotVersion = nil
+				raw, err := json.Marshal(snapshot)
+				if err != nil {
+					return err
+				}
+				value := string(raw)
+				mirroredSnapshot = &value
+			} else if currentPersonal.SnapshotJSON != nil {
+				mirroredSnapshot = model.UnknownGenerationSnapshot(taskID, personalVersion)
+			}
 			if err := tx.Model(&model.PersonalResult{}).
 				Where("id = ?", personalResult.ID).
 				Updates(map[string]interface{}{
 					"content":        req.Content,
 					"citations_json": citationsJSON,
 					"edited_at":      now,
+					"snapshot_json":  mirroredSnapshot,
 				}).Error; err != nil {
 				return err
 			}
@@ -322,16 +358,17 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 	cleanedCitations := service.CleanUnreferencedCitations(newContent, basePlainCitations)
 	cleanedTeamCitations := cleanUnreferencedTeamCitations(newContent, baseResult.GetTeamCitations())
 	newResult := model.SummaryResult{
-		TaskID:         taskID,
-		Content:        newContent,
-		TotalMsgCount:  baseResult.TotalMsgCount,
-		TotalTokenUsed: baseResult.TotalTokenUsed + tokens,
-		ModelVersion:   usedModel,
-		OperationType:  "refine",
-		OperationNote:  feedback,
-		ParentResultID: &baseResult.ID,
-		CreatedBy:      userID,
-		GeneratedAt:    timezone.Now(),
+		TaskID:          taskID,
+		Content:         newContent,
+		CitationOwnerID: baseResult.CitationOwnerID,
+		TotalMsgCount:   baseResult.TotalMsgCount,
+		TotalTokenUsed:  baseResult.TotalTokenUsed + tokens,
+		ModelVersion:    usedModel,
+		OperationType:   "refine",
+		OperationNote:   feedback,
+		ParentResultID:  &baseResult.ID,
+		CreatedBy:       userID,
+		GeneratedAt:     timezone.Now(),
 	}
 	newResult.SetCitations(cleanedCitations)
 	newResult.SetTeamCitations(cleanedTeamCitations)
@@ -356,6 +393,7 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 			return err
 		}
 		newResult.Version = nextVer
+		newResult.SnapshotJSON = refinedResultSnapshot(baseResult.SnapshotJSON, nextVer, feedback)
 		if err := tx.Create(&newResult).Error; err != nil {
 			return err
 		}
@@ -513,16 +551,17 @@ func (h *EditHandler) RefineSummaryStream(c *gin.Context) {
 	cleanedCitations := service.CleanUnreferencedCitations(newContent, basePlainCitations)
 	cleanedTeamCitations := cleanUnreferencedTeamCitations(newContent, baseResult.GetTeamCitations())
 	newResult := model.SummaryResult{
-		TaskID:         taskID,
-		Content:        newContent,
-		TotalMsgCount:  baseResult.TotalMsgCount,
-		TotalTokenUsed: baseResult.TotalTokenUsed + tokens,
-		ModelVersion:   usedModel,
-		OperationType:  "refine",
-		OperationNote:  feedback,
-		ParentResultID: &baseResult.ID,
-		CreatedBy:      userID,
-		GeneratedAt:    timezone.Now(),
+		TaskID:          taskID,
+		Content:         newContent,
+		CitationOwnerID: baseResult.CitationOwnerID,
+		TotalMsgCount:   baseResult.TotalMsgCount,
+		TotalTokenUsed:  baseResult.TotalTokenUsed + tokens,
+		ModelVersion:    usedModel,
+		OperationType:   "refine",
+		OperationNote:   feedback,
+		ParentResultID:  &baseResult.ID,
+		CreatedBy:       userID,
+		GeneratedAt:     timezone.Now(),
 	}
 	newResult.SetCitations(cleanedCitations)
 	newResult.SetTeamCitations(cleanedTeamCitations)
@@ -547,6 +586,7 @@ func (h *EditHandler) RefineSummaryStream(c *gin.Context) {
 			return err
 		}
 		newResult.Version = nextVer
+		newResult.SnapshotJSON = refinedResultSnapshot(baseResult.SnapshotJSON, nextVer, feedback)
 		if err := tx.Create(&newResult).Error; err != nil {
 			return err
 		}
@@ -706,6 +746,7 @@ func (h *EditHandler) GetSummaryVersion(c *gin.Context) {
 	ok(c, gin.H{
 		"result_id":        row.ID,
 		"version":          row.Version,
+		"snapshot":         projectResultSnapshot(h.db, nil, task, row.SnapshotJSON, userID, row.CitationOwnerID),
 		"operation_type":   row.OperationType,
 		"operation_note":   row.OperationNote,
 		"parent_result_id": row.ParentResultID,

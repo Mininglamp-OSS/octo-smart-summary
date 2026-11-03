@@ -433,7 +433,7 @@ func TestReplayFailureKeepsPreviousMessageOutputTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode save request: %v", err)
 	}
-	saveHandler := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	saveHandler := NewAgentSummaryHandler(db, newLegacySaveIMDB(t, "ch-1"), "", "", "", 0, 0)
 	w := httptest.NewRecorder()
 	saveReq := httptest.NewRequest(http.MethodPost, "/api/v1/summaries/agent", bytes.NewReader(saveBody))
 	saveReq.Header.Set("Content-Type", "application/json")
