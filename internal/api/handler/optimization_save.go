@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -290,6 +291,19 @@ func (h *AgentSummaryHandler) saveOptimizationVersion(c *gin.Context, req create
 		if err != nil {
 			return err
 		}
+		if len(cits) > 0 && contentHasCitationMarker(content) {
+			// Fresh evidence and reference summaries each number from one.
+			// Without a shared identity mapping, reject conflicting used indices.
+			for _, referenceID := range candidate.Scope.ReferencedTaskIDs {
+				reference, err := resolveReferencedArtifact(c.Request.Context(), tx, referenceID, space, user)
+				if err != nil {
+					return err
+				}
+				if optimizationCitationNamespacesConflict(content, cits, reference.Citations) {
+					return errWorkspacePreviewCitationUnresolved
+				}
+			}
+		}
 		if len(cits) == 0 {
 			// Numeric markers have no source identity across multiple references.
 			if len(candidate.Scope.ReferencedTaskIDs) != 1 && contentHasCitationMarker(content) {
@@ -479,4 +493,27 @@ func (h *AgentSummaryHandler) addOptimizationFinish(c *gin.Context, response gin
 		}
 		response["gaps"] = gaps
 	}
+}
+
+// Accept a reused ordinal only when both sides identify the same evidence.
+// Missing stable identities are insufficient to establish equivalence.
+func optimizationCitationNamespacesConflict(content string, fresh, previous []model.Citation) bool {
+	for _, old := range previous {
+		if !strings.Contains(content, fmt.Sprintf("[%d]", old.Index)) {
+			continue
+		}
+		for _, current := range fresh {
+			if current.Index != old.Index {
+				continue
+			}
+			sameMessage := old.ChannelID != "" && old.MessageSeq > 0 &&
+				old.ChannelID == current.ChannelID && old.ChannelType == current.ChannelType && old.MessageSeq == current.MessageSeq
+			sameDocument := old.DocumentID != "" && old.DocumentVersion != "" &&
+				old.DocumentID == current.DocumentID && old.DocumentVersion == current.DocumentVersion && old.DocumentChunk == current.DocumentChunk
+			if !sameMessage && !sameDocument {
+				return true
+			}
+		}
+	}
+	return false
 }

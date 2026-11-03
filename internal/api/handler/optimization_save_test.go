@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/artifact"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -474,5 +476,70 @@ func TestOptimizationDisclosesPartialRunOnSaveAndReplay(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+func TestOptimizationFreshCitationIdentityCollision(t *testing.T) {
+	for _, same := range []bool{false, true} {
+		t.Run(fmt.Sprint(same), func(t *testing.T) {
+			db, h, f, b := seedOptimization(t, "team")
+			t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+			if err := db.AutoMigrate(&model.AgentSummaryRun{}, &model.AgentSummaryTurn{}, &model.AgentSummarySpec{}, &model.AgentEvidenceArtifact{}, &model.AgentCitationManifest{}); err != nil {
+				t.Fatal(err)
+			}
+			oldChannel, oldSeq := "old-channel", int64(101)
+			if same {
+				oldChannel, oldSeq = "new-channel", 202
+			}
+			b.Result.SetCitations([]model.Citation{{Index: 1, ChannelID: oldChannel, ChannelType: 2, MessageSeq: oldSeq}})
+			if err := db.Model(&b.Result).Updates(map[string]interface{}{"content": "Budget approved [1]", "citations_json": b.Result.CitationsJSON, "citation_owner_id": "test-user"}).Error; err != nil {
+				t.Fatal(err)
+			}
+			message := f.Message
+			session := bindWorkspacePreviewRun(t, db, f, &message, "collision", agent.SummaryResultAgentPreview, 0, 3, "Budget approved [1]")
+			pool := []pipeline.Message{{ChannelID: "new-channel", ChannelType: 2, MessageSeq: 202, Content: "Unrelated new evidence", SenderUID: "alice", Timestamp: 1}}
+			seedEvidenceRow(t, db, "test-user", session, "collision-evidence", pool)
+			if _, _, _, err := artifact.NewStore(db).FreezeFromPool(context.Background(), message.RunID, "test-user", session, pool, artifact.FreezeMeta{}); err != nil {
+				t.Fatal(err)
+			}
+			f.Body["request_id"] = "collision"
+			fresh, err := loadOptimizationBase(db, "test-space", "test-user", b.Task.ID, "team", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.Body["target"] = optimizationTarget{b.Task.ID, "team", fresh.revision()}
+			w := doAgentSave(t, setupAgentSummaryRouter(h), f.Body, map[string]string{"Idempotency-Key": "collision-save"})
+			if same {
+				if w.Code != 200 {
+					t.Fatal(w.Body.String())
+				}
+			} else {
+				if w.Code != 409 || !strings.Contains(w.Body.String(), "workspace_citation_unresolved") {
+					t.Fatal(w.Body.String())
+				}
+				var session model.AgentSummarySession
+				db.First(&session, f.Session.ID)
+				if session.LatestPreviewSavedTaskID != 0 {
+					t.Fatal("collision consumed draft")
+				}
+			}
+		})
+	}
+}
+
+func TestOptimizationReferenceContextUsesTypedSources(t *testing.T) {
+	db, _, _, b := seedOptimization(t, "team")
+	raw := fmt.Sprintf(`{"task_id":%d,"content_version":1,"scope":{"channel_ids":["peer","thread"],"sources":[{"source_id":"peer","source_type":3},{"source_id":"thread","source_type":2}]}}`, b.Task.ID)
+	if err := db.Model(&b.Task).Update("origin_channel_type", model.OriginChannelGroup).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&b.Result).Updates(map[string]interface{}{"snapshot_json": raw, "citation_owner_id": "test-user"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	text, _, _ := buildReferencedSummariesContextWithArtifacts(context.Background(), db, "test-space", "test-user", []int64{b.Task.ID})
+	for _, expected := range []string{"channel_id=peer channel_type=1", "channel_id=thread channel_type=5"} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("missing %s in %s", expected, text)
+		}
 	}
 }
