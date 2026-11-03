@@ -37,9 +37,12 @@ func PersonalVersionPayloadMatches(pr model.PersonalResult, version model.Person
 	return pr.Content == version.Content && pr.CitationsJSON == version.CitationsJSON && pr.MsgCount == version.MsgCount && pr.TotalTokenUsed == version.TotalTokenUsed && pr.ModelVersion == version.ModelVersion
 }
 
-// Missing provenance alone cannot manufacture a manual edit on upgraded data.
-func KnownPersonalSnapshotsDiffer(a, b *string) bool {
-	return a != nil && b != nil && *a != *b
+// Compare after normalizing recoverable legacy history in the transaction.
+func PersonalSnapshotsDiffer(a, b *string) bool {
+	if a == nil || b == nil {
+		return a != b
+	}
+	return *a != *b
 }
 
 // RebasePersonalSnapshot labels inherited provenance with the history row that
@@ -51,7 +54,7 @@ func RebasePersonalSnapshot(raw *string, taskID int64, version int, parentVersio
 		return nil
 	}
 	var snapshot model.Snapshot
-	if json.Unmarshal([]byte(*raw), &snapshot) != nil || (snapshot.TaskID != 0 && snapshot.TaskID != taskID) {
+	if json.Unmarshal([]byte(*raw), &snapshot) != nil || snapshot.TaskID != taskID {
 		return model.UnknownGenerationSnapshot(taskID, version)
 	}
 	sameParent := snapshot.ParentSnapshotVersion == nil && parentVersion == nil

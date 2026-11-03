@@ -460,7 +460,7 @@ func TestPersonalWritesSynchronizeTeamDisplayProvenance(t *testing.T) {
 		for _, legacy := range []bool{false, true} {
 			t.Run(fmt.Sprintf("stream=%v/legacy=%v", stream, legacy), func(t *testing.T) {
 				db, h, f, b := seedOptimization(t, "team")
-				raw := `{"snapshot_version":1,"content_version":1,"scope":{"channel_ids":["original-source"]}}`
+				raw := fmt.Sprintf(`{"snapshot_version":1,"task_id":%d,"content_version":1,"scope":{"channel_ids":["original-source"]}}`, b.Task.ID)
 				pr := model.PersonalResult{TaskID: b.Task.ID, UserID: "test-user", Content: "Original personal", WorkerStatus: model.PersonalStatusCompleted, SnapshotJSON: &raw}
 				if legacy {
 					pr.SnapshotJSON = nil

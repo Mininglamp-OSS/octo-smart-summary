@@ -411,9 +411,8 @@ func saveOptimizedPersonalVersion(tx *gorm.DB, personal model.PersonalResult, co
 	snapshotCopy := *snapshot
 	snapshotCopy.ContentVersion = version
 	snapshotCopy.ParentSnapshotVersion = nil
-	if previous := personal.GetSnapshot(); previous != nil {
-		parent := previous.ContentVersion
-		snapshotCopy.ParentSnapshotVersion = &parent
+	if decodeResultSnapshot(baseline.SnapshotJSON) != nil {
+		snapshotCopy.ParentSnapshotVersion = &baseline.Version
 	}
 	raw, err := json.Marshal(snapshotCopy)
 	if err != nil {

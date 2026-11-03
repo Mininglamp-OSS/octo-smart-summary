@@ -223,7 +223,7 @@ func TestOptimizationTeamMirrorIsAtomicVersion(t *testing.T) {
 	for _, multiple := range []bool{false, true} {
 		t.Run(fmt.Sprint(multiple), func(t *testing.T) {
 			db, h, f, b := seedOptimization(t, "team")
-			old := `{"snapshot_version":1,"content_version":1,"requirement":"old source"}`
+			old := fmt.Sprintf(`{"task_id":%d,"snapshot_version":1,"content_version":1,"requirement":"old source"}`, b.Task.ID)
 			p := model.PersonalResult{TaskID: b.Task.ID, UserID: "test-user", Content: "Personal original", WorkerStatus: model.PersonalStatusCompleted, SnapshotJSON: &old, TotalTokenUsed: 123, ModelVersion: "original-model"}
 			if err := db.Create(&p).Error; err != nil {
 				t.Fatal(err)
@@ -277,6 +277,9 @@ func TestOptimizationTeamMirrorIsAtomicVersion(t *testing.T) {
 			}
 			if p.Content != team.Content || current.Content != team.Content || current.Version != 5 || p.GetSnapshot().ContentVersion != 5 || *p.SnapshotJSON != *current.SnapshotJSON || current.TotalTokenUsed != 123 {
 				t.Fatalf("inconsistent mirror: personal=%+v history=%+v", p, current)
+			}
+			if current.ParentVersionID == nil || *current.ParentVersionID != baseline.ID || p.GetSnapshot().ParentSnapshotVersion == nil || *p.GetSnapshot().ParentSnapshotVersion != 4 {
+				t.Fatal("optimized mirror must reference the archived baseline")
 			}
 			var count int64
 			db.Model(&model.PersonalResultVersion{}).Count(&count)

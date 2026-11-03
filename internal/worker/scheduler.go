@@ -262,7 +262,7 @@ func preservePersonalResultVersionsBeforeRequeue(tx *gorm.DB, taskID int64) erro
 				return normalizeErr
 			}
 		}
-		if err == nil && latest.Content == pr.Content && latest.CitationsJSON == pr.CitationsJSON && !service.KnownPersonalSnapshotsDiffer(latest.SnapshotJSON, pr.SnapshotJSON) {
+		if err == nil && latest.Content == pr.Content && latest.CitationsJSON == pr.CitationsJSON && !service.PersonalSnapshotsDiffer(latest.SnapshotJSON, pr.SnapshotJSON) {
 			if pr.CurrentVersionID == nil {
 				if err := tx.Model(&model.PersonalResult{}).Where("id = ?", pr.ID).Update("current_version_id", latest.ID).Error; err != nil {
 					return err

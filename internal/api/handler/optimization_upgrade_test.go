@@ -114,7 +114,7 @@ func TestLegacyPersonalBaselineNormalizesWithoutInventingHistory(t *testing.T) {
 			var count int64
 			db.Model(&model.PersonalResultVersion{}).Where("task_id = ?", b.Task.ID).Count(&count)
 			expected := int64(1)
-			if scenario == "known-change" {
+			if scenario == "known-change" || scenario == "different-version" || scenario == "foreign-task" {
 				expected = 2
 			}
 			if count != expected {

@@ -998,7 +998,7 @@ func ensurePersonalVersionBaseline(tx *gorm.DB, pr model.PersonalResult) (model.
 }
 
 func personalCanonicalDiffersFromVersion(pr model.PersonalResult, version model.PersonalResultVersion) bool {
-	if service.KnownPersonalSnapshotsDiffer(pr.SnapshotJSON, version.SnapshotJSON) {
+	if service.PersonalSnapshotsDiffer(pr.SnapshotJSON, version.SnapshotJSON) {
 		return true
 	}
 	if pr.EditedAt == nil {

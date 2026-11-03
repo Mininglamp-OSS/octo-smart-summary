@@ -79,6 +79,7 @@ type LLMCallFn func(ctx context.Context, prompt string) (string, error)
 // channelQuery holds the resolved discovery options for GetUserChannels.
 type channelQuery struct {
 	selectedThreadIDs []string
+	selectedDMIDs     []string
 	includeArchived   bool
 	spaceID           string
 }
@@ -92,6 +93,11 @@ type ChannelQueryOption func(*channelQuery)
 // threads the caller explicitly picked.
 func WithSelectedThreads(ids []string) ChannelQueryOption {
 	return func(q *channelQuery) { q.selectedThreadIDs = ids }
+}
+
+// WithSelectedDMIDs looks up explicit conversation IDs without the discovery page limit.
+func WithSelectedDMIDs(ids []string) ChannelQueryOption {
+	return func(q *channelQuery) { q.selectedDMIDs = ids }
 }
 
 // WithIncludeArchived, when true, discovers ALL Archived threads (status=2)
@@ -175,15 +181,19 @@ func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB, opts ...Cha
 		ChannelID string `gorm:"column:channel_id"`
 	}
 	var dms []dmRow
-	err = imDB.WithContext(ctx).Raw(`
-		SELECT channel_id
-		FROM conversation_extra
-		WHERE uid = ? AND channel_type = 1
-		GROUP BY channel_id
-		ORDER BY MAX(updated_at) DESC
-		LIMIT 200
-	`, uid).Scan(&dms).Error
+	dmQuery := imDB.WithContext(ctx).Table("conversation_extra").
+		Select("channel_id").Where("uid = ? AND channel_type = 1", uid).
+		Group("channel_id").Order("MAX(updated_at) DESC")
+	if len(q.selectedDMIDs) > 0 {
+		dmQuery = dmQuery.Where("channel_id IN ?", q.selectedDMIDs)
+	} else {
+		dmQuery = dmQuery.Limit(200)
+	}
+	err = dmQuery.Scan(&dms).Error
 	if err != nil {
+		if len(q.selectedDMIDs) > 0 {
+			return nil, fmt.Errorf("query selected DM channels: %w", err)
+		}
 		log.Printf("[pipeline] query DM channels error: %v", err)
 	}
 	activeSpacePeers := make(map[string]bool)

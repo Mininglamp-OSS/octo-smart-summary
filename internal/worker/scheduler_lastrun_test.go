@@ -769,7 +769,7 @@ func TestPersonalRequeuePreservesSnapshotAndNewGenerationMarksUnknown(t *testing
 	if err := db.Create(&task).Error; err != nil {
 		t.Fatal(err)
 	}
-	raw := `{"snapshot_version":1,"content_version":1,"scope":{"channel_ids":["old-channel"]}}`
+	raw := fmt.Sprintf(`{"snapshot_version":1,"task_id":%d,"content_version":1,"scope":{"channel_ids":["old-channel"]}}`, task.ID)
 	pr := model.PersonalResult{TaskID: task.ID, UserID: "owner", Content: "Old", SnapshotJSON: &raw, WorkerStatus: model.PersonalStatusCompleted}
 	if err := db.Create(&pr).Error; err != nil {
 		t.Fatal(err)
@@ -837,8 +837,12 @@ func TestLegacyProvenanceRequeueAndEmptyWindowStayAligned(t *testing.T) {
 				}
 				var count int64
 				db.Model(&model.PersonalResultVersion{}).Where("task_id = ?", task.ID).Count(&count)
-				if count != 1 || version.OperationType != "generate" {
-					t.Fatalf("empty run %d invented history", run)
+				expectedCount, expectedOp := int64(1), "generate"
+				if !matching {
+					expectedCount, expectedOp = 2, "manual_edit"
+				}
+				if count != expectedCount || version.OperationType != expectedOp {
+					t.Fatalf("run %d: got %d rows, operation %s", run, count, version.OperationType)
 				}
 				if version.SnapshotJSON == nil || current.SnapshotJSON == nil || *version.SnapshotJSON != *current.SnapshotJSON {
 					t.Fatal("history/current provenance desynchronized")
@@ -848,8 +852,14 @@ func TestLegacyProvenanceRequeueAndEmptyWindowStayAligned(t *testing.T) {
 					if *current.SnapshotJSON != raw {
 						t.Fatal("empty window lost known provenance")
 					}
-				} else if snapshot.ProvenanceStatus != "unknown" || len(snapshot.Scope.ChannelIDs) != 0 {
-					t.Fatal("unknown history borrowed newer source")
+				} else {
+					if snapshot.ContentVersion != 2 || len(snapshot.Scope.ChannelIDs) != 1 || snapshot.Scope.ChannelIDs[0] != "newer-channel" {
+						t.Fatal("new history did not preserve current scope")
+					}
+					var original model.PersonalResultVersion
+					if err := db.First(&original, v.ID).Error; err != nil || original.SnapshotJSON != nil {
+						t.Fatal("original history borrowed newer scope")
+					}
 				}
 			}
 		})
