@@ -3,9 +3,14 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
+
+	"github.com/mattn/go-sqlite3"
+	"gorm.io/gorm"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -35,7 +40,7 @@ func TestCreateAgentSummary_LegacyOutputEnvelope(t *testing.T) {
 					Timestamp: 1704103200, SenderUID: "alice", Content: "trusted evidence",
 				}})
 			}
-			h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+			h := NewAgentSummaryHandler(db, newLegacyOutputIMDB(t), "", "", "", 0, 0)
 			w := doAgentSave(t, setupAgentSummaryRouter(h), map[string]interface{}{
 				"session_id": tc.name, "agent_message_id": message.ID, "snapshot_version": 1,
 				"origin_channel_id": "allowed-channel", "origin_channel_type": 1,
@@ -94,4 +99,39 @@ func TestCreateAgentSummary_WorkspaceDoesNotUnwrapLegacyEnvelope(t *testing.T) {
 	if saved.Content != content {
 		t.Fatalf("workspace preview changed: got %q, want %q", saved.Content, content)
 	}
+}
+
+func newLegacyOutputIMDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	// Use an authorized source so this fixture also exercises saves when
+	// source validation is enabled; do not depend on a nil IM database.
+	db := newSummaryWorkspaceIMValidationDB(t)
+	for _, statement := range []string{
+		`INSERT INTO "group" VALUES ('allowed-channel','Allowed','test-space',1,1)`,
+		`INSERT INTO group_member VALUES ('allowed-channel','test-user',1,0,0)`,
+	} {
+		if err := db.Exec(statement).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	conn, err := sqlDB.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.Raw(func(raw interface{}) error {
+		sqliteConn := raw.(*sqlite3.SQLiteConn)
+		if err := sqliteConn.RegisterCollation("utf8mb4_unicode_ci", strings.Compare); err != nil {
+			return err
+		}
+		return sqliteConn.RegisterFunc("CONCAT", func(parts ...string) string { return strings.Join(parts, "") }, true)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return db
 }
