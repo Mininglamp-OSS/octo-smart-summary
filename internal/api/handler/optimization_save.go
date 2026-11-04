@@ -309,6 +309,9 @@ func (h *AgentSummaryHandler) saveOptimizationVersion(c *gin.Context, req create
 				return errWorkspacePreviewCitationUnresolved
 			}
 			cits = artifact.Citations
+			if len(cits) == 0 && optimizationCitationNamespacesConflict(content, cits, artifact) {
+				return errWorkspacePreviewCitationUnresolved
+			}
 			fallback = false
 		}
 		content, err = service.NormalizeGeneratedCitations(content, cits)

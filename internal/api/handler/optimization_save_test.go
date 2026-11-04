@@ -635,3 +635,78 @@ func TestOptimizationVersionRejectsDocumentScope(t *testing.T) {
 		t.Fatal("rejected document preview was bound")
 	}
 }
+
+func TestOptimizationEmptyEvidenceRedactedReference(t *testing.T) {
+	for _, tc := range []struct {
+		marker string
+		status int
+	}{
+		{"[2]", http.StatusConflict},
+		{"[02]", http.StatusConflict},
+		{"[2024]", http.StatusOK},
+	} {
+		t.Run(tc.marker, func(t *testing.T) {
+			db, h, f, b := seedOptimization(t, "team")
+			b.Result.SetCitations([]model.Citation{
+				{Index: 1, ChannelID: "private", ChannelType: 2, MessageSeq: 101},
+				{Index: 2, ChannelID: "private", ChannelType: 2, MessageSeq: 102},
+			})
+			if err := db.Create(&model.SummaryParticipant{TaskID: b.Task.ID, UserID: "producer", Status: model.ParticipantAccepted}).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Model(&b.Result).Updates(map[string]interface{}{
+				"content": "Original [1]. Approval [2]", "citations_json": b.Result.CitationsJSON, "citation_owner_id": "producer",
+			}).Error; err != nil {
+				t.Fatal(err)
+			}
+			reference, err := resolveReferencedArtifact(context.Background(), db, b.Task.ID, "test-space", "test-user")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, known := reference.CitationMarkers["2"]; !known || len(reference.Citations) != 0 {
+				t.Fatal("fixture must redact known reference evidence")
+			}
+			payload, err := json.Marshal(agent.SummaryResponsePayload{
+				ResultType: agent.SummaryResultAgentPreview, ExecutionTarget: "agent_preview",
+				Preview: &agent.SummaryResponsePreview{Content: "Retained statement " + tc.marker, Version: 3},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Model(&f.Message).Update("response_payload_json", string(payload)).Error; err != nil {
+				t.Fatal(err)
+			}
+			base, err := loadOptimizationBase(db, "test-space", "test-user", b.Task.ID, "team", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.Body["target"] = optimizationTarget{b.Task.ID, "team", base.revision()}
+			w := doAgentSave(t, setupAgentSummaryRouter(h), f.Body, map[string]string{"Idempotency-Key": "redacted-empty"})
+			if w.Code != tc.status {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+			if tc.status == http.StatusOK {
+				return
+			}
+			if !strings.Contains(w.Body.String(), "workspace_citation_unresolved") {
+				t.Fatal(w.Body.String())
+			}
+			var session model.AgentSummarySession
+			if err := db.First(&session, f.Session.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if session.LatestPreviewSavedTaskID != 0 {
+				t.Fatal("rejection consumed preview")
+			}
+			var count int64
+			db.Model(&model.SummaryAgentSaveIdempotency{}).Count(&count)
+			if count != 0 {
+				t.Fatal("rejection created binding")
+			}
+			db.Model(&model.SummaryResult{}).Where("task_id = ?", b.Task.ID).Count(&count)
+			if count != 1 {
+				t.Fatal("rejection created version")
+			}
+		})
+	}
+}
