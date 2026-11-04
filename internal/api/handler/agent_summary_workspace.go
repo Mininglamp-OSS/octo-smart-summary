@@ -2105,13 +2105,21 @@ func (w *summaryWorkspaceCoordinator) validateSources(ctx context.Context, space
 	if w == nil || w.imDB == nil || strings.TrimSpace(spaceID) == "" {
 		return false, errors.New("IM database not available")
 	}
-	selectedThreads := make([]string, 0)
+	var selectedThreads, selectedDMIDs []string
 	for _, channel := range channels {
-		if channel.ChatType == "thread" {
+		switch channel.ChatType {
+		case "thread":
 			selectedThreads = append(selectedThreads, channel.ChatID)
+		case "direct":
+			id := pipeline.NormalizeDMChannelID(channel.ChatID, actorID, model.ChannelTypeDM)
+			peer := summaryWorkspaceDMPeerID(id, actorID)
+			if peer == "" {
+				return false, nil
+			}
+			selectedDMIDs = append(selectedDMIDs, peer, actorID+"@"+peer, peer+"@"+actorID)
 		}
 	}
-	allowed, err := pipeline.GetUserChannels(ctx, actorID, w.imDB, pipeline.WithSelectedThreads(selectedThreads))
+	allowed, err := pipeline.GetUserChannels(ctx, actorID, w.imDB, pipeline.WithSelectedThreads(selectedThreads), pipeline.WithSelectedDMIDs(selectedDMIDs))
 	if err != nil {
 		return false, err
 	}

@@ -289,9 +289,25 @@ func buildReferencedSummariesContextWithArtifacts(
 				storageType := appOriginToStorageChannelType(art.Task.OriginChannelType)
 				sb.WriteString("- 候选频道 (candidate channels):\n")
 				for _, cid := range snap.Scope.ChannelIDs {
+					// Typed snapshots can contain sources unlike the task's origin.
+					channelStorageType := storageType
+					for _, source := range snap.Scope.Sources {
+						if source.SourceID != cid {
+							continue
+						}
+						switch source.SourceType {
+						case model.SourceDirect:
+							channelStorageType = model.ChannelTypeDM
+						case model.SourceGroup:
+							channelStorageType = model.ChannelTypeGroup
+						case model.SourceThread:
+							channelStorageType = model.ChannelTypeThread
+						}
+						break
+					}
 					if showCandidateChannelType {
 						sb.WriteString(fmt.Sprintf("  * channel_id=%s channel_type=%d %s\n",
-							sanitizeRefLine(cid), storageType, channelTypeLabel(storageType)))
+							sanitizeRefLine(cid), channelStorageType, channelTypeLabel(channelStorageType)))
 					} else {
 						sb.WriteString(fmt.Sprintf("  * channel_id=%s\n", sanitizeRefLine(cid)))
 					}

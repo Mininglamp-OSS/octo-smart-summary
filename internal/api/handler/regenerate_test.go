@@ -28,6 +28,7 @@ func setupRegenerateDB(t *testing.T) *gorm.DB {
 		t.Fatalf("open db: %v", err)
 	}
 	db.AutoMigrate(
+		&model.SummaryAgentSaveIdempotency{},
 		&model.SummaryTask{},
 		&model.SummarySource{},
 		&model.SummarySourceSnapshot{},

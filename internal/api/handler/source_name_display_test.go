@@ -89,9 +89,11 @@ func doAgentCreateRequest(t *testing.T, h *AgentSummaryHandler, sessionID string
 // CreateAgentSummary makes this RED (persisted name becomes "").
 func TestCreateAgentSummary_SourceNameResolvedFromIMDB(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	imDB := setupSourceNameImDB(t)
+	imDB := newLegacySaveIMDB(t, "CH-SRCNAME", "fef0c26327664232a2fd73ce2fb98ec6")
 	const groupNo = "fef0c26327664232a2fd73ce2fb98ec6"
-	seedImGroup(t, imDB, groupNo, "一个群聊")
+	if err := imDB.Exec(`UPDATE "group" SET name=? WHERE group_no=?`, "一个群聊", groupNo).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	// Seed: session with an assistant deliverable (required by the handler).
 	db.Create(&model.AgentMessage{
@@ -128,9 +130,11 @@ func TestCreateAgentSummary_SourceNameResolvedFromIMDB(t *testing.T) {
 // (buildScheduledTaskSources: "never trust a client-supplied source_name").
 func TestCreateAgentSummary_ClientSourceNameNotTrusted(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	imDB := setupSourceNameImDB(t)
+	imDB := newLegacySaveIMDB(t, "CH-SRCNAME", "81f67cec0180463a8bd74117e5582125")
 	const groupNo = "81f67cec0180463a8bd74117e5582125"
-	seedImGroup(t, imDB, groupNo, "真实群名")
+	if err := imDB.Exec(`UPDATE "group" SET name=? WHERE group_no=?`, "真实群名", groupNo).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	db.Create(&model.AgentMessage{
 		UserID:    "test-user",
@@ -156,35 +160,19 @@ func TestCreateAgentSummary_ClientSourceNameNotTrusted(t *testing.T) {
 	}
 }
 
-// TestCreateAgentSummary_SourceNameNilImDBFallback pins graceful degradation:
-// with no IM DB wired (imDB == nil) the deterministic "来源-xxxxxxxx"
-// fallback is stored instead of an empty string, so the chip never regresses
-// to a raw id.
-func TestCreateAgentSummary_SourceNameNilImDBFallback(t *testing.T) {
+// Missing IM authorization must fail closed; name fallback is only for reads.
+func TestCreateAgentSummary_SourceAuthorizationRequiresIMDB(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	const groupNo = "fef0c26327664232a2fd73ce2fb98ec6"
-
-	db.Create(&model.AgentMessage{
-		UserID:    "test-user",
-		SessionID: "session-srcname-003",
-		Role:      "assistant",
-		Content:   "Agent-generated deliverable.",
-	})
-
+	seedAssistantMessage(t, db, "test-user", "session-srcname-003", "Agent-generated deliverable.")
 	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
-	w := doAgentCreateRequest(t, h, "session-srcname-003", []map[string]interface{}{
-		{"source_type": 1, "source_id": groupNo},
-	})
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	w := doAgentCreateRequest(t, h, "session-srcname-003", []map[string]interface{}{{"source_type": 1, "source_id": "private-group"}})
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatal(w.Body.String())
 	}
-
-	var src model.SummarySource
-	if err := db.First(&src).Error; err != nil {
-		t.Fatalf("source row not persisted: %v", err)
-	}
-	if src.SourceName != "来源-fef0c263(群聊)" {
-		t.Errorf("source_name = %q, want deterministic fallback %q", src.SourceName, "来源-fef0c263(群聊)")
+	var count int64
+	db.Model(&model.SummarySource{}).Count(&count)
+	if count != 0 {
+		t.Fatal("unauthorized provenance persisted")
 	}
 }
 

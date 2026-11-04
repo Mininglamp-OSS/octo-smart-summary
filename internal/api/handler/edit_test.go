@@ -30,6 +30,7 @@ func setupEditDB(t *testing.T) *gorm.DB {
 		&model.SummarySource{},
 		&model.SummaryParticipant{},
 		&model.PersonalResult{},
+		&model.PersonalResultVersion{},
 		&model.SummaryResult{},
 		&model.SummaryChunk{},
 	)
