@@ -500,6 +500,8 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	// then the actual `## Summary 服务上线项目总结报告`. Stripping the opener
 	// keeps the deliverable clean without asking users to hand-edit each time.
 	if !workspaceSave {
+		// Older sessions may still hold the envelope from the legacy prompt.
+		content = normalizeLegacySummaryContent(content)
 		stripped := stripAgentPreamble(content)
 		if stripped != content {
 			log.Printf("[handler] CreateAgentSummary session %s: stripped %d chars of preamble", req.SessionID, len(content)-len(stripped))
