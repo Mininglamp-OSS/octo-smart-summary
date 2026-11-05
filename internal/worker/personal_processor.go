@@ -183,11 +183,21 @@ func (p *Processor) persistCompletedPersonalResult(task model.SummaryTask, pr mo
 			var latest model.PersonalResultVersion
 			if err := tx.Where("task_id = ? AND user_id = ?", lockedPR.TaskID, lockedPR.UserID).
 				Order("version DESC").Order("id DESC").First(&latest).Error; err == nil {
+				if err := service.NormalizePersonalVersionSnapshot(tx, lockedPR, &latest); err != nil {
+					return err
+				}
+				if latest.SnapshotJSON == nil && lockedPR.SnapshotJSON != nil {
+					latest.SnapshotJSON = model.UnknownGenerationSnapshot(lockedPR.TaskID, latest.Version)
+					if err := tx.Model(&latest).Update("snapshot_json", latest.SnapshotJSON).Error; err != nil {
+						return err
+					}
+				}
 				updates["content"] = latest.Content
 				updates["citations_json"] = latest.CitationsJSON
 				updates["msg_count"] = latest.MsgCount
 				updates["total_token_used"] = latest.TotalTokenUsed
 				updates["model_version"] = latest.ModelVersion
+				updates["snapshot_json"] = latest.SnapshotJSON
 				updates["current_version_id"] = latest.ID
 				updates["generated_at"] = latest.GeneratedAt
 			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -231,6 +241,10 @@ func (p *Processor) persistCompletedPersonalResult(task model.SummaryTask, pr mo
 			CreatedBy:        lockedPR.UserID,
 			GeneratedAt:      genAt,
 		}
+		if lockedPR.SnapshotJSON != nil {
+			version.SnapshotJSON = model.UnknownGenerationSnapshot(lockedPR.TaskID, nextVer)
+		}
+		updates["snapshot_json"] = version.SnapshotJSON
 		version.SetCitations(citations)
 		if err := tx.Create(&version).Error; err != nil {
 			return err

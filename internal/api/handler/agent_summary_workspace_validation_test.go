@@ -151,6 +151,12 @@ func TestSummaryWorkspaceValidateSourcesEnforcesSpaceAndDMMembership(t *testing.
 	if err != nil || valid {
 		t.Fatalf("cross-space group valid=%t err=%v", valid, err)
 	}
+	// Explicitly selected DMs remain accessible outside the recent discovery page.
+	for i := 0; i < 201; i++ {
+		if err := imDB.Exec("INSERT INTO conversation_extra VALUES (?, 'actor', 1, 99999)", fmt.Sprintf("new-peer-%d", i)).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
 	valid, err = coordinator.validateSources(ctx, "space-a", "actor", []summaryWorkspaceChannel{{ChatID: "peer-in", ChatType: "direct", Name: "私聊"}})
 	if err != nil || !valid {
 		t.Fatalf("same-space DM peer valid=%t err=%v", valid, err)

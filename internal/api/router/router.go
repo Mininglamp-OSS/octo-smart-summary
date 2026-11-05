@@ -186,6 +186,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	agentSummaryH := handler.NewAgentSummaryHandler(db, imDB, llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
 	agentSummaryH.ConfigureSummaryWorkspace(summaryWorkbenchEnabled)
 	v1.POST("/summaries/agent", agentSummaryH.CreateAgentSummary)
+	v1.GET("/summaries/:id/optimization-target", agentSummaryH.GetOptimizationTarget)
 	// Document "AI 速览": ephemeral streaming quick-glance, never persisted. See
 	// handler/document_preview.go.
 	v1.POST("/summaries/document/preview", agentSummaryH.StreamDocumentPreview)

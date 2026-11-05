@@ -271,7 +271,10 @@ func PruneSummaryResultVersions(db *gorm.DB, taskID int64, keep int) error {
 	if current.CurrentResultID != nil {
 		deleteQuery = deleteQuery.Where("id <> ?", *current.CurrentResultID)
 	}
-	return deleteQuery.Delete(&model.SummaryResult{}).Error
+	// Bound versions remain durable for same-key save retries.
+	bound := db.Model(&model.SummaryAgentSaveIdempotency{}).Select("result_id").
+		Where("task_id = ? AND result_kind = ?", taskID, "team")
+	return deleteQuery.Where("id NOT IN (?)", bound).Delete(&model.SummaryResult{}).Error
 }
 
 // InferScope infers sources and summary_mode from a topic (keyword heuristic fallback).
@@ -373,5 +376,7 @@ func PrunePersonalResultVersions(db *gorm.DB, taskID int64, userID string, keep 
 	if current.CurrentVersionID != nil {
 		deleteQuery = deleteQuery.Where("id <> ?", *current.CurrentVersionID)
 	}
-	return deleteQuery.Delete(&model.PersonalResultVersion{}).Error
+	bound := db.Model(&model.SummaryAgentSaveIdempotency{}).Select("result_id").
+		Where("task_id = ? AND user_id = ? AND result_kind = ?", taskID, userID, "personal")
+	return deleteQuery.Where("id NOT IN (?)", bound).Delete(&model.PersonalResultVersion{}).Error
 }
